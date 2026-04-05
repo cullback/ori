@@ -20,6 +20,47 @@ fn run_i64(source: &str, input: i64) -> i64 {
 }
 
 // ============================================================
+// Tuples
+// ============================================================
+
+#[test]
+fn tuple_basic() {
+    let source = "\
+main : I64
+main = |arg| (
+    pair = (1, 2)
+    (a, b) = pair
+    a + b
+)";
+    assert_eq!(run_i64(source, 0), 3);
+}
+
+#[test]
+fn tuple_from_function() {
+    let source = "\
+swap = |a, b| (b, a)
+
+main : I64
+main = |arg| (
+    (x, y) = swap(3, 7)
+    x * 10 + y
+)";
+    assert_eq!(run_i64(source, 0), 73);
+}
+
+#[test]
+fn tuple_nested() {
+    let source = "\
+main : I64
+main = |arg| (
+    t = ((1, 2), (3, 4))
+    ((a, b), (c, d)) = t
+    a + b + c + d
+)";
+    assert_eq!(run_i64(source, 0), 10);
+}
+
+// ============================================================
 // Arithmetic
 // ============================================================
 

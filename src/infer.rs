@@ -16,6 +16,7 @@ enum Type {
     Record(Box<Type>),
     RowEmpty,
     RowExtend(String, Box<Type>, Box<Type>),
+    Tuple(Vec<Type>),
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +126,7 @@ impl InferCtx {
                 Box::new(self.resolve(field_ty)),
                 Box::new(self.resolve(rest)),
             ),
+            Type::Tuple(elems) => Type::Tuple(elems.iter().map(|e| self.resolve(e)).collect()),
         }
     }
 
@@ -141,6 +143,7 @@ impl InferCtx {
             Type::RowExtend(_, field_ty, rest) => {
                 self.occurs_in(tv, field_ty) || self.occurs_in(tv, rest)
             }
+            Type::Tuple(elems) => elems.iter().any(|e| self.occurs_in(tv, e)),
         }
     }
 
@@ -184,6 +187,17 @@ impl InferCtx {
                     self.unify(x, y);
                 }
                 self.unify(r1, r2);
+            }
+            (Type::Tuple(a), Type::Tuple(b)) => {
+                if a.len() != b.len() {
+                    self.type_error(
+                        self.current_span,
+                        &format!("tuple length mismatch: {} vs {}", a.len(), b.len()),
+                    );
+                }
+                for (x, y) in a.iter().zip(b.iter()) {
+                    self.unify(x, y);
+                }
             }
             (Type::Record(r1), Type::Record(r2)) => self.unify(r1, r2),
             (Type::RowEmpty, Type::RowEmpty) => {}
@@ -256,6 +270,7 @@ impl InferCtx {
                 fvs.extend(self.free_vars(rest));
                 fvs
             }
+            Type::Tuple(elems) => elems.iter().flat_map(|e| self.free_vars(e)).collect(),
         }
     }
 
@@ -310,6 +325,12 @@ impl InferCtx {
                 Box::new(Self::apply_mapping(field_ty, mapping)),
                 Box::new(Self::apply_mapping(rest, mapping)),
             ),
+            Type::Tuple(elems) => Type::Tuple(
+                elems
+                    .iter()
+                    .map(|e| Self::apply_mapping(e, mapping))
+                    .collect(),
+            ),
         }
     }
 
@@ -351,6 +372,13 @@ impl InferCtx {
                     row = Type::RowExtend(name.clone(), Box::new(field_ty), Box::new(row));
                 }
                 Type::Record(Box::new(row))
+            }
+            TypeExpr::Tuple(elems) => {
+                let elem_types: Vec<Type> = elems
+                    .iter()
+                    .map(|e| self.type_expr_to_type(e, tvar_env))
+                    .collect();
+                Type::Tuple(elem_types)
             }
         }
     }
@@ -468,6 +496,14 @@ impl InferCtx {
                             let scheme = self.generalize(&val_ty);
                             self.env.insert(name.clone(), scheme);
                         }
+                        Stmt::TupleDestructure { pattern, val } => {
+                            let val_ty = self.infer_expr(val);
+                            let bindings = self.infer_pattern(pattern, &val_ty);
+                            for (name, ty) in bindings {
+                                let scheme = self.generalize(&ty);
+                                self.env.insert(name, scheme);
+                            }
+                        }
                     }
                 }
                 let result_ty = self.infer_expr(result);
@@ -551,6 +587,11 @@ impl InferCtx {
                 self.env = saved_env;
                 Type::Arrow(param_types, Box::new(body_ty))
             }
+
+            ExprKind::Tuple(elems) => {
+                let elem_types: Vec<Type> = elems.iter().map(|e| self.infer_expr(e)).collect();
+                Type::Tuple(elem_types)
+            }
         }
     }
 
@@ -610,7 +651,9 @@ impl InferCtx {
                                 bindings.push((n.clone(), field_ty.clone()));
                             }
                             ast::Pattern::Wildcard => {}
-                            ast::Pattern::Constructor { .. } | ast::Pattern::Record { .. } => {
+                            ast::Pattern::Constructor { .. }
+                            | ast::Pattern::Record { .. }
+                            | ast::Pattern::Tuple(_) => {
                                 bindings.extend(self.infer_pattern(field_pat, field_ty));
                             }
                         }
@@ -632,6 +675,16 @@ impl InferCtx {
                 }
                 let expected_record = Type::Record(Box::new(row));
                 self.unify(&expected_record, expected);
+                bindings
+            }
+            ast::Pattern::Tuple(elems) => {
+                let elem_types: Vec<Type> = elems.iter().map(|_| self.fresh()).collect();
+                let tuple_ty = Type::Tuple(elem_types.clone());
+                self.unify(&tuple_ty, expected);
+                let mut bindings = Vec::new();
+                for (elem_pat, elem_ty) in elems.iter().zip(elem_types.iter()) {
+                    bindings.extend(self.infer_pattern(elem_pat, elem_ty));
+                }
                 bindings
             }
             ast::Pattern::Binding(name) => {
@@ -687,7 +740,7 @@ impl InferCtx {
                             ast::Pattern::Constructor { .. } => {
                                 panic!("nested constructor patterns not supported in fold");
                             }
-                            ast::Pattern::Record { .. } => {
+                            ast::Pattern::Record { .. } | ast::Pattern::Tuple(_) => {
                                 bindings.extend(self.infer_pattern(field_pat, &bind_ty));
                             }
                         }
@@ -758,6 +811,10 @@ impl InferCtx {
                     self.display_type(field_ty),
                     self.display_type(rest)
                 )
+            }
+            Type::Tuple(elems) => {
+                let elem_strs: Vec<String> = elems.iter().map(|e| self.display_type(e)).collect();
+                format!("({})", elem_strs.join(", "))
             }
         }
     }

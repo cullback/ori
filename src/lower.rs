@@ -335,8 +335,11 @@ impl LowerCtx {
             }
             ExprKind::Block(stmts, result) => {
                 for stmt in stmts {
-                    if let Stmt::Let { val, .. } = stmt {
-                        self.scan_expr(val);
+                    match stmt {
+                        Stmt::Let { val, .. } | Stmt::TupleDestructure { val, .. } => {
+                            self.scan_expr(val);
+                        }
+                        Stmt::TypeHint { .. } => {}
                     }
                 }
                 self.scan_expr(result);
@@ -388,6 +391,11 @@ impl LowerCtx {
             }
             ExprKind::FieldAccess { record, .. } => {
                 self.scan_expr(record);
+            }
+            ExprKind::Tuple(elems) => {
+                for e in elems {
+                    self.scan_expr(e);
+                }
             }
             ExprKind::IntLit(_) | ExprKind::Name(_) => {}
         }
@@ -515,12 +523,24 @@ impl LowerCtx {
                 }
                 self.collect_free(body, &inner, seen, free);
             }
+            ExprKind::Tuple(elems) => {
+                for e in elems {
+                    self.collect_free(e, bound, seen, free);
+                }
+            }
             ExprKind::Block(stmts, result) => {
                 let mut inner = bound.clone();
                 for stmt in stmts {
-                    if let Stmt::Let { name, val } = stmt {
-                        self.collect_free(val, &inner, seen, free);
-                        inner.insert(name);
+                    match stmt {
+                        Stmt::Let { name, val } => {
+                            self.collect_free(val, &inner, seen, free);
+                            inner.insert(name);
+                        }
+                        Stmt::TupleDestructure { pattern, val } => {
+                            self.collect_free(val, &inner, seen, free);
+                            Self::pattern_names(pattern, &mut inner);
+                        }
+                        Stmt::TypeHint { .. } => {}
                     }
                 }
                 self.collect_free(result, &inner, seen, free);
@@ -566,6 +586,11 @@ impl LowerCtx {
                     Self::pattern_names(field_pat, bound);
                 }
             }
+            ast::Pattern::Tuple(elems) => {
+                for e in elems {
+                    Self::pattern_names(e, bound);
+                }
+            }
             ast::Pattern::Binding(name) => {
                 bound.insert(name);
             }
@@ -594,6 +619,10 @@ impl LowerCtx {
 
     // ---- Pass 2: Lower expressions ----
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "expression lowering handles all forms"
+    )]
     fn lower_expr(&mut self, expr: &Expr) -> Core {
         match &expr.kind {
             ExprKind::IntLit(n) => Core::i64(*n),
@@ -626,6 +655,12 @@ impl LowerCtx {
                             bindings.push((var_id, val_core));
                         }
                         Stmt::TypeHint { .. } => {} // handled by type checker
+                        Stmt::TupleDestructure { pattern, val } => {
+                            let val_core = self.lower_expr(val);
+                            let tuple_var = self.builder.var();
+                            bindings.push((tuple_var, val_core));
+                            self.lower_tuple_destructure(pattern, tuple_var, &mut bindings);
+                        }
                     }
                 }
 
@@ -687,6 +722,15 @@ impl LowerCtx {
 
             ExprKind::FieldAccess { record, field } => {
                 Core::field_access(self.lower_expr(record), field.clone())
+            }
+
+            ExprKind::Tuple(elems) => {
+                let core_fields: Vec<(String, Core)> = elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (i.to_string(), self.lower_expr(e)))
+                    .collect();
+                Core::record(core_fields)
             }
 
             ExprKind::Lambda { .. } => {
@@ -831,6 +875,36 @@ impl LowerCtx {
         self.lambda_sets = sets;
     }
 
+    // ---- Tuple destructure lowering ----
+
+    fn lower_tuple_destructure(
+        &mut self,
+        pattern: &ast::Pattern,
+        source_var: VarId,
+        bindings: &mut Vec<(VarId, Core)>,
+    ) {
+        match pattern {
+            ast::Pattern::Tuple(elems) => {
+                for (i, elem) in elems.iter().enumerate() {
+                    let field_var = self.builder.var();
+                    let access = Core::field_access(Core::var(source_var), i.to_string());
+                    bindings.push((field_var, access));
+                    match elem {
+                        ast::Pattern::Binding(name) => {
+                            self.vars.insert(name.clone(), field_var);
+                        }
+                        ast::Pattern::Tuple(_) => {
+                            self.lower_tuple_destructure(elem, field_var, bindings);
+                        }
+                        ast::Pattern::Wildcard => {}
+                        _ => panic!("unsupported pattern in tuple destructure"),
+                    }
+                }
+            }
+            _ => panic!("expected tuple pattern in tuple destructure"),
+        }
+    }
+
     // ---- Fold lowering ----
 
     fn lower_fold_arm(&mut self, arm: &ast::MatchArm) -> FoldArm {
@@ -908,12 +982,18 @@ impl LowerCtx {
                         ast::Pattern::Record { .. } => {
                             panic!("record patterns inside constructor patterns not yet supported");
                         }
+                        ast::Pattern::Tuple(_) => {
+                            panic!("tuple patterns inside constructor patterns not yet supported");
+                        }
                     }
                 }
                 (Pattern::con(con_id, field_vars), bindings)
             }
             ast::Pattern::Record { .. } => {
                 panic!("record patterns in match arms not yet supported in lowering");
+            }
+            ast::Pattern::Tuple(_) => {
+                panic!("tuple patterns in match arms not yet supported in lowering");
             }
             ast::Pattern::Wildcard | ast::Pattern::Binding(_) => {
                 panic!("top-level wildcard/binding patterns not yet supported in match arms");

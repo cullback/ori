@@ -32,6 +32,7 @@ type_atom = {
     type_name ~ "(" ~ type_atom ~ ("," ~ type_atom)* ~ ")"
   | "[" ~ (tag_decl ~ ("," ~ tag_decl)*)? ~ "]"
   | "{" ~ (field_type ~ ("," ~ field_type)*)? ~ "}"
+  | "(" ~ type_atom ~ "," ~ type_atom ~ ("," ~ type_atom)* ~ ")"
   | type_name
 }
 
@@ -52,33 +53,47 @@ prefix = {
   | record_literal
   | neg_expr
   | call_or_access
+  | tuple
   | block
   | int_lit
 }
 
+tuple = { "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)* ~ ")" }
+
 neg_expr = { "-" ~ prefix }
 
 // Calls, constructors, names, and field access.
-// Ordered so longer matches are tried first.
+// Call heads are atomic (no space before "(").
 call_or_access = {
-    constructor ~ "." ~ ident ~ "(" ~ args? ~ ")"    // Qualified: List.sum(xs)
-  | ident ~ "." ~ ident ~ "(" ~ args? ~ ")"          // Qualified: mod.func(x)
-  | constructor ~ "(" ~ args? ~ ")"                    // Constructor call: Cons(1, Nil)
-  | ident ~ "(" ~ args? ~ ")"                          // Function call: foo(1)
-  | constructor                                         // Nullary constructor: True
-  | ident ~ ("." ~ ident)+                              // Field access: r.x.y
-  | ident                                                // Name: x
+    qualified_head ~ args? ~ ")"
+  | constructor_head ~ args? ~ ")"
+  | function_head ~ args? ~ ")"
+  | constructor
+  | ident ~ ("." ~ ident)+
+  | ident
 }
+
+// Atomic heads: no whitespace allowed before "("
+qualified_head   = @{ (constructor | ident) ~ "." ~ ident ~ "(" }
+constructor_head = @{ constructor ~ "(" }
+function_head    = @{ ident ~ "(" }
 
 args = { expr ~ ("," ~ expr)* }
 
-block = { "(" ~ (block_stmt ~ !(")" | EOI))* ~ expr ~ ")" }
+block = { "(" ~ block_body ~ ")" }
+block_body = { block_stmt* ~ expr }
 
 block_stmt = { type_hint | assignment }
 
 type_hint = { ident ~ ":" ~ type_expr }
 
-assignment = { ident ~ "=" ~ expr }
+assignment = { irrefutable ~ "=" ~ expr }
+
+irrefutable = {
+    "(" ~ irrefutable ~ "," ~ irrefutable ~ ("," ~ irrefutable)* ~ ")"   // tuple: (a, b)
+  | "_"                                                                    // wildcard
+  | ident                                                                  // binding
+}
 
 record_literal = { "{" ~ (field_init ~ ("," ~ field_init)*)? ~ "}" }
 
@@ -109,6 +124,7 @@ pattern = {
     constructor ~ "(" ~ (pattern ~ ("," ~ pattern)*)? ~ ")"
   | constructor
   | "{" ~ (field_pattern ~ ("," ~ field_pattern)*)? ~ "}"
+  | "(" ~ pattern ~ "," ~ pattern ~ ("," ~ pattern)* ~ ")"
   | "_"
   | ident
 }

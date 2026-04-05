@@ -147,6 +147,11 @@ fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr {
                         inner.into_iter().map(parse_field_type).collect();
                     TypeExpr::Record(fields)
                 }
+                Rule::type_atom => {
+                    // Tuple type: all children are type_atoms
+                    let elements: Vec<TypeExpr> = inner.into_iter().map(parse_type_expr).collect();
+                    TypeExpr::Tuple(elements)
+                }
                 _ => panic!("unexpected type_atom content: {:?}", first.as_rule()),
             }
         }
@@ -237,82 +242,70 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Expr {
         Rule::fold_expr => parse_fold_expr(pair, span),
         Rule::lambda => parse_lambda(pair, span),
         Rule::record_literal => parse_record_literal(pair, span),
+        Rule::tuple => parse_tuple(pair, span),
         _ => panic!("unexpected expression rule: {:?}", pair.as_rule()),
+    }
+}
+
+fn parse_call_head(text: &str) -> (&str, Option<(&str, &str)>) {
+    // Atomic head text like "List.sum(" or "foo(" or "Cons("
+    let without_paren = &text[..text.len() - 1];
+    if let Some(dot_pos) = without_paren.find('.') {
+        let owner = &without_paren[..dot_pos];
+        let method = &without_paren[dot_pos + 1..];
+        (owner, Some((owner, method)))
+    } else {
+        (without_paren, None)
     }
 }
 
 fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
     let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
-
     let first = inner.remove(0);
-    let first_name = first.as_str().to_owned();
-    if inner.is_empty() {
-        // Bare name or nullary constructor
-        return Expr::new(ExprKind::Name(first_name), span);
-    }
 
-    let second = &inner[0];
-    match second.as_rule() {
-        Rule::ident => {
-            let second_name = second.as_str().to_owned();
-            if inner.len() >= 2 && inner[1].as_rule() == Rule::args {
-                // QualifiedCall: Owner.method(args) or mod.func(args)
-                let args_pair = inner.remove(1);
-                inner.remove(0);
-                let args: Vec<Expr> = args_pair.into_inner().map(parse_expr).collect();
-                let mut result = Expr::new(
-                    ExprKind::QualifiedCall {
-                        owner: first_name,
-                        method: second_name,
-                        args,
-                    },
-                    span,
-                );
-                for remaining in inner {
-                    if remaining.as_rule() == Rule::ident {
-                        result = Expr::new(
-                            ExprKind::FieldAccess {
-                                record: Box::new(result),
-                                field: remaining.as_str().to_owned(),
-                            },
-                            span,
-                        );
-                    }
-                }
-                result
-            } else {
-                // Field access chain: name.field.field...
-                let mut result = Expr::new(ExprKind::Name(first_name), span);
-                for field in inner {
-                    if field.as_rule() == Rule::ident {
-                        result = Expr::new(
-                            ExprKind::FieldAccess {
-                                record: Box::new(result),
-                                field: field.as_str().to_owned(),
-                            },
-                            span,
-                        );
-                    }
-                }
-                result
-            }
-        }
-        Rule::args => {
-            // Call or constructor call: name(args) or Constructor(args)
-            let args: Vec<Expr> = inner.remove(0).into_inner().map(parse_expr).collect();
-            let mut result = Expr::new(
-                ExprKind::Call {
-                    func: first_name,
+    match first.as_rule() {
+        Rule::qualified_head => {
+            let text = first.as_str();
+            let (_, Some((owner, method))) = parse_call_head(text) else {
+                unreachable!()
+            };
+            let args = inner
+                .first()
+                .filter(|p| p.as_rule() == Rule::args)
+                .map(|p| p.clone().into_inner().map(parse_expr).collect())
+                .unwrap_or_default();
+            Expr::new(
+                ExprKind::QualifiedCall {
+                    owner: owner.to_owned(),
+                    method: method.to_owned(),
                     args,
                 },
                 span,
-            );
-            for remaining in inner {
-                if remaining.as_rule() == Rule::ident {
+            )
+        }
+        Rule::constructor_head | Rule::function_head => {
+            let text = first.as_str();
+            let func = text[..text.len() - 1].to_owned();
+            let args = inner
+                .first()
+                .filter(|p| p.as_rule() == Rule::args)
+                .map(|p| p.clone().into_inner().map(parse_expr).collect())
+                .unwrap_or_default();
+            Expr::new(ExprKind::Call { func, args }, span)
+        }
+        Rule::constructor | Rule::ident => {
+            let first_name = first.as_str().to_owned();
+            if inner.is_empty() {
+                return Expr::new(ExprKind::Name(first_name), span);
+            }
+            // Field access chain
+            let mut result = Expr::new(ExprKind::Name(first_name), span);
+            for field in inner {
+                if field.as_rule() == Rule::ident {
                     result = Expr::new(
                         ExprKind::FieldAccess {
                             record: Box::new(result),
-                            field: remaining.as_str().to_owned(),
+                            field: field.as_str().to_owned(),
                         },
                         span,
                     );
@@ -320,7 +313,7 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
             }
             result
         }
-        _ => Expr::new(ExprKind::Name(first_name), span),
+        other => panic!("unexpected call_or_access child: {other:?}"),
     }
 }
 
@@ -328,16 +321,30 @@ fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
     let mut stmts = Vec::new();
     let mut result_expr = None;
 
-    for inner in pair.into_inner() {
+    // block = { "(" ~ block_body ~ ")" }, so descend into block_body
+    let body = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::block_body)
+        .unwrap_or_else(|| panic!("block missing block_body"));
+
+    for inner in body.into_inner() {
         match inner.as_rule() {
             Rule::block_stmt => {
                 let stmt_inner = inner.into_inner().next().unwrap();
                 match stmt_inner.as_rule() {
                     Rule::assignment => {
                         let mut parts = stmt_inner.into_inner();
-                        let name = parts.next().unwrap().as_str().to_owned();
+                        let lhs = parts.next().unwrap(); // irrefutable
                         let val = parse_expr(parts.next().unwrap());
-                        stmts.push(Stmt::Let { name, val });
+                        let pattern = parse_irrefutable(lhs);
+                        match pattern {
+                            Pattern::Binding(name) => {
+                                stmts.push(Stmt::Let { name, val });
+                            }
+                            _ => {
+                                stmts.push(Stmt::TupleDestructure { pattern, val });
+                            }
+                        }
                     }
                     Rule::type_hint => {
                         let mut parts = stmt_inner.into_inner();
@@ -470,6 +477,36 @@ fn parse_record_literal(pair: Pair<'_, Rule>, span: Span) -> Expr {
     Expr::new(ExprKind::Record { fields }, span)
 }
 
+fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern {
+    let text = pair.as_str().trim();
+    if text == "_" {
+        return Pattern::Wildcard;
+    }
+    let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+    if inner.is_empty() {
+        // bare ident or _
+        if text == "_" {
+            return Pattern::Wildcard;
+        }
+        return Pattern::Binding(text.to_owned());
+    }
+    if inner.len() == 1 && inner[0].as_rule() == Rule::ident {
+        return Pattern::Binding(inner[0].as_str().to_owned());
+    }
+    // Tuple pattern: all children are irrefutable
+    let sub_pats: Vec<Pattern> = inner
+        .into_iter()
+        .filter(|p| p.as_rule() == Rule::irrefutable)
+        .map(parse_irrefutable)
+        .collect();
+    Pattern::Tuple(sub_pats)
+}
+
+fn parse_tuple(pair: Pair<'_, Rule>, span: Span) -> Expr {
+    let elements: Vec<Expr> = pair.into_inner().map(parse_expr).collect();
+    Expr::new(ExprKind::Tuple(elements), span)
+}
+
 // ---- Patterns ----
 
 fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
@@ -495,6 +532,11 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
             let fields: Vec<(String, Pattern)> =
                 inner.into_iter().map(parse_field_pattern).collect();
             Pattern::Record { fields }
+        }
+        Rule::pattern => {
+            // Tuple pattern: all children are sub-patterns
+            let elements: Vec<Pattern> = inner.into_iter().map(parse_pattern).collect();
+            Pattern::Tuple(elements)
         }
         Rule::ident => {
             let name = first.as_str();
