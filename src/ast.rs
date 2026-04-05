@@ -4,7 +4,7 @@ pub struct Module {
 }
 
 #[derive(Debug)]
-#[expect(dead_code, reason = "TypeAnno parsed but not used until type checker")]
+#[allow(dead_code)]
 pub enum Decl {
     TypeAnno {
         name: String,
@@ -18,15 +18,23 @@ pub enum Decl {
 }
 
 #[derive(Debug)]
-#[expect(dead_code, reason = "parsed but not used until type checker")]
+#[allow(dead_code)]
 pub enum TypeExpr {
     Named(String),
+    TagUnion(Vec<TagDecl>),
+    Arrow(Vec<TypeExpr>, Box<TypeExpr>),
+}
+
+#[derive(Debug)]
+pub struct TagDecl {
+    pub name: String,
+    pub fields: Vec<TypeExpr>,
 }
 
 #[derive(Debug)]
 pub enum Expr {
     IntLit(i64),
-    Var(String),
+    Name(String),
     BinOp {
         op: BinOp,
         lhs: Box<Expr>,
@@ -37,6 +45,25 @@ pub enum Expr {
         args: Vec<Expr>,
     },
     Block(Vec<Stmt>, Box<Expr>),
+    If {
+        expr: Box<Expr>,
+        arms: Vec<MatchArm>,
+        #[allow(dead_code)]
+        else_body: Option<Box<Expr>>,
+    },
+}
+
+#[derive(Debug)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Expr,
+}
+
+#[derive(Debug)]
+pub enum Pattern {
+    Constructor { name: String, fields: Vec<Pattern> },
+    Wildcard,
+    Binding(String),
 }
 
 #[derive(Debug)]

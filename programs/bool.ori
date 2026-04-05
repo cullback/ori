@@ -1,0 +1,14 @@
+Bool : [True, False]
+
+not : Bool -> Bool
+not = |b| if b
+    : True then False
+    : False then True
+
+bool_to_i64 : Bool -> I64
+bool_to_i64 = |b| if b
+    : True then 1
+    : False then 0
+
+main : I64
+main = |arg| bool_to_i64(not(True))

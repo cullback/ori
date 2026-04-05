@@ -3,13 +3,19 @@ pub enum Token {
     Ident(String),
     IntLit(i64),
 
+    // Punctuation
     Eq,
     Colon,
     Pipe,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
+    Arrow,
+    Underscore,
 
+    // Operators
     Star,
     Plus,
     Minus,
@@ -18,13 +24,19 @@ pub enum Token {
     EqEq,
     BangEq,
 
+    // Keywords
+    If,
+    Then,
+    Else,
+
     Newline,
     Eof,
 }
 
 #[expect(
     clippy::arithmetic_side_effects,
-    reason = "position arithmetic in scanner is bounds-checked by the while loop"
+    clippy::too_many_lines,
+    reason = "scanner is a single match over character classes — splitting would fragment the logic"
 )]
 pub fn tokenize(source: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
@@ -53,13 +65,17 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 }
             }
 
-            // Two-character operators
+            // Two-character tokens
             b'=' if pos + 1 < bytes.len() && bytes[pos + 1] == b'=' => {
                 tokens.push(Token::EqEq);
                 pos += 2;
             }
             b'!' if pos + 1 < bytes.len() && bytes[pos + 1] == b'=' => {
                 tokens.push(Token::BangEq);
+                pos += 2;
+            }
+            b'-' if pos + 1 < bytes.len() && bytes[pos + 1] == b'>' => {
+                tokens.push(Token::Arrow);
                 pos += 2;
             }
 
@@ -84,8 +100,20 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 tokens.push(Token::RParen);
                 pos += 1;
             }
+            b'[' => {
+                tokens.push(Token::LBracket);
+                pos += 1;
+            }
+            b']' => {
+                tokens.push(Token::RBracket);
+                pos += 1;
+            }
             b',' => {
                 tokens.push(Token::Comma);
+                pos += 1;
+            }
+            b'_' if pos + 1 >= bytes.len() || !bytes[pos + 1].is_ascii_alphanumeric() => {
+                tokens.push(Token::Underscore);
                 pos += 1;
             }
             b'*' => {
@@ -122,7 +150,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 tokens.push(Token::IntLit(n));
             }
 
-            // Identifiers (lowercase, uppercase, underscore)
+            // Identifiers and keywords
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 let start = pos;
                 while pos < bytes.len()
@@ -130,7 +158,14 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 {
                     pos += 1;
                 }
-                tokens.push(Token::Ident(source[start..pos].to_owned()));
+                let word = &source[start..pos];
+                let tok = match word {
+                    "if" => Token::If,
+                    "then" => Token::Then,
+                    "else" => Token::Else,
+                    _ => Token::Ident(word.to_owned()),
+                };
+                tokens.push(tok);
             }
 
             _ => panic!("unexpected character '{}' at position {pos}", b as char),

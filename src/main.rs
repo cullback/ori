@@ -5,6 +5,8 @@ mod ir;
 mod lower;
 mod parse;
 #[cfg(test)]
+mod test_frontend;
+#[cfg(test)]
 mod test_programs;
 mod token;
 

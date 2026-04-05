@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Decl, Expr, Module, Stmt, TypeExpr};
+use crate::ast::{BinOp, Decl, Expr, MatchArm, Module, Pattern, Stmt, TagDecl, TypeExpr};
 use crate::token::Token;
 
 pub fn parse(tokens: Vec<Token>) -> Module {
@@ -46,6 +46,12 @@ impl Parser {
         }
     }
 
+    fn is_uppercase(name: &str) -> bool {
+        name.starts_with(|c: char| c.is_ascii_uppercase())
+    }
+
+    // ---- Module ----
+
     fn parse_module(&mut self) -> Module {
         let mut decls = Vec::new();
         self.skip_newlines();
@@ -59,7 +65,6 @@ impl Parser {
     }
 
     fn parse_decl(&mut self) -> Decl {
-        // Lookahead: Ident Colon → type annotation, Ident Eq → func def
         let Token::Ident(name) = self.peek().clone() else {
             panic!(
                 "expected identifier at start of declaration, got {:?}",
@@ -84,13 +89,6 @@ impl Parser {
         Decl::TypeAnno { name, ty }
     }
 
-    fn parse_type_expr(&mut self) -> TypeExpr {
-        let Token::Ident(name) = self.advance() else {
-            panic!("expected type name, got {:?}", self.tokens[self.pos - 1]);
-        };
-        TypeExpr::Named(name)
-    }
-
     fn parse_func_def(&mut self) -> Decl {
         let Token::Ident(name) = self.advance() else {
             panic!("expected identifier")
@@ -98,9 +96,8 @@ impl Parser {
         self.expect(&Token::Eq);
         self.skip_newlines();
 
-        // Check for lambda: |params| body
         if *self.peek() == Token::Pipe {
-            self.advance(); // consume |
+            self.advance();
             let mut params = Vec::new();
             if *self.peek() != Token::Pipe {
                 loop {
@@ -123,7 +120,6 @@ impl Parser {
             self.skip_newlines();
             Decl::FuncDef { name, params, body }
         } else {
-            // Constant: name = expr
             let body = self.parse_expr();
             self.skip_newlines();
             Decl::FuncDef {
@@ -133,6 +129,74 @@ impl Parser {
             }
         }
     }
+
+    // ---- Type expressions ----
+
+    fn parse_type_expr(&mut self) -> TypeExpr {
+        // Collect comma-separated type atoms, then check for ->
+        let mut parts = vec![self.parse_type_atom()];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            parts.push(self.parse_type_atom());
+        }
+        if *self.peek() == Token::Arrow {
+            self.advance();
+            let ret = self.parse_type_expr();
+            TypeExpr::Arrow(parts, Box::new(ret))
+        } else if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            panic!("comma-separated types require -> return type");
+        }
+    }
+
+    fn parse_type_atom(&mut self) -> TypeExpr {
+        match self.peek().clone() {
+            Token::Ident(name) => {
+                self.advance();
+                TypeExpr::Named(name)
+            }
+            Token::LBracket => {
+                self.advance();
+                let mut tags = Vec::new();
+                if *self.peek() != Token::RBracket {
+                    tags.push(self.parse_tag_decl());
+                    while *self.peek() == Token::Comma {
+                        self.advance();
+                        tags.push(self.parse_tag_decl());
+                    }
+                }
+                self.expect(&Token::RBracket);
+                TypeExpr::TagUnion(tags)
+            }
+            other => panic!("expected type, got {other:?}"),
+        }
+    }
+
+    fn parse_tag_decl(&mut self) -> TagDecl {
+        let Token::Ident(name) = self.advance() else {
+            panic!("expected constructor name in tag union");
+        };
+        assert!(
+            Self::is_uppercase(&name),
+            "tag names must be uppercase, got '{name}'"
+        );
+        let mut fields = Vec::new();
+        if *self.peek() == Token::LParen {
+            self.advance();
+            if *self.peek() != Token::RParen {
+                fields.push(self.parse_type_expr());
+                while *self.peek() == Token::Comma {
+                    self.advance();
+                    fields.push(self.parse_type_expr());
+                }
+            }
+            self.expect(&Token::RParen);
+        }
+        TagDecl { name, fields }
+    }
+
+    // ---- Expressions ----
 
     fn parse_expr(&mut self) -> Expr {
         self.parse_expr_bp(0)
@@ -148,7 +212,7 @@ impl Parser {
             if l_bp < min_bp {
                 break;
             }
-            self.advance(); // consume operator
+            self.advance();
             let rhs = self.parse_expr_bp(r_bp);
             lhs = Expr::BinOp {
                 op,
@@ -169,9 +233,9 @@ impl Parser {
 
             Token::Ident(name) => {
                 self.advance();
-                // Check for function call: ident(args)
+                // Check for function/constructor call: Name(args)
                 if *self.peek() == Token::LParen {
-                    self.advance(); // consume (
+                    self.advance();
                     let mut args = Vec::new();
                     if *self.peek() != Token::RParen {
                         args.push(self.parse_expr());
@@ -183,19 +247,23 @@ impl Parser {
                     self.expect(&Token::RParen);
                     Expr::Call { func: name, args }
                 } else {
-                    Expr::Var(name)
+                    Expr::Name(name)
                 }
             }
 
             Token::LParen => {
-                self.advance(); // consume (
+                self.advance();
                 self.parse_block()
+            }
+
+            Token::If => {
+                self.advance();
+                self.parse_if_expr()
             }
 
             Token::Minus => {
                 self.advance();
                 let operand = self.parse_prefix();
-                // Desugar -x as 0 - x
                 Expr::BinOp {
                     op: BinOp::Sub,
                     lhs: Box::new(Expr::IntLit(0)),
@@ -207,13 +275,80 @@ impl Parser {
         }
     }
 
+    fn parse_if_expr(&mut self) -> Expr {
+        // Parse the scrutinee expression
+        let expr = self.parse_expr();
+        self.skip_newlines();
+
+        // Multi-arm: : Pattern then Expr
+        let mut arms = Vec::new();
+        while *self.peek() == Token::Colon {
+            self.advance();
+            self.skip_newlines();
+            let pattern = self.parse_pattern();
+            self.skip_newlines();
+            self.expect(&Token::Then);
+            self.skip_newlines();
+            let body = self.parse_expr();
+            self.skip_newlines();
+            arms.push(MatchArm { pattern, body });
+        }
+
+        let else_body = (*self.peek() == Token::Else).then(|| {
+            self.advance();
+            self.skip_newlines();
+            Box::new(self.parse_expr())
+        });
+
+        assert!(
+            !arms.is_empty(),
+            "if expression requires at least one : arm"
+        );
+
+        Expr::If {
+            expr: Box::new(expr),
+            arms,
+            else_body,
+        }
+    }
+
+    fn parse_pattern(&mut self) -> Pattern {
+        match self.peek().clone() {
+            Token::Underscore => {
+                self.advance();
+                Pattern::Wildcard
+            }
+            Token::Ident(name) if Self::is_uppercase(&name) => {
+                self.advance();
+                let mut fields = Vec::new();
+                if *self.peek() == Token::LParen {
+                    self.advance();
+                    if *self.peek() != Token::RParen {
+                        fields.push(self.parse_pattern());
+                        while *self.peek() == Token::Comma {
+                            self.advance();
+                            fields.push(self.parse_pattern());
+                        }
+                    }
+                    self.expect(&Token::RParen);
+                }
+                Pattern::Constructor { name, fields }
+            }
+            Token::Ident(name) => {
+                self.advance();
+                Pattern::Binding(name)
+            }
+            other => panic!("expected pattern, got {other:?}"),
+        }
+    }
+
     fn parse_block(&mut self) -> Expr {
         self.skip_newlines();
         let mut stmts = Vec::new();
 
         loop {
-            // Check if this is a let statement: Ident Eq (not EqEq)
-            if let Token::Ident(_) = self.peek()
+            if let Token::Ident(peeked) = self.peek()
+                && !Self::is_uppercase(peeked)
                 && *self.peek_at(1) == Token::Eq
             {
                 let Token::Ident(name) = self.advance() else {
@@ -225,7 +360,6 @@ impl Parser {
                 self.skip_newlines();
                 continue;
             }
-            // Not a let statement — this must be the final expression
             break;
         }
 
@@ -234,7 +368,6 @@ impl Parser {
         self.expect(&Token::RParen);
 
         if stmts.is_empty() {
-            // Parenthesized expression, not a block
             result
         } else {
             Expr::Block(stmts, Box::new(result))
