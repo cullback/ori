@@ -1,6 +1,7 @@
 mod ast;
 mod builder;
 mod eval;
+mod infer;
 mod ir;
 mod lower;
 mod parse;
@@ -28,6 +29,7 @@ fn main() {
     // Compile
     let tokens = token::tokenize(&source);
     let module = parse::parse(tokens);
+    infer::check(&module);
     let (program, input_var) = lower::lower(&module);
 
     // Read input from stdin

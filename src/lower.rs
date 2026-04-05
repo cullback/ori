@@ -231,6 +231,7 @@ impl LowerCtx {
                     name,
                     ty: TypeExpr::TagUnion(tags),
                     methods,
+                    ..
                 } => {
                     self.register_tag_union(name, tags);
                     for method_decl in methods {
@@ -286,7 +287,9 @@ impl LowerCtx {
             let recursive_flags: Vec<bool> = tag
                 .fields
                 .iter()
-                .map(|field_ty| matches!(field_ty, TypeExpr::Named(name) if name == type_name))
+                .map(|field_ty| {
+                    matches!(field_ty, TypeExpr::Named(name) | TypeExpr::App(name, _) if name == type_name)
+                })
                 .collect();
             self.constructor_fields
                 .insert(tag.name.clone(), recursive_flags.clone());

@@ -6,6 +6,7 @@ use crate::ir::{NumVal, Value};
 fn run(source: &str, input: i64) -> Value {
     let tokens = crate::token::tokenize(source);
     let module = crate::parse::parse(tokens);
+    crate::infer::check(&module);
     let (program, input_var) = crate::lower::lower(&module);
     let mut env = HashMap::new();
     env.insert(input_var, Value::VNum(NumVal::I64(input)));
@@ -628,4 +629,56 @@ main : I64
 main = |arg| List.sum_doubled(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 12);
+}
+
+// ============================================================
+// Type inference — error detection
+// ============================================================
+
+#[test]
+#[should_panic(expected = "type error")]
+fn type_error_add_bool() {
+    run_i64("main : I64\nmain = |x| x + True", 0);
+}
+
+#[test]
+#[should_panic(expected = "type error")]
+fn type_error_if_branch_mismatch() {
+    run_i64("main : I64\nmain = |x| if x == 0 then 1 else True", 0);
+}
+
+// ============================================================
+// Type inference — parametric polymorphism
+// ============================================================
+
+#[test]
+fn generic_maybe_type() {
+    let source = "\
+Maybe(a) : [Just(a), Nothing]
+
+unwrap_or : Maybe(I64), I64 -> I64
+unwrap_or = |m, default| if m
+    : Just(val) then val
+    : Nothing then default
+
+main : I64
+main = |arg| unwrap_or(Just(42), 0)";
+
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+#[test]
+fn generic_list_type() {
+    let source = "\
+List(a) : [Nil, Cons(a, List(a))].(
+    sum : List(I64) -> I64
+    sum = |xs| fold xs
+        : Nil then 0
+        : Cons(hd, rest) then hd + rest
+)
+
+main : I64
+main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
+
+    assert_eq!(run_i64(source, 0), 6);
 }

@@ -74,6 +74,26 @@ impl Parser {
 
         match self.peek_at(1) {
             Token::Colon => self.parse_type_anno(),
+            Token::LParen => {
+                // Could be `Name(params) :` (type with params) or something else.
+                // Scan forward past the parens to find `:` or `=`.
+                let mut depth = 1_usize;
+                let mut offset = 2;
+                while depth > 0 {
+                    match self.peek_at(offset) {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        Token::Eof => panic!("unexpected EOF in declaration"),
+                        _ => {}
+                    }
+                    offset += 1;
+                }
+                match self.peek_at(offset) {
+                    Token::Colon => self.parse_type_anno(),
+                    Token::Eq => self.parse_func_def(),
+                    other => panic!("expected ':' or '=' after '{name}(...)', got {other:?}"),
+                }
+            }
             Token::Eq => self.parse_func_def(),
             other => panic!("expected ':' or '=' after '{name}', got {other:?}"),
         }
@@ -83,6 +103,29 @@ impl Parser {
         let Token::Ident(name) = self.advance() else {
             panic!("expected identifier")
         };
+
+        // Parse optional type parameters: List(a) or Maybe(a, b)
+        let type_params = if *self.peek() == Token::LParen {
+            self.advance();
+            let mut params = Vec::new();
+            if *self.peek() != Token::RParen {
+                loop {
+                    let Token::Ident(param) = self.advance() else {
+                        panic!("expected type parameter name");
+                    };
+                    params.push(param);
+                    if *self.peek() == Token::RParen {
+                        break;
+                    }
+                    self.expect(&Token::Comma);
+                }
+            }
+            self.expect(&Token::RParen);
+            params
+        } else {
+            Vec::new()
+        };
+
         self.expect(&Token::Colon);
         let ty = self.parse_type_expr();
 
@@ -103,7 +146,12 @@ impl Parser {
         };
 
         self.skip_newlines();
-        Decl::TypeAnno { name, ty, methods }
+        Decl::TypeAnno {
+            name,
+            type_params,
+            ty,
+            methods,
+        }
     }
 
     fn parse_func_def(&mut self) -> Decl {
@@ -171,7 +219,18 @@ impl Parser {
         match self.peek().clone() {
             Token::Ident(name) => {
                 self.advance();
-                TypeExpr::Named(name)
+                if *self.peek() == Token::LParen {
+                    self.advance();
+                    let mut args = vec![self.parse_type_atom()];
+                    while *self.peek() == Token::Comma {
+                        self.advance();
+                        args.push(self.parse_type_atom());
+                    }
+                    self.expect(&Token::RParen);
+                    TypeExpr::App(name, args)
+                } else {
+                    TypeExpr::Named(name)
+                }
             }
             Token::LBracket => {
                 self.advance();

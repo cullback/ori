@@ -8,6 +8,7 @@ pub struct Module {
 pub enum Decl {
     TypeAnno {
         name: String,
+        type_params: Vec<String>,
         ty: TypeExpr,
         methods: Vec<Decl>,
     },
@@ -22,6 +23,7 @@ pub enum Decl {
 #[allow(dead_code)]
 pub enum TypeExpr {
     Named(String),
+    App(String, Vec<TypeExpr>),
     TagUnion(Vec<TagDecl>),
     Arrow(Vec<TypeExpr>, Box<TypeExpr>),
 }
