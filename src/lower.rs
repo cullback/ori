@@ -335,8 +335,9 @@ impl LowerCtx {
             }
             ExprKind::Block(stmts, result) => {
                 for stmt in stmts {
-                    let Stmt::Let { val, .. } = stmt;
-                    self.scan_expr(val);
+                    if let Stmt::Let { val, .. } = stmt {
+                        self.scan_expr(val);
+                    }
                 }
                 self.scan_expr(result);
             }
@@ -517,9 +518,10 @@ impl LowerCtx {
             ExprKind::Block(stmts, result) => {
                 let mut inner = bound.clone();
                 for stmt in stmts {
-                    let Stmt::Let { name, val } = stmt;
-                    self.collect_free(val, &inner, seen, free);
-                    inner.insert(name);
+                    if let Stmt::Let { name, val } = stmt {
+                        self.collect_free(val, &inner, seen, free);
+                        inner.insert(name);
+                    }
                 }
                 self.collect_free(result, &inner, seen, free);
             }
@@ -616,11 +618,15 @@ impl LowerCtx {
             ExprKind::Block(stmts, result) => {
                 let mut bindings = Vec::new();
                 for stmt in stmts {
-                    let Stmt::Let { name, val } = stmt;
-                    let val_core = self.lower_expr(val);
-                    let var_id = self.builder.var();
-                    self.vars.insert(name.clone(), var_id);
-                    bindings.push((var_id, val_core));
+                    match stmt {
+                        Stmt::Let { name, val } => {
+                            let val_core = self.lower_expr(val);
+                            let var_id = self.builder.var();
+                            self.vars.insert(name.clone(), var_id);
+                            bindings.push((var_id, val_core));
+                        }
+                        Stmt::TypeHint { .. } => {} // handled by type checker
+                    }
                 }
 
                 let mut result_core = self.lower_expr(result);

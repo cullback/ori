@@ -72,7 +72,11 @@ call_or_access = {
 
 args = { expr ~ ("," ~ expr)* }
 
-block = { "(" ~ (let_stmt ~ !(")" | EOI))* ~ expr ~ ")" }
+block = { "(" ~ (block_stmt ~ !(")" | EOI))* ~ expr ~ ")" }
+
+block_stmt = { type_hint | let_stmt }
+
+type_hint = { ident ~ ":" ~ type_expr }
 
 let_stmt = { ident ~ "=" ~ expr }
 

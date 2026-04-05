@@ -330,11 +330,23 @@ fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
-            Rule::let_stmt => {
-                let mut parts = inner.into_inner();
-                let name = parts.next().unwrap().as_str().to_owned();
-                let val = parse_expr(parts.next().unwrap());
-                stmts.push(Stmt::Let { name, val });
+            Rule::block_stmt => {
+                let stmt_inner = inner.into_inner().next().unwrap();
+                match stmt_inner.as_rule() {
+                    Rule::let_stmt => {
+                        let mut parts = stmt_inner.into_inner();
+                        let name = parts.next().unwrap().as_str().to_owned();
+                        let val = parse_expr(parts.next().unwrap());
+                        stmts.push(Stmt::Let { name, val });
+                    }
+                    Rule::type_hint => {
+                        let mut parts = stmt_inner.into_inner();
+                        let name = parts.next().unwrap().as_str().to_owned();
+                        let ty = parse_type_expr(parts.next().unwrap());
+                        stmts.push(Stmt::TypeHint { name, ty });
+                    }
+                    other => panic!("unexpected block statement: {other:?}"),
+                }
             }
             Rule::expr | Rule::prefix => {
                 result_expr = Some(parse_expr(inner));

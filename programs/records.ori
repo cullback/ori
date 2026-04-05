@@ -21,10 +21,12 @@ get_age = |person| person.age
 main : I64
 main = |arg| (
     alice = { name: 1, age: 30 }
-    bob : Person
-    bob = { age: 25, location: 2 }
 
-    // get_age works on both records despite different shapes
+    // Type hint enforced: bob must be a Person
+    bob : Person
+    bob = { name: 2, age: 25 }
+
+    // get_age works on both records (same shape here, but row-polymorphic)
     total_age = get_age(alice) + get_age(bob)
 
     // Records + lists + lambdas

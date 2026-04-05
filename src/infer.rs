@@ -452,11 +452,23 @@ impl InferCtx {
 
             ExprKind::Block(stmts, result) => {
                 let saved_env = self.env.clone();
+                let mut pending_hints: HashMap<String, TypeExpr> = HashMap::new();
                 for stmt in stmts {
-                    let Stmt::Let { name, val } = stmt;
-                    let val_ty = self.infer_expr(val);
-                    let scheme = self.generalize(&val_ty);
-                    self.env.insert(name.clone(), scheme);
+                    match stmt {
+                        Stmt::TypeHint { name, ty } => {
+                            pending_hints.insert(name.clone(), ty.clone());
+                        }
+                        Stmt::Let { name, val } => {
+                            let val_ty = self.infer_expr(val);
+                            // If there's a type hint for this binding, enforce it
+                            if let Some(hint) = pending_hints.remove(name) {
+                                let hint_ty = self.type_expr_to_type(&hint, &HashMap::new());
+                                self.unify(&val_ty, &hint_ty);
+                            }
+                            let scheme = self.generalize(&val_ty);
+                            self.env.insert(name.clone(), scheme);
+                        }
+                    }
                 }
                 let result_ty = self.infer_expr(result);
                 self.env = saved_env;

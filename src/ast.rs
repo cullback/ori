@@ -111,8 +111,10 @@ pub enum Pattern {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum Stmt {
     Let { name: String, val: Expr },
+    TypeHint { name: String, ty: TypeExpr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
