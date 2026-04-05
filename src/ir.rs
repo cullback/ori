@@ -118,6 +118,13 @@ pub enum Core {
         expr: Box<Core>,
         arms: Vec<FoldArm>,
     },
+    Record {
+        fields: Vec<(String, Core)>,
+    },
+    FieldAccess {
+        record: Box<Core>,
+        field: String,
+    },
 }
 
 #[allow(dead_code)]
@@ -159,12 +166,25 @@ impl Core {
             arms,
         }
     }
+
+    pub const fn record(fields: Vec<(String, Self)>) -> Self {
+        Self::Record { fields }
+    }
+
+    pub fn field_access(record: Self, field: String) -> Self {
+        Self::FieldAccess {
+            record: Box::new(record),
+            field,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Value {
     VNum(NumVal),
     VConstruct { tag: FuncId, fields: Vec<Value> },
+    VRecord { fields: Vec<(String, Value)> },
 }
 
 /// Marks whether a constructor field refers back to the enclosing type.

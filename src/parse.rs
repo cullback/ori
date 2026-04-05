@@ -245,6 +245,26 @@ impl Parser {
                 self.expect(&Token::RBracket);
                 TypeExpr::TagUnion(tags)
             }
+            Token::LBrace => {
+                self.advance();
+                let mut fields = Vec::new();
+                if *self.peek() != Token::RBrace {
+                    loop {
+                        let Token::Ident(name) = self.advance() else {
+                            panic!("expected field name");
+                        };
+                        self.expect(&Token::Colon);
+                        let ty = self.parse_type_expr();
+                        fields.push((name, ty));
+                        if *self.peek() == Token::RBrace {
+                            break;
+                        }
+                        self.expect(&Token::Comma);
+                    }
+                }
+                self.expect(&Token::RBrace);
+                TypeExpr::Record(fields)
+            }
             other => panic!("expected type, got {other:?}"),
         }
     }
@@ -282,6 +302,20 @@ impl Parser {
         let mut lhs = self.parse_prefix();
 
         loop {
+            // Field access (postfix): expr.field (but not expr.method(...))
+            if *self.peek() == Token::Dot
+                && let Token::Ident(fname) = self.peek_at(1).clone()
+                && *self.peek_at(2) != Token::LParen
+            {
+                self.advance(); // Dot
+                self.advance(); // Ident
+                lhs = Expr::FieldAccess {
+                    record: Box::new(lhs),
+                    field: fname,
+                };
+                continue;
+            }
+
             let Some((l_bp, r_bp, op)) = self.infix_bp() else {
                 break;
             };
@@ -300,6 +334,10 @@ impl Parser {
         lhs
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "prefix parsing handles all expression forms"
+    )]
     fn parse_prefix(&mut self) -> Expr {
         match self.peek().clone() {
             Token::IntLit(n) => {
@@ -391,6 +429,27 @@ impl Parser {
                     params,
                     body: Box::new(body),
                 }
+            }
+
+            Token::LBrace => {
+                self.advance();
+                let mut fields = Vec::new();
+                if *self.peek() != Token::RBrace {
+                    loop {
+                        let Token::Ident(name) = self.advance() else {
+                            panic!("expected field name in record");
+                        };
+                        self.expect(&Token::Colon);
+                        let val = self.parse_expr();
+                        fields.push((name, val));
+                        if *self.peek() == Token::RBrace {
+                            break;
+                        }
+                        self.expect(&Token::Comma);
+                    }
+                }
+                self.expect(&Token::RBrace);
+                Expr::Record { fields }
             }
 
             Token::Minus => {
@@ -530,6 +589,30 @@ impl Parser {
             Token::Ident(name) => {
                 self.advance();
                 Pattern::Binding(name)
+            }
+            Token::LBrace => {
+                self.advance();
+                let mut fields = Vec::new();
+                if *self.peek() != Token::RBrace {
+                    loop {
+                        let Token::Ident(name) = self.advance() else {
+                            panic!("expected field name in record pattern");
+                        };
+                        if *self.peek() == Token::Colon {
+                            self.advance();
+                            let pat = self.parse_pattern();
+                            fields.push((name, pat));
+                        } else {
+                            fields.push((name.clone(), Pattern::Binding(name)));
+                        }
+                        if *self.peek() == Token::RBrace {
+                            break;
+                        }
+                        self.expect(&Token::Comma);
+                    }
+                }
+                self.expect(&Token::RBrace);
+                Pattern::Record { fields }
             }
             other => panic!("expected pattern, got {other:?}"),
         }

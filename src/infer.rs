@@ -13,6 +13,9 @@ enum Type {
     Con(String),
     App(String, Vec<Type>),
     Arrow(Vec<Type>, Box<Type>),
+    Record(Box<Type>),
+    RowEmpty,
+    RowExtend(String, Box<Type>, Box<Type>),
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +79,13 @@ impl InferCtx {
                 params.iter().map(|p| self.resolve(p)).collect(),
                 Box::new(self.resolve(ret)),
             ),
+            Type::Record(row) => Type::Record(Box::new(self.resolve(row))),
+            Type::RowEmpty => Type::RowEmpty,
+            Type::RowExtend(label, field_ty, rest) => Type::RowExtend(
+                label.clone(),
+                Box::new(self.resolve(field_ty)),
+                Box::new(self.resolve(rest)),
+            ),
         }
     }
 
@@ -83,10 +93,14 @@ impl InferCtx {
         let resolved = self.resolve(ty);
         match &resolved {
             Type::Var(v) => *v == tv,
-            Type::Con(_) => false,
+            Type::Con(_) | Type::RowEmpty => false,
             Type::App(_, args) => args.iter().any(|a| self.occurs_in(tv, a)),
             Type::Arrow(params, ret) => {
                 params.iter().any(|p| self.occurs_in(tv, p)) || self.occurs_in(tv, ret)
+            }
+            Type::Record(row) => self.occurs_in(tv, row),
+            Type::RowExtend(_, field_ty, rest) => {
+                self.occurs_in(tv, field_ty) || self.occurs_in(tv, rest)
             }
         }
     }
@@ -133,6 +147,14 @@ impl InferCtx {
                 }
                 self.unify(r1, r2);
             }
+            (Type::Record(r1), Type::Record(r2)) => self.unify(r1, r2),
+            (Type::RowEmpty, Type::RowEmpty) => {}
+            (Type::RowExtend(label, ty, rest), _) => {
+                let (other_ty, other_rest) = self.rewrite_row(&rhs, label);
+                self.unify(ty, &other_ty);
+                self.unify(rest, &other_rest);
+            }
+            (_, Type::RowExtend(..)) => self.unify(&rhs, &lhs),
             _ => {
                 panic!(
                     "type error: cannot unify {} with {}",
@@ -143,18 +165,54 @@ impl InferCtx {
         }
     }
 
+    // ---- Row rewriting ----
+
+    fn rewrite_row(&mut self, row: &Type, label: &str) -> (Type, Type) {
+        let resolved = self.resolve(row);
+        match resolved {
+            Type::RowEmpty => panic!("type error: record has no field '{label}'"),
+            Type::RowExtend(l, ty, rest) if l == label => (*ty, *rest),
+            Type::RowExtend(l, ty, rest) => {
+                let (field_ty, new_rest) = self.rewrite_row(&rest, label);
+                (field_ty, Type::RowExtend(l, ty, Box::new(new_rest)))
+            }
+            Type::Var(tv) => {
+                let field_ty = self.fresh();
+                let new_rest = self.fresh();
+                let new_row = Type::RowExtend(
+                    label.to_owned(),
+                    Box::new(field_ty.clone()),
+                    Box::new(new_rest.clone()),
+                );
+                assert!(!self.occurs_in(tv, &new_row), "infinite row type");
+                self.subst.insert(tv, new_row);
+                (field_ty, new_rest)
+            }
+            _ => panic!(
+                "type error: expected row, got {}",
+                self.display_type(&resolved)
+            ),
+        }
+    }
+
     // ---- Generalization & Instantiation ----
 
     fn free_vars(&self, ty: &Type) -> HashSet<TypeVar> {
         let resolved = self.resolve(ty);
         match &resolved {
             Type::Var(v) => HashSet::from([*v]),
-            Type::Con(_) => HashSet::new(),
+            Type::Con(_) | Type::RowEmpty => HashSet::new(),
             Type::App(_, args) => args.iter().flat_map(|a| self.free_vars(a)).collect(),
             Type::Arrow(params, ret) => {
                 let mut fvs: HashSet<TypeVar> =
                     params.iter().flat_map(|p| self.free_vars(p)).collect();
                 fvs.extend(self.free_vars(ret));
+                fvs
+            }
+            Type::Record(row) => self.free_vars(row),
+            Type::RowExtend(_, field_ty, rest) => {
+                let mut fvs = self.free_vars(field_ty);
+                fvs.extend(self.free_vars(rest));
                 fvs
             }
         }
@@ -204,6 +262,13 @@ impl InferCtx {
                     .collect(),
                 Box::new(Self::apply_mapping(ret, mapping)),
             ),
+            Type::Record(row) => Type::Record(Box::new(Self::apply_mapping(row, mapping))),
+            Type::RowEmpty => Type::RowEmpty,
+            Type::RowExtend(label, field_ty, rest) => Type::RowExtend(
+                label.clone(),
+                Box::new(Self::apply_mapping(field_ty, mapping)),
+                Box::new(Self::apply_mapping(rest, mapping)),
+            ),
         }
     }
 
@@ -235,6 +300,14 @@ impl InferCtx {
             TypeExpr::TagUnion(_) => {
                 // Inline tag unions in type expressions are not supported in inference yet
                 self.fresh()
+            }
+            TypeExpr::Record(fields) => {
+                let mut row = Type::RowEmpty;
+                for (name, field_texpr) in fields.iter().rev() {
+                    let field_ty = self.type_expr_to_type(field_texpr, tvar_env);
+                    row = Type::RowExtend(name.clone(), Box::new(field_ty), Box::new(row));
+                }
+                Type::Record(Box::new(row))
             }
         }
     }
@@ -287,6 +360,10 @@ impl InferCtx {
 
     // ---- Expression inference ----
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "expression inference handles all forms"
+    )]
     fn infer_expr(&mut self, expr: &Expr) -> Type {
         match expr {
             Expr::IntLit(_) => Type::Con("I64".to_owned()),
@@ -382,6 +459,28 @@ impl InferCtx {
                 result_ty
             }
 
+            Expr::Record { fields } => {
+                let mut row = Type::RowEmpty;
+                for (name, field_expr) in fields.iter().rev() {
+                    let field_ty = self.infer_expr(field_expr);
+                    row = Type::RowExtend(name.clone(), Box::new(field_ty), Box::new(row));
+                }
+                Type::Record(Box::new(row))
+            }
+
+            Expr::FieldAccess { record, field } => {
+                let record_ty = self.infer_expr(record);
+                let field_ty = self.fresh();
+                let rest_row = self.fresh();
+                let expected = Type::Record(Box::new(Type::RowExtend(
+                    field.clone(),
+                    Box::new(field_ty.clone()),
+                    Box::new(rest_row),
+                )));
+                self.unify(&record_ty, &expected);
+                field_ty
+            }
+
             Expr::Lambda { params, body } => {
                 let saved_env = self.env.clone();
                 let param_types: Vec<Type> = params
@@ -455,13 +554,29 @@ impl InferCtx {
                                 bindings.push((n.clone(), field_ty.clone()));
                             }
                             ast::Pattern::Wildcard => {}
-                            ast::Pattern::Constructor { .. } => {
+                            ast::Pattern::Constructor { .. } | ast::Pattern::Record { .. } => {
                                 bindings.extend(self.infer_pattern(field_pat, field_ty));
                             }
                         }
                     }
                     bindings
                 }
+            }
+            ast::Pattern::Record { fields } => {
+                let mut row = self.fresh(); // open rest
+                let mut bindings = Vec::new();
+                for (field_name, field_pat) in fields.iter().rev() {
+                    let field_ty = self.fresh();
+                    row = Type::RowExtend(
+                        field_name.clone(),
+                        Box::new(field_ty.clone()),
+                        Box::new(row),
+                    );
+                    bindings.extend(self.infer_pattern(field_pat, &field_ty));
+                }
+                let expected_record = Type::Record(Box::new(row));
+                self.unify(&expected_record, expected);
+                bindings
             }
             ast::Pattern::Binding(name) => {
                 vec![(name.clone(), expected.clone())]
@@ -516,6 +631,9 @@ impl InferCtx {
                             ast::Pattern::Constructor { .. } => {
                                 panic!("nested constructor patterns not supported in fold");
                             }
+                            ast::Pattern::Record { .. } => {
+                                bindings.extend(self.infer_pattern(field_pat, &bind_ty));
+                            }
                         }
                     }
                     bindings
@@ -558,6 +676,32 @@ impl InferCtx {
             Type::Arrow(params, ret) => {
                 let param_strs: Vec<String> = params.iter().map(|p| self.display_type(p)).collect();
                 format!("{} -> {}", param_strs.join(", "), self.display_type(ret))
+            }
+            Type::Record(row) => {
+                let mut field_strs = Vec::new();
+                let mut current = self.resolve(row);
+                loop {
+                    match current {
+                        Type::RowExtend(label, field_ty, rest) => {
+                            field_strs.push(format!("{label}: {}", self.display_type(&field_ty)));
+                            current = self.resolve(&rest);
+                        }
+                        Type::RowEmpty => break,
+                        _ => {
+                            field_strs.push("..".to_owned());
+                            break;
+                        }
+                    }
+                }
+                format!("{{ {} }}", field_strs.join(", "))
+            }
+            Type::RowEmpty => "{}".to_owned(),
+            Type::RowExtend(label, field_ty, rest) => {
+                format!(
+                    "{{ {label}: {} | {} }}",
+                    self.display_type(field_ty),
+                    self.display_type(rest)
+                )
             }
         }
     }
@@ -640,6 +784,7 @@ pub fn check(module: &Module) {
                 ctx.unify(&ret, &body_ty);
 
                 ctx.env = saved_env;
+                ctx.env.remove(name); // remove monomorphic binding before generalizing
 
                 let resolved = ctx.resolve(&func_ty);
                 let generalized = ctx.generalize(&resolved);
@@ -670,6 +815,7 @@ pub fn check(module: &Module) {
                         ctx.unify(&ret, &body_ty);
 
                         ctx.env = saved_env;
+                        ctx.env.remove(&mangled);
 
                         let resolved = ctx.resolve(&func_ty);
                         let generalized = ctx.generalize(&resolved);

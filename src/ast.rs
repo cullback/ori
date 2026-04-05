@@ -26,6 +26,7 @@ pub enum TypeExpr {
     App(String, Vec<TypeExpr>),
     TagUnion(Vec<TagDecl>),
     Arrow(Vec<TypeExpr>, Box<TypeExpr>),
+    Record(Vec<(String, TypeExpr)>),
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +68,13 @@ pub enum Expr {
         method: String,
         args: Vec<Expr>,
     },
+    Record {
+        fields: Vec<(String, Expr)>,
+    },
+    FieldAccess {
+        record: Box<Expr>,
+        field: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +86,7 @@ pub struct MatchArm {
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Constructor { name: String, fields: Vec<Pattern> },
+    Record { fields: Vec<(String, Pattern)> },
     Wildcard,
     Binding(String),
 }

@@ -125,6 +125,28 @@ pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
             let val = eval(env, program, expr);
             fold_value(env, program, &val, arms)
         }
+
+        Core::Record { fields } => {
+            let field_vals: Vec<(String, Value)> = fields
+                .iter()
+                .map(|(name, expr)| (name.clone(), eval(env, program, expr)))
+                .collect();
+            Value::VRecord { fields: field_vals }
+        }
+
+        Core::FieldAccess { record, field } => {
+            let val = eval(env, program, record);
+            match val {
+                Value::VRecord { fields } => {
+                    fields
+                        .into_iter()
+                        .find(|(name, _)| name == field)
+                        .unwrap_or_else(|| panic!("no field '{field}' in record"))
+                        .1
+                }
+                _ => panic!("field access on non-record value"),
+            }
+        }
     }
 }
 
@@ -141,13 +163,13 @@ fn match_pattern(val: &Value, pattern: &Pattern) -> Option<HashMap<VarId, Value>
                 .zip(vfields.iter().cloned())
                 .collect(),
         ),
-        Value::VConstruct { .. } | Value::VNum(_) => None,
+        Value::VConstruct { .. } | Value::VNum(_) | Value::VRecord { .. } => None,
     }
 }
 
 fn fold_value(env: &Env, program: &Program, val: &Value, arms: &[FoldArm]) -> Value {
     match val {
-        Value::VNum(_) => val.clone(),
+        Value::VNum(_) | Value::VRecord { .. } => val.clone(),
 
         Value::VConstruct { tag, fields } => {
             let arm = arms

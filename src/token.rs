@@ -15,6 +15,8 @@ pub enum Token {
     Arrow,
     Underscore,
     Dot,
+    LBrace,
+    RBrace,
 
     // Operators
     Star,
@@ -116,6 +118,14 @@ pub fn tokenize(source: &str) -> Vec<Token> {
             }
             b'.' => {
                 tokens.push(Token::Dot);
+                pos += 1;
+            }
+            b'{' => {
+                tokens.push(Token::LBrace);
+                pos += 1;
+            }
+            b'}' => {
+                tokens.push(Token::RBrace);
                 pos += 1;
             }
             b'_' if pos + 1 >= bytes.len() || !bytes[pos + 1].is_ascii_alphanumeric() => {

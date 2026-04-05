@@ -632,6 +632,81 @@ main = |arg| List.sum_doubled(Cons(1, Cons(2, Cons(3, Nil))))";
 }
 
 // ============================================================
+// Records and row polymorphism
+// ============================================================
+
+#[test]
+fn record_literal_and_field_access() {
+    let source = "\
+main : I64
+main = |arg| (
+    point = { x: 1, y: 2 }
+    point.x + point.y
+)";
+    assert_eq!(run_i64(source, 0), 3);
+}
+
+#[test]
+fn record_as_function_arg() {
+    let source = "\
+get_x = |r| r.x
+
+main : I64
+main = |arg| get_x({ x: 42, y: 0 })";
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+#[test]
+fn record_row_polymorphism() {
+    let source = "\
+get_x = |r| r.x
+
+main : I64
+main = |arg| (
+    a = get_x({ x: 10, y: 20 })
+    b = get_x({ x: 30, z: 40 })
+    a + b
+)";
+    assert_eq!(run_i64(source, 0), 40);
+}
+
+#[test]
+fn nested_record_field_access() {
+    let source = "\
+main : I64
+main = |arg| (
+    r = { inner: { val: 42 } }
+    r.inner.val
+)";
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+#[test]
+fn record_returned_from_function() {
+    let source = "\
+make_point = |x, y| { x: x, y: y }
+
+main : I64
+main = |arg| (
+    p = make_point(3, 4)
+    p.x + p.y
+)";
+    assert_eq!(run_i64(source, 0), 7);
+}
+
+#[test]
+#[should_panic(expected = "type error")]
+fn record_type_error_missing_field() {
+    run_i64(
+        "\
+get_x = |r| r.x
+main : I64
+main = |arg| get_x({ y: 1 })",
+        0,
+    );
+}
+
+// ============================================================
 // Type inference — error detection
 // ============================================================
 

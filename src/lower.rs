@@ -382,6 +382,14 @@ impl LowerCtx {
             Expr::Lambda { body, .. } => {
                 self.scan_expr(body);
             }
+            Expr::Record { fields } => {
+                for (_, field_expr) in fields {
+                    self.scan_expr(field_expr);
+                }
+            }
+            Expr::FieldAccess { record, .. } => {
+                self.scan_expr(record);
+            }
             Expr::IntLit(_) | Expr::Name(_) => {}
         }
     }
@@ -493,6 +501,14 @@ impl LowerCtx {
                     self.collect_free(arg, bound, seen, free);
                 }
             }
+            Expr::Record { fields } => {
+                for (_, field_expr) in fields {
+                    self.collect_free(field_expr, bound, seen, free);
+                }
+            }
+            Expr::FieldAccess { record, .. } => {
+                self.collect_free(record, bound, seen, free);
+            }
             Expr::Lambda { params, body } => {
                 let mut inner = bound.clone();
                 for p in params {
@@ -543,6 +559,11 @@ impl LowerCtx {
             ast::Pattern::Constructor { fields, .. } => {
                 for f in fields {
                     Self::pattern_names(f, bound);
+                }
+            }
+            ast::Pattern::Record { fields } => {
+                for (_, field_pat) in fields {
+                    Self::pattern_names(field_pat, bound);
                 }
             }
             ast::Pattern::Binding(name) => {
@@ -650,6 +671,18 @@ impl LowerCtx {
             } => {
                 let mangled = format!("{owner}.{method}");
                 self.lower_call(&mangled, args)
+            }
+
+            Expr::Record { fields } => {
+                let core_fields: Vec<(String, Core)> = fields
+                    .iter()
+                    .map(|(name, field_expr)| (name.clone(), self.lower_expr(field_expr)))
+                    .collect();
+                Core::record(core_fields)
+            }
+
+            Expr::FieldAccess { record, field } => {
+                Core::field_access(self.lower_expr(record), field.clone())
             }
 
             Expr::Lambda { .. } => {
@@ -868,9 +901,15 @@ impl LowerCtx {
                         ast::Pattern::Constructor { .. } => {
                             panic!("nested constructor patterns not yet supported");
                         }
+                        ast::Pattern::Record { .. } => {
+                            panic!("record patterns inside constructor patterns not yet supported");
+                        }
                     }
                 }
                 (Pattern::con(con_id, field_vars), bindings)
+            }
+            ast::Pattern::Record { .. } => {
+                panic!("record patterns in match arms not yet supported in lowering");
             }
             ast::Pattern::Wildcard | ast::Pattern::Binding(_) => {
                 panic!("top-level wildcard/binding patterns not yet supported in match arms");

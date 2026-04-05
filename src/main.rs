@@ -50,6 +50,6 @@ fn main() {
         ir::Value::VNum(ir::NumVal::I64(n)) => println!("{n}"),
         ir::Value::VNum(ir::NumVal::U64(n)) => println!("{n}"),
         ir::Value::VNum(ir::NumVal::F64(n)) => println!("{n}"),
-        ir::Value::VConstruct { .. } => println!("{result:?}"),
+        ir::Value::VConstruct { .. } | ir::Value::VRecord { .. } => println!("{result:?}"),
     }
 }
