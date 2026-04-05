@@ -333,7 +333,7 @@ fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
             Rule::block_stmt => {
                 let stmt_inner = inner.into_inner().next().unwrap();
                 match stmt_inner.as_rule() {
-                    Rule::let_stmt => {
+                    Rule::assignment => {
                         let mut parts = stmt_inner.into_inner();
                         let name = parts.next().unwrap().as_str().to_owned();
                         let val = parse_expr(parts.next().unwrap());

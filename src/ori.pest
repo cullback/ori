@@ -74,11 +74,11 @@ args = { expr ~ ("," ~ expr)* }
 
 block = { "(" ~ (block_stmt ~ !(")" | EOI))* ~ expr ~ ")" }
 
-block_stmt = { type_hint | let_stmt }
+block_stmt = { type_hint | assignment }
 
 type_hint = { ident ~ ":" ~ type_expr }
 
-let_stmt = { ident ~ "=" ~ expr }
+assignment = { ident ~ "=" ~ expr }
 
 record_literal = { "{" ~ (field_init ~ ("," ~ field_init)*)? ~ "}" }
 
