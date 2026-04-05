@@ -1,0 +1,204 @@
+use std::collections::HashMap;
+
+use crate::ir::{Builtin, Core, FoldArm, FuncId, Literal, NumVal, Pattern, Program, Value, VarId};
+
+type Env = HashMap<VarId, Value>;
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::integer_division_remainder_used,
+    clippy::modulo_arithmetic,
+    reason = "builtins implement language-level arithmetic"
+)]
+fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value> {
+    let builtin = program.builtins.get(&func)?;
+    let u64_pair = || match args {
+        [Value::VNum(NumVal::U64(a)), Value::VNum(NumVal::U64(b))] => Some((*a, *b)),
+        _ => None,
+    };
+    let i64_pair = || match args {
+        [Value::VNum(NumVal::I64(a)), Value::VNum(NumVal::I64(b))] => Some((*a, *b)),
+        _ => None,
+    };
+    match *builtin {
+        Builtin::Add => u64_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U64(a + b)))
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a + b)))),
+        Builtin::Sub => u64_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U64(a - b)))
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a - b)))),
+        Builtin::Mul => u64_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U64(a * b)))
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a * b)))),
+        Builtin::Rem => u64_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U64(a % b)))
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a % b)))),
+        Builtin::Max => u64_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U64(a.max(b))))
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a.max(b))))),
+        Builtin::Eq {
+            true_con,
+            false_con,
+        } => {
+            let equal = u64_pair()
+                .map(|(a, b)| a == b)
+                .or_else(|| i64_pair().map(|(a, b)| a == b))?;
+            let tag = if equal { true_con } else { false_con };
+            Some(Value::VConstruct {
+                tag,
+                fields: vec![],
+            })
+        }
+    }
+}
+
+fn is_constructor(program: &Program, func: FuncId) -> bool {
+    program
+        .types
+        .iter()
+        .flat_map(|t| &t.constructors)
+        .any(|c| c.tag == func)
+}
+
+pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
+    match core {
+        Core::Var(name) => env
+            .get(name)
+            .unwrap_or_else(|| {
+                panic!("unbound variable: {}", program.debug_names.var_name(*name));
+            })
+            .clone(),
+
+        Core::Lit(Literal::Num(n)) => Value::VNum(n.clone()),
+
+        Core::App { func, args } => {
+            let arg_vals: Vec<Value> = args.iter().map(|a| eval(env, program, a)).collect();
+
+            if let Some(result) = eval_builtin(*func, &arg_vals, program) {
+                return result;
+            }
+
+            if is_constructor(program, *func) {
+                return Value::VConstruct {
+                    tag: *func,
+                    fields: arg_vals,
+                };
+            }
+
+            let func_def = program
+                .funcs
+                .iter()
+                .find(|f| f.name == *func)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "undefined function: {}",
+                        program.debug_names.func_name(*func)
+                    );
+                });
+            let mut local_env = env.clone();
+            for (param, val) in func_def.params.iter().zip(arg_vals) {
+                local_env.insert(*param, val);
+            }
+            eval(&local_env, program, &func_def.body)
+        }
+
+        Core::Let { name, val, body } => {
+            let v = eval(env, program, val);
+            let mut local_env = env.clone();
+            local_env.insert(*name, v);
+            eval(&local_env, program, body)
+        }
+
+        Core::Match { expr, arms } => {
+            let val = eval(env, program, expr);
+            for (pattern, body) in arms {
+                if let Some(bindings) = match_pattern(&val, pattern) {
+                    let mut local_env = env.clone();
+                    local_env.extend(bindings);
+                    return eval(&local_env, program, body);
+                }
+            }
+            panic!("no matching arm for: {val:?}");
+        }
+
+        Core::Fold { expr, arms } => {
+            let val = eval(env, program, expr);
+            fold_value(env, program, &val, arms)
+        }
+    }
+}
+
+fn match_pattern(val: &Value, pattern: &Pattern) -> Option<HashMap<VarId, Value>> {
+    let Pattern::Constructor { tag, fields } = pattern;
+    match val {
+        Value::VConstruct {
+            tag: vtag,
+            fields: vfields,
+        } if vtag == tag => Some(
+            fields
+                .iter()
+                .copied()
+                .zip(vfields.iter().cloned())
+                .collect(),
+        ),
+        Value::VConstruct { .. } | Value::VNum(_) => None,
+    }
+}
+
+fn fold_value(env: &Env, program: &Program, val: &Value, arms: &[FoldArm]) -> Value {
+    match val {
+        Value::VNum(_) => val.clone(),
+
+        Value::VConstruct { tag, fields } => {
+            let arm = arms
+                .iter()
+                .find(|a| {
+                    let Pattern::Constructor { tag: t, .. } = &a.pattern;
+                    t == tag
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no fold arm for tag: {}",
+                        program.debug_names.func_name(*tag)
+                    );
+                });
+
+            let Pattern::Constructor {
+                fields: field_names,
+                ..
+            } = &arm.pattern;
+
+            let constructor_def = program
+                .types
+                .iter()
+                .flat_map(|t| &t.constructors)
+                .find(|c| c.tag == *tag)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "unknown constructor: {}",
+                        program.debug_names.func_name(*tag)
+                    );
+                });
+
+            // Recursively fold each recursive field
+            let rec_results: Vec<Value> = constructor_def
+                .fields
+                .iter()
+                .zip(fields.iter())
+                .filter(|(def, _)| def.recursive)
+                .map(|(_, field_val)| fold_value(env, program, field_val, arms))
+                .collect();
+
+            // Bind constructor fields and recursive results into the arm body's env
+            let mut local_env = env.clone();
+            for (bind_name, field_val) in field_names.iter().zip(fields.iter()) {
+                local_env.insert(*bind_name, field_val.clone());
+            }
+            for (bind_name, rec_val) in arm.rec_binds.iter().zip(rec_results) {
+                local_env.insert(*bind_name, rec_val);
+            }
+
+            eval(&local_env, program, &arm.body)
+        }
+    }
+}

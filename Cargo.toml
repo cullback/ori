@@ -4,3 +4,60 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+restriction = { level = "deny", priority = -1 }
+
+arbitrary_source_item_ordering = "allow"
+blanket_clippy_restriction_lints = "allow"
+cargo_common_metadata = "allow"
+expect_used = "allow"
+implicit_return = "allow"
+indexing_slicing = "allow"
+min_ident_chars = "allow"
+missing_docs_in_private_items = "allow"
+mod_module_files = "allow"
+multiple_crate_versions = "allow"
+option_if_let_else = "allow"
+panic = "allow"
+print_stderr = "allow"
+print_stdout = "allow"
+question_mark_used = "allow"
+single_call_fn = "allow"
+single_char_lifetime_names = "allow"
+std_instead_of_alloc = "allow"
+std_instead_of_core = "allow"
+unwrap_used = "allow"
+missing_trait_methods = "allow"
+
+# Overly pedantic lints from restriction group
+absolute_paths = "allow"
+allow_attributes = "allow"
+allow_attributes_without_reason = "allow"
+as_conversions = "allow"
+cognitive_complexity = "allow"
+let_underscore_untyped = "allow"
+pub_use = "allow"
+similar_names = "allow"
+string_slice = "allow"
+unreachable = "allow"
+wildcard_enum_match_arm = "allow"
+
+# Edition 2024 match ergonomics conflict with ref_patterns
+pattern_type_mismatch = "allow"
+struct_excessive_bools = "allow"
+separated_literal_suffix = "allow"
+
+# Internal library - public API lints not useful
+exhaustive_enums = "allow"
+exhaustive_structs = "allow"
+missing_errors_doc = "allow"
+missing_inline_in_public_items = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+use_debug = "allow"

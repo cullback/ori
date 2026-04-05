@@ -1,0 +1,5 @@
+main : I64
+main = |arg| (
+  c = 2 * arg
+  c
+)
