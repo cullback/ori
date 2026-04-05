@@ -336,7 +336,7 @@ impl LowerCtx {
             ExprKind::Block(stmts, result) => {
                 for stmt in stmts {
                     match stmt {
-                        Stmt::Let { val, .. } | Stmt::TupleDestructure { val, .. } => {
+                        Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
                             self.scan_expr(val);
                         }
                         Stmt::TypeHint { .. } => {}
@@ -536,7 +536,7 @@ impl LowerCtx {
                             self.collect_free(val, &inner, seen, free);
                             inner.insert(name);
                         }
-                        Stmt::TupleDestructure { pattern, val } => {
+                        Stmt::Destructure { pattern, val } => {
                             self.collect_free(val, &inner, seen, free);
                             Self::pattern_names(pattern, &mut inner);
                         }
@@ -655,11 +655,11 @@ impl LowerCtx {
                             bindings.push((var_id, val_core));
                         }
                         Stmt::TypeHint { .. } => {} // handled by type checker
-                        Stmt::TupleDestructure { pattern, val } => {
+                        Stmt::Destructure { pattern, val } => {
                             let val_core = self.lower_expr(val);
-                            let tuple_var = self.builder.var();
-                            bindings.push((tuple_var, val_core));
-                            self.lower_tuple_destructure(pattern, tuple_var, &mut bindings);
+                            let src_var = self.builder.var();
+                            bindings.push((src_var, val_core));
+                            self.lower_destructure(pattern, src_var, &mut bindings);
                         }
                     }
                 }
@@ -875,9 +875,9 @@ impl LowerCtx {
         self.lambda_sets = sets;
     }
 
-    // ---- Tuple destructure lowering ----
+    // ---- Destructure lowering ----
 
-    fn lower_tuple_destructure(
+    fn lower_destructure(
         &mut self,
         pattern: &ast::Pattern,
         source_var: VarId,
@@ -889,19 +889,36 @@ impl LowerCtx {
                     let field_var = self.builder.var();
                     let access = Core::field_access(Core::var(source_var), i.to_string());
                     bindings.push((field_var, access));
-                    match elem {
-                        ast::Pattern::Binding(name) => {
-                            self.vars.insert(name.clone(), field_var);
-                        }
-                        ast::Pattern::Tuple(_) => {
-                            self.lower_tuple_destructure(elem, field_var, bindings);
-                        }
-                        ast::Pattern::Wildcard => {}
-                        _ => panic!("unsupported pattern in tuple destructure"),
-                    }
+                    self.lower_destructure_elem(elem, field_var, bindings);
                 }
             }
-            _ => panic!("expected tuple pattern in tuple destructure"),
+            ast::Pattern::Record { fields } => {
+                for (name, elem) in fields {
+                    let field_var = self.builder.var();
+                    let access = Core::field_access(Core::var(source_var), name.clone());
+                    bindings.push((field_var, access));
+                    self.lower_destructure_elem(elem, field_var, bindings);
+                }
+            }
+            _ => panic!("expected tuple or record pattern in destructure"),
+        }
+    }
+
+    fn lower_destructure_elem(
+        &mut self,
+        elem: &ast::Pattern,
+        var: VarId,
+        bindings: &mut Vec<(VarId, Core)>,
+    ) {
+        match elem {
+            ast::Pattern::Binding(name) => {
+                self.vars.insert(name.clone(), var);
+            }
+            ast::Pattern::Tuple(_) | ast::Pattern::Record { .. } => {
+                self.lower_destructure(elem, var, bindings);
+            }
+            ast::Pattern::Wildcard => {}
+            ast::Pattern::Constructor { .. } => panic!("unsupported pattern in destructure"),
         }
     }
 

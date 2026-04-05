@@ -747,6 +747,47 @@ main = |arg| get_x({ y: 1 })",
 }
 
 // ============================================================
+// Record destructuring
+// ============================================================
+
+#[test]
+fn record_destructure_basic() {
+    let source = "\
+main : I64
+main = |arg| (
+    point = { x: 10, y: 20 }
+    { x, y } = point
+    x + y
+)";
+    assert_eq!(run_i64(source, 0), 30);
+}
+
+#[test]
+fn record_destructure_rename() {
+    let source = "\
+main : I64
+main = |arg| (
+    point = { x: 3, y: 4 }
+    { x: a, y: b } = point
+    a * b
+)";
+    assert_eq!(run_i64(source, 0), 12);
+}
+
+#[test]
+fn record_destructure_nested() {
+    let source = "\
+main : I64
+main = |arg| (
+    r = { inner: { val: 42 } }
+    { inner } = r
+    { val } = inner
+    val
+)";
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+// ============================================================
 // Type aliases
 // ============================================================
 

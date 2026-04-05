@@ -217,7 +217,7 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Expr {
                 })
                 .parse(pair.into_inner())
         }
-        Rule::prefix => {
+        Rule::atom => {
             let inner = pair.into_inner().next().unwrap();
             parse_expr(inner)
         }
@@ -342,7 +342,7 @@ fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
                                 stmts.push(Stmt::Let { name, val });
                             }
                             _ => {
-                                stmts.push(Stmt::TupleDestructure { pattern, val });
+                                stmts.push(Stmt::Destructure { pattern, val });
                             }
                         }
                     }
@@ -355,7 +355,7 @@ fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
                     other => panic!("unexpected block statement: {other:?}"),
                 }
             }
-            Rule::expr | Rule::prefix => {
+            Rule::expr | Rule::atom => {
                 result_expr = Some(parse_expr(inner));
             }
             _ => {}
@@ -384,7 +384,7 @@ fn parse_if_expr(pair: Pair<'_, Rule>, span: Span) -> Expr {
         for part in inner {
             match part.as_rule() {
                 Rule::match_arm => arms.push(parse_match_arm(part)),
-                Rule::expr | Rule::prefix => else_body = Some(Box::new(parse_expr(part))),
+                Rule::expr | Rule::atom => else_body = Some(Box::new(parse_expr(part))),
                 _ => {}
             }
         }
@@ -484,7 +484,6 @@ fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern {
     }
     let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
     if inner.is_empty() {
-        // bare ident or _
         if text == "_" {
             return Pattern::Wildcard;
         }
@@ -493,13 +492,35 @@ fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern {
     if inner.len() == 1 && inner[0].as_rule() == Rule::ident {
         return Pattern::Binding(inner[0].as_str().to_owned());
     }
-    // Tuple pattern: all children are irrefutable
-    let sub_pats: Vec<Pattern> = inner
-        .into_iter()
-        .filter(|p| p.as_rule() == Rule::irrefutable)
-        .map(parse_irrefutable)
-        .collect();
-    Pattern::Tuple(sub_pats)
+    let first = &inner[0];
+    match first.as_rule() {
+        Rule::irrefutable => {
+            // Tuple pattern: (a, b)
+            let sub_pats: Vec<Pattern> = inner
+                .into_iter()
+                .filter(|p| p.as_rule() == Rule::irrefutable)
+                .map(parse_irrefutable)
+                .collect();
+            Pattern::Tuple(sub_pats)
+        }
+        Rule::field_irrefutable => {
+            // Record pattern: { x, y: z }
+            let fields: Vec<(String, Pattern)> = inner
+                .into_iter()
+                .map(|fi| {
+                    let mut fi_inner = fi.into_inner();
+                    let name = fi_inner.next().unwrap().as_str().to_owned();
+                    if let Some(pat) = fi_inner.next() {
+                        (name, parse_irrefutable(pat))
+                    } else {
+                        (name.clone(), Pattern::Binding(name))
+                    }
+                })
+                .collect();
+            Pattern::Record { fields }
+        }
+        _ => panic!("unexpected irrefutable pattern: {:?}", first.as_rule()),
+    }
 }
 
 fn parse_tuple(pair: Pair<'_, Rule>, span: Span) -> Expr {

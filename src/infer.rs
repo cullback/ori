@@ -496,7 +496,7 @@ impl InferCtx {
                             let scheme = self.generalize(&val_ty);
                             self.env.insert(name.clone(), scheme);
                         }
-                        Stmt::TupleDestructure { pattern, val } => {
+                        Stmt::Destructure { pattern, val } => {
                             let val_ty = self.infer_expr(val);
                             let bindings = self.infer_pattern(pattern, &val_ty);
                             for (name, ty) in bindings {

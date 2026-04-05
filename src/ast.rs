@@ -118,7 +118,7 @@ pub enum Pattern {
 pub enum Stmt {
     Let { name: String, val: Expr },
     TypeHint { name: String, ty: TypeExpr },
-    TupleDestructure { pattern: Pattern, val: Expr },
+    Destructure { pattern: Pattern, val: Expr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

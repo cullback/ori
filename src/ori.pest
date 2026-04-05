@@ -37,12 +37,10 @@ tag_decl = { constructor ~ ("(" ~ type_atom ~ ("," ~ type_atom)* ~ ")")? }
 field_type = { ident ~ ":" ~ type_atom }
 
 // ---- Expressions ----
-// Pratt parsing handles precedence for binary operators.
-// `prefix` is the primary (atom) level.
 
-expr = { prefix ~ (binop ~ prefix)* }
+expr = { atom ~ (binop ~ atom)* }
 
-prefix = {
+atom = {
     if_expr
   | fold_expr
   | lambda
@@ -56,7 +54,7 @@ prefix = {
 
 tuple = { "(" ~ expr ~ ("," ~ expr)+ ~ ")" }
 
-neg_expr = { "-" ~ prefix }
+neg_expr = { "-" ~ atom }
 
 // Calls, constructors, names, and field access.
 // Call heads are atomic (no space before "(").
@@ -86,10 +84,13 @@ type_hint = { ident ~ ":" ~ type_expr }
 assignment = { irrefutable ~ "=" ~ expr }
 
 irrefutable = {
-    "(" ~ irrefutable ~ ("," ~ irrefutable)+ ~ ")"   // tuple: (a, b)
-  | "_"                                                                    // wildcard
-  | ident                                                                  // binding
+    "(" ~ irrefutable ~ ("," ~ irrefutable)+ ~ ")"
+  | "{" ~ (field_irrefutable ~ ("," ~ field_irrefutable)*)? ~ "}"
+  | "_"
+  | ident
 }
+
+field_irrefutable = { ident ~ ":" ~ irrefutable | ident }
 
 record_literal = { "{" ~ (field_init ~ ("," ~ field_init)*)? ~ "}" }
 
