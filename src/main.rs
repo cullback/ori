@@ -25,10 +25,28 @@ fn main() {
         process::exit(1);
     });
 
-    // Compile
-    let module = parse::parse(&source);
-    infer::check(&source, &module);
-    let (program, input_var) = lower::lower(&module);
+    // Compile (catch panics from parser/type checker and print cleanly)
+    std::panic::set_hook(Box::new(|_| {}));
+    let compile_result = std::panic::catch_unwind(|| {
+        let module = parse::parse(&source);
+        infer::check(&source, &module);
+        lower::lower(&module)
+    });
+    drop(std::panic::take_hook());
+    let (program, input_var) = match compile_result {
+        Ok(result) => result,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.as_str()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s
+            } else {
+                "unknown error"
+            };
+            eprintln!("{msg}");
+            process::exit(1);
+        }
+    };
 
     // Read input from stdin
     let mut input = String::new();
