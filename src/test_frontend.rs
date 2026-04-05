@@ -130,6 +130,61 @@ main = |arg| unwrap_or(Nothing, 99)";
 }
 
 // ============================================================
+// Boolean if-then-else (desugars to match on Bool)
+// ============================================================
+
+#[test]
+fn if_then_else_true_branch() {
+    let source = "main : I64\nmain = |x| if x == 0 then 99 else x * 2";
+    assert_eq!(run_i64(source, 0), 99);
+}
+
+#[test]
+fn if_then_else_false_branch() {
+    let source = "main : I64\nmain = |x| if x == 0 then 99 else x * 2";
+    assert_eq!(run_i64(source, 5), 10);
+}
+
+#[test]
+fn if_then_else_nested() {
+    let source = "\
+main : I64
+main = |x| (
+    a = if x == 0 then 1 else 0
+    b = if a == 1 then 100 else 200
+    b
+)";
+    assert_eq!(run_i64(source, 0), 100);
+    assert_eq!(run_i64(source, 5), 200);
+}
+
+#[test]
+fn not_equal() {
+    let source = "main : I64\nmain = |x| if x != 0 then 1 else 0";
+    assert_eq!(run_i64(source, 0), 0);
+    assert_eq!(run_i64(source, 7), 1);
+}
+
+// ============================================================
+// Prelude (Bool available without declaration)
+// ============================================================
+
+#[test]
+fn prelude_bool_available() {
+    // Use True/False without declaring Bool
+    let source = "\
+to_i64 : Bool -> I64
+to_i64 = |b| if b
+    : True then 1
+    : False then 0
+
+main : I64
+main = |arg| to_i64(True)";
+
+    assert_eq!(run_i64(source, 0), 1);
+}
+
+// ============================================================
 // Multiple functions
 // ============================================================
 
@@ -178,4 +233,11 @@ fn program_double_ori() {
 fn program_bool_ori() {
     let source = std::fs::read_to_string("programs/bool.ori").unwrap();
     assert_eq!(run_i64(&source, 0), 0);
+}
+
+#[test]
+fn program_conditional_ori() {
+    let source = std::fs::read_to_string("programs/conditional.ori").unwrap();
+    assert_eq!(run_i64(&source, 0), 99);
+    assert_eq!(run_i64(&source, 5), 10);
 }

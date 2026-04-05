@@ -5,6 +5,10 @@ use crate::builder::Builder;
 use crate::ir::{
     Builtin, ConstructorDef, Core, FieldDef, FuncDef, FuncId, Pattern, Program, VarId,
 };
+use crate::parse;
+use crate::token;
+
+const PRELUDE: &str = "Bool : [True, False]\n";
 
 /// Lower a parsed AST module into a Core IR program.
 ///
@@ -13,22 +17,16 @@ use crate::ir::{
 pub fn lower(module: Module) -> (Program, VarId) {
     let mut ctx = LowerCtx::new();
 
-    // Pass 1: register type declarations (introduces constructors) and function names
-    for decl in &module.decls {
-        match decl {
-            Decl::TypeAnno {
-                ty: TypeExpr::TagUnion(tags),
-                ..
-            } => {
-                ctx.register_tag_union(tags);
-            }
-            Decl::TypeAnno { .. } => {}
-            Decl::FuncDef { name, .. } => {
-                let func_id = ctx.builder.func();
-                ctx.funcs.insert(name.clone(), func_id);
-            }
-        }
-    }
+    // Parse and register the prelude
+    let prelude_tokens = token::tokenize(PRELUDE);
+    let prelude = parse::parse(prelude_tokens);
+    ctx.register_decls(&prelude.decls);
+
+    // Now that Bool is known, register comparison builtins
+    ctx.register_comparison_builtins();
+
+    // Pass 1: register user type declarations and function names
+    ctx.register_decls(&module.decls);
 
     // Pass 2: lower all function bodies
     let mut main_params = None;
@@ -99,6 +97,7 @@ impl LowerCtx {
         binops.insert(BinOp::Mul, builder.builtin(Builtin::Mul));
         binops.insert(BinOp::Div, builder.builtin(Builtin::Mul)); // TODO: add Div builtin
         binops.insert(BinOp::Rem, builder.builtin(Builtin::Rem));
+        // Eq and Neq are registered after the prelude defines Bool
 
         Self {
             builder,
@@ -107,6 +106,46 @@ impl LowerCtx {
             constructors: HashMap::new(),
             binops,
         }
+    }
+
+    /// Register type declarations and function names from a list of declarations.
+    fn register_decls(&mut self, decls: &[Decl]) {
+        for decl in decls {
+            match decl {
+                Decl::TypeAnno {
+                    ty: TypeExpr::TagUnion(tags),
+                    ..
+                } => {
+                    self.register_tag_union(tags);
+                }
+                Decl::TypeAnno { .. } => {}
+                Decl::FuncDef { name, .. } => {
+                    let func_id = self.builder.func();
+                    self.funcs.insert(name.clone(), func_id);
+                }
+            }
+        }
+    }
+
+    fn register_comparison_builtins(&mut self) {
+        let true_con = *self
+            .constructors
+            .get("True")
+            .expect("prelude must define True");
+        let false_con = *self
+            .constructors
+            .get("False")
+            .expect("prelude must define False");
+        let eq = self.builder.builtin(Builtin::Eq {
+            true_con,
+            false_con,
+        });
+        let neq = self.builder.builtin(Builtin::Eq {
+            true_con: false_con,
+            false_con: true_con,
+        });
+        self.binops.insert(BinOp::Eq, eq);
+        self.binops.insert(BinOp::Neq, neq);
     }
 
     fn register_tag_union(&mut self, tags: &[ast::TagDecl]) {

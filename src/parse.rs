@@ -276,39 +276,72 @@ impl Parser {
     }
 
     fn parse_if_expr(&mut self) -> Expr {
-        // Parse the scrutinee expression
         let expr = self.parse_expr();
         self.skip_newlines();
 
-        // Multi-arm: : Pattern then Expr
-        let mut arms = Vec::new();
-        while *self.peek() == Token::Colon {
+        // Disambiguate: "then" → boolean if-then-else, ":" → multi-arm match
+        if *self.peek() == Token::Then {
+            // if expr then a else b → desugar to match on Bool
             self.advance();
             self.skip_newlines();
-            let pattern = self.parse_pattern();
+            let then_body = self.parse_expr();
             self.skip_newlines();
-            self.expect(&Token::Then);
+            self.expect(&Token::Else);
             self.skip_newlines();
-            let body = self.parse_expr();
-            self.skip_newlines();
-            arms.push(MatchArm { pattern, body });
-        }
+            let else_body = self.parse_expr();
 
-        let else_body = (*self.peek() == Token::Else).then(|| {
-            self.advance();
-            self.skip_newlines();
-            Box::new(self.parse_expr())
-        });
+            // Desugar: if cond then a else b → if cond : True then a : False then b
+            Expr::If {
+                expr: Box::new(expr),
+                arms: vec![
+                    MatchArm {
+                        pattern: Pattern::Constructor {
+                            name: "True".to_owned(),
+                            fields: vec![],
+                        },
+                        body: then_body,
+                    },
+                    MatchArm {
+                        pattern: Pattern::Constructor {
+                            name: "False".to_owned(),
+                            fields: vec![],
+                        },
+                        body: else_body,
+                    },
+                ],
+                else_body: None,
+            }
+        } else {
+            // Multi-arm: : Pattern then Expr
+            let mut arms = Vec::new();
+            while *self.peek() == Token::Colon {
+                self.advance();
+                self.skip_newlines();
+                let pattern = self.parse_pattern();
+                self.skip_newlines();
+                self.expect(&Token::Then);
+                self.skip_newlines();
+                let body = self.parse_expr();
+                self.skip_newlines();
+                arms.push(MatchArm { pattern, body });
+            }
 
-        assert!(
-            !arms.is_empty(),
-            "if expression requires at least one : arm"
-        );
+            let else_body = (*self.peek() == Token::Else).then(|| {
+                self.advance();
+                self.skip_newlines();
+                Box::new(self.parse_expr())
+            });
 
-        Expr::If {
-            expr: Box::new(expr),
-            arms,
-            else_body,
+            assert!(
+                !arms.is_empty(),
+                "if expression requires at least one : arm"
+            );
+
+            Expr::If {
+                expr: Box::new(expr),
+                arms,
+                else_body,
+            }
         }
     }
 
