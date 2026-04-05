@@ -1,0 +1,130 @@
+// ---- Ori grammar (whitespace-agnostic) ----
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
+
+// ---- Module ----
+
+module = { SOI ~ decl* ~ EOI }
+
+decl = { type_anno | func_def }
+
+type_anno = {
+    type_name ~ type_params? ~ ":" ~ type_expr ~ method_block?
+}
+
+type_params = { "(" ~ ident ~ ("," ~ ident)* ~ ")" }
+
+method_block = { ".(" ~ decl* ~ ")" }
+
+func_def = {
+    ident ~ "=" ~ expr
+}
+
+// ---- Type expressions ----
+
+type_expr = {
+    type_atom ~ ("," ~ type_atom)* ~ "->" ~ type_expr
+  | type_atom
+}
+
+type_atom = {
+    type_name ~ "(" ~ type_atom ~ ("," ~ type_atom)* ~ ")"
+  | "[" ~ (tag_decl ~ ("," ~ tag_decl)*)? ~ "]"
+  | "{" ~ (field_type ~ ("," ~ field_type)*)? ~ "}"
+  | type_name
+}
+
+tag_decl = { constructor ~ ("(" ~ type_atom ~ ("," ~ type_atom)* ~ ")")? }
+
+field_type = { ident ~ ":" ~ type_atom }
+
+// ---- Expressions ----
+// Pratt parsing handles precedence for binary operators.
+// `prefix` is the primary (atom) level.
+
+expr = { prefix ~ (binop ~ prefix)* }
+
+prefix = {
+    if_expr
+  | fold_expr
+  | lambda
+  | record_literal
+  | neg_expr
+  | call_or_access
+  | block
+  | int_lit
+}
+
+neg_expr = { "-" ~ prefix }
+
+// Calls, constructors, names, and field access.
+// Ordered so longer matches are tried first.
+call_or_access = {
+    constructor ~ "." ~ ident ~ "(" ~ args? ~ ")"    // Qualified: List.sum(xs)
+  | ident ~ "." ~ ident ~ "(" ~ args? ~ ")"          // Qualified: mod.func(x)
+  | constructor ~ "(" ~ args? ~ ")"                    // Constructor call: Cons(1, Nil)
+  | ident ~ "(" ~ args? ~ ")"                          // Function call: foo(1)
+  | constructor                                         // Nullary constructor: True
+  | ident ~ ("." ~ ident)+                              // Field access: r.x.y
+  | ident                                                // Name: x
+}
+
+args = { expr ~ ("," ~ expr)* }
+
+block = { "(" ~ (let_stmt ~ !(")" | EOI))* ~ expr ~ ")" }
+
+let_stmt = { ident ~ "=" ~ expr }
+
+record_literal = { "{" ~ (field_init ~ ("," ~ field_init)*)? ~ "}" }
+
+field_init = { ident ~ ":" ~ expr }
+
+lambda = { "|" ~ (lambda_param ~ ("," ~ lambda_param)*)? ~ "|" ~ expr }
+
+lambda_param = @{ "_" | ident }
+
+int_lit = @{ ASCII_DIGIT+ }
+
+// ---- If / Fold ----
+
+if_expr = {
+    "if" ~ expr ~ "then" ~ expr ~ "else" ~ expr
+  | "if" ~ expr ~ match_arm+ ~ ("else" ~ expr)?
+}
+
+fold_expr = {
+    "fold" ~ expr ~ match_arm+
+}
+
+match_arm = { ":" ~ pattern ~ "then" ~ expr }
+
+// ---- Patterns ----
+
+pattern = {
+    constructor ~ "(" ~ (pattern ~ ("," ~ pattern)*)? ~ ")"
+  | constructor
+  | "{" ~ (field_pattern ~ ("," ~ field_pattern)*)? ~ "}"
+  | "_"
+  | ident
+}
+
+field_pattern = {
+    ident ~ ":" ~ pattern
+  | ident
+}
+
+// ---- Operators ----
+
+binop  = _{ cmp_op | add_op | mul_op }
+cmp_op =  { "==" | "!=" }
+add_op =  { "+" | "-" }
+mul_op =  { "*" | "/" | "%" }
+
+// ---- Terminals ----
+
+ident       = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA_LOWER ~ (ASCII_ALPHANUMERIC | "_")* }
+constructor = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
+type_name   = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+
+keyword = { "if" | "then" | "else" | "fold" }

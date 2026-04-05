@@ -1,687 +1,464 @@
+use pest::Parser as _;
+use pest::iterators::Pair;
+use pest::pratt_parser::{Assoc, Op, PrattParser};
+use pest_derive::Parser;
+
 use crate::ast::{BinOp, Decl, Expr, MatchArm, Module, Pattern, Stmt, TagDecl, TypeExpr};
-use crate::token::{Span, Token};
 
-pub fn parse(tokens: Vec<Token>, spans: Vec<Span>, source: &str) -> Module {
-    let mut parser = Parser {
-        tokens,
-        spans,
-        source: source.to_owned(),
-        pos: 0,
-    };
-    parser.parse_module()
+#[derive(Parser)]
+#[grammar = "ori.pest"]
+struct OriParser;
+
+pub fn parse(source: &str) -> Module {
+    let pairs = OriParser::parse(Rule::module, source).unwrap_or_else(|e| panic!("{e}"));
+    let module_pair = pairs.into_iter().next().unwrap();
+    parse_module(module_pair)
 }
 
-struct Parser {
-    tokens: Vec<Token>,
-    spans: Vec<Span>,
-    source: String,
-    pos: usize,
+fn parse_module(pair: Pair<'_, Rule>) -> Module {
+    let mut decls = Vec::new();
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::decl {
+            decls.push(parse_decl(inner));
+        }
+    }
+    Module { decls }
 }
 
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "position arithmetic in parser is bounds-checked"
-)]
-impl Parser {
-    fn peek(&self) -> &Token {
-        &self.tokens[self.pos]
+fn parse_decl(pair: Pair<'_, Rule>) -> Decl {
+    let inner = pair.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::type_anno => parse_type_anno(inner),
+        Rule::func_def => parse_func_def(inner),
+        other => panic!("unexpected decl rule: {other:?}"),
     }
+}
 
-    fn peek_at(&self, offset: usize) -> &Token {
-        let idx = self.pos + offset;
-        if idx < self.tokens.len() {
-            &self.tokens[idx]
-        } else {
-            &Token::Eof
-        }
-    }
+fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl {
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_owned();
 
-    fn advance(&mut self) -> Token {
-        let tok = self.tokens[self.pos].clone();
-        self.pos += 1;
-        tok
-    }
+    let mut type_params = Vec::new();
+    let mut ty = None;
+    let mut methods = Vec::new();
 
-    fn error(&self, msg: &str) -> ! {
-        let span = self.spans[self.pos];
-        panic!("\n{}", span.display(&self.source, msg));
-    }
-
-    fn expect(&mut self, expected: &Token) {
-        let tok = self.advance();
-        if tok != *expected {
-            let span = self.spans[self.pos - 1];
-            panic!(
-                "\n{}",
-                span.display(&self.source, &format!("expected {expected:?}, got {tok:?}"))
-            );
-        }
-    }
-
-    fn skip_newlines(&mut self) {
-        while *self.peek() == Token::Newline {
-            self.advance();
-        }
-    }
-
-    fn is_uppercase(name: &str) -> bool {
-        name.starts_with(|c: char| c.is_ascii_uppercase())
-    }
-
-    // ---- Module ----
-
-    fn parse_module(&mut self) -> Module {
-        let mut decls = Vec::new();
-        self.skip_newlines();
-
-        while *self.peek() != Token::Eof {
-            decls.push(self.parse_decl());
-            self.skip_newlines();
-        }
-
-        Module { decls }
-    }
-
-    fn parse_decl(&mut self) -> Decl {
-        let Token::Ident(name) = self.peek().clone() else {
-            self.error(&format!(
-                "expected identifier at start of declaration, got {:?}",
-                self.peek()
-            ));
-        };
-
-        match self.peek_at(1) {
-            Token::Colon => self.parse_type_anno(),
-            Token::LParen => {
-                // Could be `Name(params) :` (type with params) or something else.
-                // Scan forward past the parens to find `:` or `=`.
-                let mut depth = 1_usize;
-                let mut offset = 2;
-                while depth > 0 {
-                    match self.peek_at(offset) {
-                        Token::LParen => depth += 1,
-                        Token::RParen => depth -= 1,
-                        Token::Eof => panic!("unexpected EOF in declaration"),
-                        _ => {}
+    for part in inner {
+        match part.as_rule() {
+            Rule::type_params => {
+                for p in part.into_inner() {
+                    type_params.push(p.as_str().to_owned());
+                }
+            }
+            Rule::type_expr | Rule::type_atom => {
+                ty = Some(parse_type_expr(part));
+            }
+            Rule::method_block => {
+                for method_pair in part.into_inner() {
+                    if method_pair.as_rule() == Rule::decl {
+                        methods.push(parse_decl(method_pair));
                     }
-                    offset += 1;
-                }
-                match self.peek_at(offset) {
-                    Token::Colon => self.parse_type_anno(),
-                    Token::Eq => self.parse_func_def(),
-                    other => self.error(&format!(
-                        "expected ':' or '=' after '{name}(...)', got {other:?}"
-                    )),
                 }
             }
-            Token::Eq => self.parse_func_def(),
-            other => self.error(&format!(
-                "expected ':' or '=' after '{name}', got {other:?}"
-            )),
+            _ => {}
         }
     }
 
-    fn parse_type_anno(&mut self) -> Decl {
-        let Token::Ident(name) = self.advance() else {
-            panic!("expected identifier")
-        };
+    Decl::TypeAnno {
+        name,
+        type_params,
+        ty: ty.expect("type annotation missing type"),
+        methods,
+    }
+}
 
-        // Parse optional type parameters: List(a) or Maybe(a, b)
-        let type_params = if *self.peek() == Token::LParen {
-            self.advance();
-            let mut params = Vec::new();
-            if *self.peek() != Token::RParen {
-                loop {
-                    let Token::Ident(param) = self.advance() else {
-                        panic!("expected type parameter name");
-                    };
-                    params.push(param);
-                    if *self.peek() == Token::RParen {
-                        break;
-                    }
-                    self.expect(&Token::Comma);
-                }
-            }
-            self.expect(&Token::RParen);
-            params
-        } else {
-            Vec::new()
-        };
+fn parse_func_def(pair: Pair<'_, Rule>) -> Decl {
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_owned();
+    let body_pair = inner.next().unwrap();
+    let body = parse_expr(body_pair);
 
-        self.expect(&Token::Colon);
-        let ty = self.parse_type_expr();
-
-        // Parse optional .() associated function block
-        let methods = if *self.peek() == Token::Dot && *self.peek_at(1) == Token::LParen {
-            self.advance(); // consume Dot
-            self.advance(); // consume LParen
-            self.skip_newlines();
-            let mut decls = Vec::new();
-            while *self.peek() != Token::RParen {
-                decls.push(self.parse_decl());
-                self.skip_newlines();
-            }
-            self.expect(&Token::RParen);
-            decls
-        } else {
-            Vec::new()
-        };
-
-        self.skip_newlines();
-        Decl::TypeAnno {
+    // If the body is a lambda, extract its params as the function's params
+    if let Expr::Lambda {
+        params,
+        body: lam_body,
+    } = body
+    {
+        Decl::FuncDef {
             name,
-            type_params,
-            ty,
-            methods,
+            params,
+            body: *lam_body,
+        }
+    } else {
+        Decl::FuncDef {
+            name,
+            params: vec![],
+            body,
         }
     }
+}
 
-    fn parse_func_def(&mut self) -> Decl {
-        let Token::Ident(name) = self.advance() else {
-            panic!("expected identifier")
-        };
-        self.expect(&Token::Eq);
-        self.skip_newlines();
+// ---- Type expressions ----
 
-        if *self.peek() == Token::Pipe {
-            self.advance();
-            let mut params = Vec::new();
-            if *self.peek() != Token::Pipe {
-                loop {
-                    let Token::Ident(param) = self.advance() else {
-                        panic!(
-                            "expected parameter name, got {:?}",
-                            self.tokens[self.pos - 1]
-                        );
+fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr {
+    match pair.as_rule() {
+        Rule::type_expr => {
+            let mut parts: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+            // Check if last element is a type_expr (Arrow return type)
+            if parts.len() >= 2 && parts.last().is_some_and(|p| p.as_rule() == Rule::type_expr) {
+                let ret = parse_type_expr(parts.pop().unwrap());
+                let params: Vec<TypeExpr> = parts.into_iter().map(parse_type_expr).collect();
+                TypeExpr::Arrow(params, Box::new(ret))
+            } else if parts.len() == 1 {
+                parse_type_expr(parts.pop().unwrap())
+            } else {
+                panic!("unexpected type_expr structure");
+            }
+        }
+        Rule::type_atom => {
+            let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+            assert!(!inner.is_empty(), "empty type_atom");
+            let first = &inner[0];
+            match first.as_rule() {
+                Rule::type_name => {
+                    let name = first.as_str().to_owned();
+                    if inner.len() == 1 {
+                        TypeExpr::Named(name)
+                    } else {
+                        let args: Vec<TypeExpr> = inner.drain(1..).map(parse_type_expr).collect();
+                        TypeExpr::App(name, args)
+                    }
+                }
+                Rule::tag_decl => {
+                    let tags: Vec<TagDecl> = inner.into_iter().map(parse_tag_decl).collect();
+                    TypeExpr::TagUnion(tags)
+                }
+                Rule::field_type => {
+                    let fields: Vec<(String, TypeExpr)> =
+                        inner.into_iter().map(parse_field_type).collect();
+                    TypeExpr::Record(fields)
+                }
+                _ => panic!("unexpected type_atom content: {:?}", first.as_rule()),
+            }
+        }
+        _ => panic!("unexpected rule in type position: {:?}", pair.as_rule()),
+    }
+}
+
+fn parse_tag_decl(pair: Pair<'_, Rule>) -> TagDecl {
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_owned();
+    let fields: Vec<TypeExpr> = inner.map(parse_type_expr).collect();
+    TagDecl { name, fields }
+}
+
+fn parse_field_type(pair: Pair<'_, Rule>) -> (String, TypeExpr) {
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_owned();
+    let ty = parse_type_expr(inner.next().unwrap());
+    (name, ty)
+}
+
+// ---- Expressions (Pratt parser for operators) ----
+
+fn pratt_parser() -> PrattParser<Rule> {
+    PrattParser::new()
+        .op(Op::infix(Rule::cmp_op, Assoc::Left))
+        .op(Op::infix(Rule::add_op, Assoc::Left))
+        .op(Op::infix(Rule::mul_op, Assoc::Left))
+}
+
+fn parse_expr(pair: Pair<'_, Rule>) -> Expr {
+    match pair.as_rule() {
+        Rule::expr => {
+            let parser = pratt_parser();
+            parser
+                .map_primary(parse_expr)
+                .map_infix(|lhs, op_pair, rhs| {
+                    let binop = match op_pair.as_str() {
+                        "+" => BinOp::Add,
+                        "-" => BinOp::Sub,
+                        "*" => BinOp::Mul,
+                        "/" => BinOp::Div,
+                        "%" => BinOp::Rem,
+                        "==" => BinOp::Eq,
+                        "!=" => BinOp::Neq,
+                        other => panic!("unknown operator: {other}"),
                     };
-                    params.push(param);
-                    if *self.peek() == Token::Pipe {
-                        break;
+                    Expr::BinOp {
+                        op: binop,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
                     }
-                    self.expect(&Token::Comma);
-                }
-            }
-            self.expect(&Token::Pipe);
-            self.skip_newlines();
-            let body = self.parse_expr();
-            self.skip_newlines();
-            Decl::FuncDef { name, params, body }
-        } else {
-            let body = self.parse_expr();
-            self.skip_newlines();
-            Decl::FuncDef {
-                name,
-                params: vec![],
-                body,
+                })
+                .parse(pair.into_inner())
+        }
+        Rule::prefix => {
+            let inner = pair.into_inner().next().unwrap();
+            parse_expr(inner)
+        }
+        Rule::int_lit => {
+            let n: i64 = pair.as_str().parse().unwrap();
+            Expr::IntLit(n)
+        }
+        Rule::neg_expr => {
+            let inner = pair.into_inner().next().unwrap();
+            Expr::BinOp {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::IntLit(0)),
+                rhs: Box::new(parse_expr(inner)),
             }
         }
+        Rule::call_or_access => parse_call_or_access(pair),
+        Rule::block => parse_block(pair),
+        Rule::if_expr => parse_if_expr(pair),
+        Rule::fold_expr => parse_fold_expr(pair),
+        Rule::lambda => parse_lambda(pair),
+        Rule::record_literal => parse_record_literal(pair),
+        _ => panic!("unexpected expression rule: {:?}", pair.as_rule()),
+    }
+}
+
+fn parse_call_or_access(pair: Pair<'_, Rule>) -> Expr {
+    let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+
+    let first = inner.remove(0);
+    let first_name = first.as_str().to_owned();
+    if inner.is_empty() {
+        // Bare name or nullary constructor
+        return Expr::Name(first_name);
     }
 
-    // ---- Type expressions ----
-
-    fn parse_type_expr(&mut self) -> TypeExpr {
-        // Collect comma-separated type atoms, then check for ->
-        let mut parts = vec![self.parse_type_atom()];
-        while *self.peek() == Token::Comma {
-            self.advance();
-            parts.push(self.parse_type_atom());
-        }
-        if *self.peek() == Token::Arrow {
-            self.advance();
-            let ret = self.parse_type_expr();
-            TypeExpr::Arrow(parts, Box::new(ret))
-        } else if parts.len() == 1 {
-            parts.pop().unwrap()
-        } else {
-            panic!("comma-separated types require -> return type");
-        }
-    }
-
-    fn parse_type_atom(&mut self) -> TypeExpr {
-        match self.peek().clone() {
-            Token::Ident(name) => {
-                self.advance();
-                if *self.peek() == Token::LParen {
-                    self.advance();
-                    let mut args = vec![self.parse_type_atom()];
-                    while *self.peek() == Token::Comma {
-                        self.advance();
-                        args.push(self.parse_type_atom());
-                    }
-                    self.expect(&Token::RParen);
-                    TypeExpr::App(name, args)
-                } else {
-                    TypeExpr::Named(name)
-                }
-            }
-            Token::LBracket => {
-                self.advance();
-                let mut tags = Vec::new();
-                if *self.peek() != Token::RBracket {
-                    tags.push(self.parse_tag_decl());
-                    while *self.peek() == Token::Comma {
-                        self.advance();
-                        tags.push(self.parse_tag_decl());
-                    }
-                }
-                self.expect(&Token::RBracket);
-                TypeExpr::TagUnion(tags)
-            }
-            Token::LBrace => {
-                self.advance();
-                let mut fields = Vec::new();
-                if *self.peek() != Token::RBrace {
-                    loop {
-                        let Token::Ident(name) = self.advance() else {
-                            panic!("expected field name");
-                        };
-                        self.expect(&Token::Colon);
-                        let ty = self.parse_type_atom();
-                        fields.push((name, ty));
-                        if *self.peek() == Token::RBrace {
-                            break;
-                        }
-                        self.expect(&Token::Comma);
-                    }
-                }
-                self.expect(&Token::RBrace);
-                TypeExpr::Record(fields)
-            }
-            other => self.error(&format!("expected type, got {other:?}")),
-        }
-    }
-
-    fn parse_tag_decl(&mut self) -> TagDecl {
-        let Token::Ident(name) = self.advance() else {
-            panic!("expected constructor name in tag union");
-        };
-        assert!(
-            Self::is_uppercase(&name),
-            "tag names must be uppercase, got '{name}'"
-        );
-        let mut fields = Vec::new();
-        if *self.peek() == Token::LParen {
-            self.advance();
-            if *self.peek() != Token::RParen {
-                fields.push(self.parse_type_atom());
-                while *self.peek() == Token::Comma {
-                    self.advance();
-                    fields.push(self.parse_type_atom());
-                }
-            }
-            self.expect(&Token::RParen);
-        }
-        TagDecl { name, fields }
-    }
-
-    // ---- Expressions ----
-
-    fn parse_expr(&mut self) -> Expr {
-        self.parse_expr_bp(0)
-    }
-
-    fn parse_expr_bp(&mut self, min_bp: u8) -> Expr {
-        let mut lhs = self.parse_prefix();
-
-        loop {
-            // Field access (postfix): expr.field (but not expr.method(...))
-            if *self.peek() == Token::Dot
-                && let Token::Ident(fname) = self.peek_at(1).clone()
-                && *self.peek_at(2) != Token::LParen
-            {
-                self.advance(); // Dot
-                self.advance(); // Ident
-                lhs = Expr::FieldAccess {
-                    record: Box::new(lhs),
-                    field: fname,
+    let second = &inner[0];
+    match second.as_rule() {
+        Rule::ident => {
+            let second_name = second.as_str().to_owned();
+            if inner.len() >= 2 && inner[1].as_rule() == Rule::args {
+                // QualifiedCall: Owner.method(args) or mod.func(args)
+                let args_pair = inner.remove(1);
+                inner.remove(0);
+                let args: Vec<Expr> = args_pair.into_inner().map(parse_expr).collect();
+                let mut result = Expr::QualifiedCall {
+                    owner: first_name,
+                    method: second_name,
+                    args,
                 };
-                continue;
+                for remaining in inner {
+                    if remaining.as_rule() == Rule::ident {
+                        result = Expr::FieldAccess {
+                            record: Box::new(result),
+                            field: remaining.as_str().to_owned(),
+                        };
+                    }
+                }
+                result
+            } else {
+                // Field access chain: name.field.field...
+                let mut result = Expr::Name(first_name);
+                for field in inner {
+                    if field.as_rule() == Rule::ident {
+                        result = Expr::FieldAccess {
+                            record: Box::new(result),
+                            field: field.as_str().to_owned(),
+                        };
+                    }
+                }
+                result
             }
-
-            let Some((l_bp, r_bp, op)) = self.infix_bp() else {
-                break;
-            };
-            if l_bp < min_bp {
-                break;
-            }
-            self.advance();
-            let rhs = self.parse_expr_bp(r_bp);
-            lhs = Expr::BinOp {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
         }
-
-        lhs
-    }
-
-    #[expect(
-        clippy::too_many_lines,
-        reason = "prefix parsing handles all expression forms"
-    )]
-    fn parse_prefix(&mut self) -> Expr {
-        match self.peek().clone() {
-            Token::IntLit(n) => {
-                self.advance();
-                Expr::IntLit(n)
-            }
-
-            Token::Ident(name) => {
-                self.advance();
-                // Check for qualified call: Type.method(args)
-                if *self.peek() == Token::Dot
-                    && matches!(self.peek_at(1), Token::Ident(_))
-                    && *self.peek_at(2) == Token::LParen
-                {
-                    self.advance(); // consume Dot
-                    let Token::Ident(method) = self.advance() else {
-                        unreachable!()
+        Rule::args => {
+            // Call or constructor call: name(args) or Constructor(args)
+            let args: Vec<Expr> = inner.remove(0).into_inner().map(parse_expr).collect();
+            let mut result = Expr::Call {
+                func: first_name,
+                args,
+            };
+            for remaining in inner {
+                if remaining.as_rule() == Rule::ident {
+                    result = Expr::FieldAccess {
+                        record: Box::new(result),
+                        field: remaining.as_str().to_owned(),
                     };
-                    self.advance(); // consume LParen
-                    let mut args = Vec::new();
-                    if *self.peek() != Token::RParen {
-                        args.push(self.parse_expr());
-                        while *self.peek() == Token::Comma {
-                            self.advance();
-                            args.push(self.parse_expr());
-                        }
-                    }
-                    self.expect(&Token::RParen);
-                    Expr::QualifiedCall {
-                        owner: name,
-                        method,
-                        args,
-                    }
-                } else if *self.peek() == Token::LParen {
-                    // Check for function/constructor call: Name(args)
-                    self.advance();
-                    let mut args = Vec::new();
-                    if *self.peek() != Token::RParen {
-                        args.push(self.parse_expr());
-                        while *self.peek() == Token::Comma {
-                            self.advance();
-                            args.push(self.parse_expr());
-                        }
-                    }
-                    self.expect(&Token::RParen);
-                    Expr::Call { func: name, args }
-                } else {
-                    Expr::Name(name)
                 }
             }
-
-            Token::LParen => {
-                self.advance();
-                self.parse_block()
-            }
-
-            Token::If => {
-                self.advance();
-                self.parse_if_expr()
-            }
-
-            Token::Fold => {
-                self.advance();
-                self.parse_fold_expr()
-            }
-
-            Token::Pipe => {
-                self.advance();
-                let mut params = Vec::new();
-                if *self.peek() != Token::Pipe {
-                    loop {
-                        let tok = self.advance();
-                        let param = match tok {
-                            Token::Ident(name) => name,
-                            Token::Underscore => "_".to_owned(),
-                            other => panic!("expected parameter name in lambda, got {other:?}"),
-                        };
-                        params.push(param);
-                        if *self.peek() == Token::Pipe {
-                            break;
-                        }
-                        self.expect(&Token::Comma);
-                    }
-                }
-                self.expect(&Token::Pipe);
-                self.skip_newlines();
-                let body = self.parse_expr();
-                Expr::Lambda {
-                    params,
-                    body: Box::new(body),
-                }
-            }
-
-            Token::LBrace => {
-                self.advance();
-                let mut fields = Vec::new();
-                if *self.peek() != Token::RBrace {
-                    loop {
-                        let Token::Ident(name) = self.advance() else {
-                            panic!("expected field name in record");
-                        };
-                        self.expect(&Token::Colon);
-                        let val = self.parse_expr();
-                        fields.push((name, val));
-                        if *self.peek() == Token::RBrace {
-                            break;
-                        }
-                        self.expect(&Token::Comma);
-                    }
-                }
-                self.expect(&Token::RBrace);
-                Expr::Record { fields }
-            }
-
-            Token::Minus => {
-                self.advance();
-                let operand = self.parse_prefix();
-                Expr::BinOp {
-                    op: BinOp::Sub,
-                    lhs: Box::new(Expr::IntLit(0)),
-                    rhs: Box::new(operand),
-                }
-            }
-
-            other => self.error(&format!("expected expression, got {other:?}")),
-        }
-    }
-
-    fn parse_if_expr(&mut self) -> Expr {
-        let expr = self.parse_expr();
-        self.skip_newlines();
-
-        // Disambiguate: "then" → boolean if-then-else, ":" → multi-arm match
-        if *self.peek() == Token::Then {
-            // if expr then a else b → desugar to match on Bool
-            self.advance();
-            self.skip_newlines();
-            let then_body = self.parse_expr();
-            self.skip_newlines();
-            self.expect(&Token::Else);
-            self.skip_newlines();
-            let else_body = self.parse_expr();
-
-            // Desugar: if cond then a else b → if cond : True then a : False then b
-            Expr::If {
-                expr: Box::new(expr),
-                arms: vec![
-                    MatchArm {
-                        pattern: Pattern::Constructor {
-                            name: "True".to_owned(),
-                            fields: vec![],
-                        },
-                        body: then_body,
-                    },
-                    MatchArm {
-                        pattern: Pattern::Constructor {
-                            name: "False".to_owned(),
-                            fields: vec![],
-                        },
-                        body: else_body,
-                    },
-                ],
-                else_body: None,
-            }
-        } else {
-            // Multi-arm: : Pattern then Expr
-            let mut arms = Vec::new();
-            while *self.peek() == Token::Colon {
-                self.advance();
-                self.skip_newlines();
-                let pattern = self.parse_pattern();
-                self.skip_newlines();
-                self.expect(&Token::Then);
-                self.skip_newlines();
-                let body = self.parse_expr();
-                self.skip_newlines();
-                arms.push(MatchArm { pattern, body });
-            }
-
-            let else_body = (*self.peek() == Token::Else).then(|| {
-                self.advance();
-                self.skip_newlines();
-                Box::new(self.parse_expr())
-            });
-
-            assert!(
-                !arms.is_empty(),
-                "if expression requires at least one : arm"
-            );
-
-            Expr::If {
-                expr: Box::new(expr),
-                arms,
-                else_body,
-            }
-        }
-    }
-
-    fn parse_fold_expr(&mut self) -> Expr {
-        let expr = self.parse_expr();
-        self.skip_newlines();
-
-        let mut arms = Vec::new();
-        while *self.peek() == Token::Colon {
-            self.advance();
-            self.skip_newlines();
-            let pattern = self.parse_pattern();
-            self.skip_newlines();
-            self.expect(&Token::Then);
-            self.skip_newlines();
-            let body = self.parse_expr();
-            self.skip_newlines();
-            arms.push(MatchArm { pattern, body });
-        }
-
-        assert!(
-            !arms.is_empty(),
-            "fold expression requires at least one : arm"
-        );
-
-        Expr::Fold {
-            expr: Box::new(expr),
-            arms,
-        }
-    }
-
-    fn parse_pattern(&mut self) -> Pattern {
-        match self.peek().clone() {
-            Token::Underscore => {
-                self.advance();
-                Pattern::Wildcard
-            }
-            Token::Ident(name) if Self::is_uppercase(&name) => {
-                self.advance();
-                let mut fields = Vec::new();
-                if *self.peek() == Token::LParen {
-                    self.advance();
-                    if *self.peek() != Token::RParen {
-                        fields.push(self.parse_pattern());
-                        while *self.peek() == Token::Comma {
-                            self.advance();
-                            fields.push(self.parse_pattern());
-                        }
-                    }
-                    self.expect(&Token::RParen);
-                }
-                Pattern::Constructor { name, fields }
-            }
-            Token::Ident(name) => {
-                self.advance();
-                Pattern::Binding(name)
-            }
-            Token::LBrace => {
-                self.advance();
-                let mut fields = Vec::new();
-                if *self.peek() != Token::RBrace {
-                    loop {
-                        let Token::Ident(name) = self.advance() else {
-                            panic!("expected field name in record pattern");
-                        };
-                        if *self.peek() == Token::Colon {
-                            self.advance();
-                            let pat = self.parse_pattern();
-                            fields.push((name, pat));
-                        } else {
-                            fields.push((name.clone(), Pattern::Binding(name)));
-                        }
-                        if *self.peek() == Token::RBrace {
-                            break;
-                        }
-                        self.expect(&Token::Comma);
-                    }
-                }
-                self.expect(&Token::RBrace);
-                Pattern::Record { fields }
-            }
-            other => self.error(&format!("expected pattern, got {other:?}")),
-        }
-    }
-
-    fn parse_block(&mut self) -> Expr {
-        self.skip_newlines();
-        let mut stmts = Vec::new();
-
-        loop {
-            if let Token::Ident(peeked) = self.peek()
-                && !Self::is_uppercase(peeked)
-                && *self.peek_at(1) == Token::Eq
-            {
-                let Token::Ident(name) = self.advance() else {
-                    panic!("expected identifier")
-                };
-                self.expect(&Token::Eq);
-                let val = self.parse_expr();
-                stmts.push(Stmt::Let { name, val });
-                self.skip_newlines();
-                continue;
-            }
-            break;
-        }
-
-        let result = self.parse_expr();
-        self.skip_newlines();
-        self.expect(&Token::RParen);
-
-        if stmts.is_empty() {
             result
-        } else {
-            Expr::Block(stmts, Box::new(result))
+        }
+        _ => Expr::Name(first_name),
+    }
+}
+
+fn parse_block(pair: Pair<'_, Rule>) -> Expr {
+    let mut stmts = Vec::new();
+    let mut result_expr = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::let_stmt => {
+                let mut parts = inner.into_inner();
+                let name = parts.next().unwrap().as_str().to_owned();
+                let val = parse_expr(parts.next().unwrap());
+                stmts.push(Stmt::Let { name, val });
+            }
+            Rule::expr | Rule::prefix => {
+                result_expr = Some(parse_expr(inner));
+            }
+            _ => {}
         }
     }
 
-    fn infix_bp(&self) -> Option<(u8, u8, BinOp)> {
-        match self.peek() {
-            Token::EqEq => Some((3, 4, BinOp::Eq)),
-            Token::BangEq => Some((3, 4, BinOp::Neq)),
-            Token::Plus => Some((5, 6, BinOp::Add)),
-            Token::Minus => Some((5, 6, BinOp::Sub)),
-            Token::Star => Some((7, 8, BinOp::Mul)),
-            Token::Slash => Some((7, 8, BinOp::Div)),
-            Token::Percent => Some((7, 8, BinOp::Rem)),
-            _ => None,
+    let result = result_expr.expect("block must have a result expression");
+    if stmts.is_empty() {
+        result
+    } else {
+        Expr::Block(stmts, Box::new(result))
+    }
+}
+
+fn parse_if_expr(pair: Pair<'_, Rule>) -> Expr {
+    let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+
+    // Check if it's boolean if-then-else or multi-arm match
+    let has_match_arm = inner.iter().any(|p| p.as_rule() == Rule::match_arm);
+
+    let scrutinee = parse_expr(inner.remove(0));
+    if has_match_arm {
+        let mut arms = Vec::new();
+        let mut else_body = None;
+
+        for part in inner {
+            match part.as_rule() {
+                Rule::match_arm => arms.push(parse_match_arm(part)),
+                Rule::expr | Rule::prefix => else_body = Some(Box::new(parse_expr(part))),
+                _ => {}
+            }
         }
+
+        Expr::If {
+            expr: Box::new(scrutinee),
+            arms,
+            else_body,
+        }
+    } else {
+        let then_body = parse_expr(inner.remove(0));
+        let else_body = parse_expr(inner.remove(0));
+
+        Expr::If {
+            expr: Box::new(scrutinee),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Constructor {
+                        name: "True".to_owned(),
+                        fields: vec![],
+                    },
+                    body: then_body,
+                },
+                MatchArm {
+                    pattern: Pattern::Constructor {
+                        name: "False".to_owned(),
+                        fields: vec![],
+                    },
+                    body: else_body,
+                },
+            ],
+            else_body: None,
+        }
+    }
+}
+
+fn parse_fold_expr(pair: Pair<'_, Rule>) -> Expr {
+    let mut inner = pair.into_inner();
+    let scrutinee = parse_expr(inner.next().unwrap());
+    let arms: Vec<MatchArm> = inner.map(parse_match_arm).collect();
+    Expr::Fold {
+        expr: Box::new(scrutinee),
+        arms,
+    }
+}
+
+fn parse_match_arm(pair: Pair<'_, Rule>) -> MatchArm {
+    let mut inner = pair.into_inner();
+    let pattern = parse_pattern(inner.next().unwrap());
+    let body = parse_expr(inner.next().unwrap());
+    MatchArm { pattern, body }
+}
+
+fn parse_lambda(pair: Pair<'_, Rule>) -> Expr {
+    let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+    let body = parse_expr(inner.pop().unwrap());
+    let params: Vec<String> = inner
+        .into_iter()
+        .filter(|p| p.as_rule() == Rule::lambda_param)
+        .map(|p| p.as_str().to_owned())
+        .collect();
+    Expr::Lambda {
+        params,
+        body: Box::new(body),
+    }
+}
+
+fn parse_record_literal(pair: Pair<'_, Rule>) -> Expr {
+    let fields: Vec<(String, Expr)> = pair
+        .into_inner()
+        .map(|fi| {
+            let mut inner = fi.into_inner();
+            let name = inner.next().unwrap().as_str().to_owned();
+            let val = parse_expr(inner.next().unwrap());
+            (name, val)
+        })
+        .collect();
+    Expr::Record { fields }
+}
+
+// ---- Patterns ----
+
+fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
+    let text = pair.as_str().trim();
+    let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
+
+    if inner.is_empty() {
+        // Literal `_` wildcard (no inner pairs)
+        if text == "_" {
+            return Pattern::Wildcard;
+        }
+        panic!("empty pattern: '{text}'");
+    }
+
+    let first = &inner[0];
+    match first.as_rule() {
+        Rule::constructor => {
+            let name = first.as_str().to_owned();
+            let fields: Vec<Pattern> = inner.into_iter().skip(1).map(parse_pattern).collect();
+            Pattern::Constructor { name, fields }
+        }
+        Rule::field_pattern => {
+            let fields: Vec<(String, Pattern)> =
+                inner.into_iter().map(parse_field_pattern).collect();
+            Pattern::Record { fields }
+        }
+        Rule::ident => {
+            let name = first.as_str();
+            if name == "_" {
+                Pattern::Wildcard
+            } else {
+                Pattern::Binding(name.to_owned())
+            }
+        }
+        _ => {
+            let first_text = first.as_str();
+            if first_text == "_" {
+                Pattern::Wildcard
+            } else {
+                panic!("unexpected pattern: {first_text}");
+            }
+        }
+    }
+}
+
+fn parse_field_pattern(pair: Pair<'_, Rule>) -> (String, Pattern) {
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_owned();
+    if let Some(pat) = inner.next() {
+        (name, parse_pattern(pat))
+    } else {
+        (name.clone(), Pattern::Binding(name))
     }
 }

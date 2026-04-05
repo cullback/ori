@@ -6,7 +6,6 @@ use crate::ir::{
     Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, Pattern, Program, VarId,
 };
 use crate::parse;
-use crate::token;
 
 const PRELUDE: &str = "Bool : [True, False]\n";
 
@@ -19,8 +18,7 @@ pub fn lower(module: &Module) -> (Program, VarId) {
     let mut ctx = LowerCtx::new();
 
     // Parse and register the prelude
-    let (prelude_tokens, prelude_spans) = token::tokenize(PRELUDE);
-    let prelude = parse::parse(prelude_tokens, prelude_spans, PRELUDE);
+    let prelude = parse::parse(PRELUDE);
     ctx.register_decls(&prelude.decls);
 
     // Now that Bool is known, register comparison builtins

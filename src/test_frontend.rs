@@ -4,8 +4,7 @@ use crate::ir::{NumVal, Value};
 
 /// Compile and run an Ori program with the given I64 input.
 fn run(source: &str, input: i64) -> Value {
-    let (tokens, spans) = crate::token::tokenize(source);
-    let module = crate::parse::parse(tokens, spans, source);
+    let module = crate::parse::parse(source);
     crate::infer::check(&module);
     let (program, input_var) = crate::lower::lower(&module);
     let mut env = HashMap::new();

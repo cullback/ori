@@ -9,7 +9,6 @@ mod parse;
 mod test_frontend;
 #[cfg(test)]
 mod test_programs;
-mod token;
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -27,8 +26,7 @@ fn main() {
     });
 
     // Compile
-    let (tokens, spans) = token::tokenize(&source);
-    let module = parse::parse(tokens, spans, &source);
+    let module = parse::parse(&source);
     infer::check(&module);
     let (program, input_var) = lower::lower(&module);
 
