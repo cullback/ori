@@ -707,6 +707,39 @@ main = |arg| get_x({ y: 1 })",
 }
 
 // ============================================================
+// Type aliases
+// ============================================================
+
+#[test]
+fn type_alias_record() {
+    let source = "\
+Point : { x: I64, y: I64 }
+
+make_point : I64, I64 -> Point
+make_point = |x, y| { x: x, y: y }
+
+main : I64
+main = |arg| (
+    p = make_point(3, 4)
+    p.x + p.y
+)";
+    assert_eq!(run_i64(source, 0), 7);
+}
+
+#[test]
+fn type_alias_in_function_annotation() {
+    let source = "\
+Point : { x: I64, y: I64 }
+
+get_x : Point -> I64
+get_x = |p| p.x
+
+main : I64
+main = |arg| get_x({ x: 42, y: 0 })";
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+// ============================================================
 // Type inference — error detection
 // ============================================================
 

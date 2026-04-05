@@ -1,0 +1,34 @@
+// Records, row polymorphism, type aliases, and higher-order functions
+
+List(a) : [Nil, Cons(a, List(a))].(
+    sum : List(I64) -> I64
+    sum = |xs| fold xs
+        : Nil then 0
+        : Cons(hd, rest) then hd + rest
+
+    map : List(a), I64 -> List(a)
+    map = |xs, f| fold xs
+        : Nil then Nil
+        : Cons(hd, rest) then Cons(f(hd), rest)
+)
+
+// Type alias for a record type
+Person : { name: I64, age: I64 }
+
+// Row-polymorphic: works on any record with an `age` field
+get_age = |person| person.age
+
+main : I64
+main = |arg| (
+    alice = { name: 1, age: 30 }
+    bob = { age: 25, location: 2 }
+
+    // get_age works on both records despite different shapes
+    total_age = get_age(alice) + get_age(bob)
+
+    // Records + lists + lambdas
+    ages = Cons(alice.age, Cons(bob.age, Nil))
+    doubled = List.map(ages, |x| x * 2)
+
+    total_age + List.sum(doubled)
+)

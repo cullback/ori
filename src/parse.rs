@@ -254,7 +254,7 @@ impl Parser {
                             panic!("expected field name");
                         };
                         self.expect(&Token::Colon);
-                        let ty = self.parse_type_expr();
+                        let ty = self.parse_type_atom();
                         fields.push((name, ty));
                         if *self.peek() == Token::RBrace {
                             break;

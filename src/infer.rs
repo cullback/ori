@@ -37,6 +37,10 @@ struct InferCtx {
     subst: HashMap<TypeVar, Type>,
     env: HashMap<String, Scheme>,
     constructors: HashMap<String, Scheme>,
+    /// Type aliases: Name -> Scheme (e.g. Point -> { x: I64, y: I64 })
+    type_aliases: HashMap<String, Scheme>,
+    /// Declared type annotations for checking against inferred types.
+    type_annos: HashMap<String, TypeExpr>,
 }
 
 impl InferCtx {
@@ -46,6 +50,8 @@ impl InferCtx {
             subst: HashMap::new(),
             env: HashMap::new(),
             constructors: HashMap::new(),
+            type_aliases: HashMap::new(),
+            type_annos: HashMap::new(),
         }
     }
 
@@ -279,6 +285,8 @@ impl InferCtx {
             TypeExpr::Named(name) => {
                 if let Some(&tv) = tvar_env.get(name) {
                     Type::Var(tv)
+                } else if let Some(scheme) = self.type_aliases.get(name).cloned() {
+                    self.instantiate(&scheme)
                 } else {
                     Type::Con(name.clone())
                 }
@@ -709,6 +717,10 @@ impl InferCtx {
 
 // ---- Public API ----
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "multi-pass type checking orchestration"
+)]
 pub fn check(module: &Module) {
     let mut ctx = InferCtx::new();
 
@@ -738,23 +750,62 @@ pub fn check(module: &Module) {
                 methods,
             } => {
                 ctx.register_type_decl(name, type_params, tags);
-                // Register method signatures with fresh types
+                // Register method signatures and collect method annotations
                 for method in methods {
-                    if let Decl::FuncDef {
-                        name: method_name,
-                        params,
-                        ..
-                    } = method
-                    {
-                        let mangled = format!("{name}.{method_name}");
-                        let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
-                        let ret = ctx.fresh();
-                        let func_ty = Type::Arrow(param_types, Box::new(ret));
-                        ctx.env.insert(mangled, Scheme::mono(func_ty));
+                    match method {
+                        Decl::FuncDef {
+                            name: method_name,
+                            params,
+                            ..
+                        } => {
+                            let mangled = format!("{name}.{method_name}");
+                            let param_types: Vec<Type> =
+                                params.iter().map(|_| ctx.fresh()).collect();
+                            let ret = ctx.fresh();
+                            let func_ty = Type::Arrow(param_types, Box::new(ret));
+                            ctx.env.insert(mangled, Scheme::mono(func_ty));
+                        }
+                        Decl::TypeAnno {
+                            name: method_name,
+                            ty,
+                            ..
+                        } => {
+                            let mangled = format!("{name}.{method_name}");
+                            ctx.type_annos.insert(mangled, ty.clone());
+                        }
                     }
                 }
             }
-            Decl::TypeAnno { .. } => {}
+            Decl::TypeAnno {
+                name,
+                type_params,
+                ty,
+                ..
+            } => {
+                if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    // CamelCase: type alias (e.g. Point : { x: I64, y: I64 })
+                    let tvar_env: HashMap<String, TypeVar> = type_params
+                        .iter()
+                        .map(|p| {
+                            let t = ctx.fresh();
+                            let Type::Var(tv) = t else { unreachable!() };
+                            (p.clone(), tv)
+                        })
+                        .collect();
+                    let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[p]).collect();
+                    let alias_ty = ctx.type_expr_to_type(ty, &tvar_env);
+                    ctx.type_aliases.insert(
+                        name.clone(),
+                        Scheme {
+                            vars: tvars,
+                            ty: alias_ty,
+                        },
+                    );
+                } else {
+                    // snake_case: value/function annotation (e.g. get_x : I64 -> I64)
+                    ctx.type_annos.insert(name.clone(), ty.clone());
+                }
+            }
             Decl::FuncDef { name, params, .. } => {
                 let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
                 let ret = ctx.fresh();
@@ -782,6 +833,8 @@ pub fn check(module: &Module) {
                 }
                 let body_ty = ctx.infer_expr(body);
                 ctx.unify(&ret, &body_ty);
+
+                // TODO: enforce type annotations against inferred types
 
                 ctx.env = saved_env;
                 ctx.env.remove(name); // remove monomorphic binding before generalizing
@@ -813,6 +866,8 @@ pub fn check(module: &Module) {
                         }
                         let body_ty = ctx.infer_expr(body);
                         ctx.unify(&ret, &body_ty);
+
+                        // TODO: enforce type annotations against inferred types
 
                         ctx.env = saved_env;
                         ctx.env.remove(&mangled);
