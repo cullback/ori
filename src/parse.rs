@@ -1,13 +1,20 @@
 use crate::ast::{BinOp, Decl, Expr, MatchArm, Module, Pattern, Stmt, TagDecl, TypeExpr};
-use crate::token::Token;
+use crate::token::{Span, Token};
 
-pub fn parse(tokens: Vec<Token>) -> Module {
-    let mut parser = Parser { tokens, pos: 0 };
+pub fn parse(tokens: Vec<Token>, spans: Vec<Span>, source: &str) -> Module {
+    let mut parser = Parser {
+        tokens,
+        spans,
+        source: source.to_owned(),
+        pos: 0,
+    };
     parser.parse_module()
 }
 
 struct Parser {
     tokens: Vec<Token>,
+    spans: Vec<Span>,
+    source: String,
     pos: usize,
 }
 
@@ -35,9 +42,20 @@ impl Parser {
         tok
     }
 
+    fn error(&self, msg: &str) -> ! {
+        let span = self.spans[self.pos];
+        panic!("\n{}", span.display(&self.source, msg));
+    }
+
     fn expect(&mut self, expected: &Token) {
         let tok = self.advance();
-        assert!(tok == *expected, "expected {expected:?}, got {tok:?}");
+        if tok != *expected {
+            let span = self.spans[self.pos - 1];
+            panic!(
+                "\n{}",
+                span.display(&self.source, &format!("expected {expected:?}, got {tok:?}"))
+            );
+        }
     }
 
     fn skip_newlines(&mut self) {
@@ -66,10 +84,10 @@ impl Parser {
 
     fn parse_decl(&mut self) -> Decl {
         let Token::Ident(name) = self.peek().clone() else {
-            panic!(
+            self.error(&format!(
                 "expected identifier at start of declaration, got {:?}",
                 self.peek()
-            );
+            ));
         };
 
         match self.peek_at(1) {
@@ -91,11 +109,15 @@ impl Parser {
                 match self.peek_at(offset) {
                     Token::Colon => self.parse_type_anno(),
                     Token::Eq => self.parse_func_def(),
-                    other => panic!("expected ':' or '=' after '{name}(...)', got {other:?}"),
+                    other => self.error(&format!(
+                        "expected ':' or '=' after '{name}(...)', got {other:?}"
+                    )),
                 }
             }
             Token::Eq => self.parse_func_def(),
-            other => panic!("expected ':' or '=' after '{name}', got {other:?}"),
+            other => self.error(&format!(
+                "expected ':' or '=' after '{name}', got {other:?}"
+            )),
         }
     }
 
@@ -265,7 +287,7 @@ impl Parser {
                 self.expect(&Token::RBrace);
                 TypeExpr::Record(fields)
             }
-            other => panic!("expected type, got {other:?}"),
+            other => self.error(&format!("expected type, got {other:?}")),
         }
     }
 
@@ -462,7 +484,7 @@ impl Parser {
                 }
             }
 
-            other => panic!("expected expression, got {other:?}"),
+            other => self.error(&format!("expected expression, got {other:?}")),
         }
     }
 
@@ -614,7 +636,7 @@ impl Parser {
                 self.expect(&Token::RBrace);
                 Pattern::Record { fields }
             }
-            other => panic!("expected pattern, got {other:?}"),
+            other => self.error(&format!("expected pattern, got {other:?}")),
         }
     }
 

@@ -21,6 +21,7 @@ get_age = |person| person.age
 main : I64
 main = |arg| (
     alice = { name: 1, age: 30 }
+    bob : Person
     bob = { age: 25, location: 2 }
 
     // get_age works on both records despite different shapes

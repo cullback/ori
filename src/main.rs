@@ -27,8 +27,8 @@ fn main() {
     });
 
     // Compile
-    let tokens = token::tokenize(&source);
-    let module = parse::parse(tokens);
+    let (tokens, spans) = token::tokenize(&source);
+    let module = parse::parse(tokens, spans, &source);
     infer::check(&module);
     let (program, input_var) = lower::lower(&module);
 

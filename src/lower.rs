@@ -19,8 +19,8 @@ pub fn lower(module: &Module) -> (Program, VarId) {
     let mut ctx = LowerCtx::new();
 
     // Parse and register the prelude
-    let prelude_tokens = token::tokenize(PRELUDE);
-    let prelude = parse::parse(prelude_tokens);
+    let (prelude_tokens, prelude_spans) = token::tokenize(PRELUDE);
+    let prelude = parse::parse(prelude_tokens, prelude_spans, PRELUDE);
     ctx.register_decls(&prelude.decls);
 
     // Now that Bool is known, register comparison builtins

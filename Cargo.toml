@@ -13,6 +13,7 @@ cargo = { level = "deny", priority = -1 }
 restriction = { level = "deny", priority = -1 }
 
 arbitrary_source_item_ordering = "allow"
+arithmetic_side_effects = "allow"
 blanket_clippy_restriction_lints = "allow"
 cargo_common_metadata = "allow"
 expect_used = "allow"
