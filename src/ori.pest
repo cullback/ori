@@ -7,7 +7,7 @@ COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
 
 module = { SOI ~ decl* ~ EOI }
 
-decl = { type_anno | func_def }
+decl = { type_anno | assignment }
 
 type_anno = {
     type_name ~ type_params? ~ ":" ~ type_expr ~ method_block?
@@ -16,10 +16,6 @@ type_anno = {
 type_params = { "(" ~ ident ~ ("," ~ ident)* ~ ")" }
 
 method_block = { ".(" ~ decl* ~ ")" }
-
-func_def = {
-    ident ~ "=" ~ expr
-}
 
 // ---- Type expressions ----
 

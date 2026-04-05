@@ -39,7 +39,7 @@ fn parse_decl(pair: Pair<'_, Rule>) -> Decl {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
         Rule::type_anno => parse_type_anno(inner),
-        Rule::func_def => parse_func_def(inner),
+        Rule::assignment => parse_assignment_as_decl(inner),
         other => panic!("unexpected decl rule: {other:?}"),
     }
 }
@@ -81,11 +81,11 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl {
     }
 }
 
-fn parse_func_def(pair: Pair<'_, Rule>) -> Decl {
+fn parse_assignment_as_decl(pair: Pair<'_, Rule>) -> Decl {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_owned();
-    let body_pair = inner.next().unwrap();
-    let body = parse_expr(body_pair);
+    let lhs = inner.next().unwrap(); // irrefutable
+    let name = lhs.as_str().trim().to_owned();
+    let body = parse_expr(inner.next().unwrap());
 
     // If the body is a lambda, extract its params as the function's params
     if let ExprKind::Lambda {
