@@ -129,13 +129,15 @@ fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr {
             assert!(!inner.is_empty(), "empty type_atom");
             let first = &inner[0];
             match first.as_rule() {
-                Rule::type_name => {
+                Rule::name => {
                     let name = first.as_str().to_owned();
                     if inner.len() == 1 {
                         TypeExpr::Named(name)
-                    } else {
+                    } else if inner[1].as_rule() == Rule::type_atom {
                         let args: Vec<TypeExpr> = inner.drain(1..).map(parse_type_expr).collect();
                         TypeExpr::App(name, args)
+                    } else {
+                        panic!("unexpected type_atom after name");
                     }
                 }
                 Rule::tag_decl => {
@@ -283,7 +285,7 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
                 span,
             )
         }
-        Rule::constructor_head | Rule::function_head => {
+        Rule::call_head => {
             let text = first.as_str();
             let func = text[..text.len() - 1].to_owned();
             let args = inner
@@ -293,7 +295,7 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
                 .unwrap_or_default();
             Expr::new(ExprKind::Call { func, args }, span)
         }
-        Rule::constructor | Rule::ident => {
+        Rule::name => {
             let first_name = first.as_str().to_owned();
             if inner.is_empty() {
                 return Expr::new(ExprKind::Name(first_name), span);
@@ -301,7 +303,7 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
             // Field access chain
             let mut result = Expr::new(ExprKind::Name(first_name), span);
             for field in inner {
-                if field.as_rule() == Rule::ident {
+                if field.as_rule() == Rule::name {
                     result = Expr::new(
                         ExprKind::FieldAccess {
                             record: Box::new(result),
@@ -489,7 +491,7 @@ fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern {
         }
         return Pattern::Binding(text.to_owned());
     }
-    if inner.len() == 1 && inner[0].as_rule() == Rule::ident {
+    if inner.len() == 1 && inner[0].as_rule() == Rule::name {
         return Pattern::Binding(inner[0].as_str().to_owned());
     }
     let first = &inner[0];
@@ -530,12 +532,15 @@ fn parse_tuple(pair: Pair<'_, Rule>, span: Span) -> Expr {
 
 // ---- Patterns ----
 
+fn is_constructor_name(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
 fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
     let text = pair.as_str().trim();
     let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
 
     if inner.is_empty() {
-        // Literal `_` wildcard (no inner pairs)
         if text == "_" {
             return Pattern::Wildcard;
         }
@@ -544,10 +549,21 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
 
     let first = &inner[0];
     match first.as_rule() {
-        Rule::constructor => {
+        Rule::name => {
             let name = first.as_str().to_owned();
-            let fields: Vec<Pattern> = inner.into_iter().skip(1).map(parse_pattern).collect();
-            Pattern::Constructor { name, fields }
+            if inner.len() > 1 {
+                // Constructor with fields: Name(pat, ...)
+                let fields: Vec<Pattern> = inner.into_iter().skip(1).map(parse_pattern).collect();
+                Pattern::Constructor { name, fields }
+            } else if is_constructor_name(&name) {
+                // Bare uppercase name: nullary constructor
+                Pattern::Constructor {
+                    name,
+                    fields: vec![],
+                }
+            } else {
+                Pattern::Binding(name)
+            }
         }
         Rule::field_pattern => {
             let fields: Vec<(String, Pattern)> =
@@ -559,20 +575,11 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
             let elements: Vec<Pattern> = inner.into_iter().map(parse_pattern).collect();
             Pattern::Tuple(elements)
         }
-        Rule::ident => {
-            let name = first.as_str();
-            if name == "_" {
-                Pattern::Wildcard
-            } else {
-                Pattern::Binding(name.to_owned())
-            }
-        }
         _ => {
-            let first_text = first.as_str();
-            if first_text == "_" {
+            if first.as_str() == "_" {
                 Pattern::Wildcard
             } else {
-                panic!("unexpected pattern: {first_text}");
+                panic!("unexpected pattern: {:?}", first.as_rule());
             }
         }
     }

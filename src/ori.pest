@@ -10,10 +10,10 @@ module = { SOI ~ decl* ~ EOI }
 decl = { type_anno | assignment }
 
 type_anno = {
-    type_name ~ type_params? ~ ":" ~ type_expr ~ method_block?
+    name ~ type_params? ~ ":" ~ type_expr ~ method_block?
 }
 
-type_params = { "(" ~ ident ~ ("," ~ ident)* ~ ")" }
+type_params = { "(" ~ name ~ ("," ~ name)* ~ ")" }
 
 method_block = { ".(" ~ decl* ~ ")" }
 
@@ -25,16 +25,16 @@ type_expr = {
 }
 
 type_atom = {
-    type_name ~ "(" ~ type_atom ~ ("," ~ type_atom)* ~ ")"
+    name ~ "(" ~ type_atom ~ ("," ~ type_atom)* ~ ")"
   | "[" ~ (tag_decl ~ ("," ~ tag_decl)*)? ~ "]"
   | "{" ~ (field_type ~ ("," ~ field_type)*)? ~ "}"
   | "(" ~ type_atom ~ ("," ~ type_atom)+ ~ ")"
-  | type_name
+  | name
 }
 
-tag_decl = { constructor ~ ("(" ~ type_atom ~ ("," ~ type_atom)* ~ ")")? }
+tag_decl = { name ~ ("(" ~ type_atom ~ ("," ~ type_atom)* ~ ")")? }
 
-field_type = { ident ~ ":" ~ type_atom }
+field_type = { name ~ ":" ~ type_atom }
 
 // ---- Expressions ----
 
@@ -56,21 +56,18 @@ tuple = { "(" ~ expr ~ ("," ~ expr)+ ~ ")" }
 
 neg_expr = { "-" ~ atom }
 
-// Calls, constructors, names, and field access.
+// Calls, names, and field access.
 // Call heads are atomic (no space before "(").
 call_or_access = {
     qualified_head ~ args? ~ ")"
-  | constructor_head ~ args? ~ ")"
-  | function_head ~ args? ~ ")"
-  | constructor
-  | ident ~ ("." ~ ident)+
-  | ident
+  | call_head ~ args? ~ ")"
+  | name ~ ("." ~ name)+
+  | name
 }
 
 // Atomic heads: no whitespace allowed before "("
-qualified_head   = @{ (constructor | ident) ~ "." ~ ident ~ "(" }
-constructor_head = @{ constructor ~ "(" }
-function_head    = @{ ident ~ "(" }
+qualified_head = @{ name ~ "." ~ name ~ "(" }
+call_head      = @{ name ~ "(" }
 
 args = { expr ~ ("," ~ expr)* }
 
@@ -79,7 +76,7 @@ block_body = { block_stmt* ~ expr }
 
 block_stmt = { type_hint | assignment }
 
-type_hint = { ident ~ ":" ~ type_expr }
+type_hint = { name ~ ":" ~ type_expr }
 
 assignment = { irrefutable ~ "=" ~ expr }
 
@@ -87,18 +84,18 @@ irrefutable = {
     "(" ~ irrefutable ~ ("," ~ irrefutable)+ ~ ")"
   | "{" ~ (field_irrefutable ~ ("," ~ field_irrefutable)*)? ~ "}"
   | "_"
-  | ident
+  | name
 }
 
-field_irrefutable = { ident ~ ":" ~ irrefutable | ident }
+field_irrefutable = { name ~ ":" ~ irrefutable | name }
 
 record_literal = { "{" ~ (field_init ~ ("," ~ field_init)*)? ~ "}" }
 
-field_init = { ident ~ ":" ~ expr }
+field_init = { name ~ ":" ~ expr }
 
 lambda = { "|" ~ (lambda_param ~ ("," ~ lambda_param)*)? ~ "|" ~ expr }
 
-lambda_param = @{ "_" | ident }
+lambda_param = @{ "_" | name }
 
 int_lit = @{ ASCII_DIGIT+ }
 
@@ -118,17 +115,16 @@ match_arm = { ":" ~ pattern ~ "then" ~ expr }
 // ---- Patterns ----
 
 pattern = {
-    constructor ~ "(" ~ (pattern ~ ("," ~ pattern)*)? ~ ")"
-  | constructor
+    name ~ "(" ~ (pattern ~ ("," ~ pattern)*)? ~ ")"
   | "{" ~ (field_pattern ~ ("," ~ field_pattern)*)? ~ "}"
   | "(" ~ pattern ~ ("," ~ pattern)+ ~ ")"
   | "_"
-  | ident
+  | name
 }
 
 field_pattern = {
-    ident ~ ":" ~ pattern
-  | ident
+    name ~ ":" ~ pattern
+  | name
 }
 
 // ---- Operators ----
@@ -140,8 +136,6 @@ mul_op =  { "*" | "/" | "%" }
 
 // ---- Terminals ----
 
-ident       = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA_LOWER ~ (ASCII_ALPHANUMERIC | "_")* }
-constructor = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
-type_name   = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+name = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
 keyword = { "if" | "then" | "else" | "fold" }
