@@ -35,8 +35,27 @@ pub struct TagDecl {
     pub fields: Vec<TypeExpr>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+impl Expr {
+    pub const fn new(kind: ExprKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ExprKind {
     IntLit(i64),
     Name(String),
     BinOp {

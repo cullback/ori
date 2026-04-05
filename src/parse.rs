@@ -3,11 +3,21 @@ use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest_derive::Parser;
 
-use crate::ast::{BinOp, Decl, Expr, MatchArm, Module, Pattern, Stmt, TagDecl, TypeExpr};
+use crate::ast::{
+    BinOp, Decl, Expr, ExprKind, MatchArm, Module, Pattern, Span, Stmt, TagDecl, TypeExpr,
+};
 
 #[derive(Parser)]
 #[grammar = "ori.pest"]
 struct OriParser;
+
+fn span_of(pair: &Pair<'_, Rule>) -> Span {
+    let pest_span = pair.as_span();
+    Span {
+        start: pest_span.start(),
+        end: pest_span.end(),
+    }
+}
 
 pub fn parse(source: &str) -> Module {
     let pairs = OriParser::parse(Rule::module, source).unwrap_or_else(|e| panic!("{e}"));
@@ -78,10 +88,10 @@ fn parse_func_def(pair: Pair<'_, Rule>) -> Decl {
     let body = parse_expr(body_pair);
 
     // If the body is a lambda, extract its params as the function's params
-    if let Expr::Lambda {
+    if let ExprKind::Lambda {
         params,
         body: lam_body,
-    } = body
+    } = body.kind
     {
         Decl::FuncDef {
             name,
@@ -168,12 +178,19 @@ fn pratt_parser() -> PrattParser<Rule> {
 }
 
 fn parse_expr(pair: Pair<'_, Rule>) -> Expr {
+    let span = span_of(&pair);
     match pair.as_rule() {
         Rule::expr => {
             let parser = pratt_parser();
             parser
                 .map_primary(parse_expr)
                 .map_infix(|lhs, op_pair, rhs| {
+                    let infix_start = lhs.span.start;
+                    let infix_end = rhs.span.end;
+                    let infix_span = Span {
+                        start: infix_start,
+                        end: infix_end,
+                    };
                     let binop = match op_pair.as_str() {
                         "+" => BinOp::Add,
                         "-" => BinOp::Sub,
@@ -184,11 +201,14 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Expr {
                         "!=" => BinOp::Neq,
                         other => panic!("unknown operator: {other}"),
                     };
-                    Expr::BinOp {
-                        op: binop,
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(rhs),
-                    }
+                    Expr::new(
+                        ExprKind::BinOp {
+                            op: binop,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                        infix_span,
+                    )
                 })
                 .parse(pair.into_inner())
         }
@@ -198,34 +218,37 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Expr {
         }
         Rule::int_lit => {
             let n: i64 = pair.as_str().parse().unwrap();
-            Expr::IntLit(n)
+            Expr::new(ExprKind::IntLit(n), span)
         }
         Rule::neg_expr => {
             let inner = pair.into_inner().next().unwrap();
-            Expr::BinOp {
-                op: BinOp::Sub,
-                lhs: Box::new(Expr::IntLit(0)),
-                rhs: Box::new(parse_expr(inner)),
-            }
+            Expr::new(
+                ExprKind::BinOp {
+                    op: BinOp::Sub,
+                    lhs: Box::new(Expr::new(ExprKind::IntLit(0), span)),
+                    rhs: Box::new(parse_expr(inner)),
+                },
+                span,
+            )
         }
-        Rule::call_or_access => parse_call_or_access(pair),
-        Rule::block => parse_block(pair),
-        Rule::if_expr => parse_if_expr(pair),
-        Rule::fold_expr => parse_fold_expr(pair),
-        Rule::lambda => parse_lambda(pair),
-        Rule::record_literal => parse_record_literal(pair),
+        Rule::call_or_access => parse_call_or_access(pair, span),
+        Rule::block => parse_block(pair, span),
+        Rule::if_expr => parse_if_expr(pair, span),
+        Rule::fold_expr => parse_fold_expr(pair, span),
+        Rule::lambda => parse_lambda(pair, span),
+        Rule::record_literal => parse_record_literal(pair, span),
         _ => panic!("unexpected expression rule: {:?}", pair.as_rule()),
     }
 }
 
-fn parse_call_or_access(pair: Pair<'_, Rule>) -> Expr {
+fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
     let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
 
     let first = inner.remove(0);
     let first_name = first.as_str().to_owned();
     if inner.is_empty() {
         // Bare name or nullary constructor
-        return Expr::Name(first_name);
+        return Expr::new(ExprKind::Name(first_name), span);
     }
 
     let second = &inner[0];
@@ -237,29 +260,38 @@ fn parse_call_or_access(pair: Pair<'_, Rule>) -> Expr {
                 let args_pair = inner.remove(1);
                 inner.remove(0);
                 let args: Vec<Expr> = args_pair.into_inner().map(parse_expr).collect();
-                let mut result = Expr::QualifiedCall {
-                    owner: first_name,
-                    method: second_name,
-                    args,
-                };
+                let mut result = Expr::new(
+                    ExprKind::QualifiedCall {
+                        owner: first_name,
+                        method: second_name,
+                        args,
+                    },
+                    span,
+                );
                 for remaining in inner {
                     if remaining.as_rule() == Rule::ident {
-                        result = Expr::FieldAccess {
-                            record: Box::new(result),
-                            field: remaining.as_str().to_owned(),
-                        };
+                        result = Expr::new(
+                            ExprKind::FieldAccess {
+                                record: Box::new(result),
+                                field: remaining.as_str().to_owned(),
+                            },
+                            span,
+                        );
                     }
                 }
                 result
             } else {
                 // Field access chain: name.field.field...
-                let mut result = Expr::Name(first_name);
+                let mut result = Expr::new(ExprKind::Name(first_name), span);
                 for field in inner {
                     if field.as_rule() == Rule::ident {
-                        result = Expr::FieldAccess {
-                            record: Box::new(result),
-                            field: field.as_str().to_owned(),
-                        };
+                        result = Expr::new(
+                            ExprKind::FieldAccess {
+                                record: Box::new(result),
+                                field: field.as_str().to_owned(),
+                            },
+                            span,
+                        );
                     }
                 }
                 result
@@ -268,25 +300,31 @@ fn parse_call_or_access(pair: Pair<'_, Rule>) -> Expr {
         Rule::args => {
             // Call or constructor call: name(args) or Constructor(args)
             let args: Vec<Expr> = inner.remove(0).into_inner().map(parse_expr).collect();
-            let mut result = Expr::Call {
-                func: first_name,
-                args,
-            };
+            let mut result = Expr::new(
+                ExprKind::Call {
+                    func: first_name,
+                    args,
+                },
+                span,
+            );
             for remaining in inner {
                 if remaining.as_rule() == Rule::ident {
-                    result = Expr::FieldAccess {
-                        record: Box::new(result),
-                        field: remaining.as_str().to_owned(),
-                    };
+                    result = Expr::new(
+                        ExprKind::FieldAccess {
+                            record: Box::new(result),
+                            field: remaining.as_str().to_owned(),
+                        },
+                        span,
+                    );
                 }
             }
             result
         }
-        _ => Expr::Name(first_name),
+        _ => Expr::new(ExprKind::Name(first_name), span),
     }
 }
 
-fn parse_block(pair: Pair<'_, Rule>) -> Expr {
+fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
     let mut stmts = Vec::new();
     let mut result_expr = None;
 
@@ -309,11 +347,11 @@ fn parse_block(pair: Pair<'_, Rule>) -> Expr {
     if stmts.is_empty() {
         result
     } else {
-        Expr::Block(stmts, Box::new(result))
+        Expr::new(ExprKind::Block(stmts, Box::new(result)), span)
     }
 }
 
-fn parse_if_expr(pair: Pair<'_, Rule>) -> Expr {
+fn parse_if_expr(pair: Pair<'_, Rule>, span: Span) -> Expr {
     let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
 
     // Check if it's boolean if-then-else or multi-arm match
@@ -332,46 +370,55 @@ fn parse_if_expr(pair: Pair<'_, Rule>) -> Expr {
             }
         }
 
-        Expr::If {
-            expr: Box::new(scrutinee),
-            arms,
-            else_body,
-        }
+        Expr::new(
+            ExprKind::If {
+                expr: Box::new(scrutinee),
+                arms,
+                else_body,
+            },
+            span,
+        )
     } else {
         let then_body = parse_expr(inner.remove(0));
         let else_body = parse_expr(inner.remove(0));
 
-        Expr::If {
-            expr: Box::new(scrutinee),
-            arms: vec![
-                MatchArm {
-                    pattern: Pattern::Constructor {
-                        name: "True".to_owned(),
-                        fields: vec![],
+        Expr::new(
+            ExprKind::If {
+                expr: Box::new(scrutinee),
+                arms: vec![
+                    MatchArm {
+                        pattern: Pattern::Constructor {
+                            name: "True".to_owned(),
+                            fields: vec![],
+                        },
+                        body: then_body,
                     },
-                    body: then_body,
-                },
-                MatchArm {
-                    pattern: Pattern::Constructor {
-                        name: "False".to_owned(),
-                        fields: vec![],
+                    MatchArm {
+                        pattern: Pattern::Constructor {
+                            name: "False".to_owned(),
+                            fields: vec![],
+                        },
+                        body: else_body,
                     },
-                    body: else_body,
-                },
-            ],
-            else_body: None,
-        }
+                ],
+                else_body: None,
+            },
+            span,
+        )
     }
 }
 
-fn parse_fold_expr(pair: Pair<'_, Rule>) -> Expr {
+fn parse_fold_expr(pair: Pair<'_, Rule>, span: Span) -> Expr {
     let mut inner = pair.into_inner();
     let scrutinee = parse_expr(inner.next().unwrap());
     let arms: Vec<MatchArm> = inner.map(parse_match_arm).collect();
-    Expr::Fold {
-        expr: Box::new(scrutinee),
-        arms,
-    }
+    Expr::new(
+        ExprKind::Fold {
+            expr: Box::new(scrutinee),
+            arms,
+        },
+        span,
+    )
 }
 
 fn parse_match_arm(pair: Pair<'_, Rule>) -> MatchArm {
@@ -381,7 +428,7 @@ fn parse_match_arm(pair: Pair<'_, Rule>) -> MatchArm {
     MatchArm { pattern, body }
 }
 
-fn parse_lambda(pair: Pair<'_, Rule>) -> Expr {
+fn parse_lambda(pair: Pair<'_, Rule>, span: Span) -> Expr {
     let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
     let body = parse_expr(inner.pop().unwrap());
     let params: Vec<String> = inner
@@ -389,13 +436,16 @@ fn parse_lambda(pair: Pair<'_, Rule>) -> Expr {
         .filter(|p| p.as_rule() == Rule::lambda_param)
         .map(|p| p.as_str().to_owned())
         .collect();
-    Expr::Lambda {
-        params,
-        body: Box::new(body),
-    }
+    Expr::new(
+        ExprKind::Lambda {
+            params,
+            body: Box::new(body),
+        },
+        span,
+    )
 }
 
-fn parse_record_literal(pair: Pair<'_, Rule>) -> Expr {
+fn parse_record_literal(pair: Pair<'_, Rule>, span: Span) -> Expr {
     let fields: Vec<(String, Expr)> = pair
         .into_inner()
         .map(|fi| {
@@ -405,7 +455,7 @@ fn parse_record_literal(pair: Pair<'_, Rule>) -> Expr {
             (name, val)
         })
         .collect();
-    Expr::Record { fields }
+    Expr::new(ExprKind::Record { fields }, span)
 }
 
 // ---- Patterns ----

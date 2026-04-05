@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, BinOp, Decl, Expr, Module, Stmt, TypeExpr};
+use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr};
 
 // ---- Type representation ----
 
@@ -33,6 +33,7 @@ impl Scheme {
 // ---- Inference context ----
 
 struct InferCtx {
+    source: String,
     next_var: usize,
     subst: HashMap<TypeVar, Type>,
     env: HashMap<String, Scheme>,
@@ -41,17 +42,21 @@ struct InferCtx {
     type_aliases: HashMap<String, Scheme>,
     /// Declared type annotations for checking against inferred types.
     type_annos: HashMap<String, TypeExpr>,
+    /// Current expression span for error reporting in unify.
+    current_span: Span,
 }
 
 impl InferCtx {
-    fn new() -> Self {
+    fn new(source: &str) -> Self {
         Self {
+            source: source.to_owned(),
             next_var: 0,
             subst: HashMap::new(),
             env: HashMap::new(),
             constructors: HashMap::new(),
             type_aliases: HashMap::new(),
             type_annos: HashMap::new(),
+            current_span: Span::default(),
         }
     }
 
@@ -64,6 +69,34 @@ impl InferCtx {
         let tv = TypeVar(self.next_var);
         self.next_var += 1;
         Type::Var(tv)
+    }
+
+    #[expect(clippy::arithmetic_side_effects, reason = "line/col counting")]
+    fn type_error(&self, span: Span, msg: &str) -> ! {
+        let src = &self.source;
+        let mut line = 1_usize;
+        let mut col = 1_usize;
+        for (i, ch) in src.char_indices() {
+            if i >= span.start {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        let line_start = src[..span.start].rfind('\n').map_or(0_usize, |i| i + 1);
+        let line_end = src[span.start..]
+            .find('\n')
+            .map_or(src.len(), |i| span.start + i);
+        let src_line = &src[line_start..line_end];
+        let pad = " ".repeat(col - 1);
+        let carets = "^".repeat((span.end - span.start).max(1));
+        panic!(
+            "\n --> {line}:{col}\n    | \n{line:>3} | {src_line}\n    | {pad}{carets}\n    | type error: {msg}"
+        );
     }
 
     // ---- Substitution ----
@@ -128,26 +161,25 @@ impl InferCtx {
             }
             (_, Type::Var(_)) => self.unify(&rhs, &lhs),
             (Type::Con(a), Type::Con(b)) => {
-                assert!(a == b, "type error: cannot unify {a} with {b}");
+                if a != b {
+                    self.type_error(self.current_span, &format!("cannot unify {a} with {b}"));
+                }
             }
             (Type::App(n1, a1), Type::App(n2, a2)) => {
-                assert!(
-                    n1 == n2 && a1.len() == a2.len(),
-                    "type error: cannot unify {n1}({}) with {n2}({})",
-                    a1.len(),
-                    a2.len()
-                );
+                if n1 != n2 || a1.len() != a2.len() {
+                    self.type_error(self.current_span, &format!("cannot unify {n1} with {n2}"));
+                }
                 for (x, y) in a1.iter().zip(a2.iter()) {
                     self.unify(x, y);
                 }
             }
             (Type::Arrow(p1, r1), Type::Arrow(p2, r2)) => {
-                assert!(
-                    p1.len() == p2.len(),
-                    "type error: function arity mismatch: {} vs {}",
-                    p1.len(),
-                    p2.len()
-                );
+                if p1.len() != p2.len() {
+                    self.type_error(
+                        self.current_span,
+                        &format!("function arity mismatch: {} vs {}", p1.len(), p2.len()),
+                    );
+                }
                 for (x, y) in p1.iter().zip(p2.iter()) {
                     self.unify(x, y);
                 }
@@ -162,10 +194,13 @@ impl InferCtx {
             }
             (_, Type::RowExtend(..)) => self.unify(&rhs, &lhs),
             _ => {
-                panic!(
-                    "type error: cannot unify {} with {}",
-                    self.display_type(&lhs),
-                    self.display_type(&rhs)
+                self.type_error(
+                    self.current_span,
+                    &format!(
+                        "cannot unify {} with {}",
+                        self.display_type(&lhs),
+                        self.display_type(&rhs)
+                    ),
                 );
             }
         }
@@ -373,20 +408,21 @@ impl InferCtx {
         reason = "expression inference handles all forms"
     )]
     fn infer_expr(&mut self, expr: &Expr) -> Type {
-        match expr {
-            Expr::IntLit(_) => Type::Con("I64".to_owned()),
+        self.current_span = expr.span;
+        match &expr.kind {
+            ExprKind::IntLit(_) => Type::Con("I64".to_owned()),
 
-            Expr::Name(name) => {
+            ExprKind::Name(name) => {
                 if let Some(scheme) = self.env.get(name).cloned() {
                     return self.instantiate(&scheme);
                 }
                 if let Some(scheme) = self.constructors.get(name).cloned() {
                     return self.instantiate(&scheme);
                 }
-                panic!("type error: undefined name '{name}'");
+                self.type_error(expr.span, &format!("undefined name '{name}'"));
             }
 
-            Expr::BinOp { op, lhs, rhs } => {
+            ExprKind::BinOp { op, lhs, rhs } => {
                 let lt = self.infer_expr(lhs);
                 let rt = self.infer_expr(rhs);
                 let i64_ty = Type::Con("I64".to_owned());
@@ -403,9 +439,9 @@ impl InferCtx {
                 }
             }
 
-            Expr::Call { func, args } => self.infer_call(func, args),
+            ExprKind::Call { func, args } => self.infer_call(func, args),
 
-            Expr::QualifiedCall {
+            ExprKind::QualifiedCall {
                 owner,
                 method,
                 args,
@@ -414,7 +450,7 @@ impl InferCtx {
                 self.infer_call(&mangled, args)
             }
 
-            Expr::Block(stmts, result) => {
+            ExprKind::Block(stmts, result) => {
                 let saved_env = self.env.clone();
                 for stmt in stmts {
                     let Stmt::Let { name, val } = stmt;
@@ -427,7 +463,7 @@ impl InferCtx {
                 result_ty
             }
 
-            Expr::If {
+            ExprKind::If {
                 expr: scrutinee,
                 arms,
                 ..
@@ -447,7 +483,7 @@ impl InferCtx {
                 result_ty
             }
 
-            Expr::Fold {
+            ExprKind::Fold {
                 expr: scrutinee,
                 arms,
             } => {
@@ -467,7 +503,7 @@ impl InferCtx {
                 result_ty
             }
 
-            Expr::Record { fields } => {
+            ExprKind::Record { fields } => {
                 let mut row = Type::RowEmpty;
                 for (name, field_expr) in fields.iter().rev() {
                     let field_ty = self.infer_expr(field_expr);
@@ -476,7 +512,7 @@ impl InferCtx {
                 Type::Record(Box::new(row))
             }
 
-            Expr::FieldAccess { record, field } => {
+            ExprKind::FieldAccess { record, field } => {
                 let record_ty = self.infer_expr(record);
                 let field_ty = self.fresh();
                 let rest_row = self.fresh();
@@ -489,7 +525,7 @@ impl InferCtx {
                 field_ty
             }
 
-            Expr::Lambda { params, body } => {
+            ExprKind::Lambda { params, body } => {
                 let saved_env = self.env.clone();
                 let param_types: Vec<Type> = params
                     .iter()
@@ -721,8 +757,8 @@ impl InferCtx {
     clippy::too_many_lines,
     reason = "multi-pass type checking orchestration"
 )]
-pub fn check(module: &Module) {
-    let mut ctx = InferCtx::new();
+pub fn check(source: &str, module: &Module) {
+    let mut ctx = InferCtx::new(source);
 
     // Register prelude: Bool : [True, False]
     ctx.register_type_decl(

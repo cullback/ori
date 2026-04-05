@@ -27,7 +27,7 @@ fn main() {
 
     // Compile
     let module = parse::parse(&source);
-    infer::check(&module);
+    infer::check(&source, &module);
     let (program, input_var) = lower::lower(&module);
 
     // Read input from stdin

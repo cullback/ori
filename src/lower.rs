@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, BinOp, Decl, Expr, Module, Stmt, TypeExpr};
+use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Stmt, TypeExpr};
 use crate::builder::Builder;
 use crate::ir::{
     Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, Pattern, Program, VarId,
@@ -320,27 +320,27 @@ impl LowerCtx {
     }
 
     fn scan_expr(&mut self, expr: &Expr) {
-        match expr {
-            Expr::Call { func, args } if self.funcs.contains_key(func) => {
+        match &expr.kind {
+            ExprKind::Call { func, args } if self.funcs.contains_key(func) => {
                 self.scan_call_args(func, args);
             }
-            Expr::Call { args, .. } => {
+            ExprKind::Call { args, .. } => {
                 for arg in args {
                     self.scan_expr(arg);
                 }
             }
-            Expr::BinOp { lhs, rhs, .. } => {
+            ExprKind::BinOp { lhs, rhs, .. } => {
                 self.scan_expr(lhs);
                 self.scan_expr(rhs);
             }
-            Expr::Block(stmts, result) => {
+            ExprKind::Block(stmts, result) => {
                 for stmt in stmts {
                     let Stmt::Let { val, .. } = stmt;
                     self.scan_expr(val);
                 }
                 self.scan_expr(result);
             }
-            Expr::If {
+            ExprKind::If {
                 expr: scrutinee,
                 arms,
                 else_body,
@@ -354,7 +354,7 @@ impl LowerCtx {
                     self.scan_expr(eb);
                 }
             }
-            Expr::Fold {
+            ExprKind::Fold {
                 expr: scrutinee,
                 arms,
             } => {
@@ -363,7 +363,7 @@ impl LowerCtx {
                     self.scan_expr(&arm.body);
                 }
             }
-            Expr::QualifiedCall {
+            ExprKind::QualifiedCall {
                 owner,
                 method,
                 args,
@@ -377,29 +377,29 @@ impl LowerCtx {
                     }
                 }
             }
-            Expr::Lambda { body, .. } => {
+            ExprKind::Lambda { body, .. } => {
                 self.scan_expr(body);
             }
-            Expr::Record { fields } => {
+            ExprKind::Record { fields } => {
                 for (_, field_expr) in fields {
                     self.scan_expr(field_expr);
                 }
             }
-            Expr::FieldAccess { record, .. } => {
+            ExprKind::FieldAccess { record, .. } => {
                 self.scan_expr(record);
             }
-            Expr::IntLit(_) | Expr::Name(_) => {}
+            ExprKind::IntLit(_) | ExprKind::Name(_) => {}
         }
     }
 
     fn scan_call_args(&mut self, func_name: &str, args: &[Expr]) {
         for (i, arg) in args.iter().enumerate() {
-            match arg {
-                Expr::Lambda { params, body } => {
+            match &arg.kind {
+                ExprKind::Lambda { params, body } => {
                     let free = self.compute_free_vars(body, params);
                     self.register_lambda(func_name, i, params.clone(), Some(body), free, None);
                 }
-                Expr::Name(name)
+                ExprKind::Name(name)
                     if self.funcs.contains_key(name) && !self.constructors.contains_key(name) =>
                 {
                     let func_id = self.funcs[name];
@@ -478,8 +478,8 @@ impl LowerCtx {
         seen: &mut HashSet<&'a str>,
         free: &mut Vec<String>,
     ) {
-        match expr {
-            Expr::Name(name) => {
+        match &expr.kind {
+            ExprKind::Name(name) => {
                 if !bound.contains(name.as_str())
                     && !self.constructors.contains_key(name)
                     && !self.funcs.contains_key(name)
@@ -489,32 +489,32 @@ impl LowerCtx {
                     free.push(name.clone());
                 }
             }
-            Expr::IntLit(_) => {}
-            Expr::BinOp { lhs, rhs, .. } => {
+            ExprKind::IntLit(_) => {}
+            ExprKind::BinOp { lhs, rhs, .. } => {
                 self.collect_free(lhs, bound, seen, free);
                 self.collect_free(rhs, bound, seen, free);
             }
-            Expr::Call { args, .. } | Expr::QualifiedCall { args, .. } => {
+            ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
                 for arg in args {
                     self.collect_free(arg, bound, seen, free);
                 }
             }
-            Expr::Record { fields } => {
+            ExprKind::Record { fields } => {
                 for (_, field_expr) in fields {
                     self.collect_free(field_expr, bound, seen, free);
                 }
             }
-            Expr::FieldAccess { record, .. } => {
+            ExprKind::FieldAccess { record, .. } => {
                 self.collect_free(record, bound, seen, free);
             }
-            Expr::Lambda { params, body } => {
+            ExprKind::Lambda { params, body } => {
                 let mut inner = bound.clone();
                 for p in params {
                     inner.insert(p);
                 }
                 self.collect_free(body, &inner, seen, free);
             }
-            Expr::Block(stmts, result) => {
+            ExprKind::Block(stmts, result) => {
                 let mut inner = bound.clone();
                 for stmt in stmts {
                     let Stmt::Let { name, val } = stmt;
@@ -523,7 +523,7 @@ impl LowerCtx {
                 }
                 self.collect_free(result, &inner, seen, free);
             }
-            Expr::If {
+            ExprKind::If {
                 expr: scrutinee,
                 arms,
                 else_body,
@@ -538,7 +538,7 @@ impl LowerCtx {
                     self.collect_free(eb, bound, seen, free);
                 }
             }
-            Expr::Fold {
+            ExprKind::Fold {
                 expr: scrutinee,
                 arms,
             } => {
@@ -593,10 +593,10 @@ impl LowerCtx {
     // ---- Pass 2: Lower expressions ----
 
     fn lower_expr(&mut self, expr: &Expr) -> Core {
-        match expr {
-            Expr::IntLit(n) => Core::i64(*n),
+        match &expr.kind {
+            ExprKind::IntLit(n) => Core::i64(*n),
 
-            Expr::Name(name) => {
+            ExprKind::Name(name) => {
                 if let Some(&var_id) = self.vars.get(name) {
                     return Core::var(var_id);
                 }
@@ -606,14 +606,14 @@ impl LowerCtx {
                 panic!("undefined name: {name}");
             }
 
-            Expr::BinOp { op, lhs, rhs } => {
+            ExprKind::BinOp { op, lhs, rhs } => {
                 let func_id = self.binops[op];
                 Core::app(func_id, vec![self.lower_expr(lhs), self.lower_expr(rhs)])
             }
 
-            Expr::Call { func, args } => self.lower_call(func, args),
+            ExprKind::Call { func, args } => self.lower_call(func, args),
 
-            Expr::Block(stmts, result) => {
+            ExprKind::Block(stmts, result) => {
                 let mut bindings = Vec::new();
                 for stmt in stmts {
                     let Stmt::Let { name, val } = stmt;
@@ -630,7 +630,7 @@ impl LowerCtx {
                 result_core
             }
 
-            Expr::If {
+            ExprKind::If {
                 expr: scrutinee_expr,
                 arms,
                 ..
@@ -653,7 +653,7 @@ impl LowerCtx {
                 Core::match_(scrutinee, core_arms)
             }
 
-            Expr::Fold {
+            ExprKind::Fold {
                 expr: scrutinee_expr,
                 arms,
             } => {
@@ -662,7 +662,7 @@ impl LowerCtx {
                 Core::fold(scrutinee, core_arms)
             }
 
-            Expr::QualifiedCall {
+            ExprKind::QualifiedCall {
                 owner,
                 method,
                 args,
@@ -671,7 +671,7 @@ impl LowerCtx {
                 self.lower_call(&mangled, args)
             }
 
-            Expr::Record { fields } => {
+            ExprKind::Record { fields } => {
                 let core_fields: Vec<(String, Core)> = fields
                     .iter()
                     .map(|(name, field_expr)| (name.clone(), self.lower_expr(field_expr)))
@@ -679,11 +679,11 @@ impl LowerCtx {
                 Core::record(core_fields)
             }
 
-            Expr::FieldAccess { record, field } => {
+            ExprKind::FieldAccess { record, field } => {
                 Core::field_access(self.lower_expr(record), field.clone())
             }
 
-            Expr::Lambda { .. } => {
+            ExprKind::Lambda { .. } => {
                 panic!("lambdas are only supported as direct arguments to function calls");
             }
         }
@@ -738,8 +738,8 @@ impl LowerCtx {
         let tag = entry.tag;
         let captures: Vec<String> = entry.captures.clone();
 
-        match arg {
-            Expr::Lambda { .. } => {
+        match &arg.kind {
+            ExprKind::Lambda { .. } => {
                 let capture_vals: Vec<Core> = captures
                     .iter()
                     .map(|name| {
@@ -752,7 +752,7 @@ impl LowerCtx {
                     .collect();
                 Core::app(tag, capture_vals)
             }
-            Expr::Name(_) => {
+            ExprKind::Name(_) => {
                 // Function reference — nullary constructor
                 Core::app(tag, vec![])
             }
