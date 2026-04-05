@@ -14,6 +14,7 @@ pub enum Token {
     Comma,
     Arrow,
     Underscore,
+    Dot,
 
     // Operators
     Star,
@@ -28,6 +29,7 @@ pub enum Token {
     If,
     Then,
     Else,
+    Fold,
 
     Newline,
     Eof,
@@ -112,6 +114,10 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 tokens.push(Token::Comma);
                 pos += 1;
             }
+            b'.' => {
+                tokens.push(Token::Dot);
+                pos += 1;
+            }
             b'_' if pos + 1 >= bytes.len() || !bytes[pos + 1].is_ascii_alphanumeric() => {
                 tokens.push(Token::Underscore);
                 pos += 1;
@@ -163,6 +169,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                     "if" => Token::If,
                     "then" => Token::Then,
                     "else" => Token::Else,
+                    "fold" => Token::Fold,
                     _ => Token::Ident(word.to_owned()),
                 };
                 tokens.push(tok);

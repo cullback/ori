@@ -2,6 +2,8 @@
 
 **A total functional language with fold-only recursion, compiled for native performance and automatic parallelism.**
 
+- predicative System F with inductive types and structural recursion
+
 ---
 
 ## 1. Core Calculus

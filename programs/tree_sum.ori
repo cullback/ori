@@ -1,0 +1,9 @@
+Tree : [Leaf(I64), Branch(Tree, Tree)]
+
+tree_sum : Tree -> I64
+tree_sum = |t| fold t
+    : Leaf(val) then val
+    : Branch(left, right) then left + right
+
+main : I64
+main = |arg| tree_sum(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3)))

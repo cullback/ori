@@ -1,0 +1,9 @@
+List : [Nil, Cons(I64, List)]
+
+list_sum : List -> I64
+list_sum = |xs| fold xs
+    : Nil then 0
+    : Cons(hd, rest) then hd + rest
+
+main : I64
+main = |arg| list_sum(Cons(10, Cons(20, Cons(12, Nil))))

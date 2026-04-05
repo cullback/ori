@@ -6,7 +6,7 @@ use crate::ir::{NumVal, Value};
 fn run(source: &str, input: i64) -> Value {
     let tokens = crate::token::tokenize(source);
     let module = crate::parse::parse(tokens);
-    let (program, input_var) = crate::lower::lower(module);
+    let (program, input_var) = crate::lower::lower(&module);
     let mut env = HashMap::new();
     env.insert(input_var, Value::VNum(NumVal::I64(input)));
     crate::eval::eval(&env, &program, &program.main)
@@ -240,4 +240,392 @@ fn program_conditional_ori() {
     let source = std::fs::read_to_string("programs/conditional.ori").unwrap();
     assert_eq!(run_i64(&source, 0), 99);
     assert_eq!(run_i64(&source, 5), 10);
+}
+
+// ============================================================
+// Fold (structural recursion)
+// ============================================================
+
+#[test]
+fn fold_nat_to_i64() {
+    let source = "\
+Nat : [Zero, Succ(Nat)]
+
+to_i64 : Nat -> I64
+to_i64 = |n| fold n
+    : Zero then 0
+    : Succ(prev) then prev + 1
+
+main : I64
+main = |arg| to_i64(Succ(Succ(Succ(Zero))))";
+
+    assert_eq!(run_i64(source, 0), 3);
+}
+
+#[test]
+fn fold_list_sum() {
+    let source = "\
+List : [Nil, Cons(I64, List)]
+
+list_sum : List -> I64
+list_sum = |xs| fold xs
+    : Nil then 0
+    : Cons(hd, rest) then hd + rest
+
+main : I64
+main = |arg| list_sum(Cons(1, Cons(2, Cons(3, Nil))))";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn fold_list_length() {
+    let source = "\
+List : [Nil, Cons(I64, List)]
+
+list_length : List -> I64
+list_length = |xs| fold xs
+    : Nil then 0
+    : Cons(_, rest) then rest + 1
+
+main : I64
+main = |arg| list_length(Cons(10, Cons(20, Cons(30, Cons(40, Cons(50, Nil))))))";
+
+    assert_eq!(run_i64(source, 0), 5);
+}
+
+#[test]
+fn fold_tree_sum() {
+    let source = "\
+Tree : [Leaf(I64), Branch(Tree, Tree)]
+
+tree_sum : Tree -> I64
+tree_sum = |t| fold t
+    : Leaf(val) then val
+    : Branch(left, right) then left + right
+
+main : I64
+main = |arg| tree_sum(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3)))";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn fold_tree_depth() {
+    let source = "\
+Tree : [Leaf(I64), Branch(Tree, Tree)]
+
+max : I64, I64 -> I64
+max = |a, b| if a != b then (if b != a then a else b) else a
+
+tree_depth : Tree -> I64
+tree_depth = |t| fold t
+    : Leaf(_) then 1
+    : Branch(left, right) then (
+        m = max(left, right)
+        m + 1
+    )
+
+main : I64
+main = |arg| tree_depth(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3)))";
+
+    assert_eq!(run_i64(source, 0), 3);
+}
+
+#[test]
+fn fold_list_map_inc() {
+    let source = "\
+List : [Nil, Cons(I64, List)]
+
+map_inc : List -> List
+map_inc = |xs| fold xs
+    : Nil then Nil
+    : Cons(hd, rest) then Cons(hd + 1, rest)
+
+list_sum : List -> I64
+list_sum = |xs| fold xs
+    : Nil then 0
+    : Cons(hd, rest) then hd + rest
+
+main : I64
+main = |arg| list_sum(map_inc(Cons(1, Cons(2, Cons(3, Nil)))))";
+
+    // (1+1) + (2+1) + (3+1) = 9
+    assert_eq!(run_i64(source, 0), 9);
+}
+
+#[test]
+fn fold_factorial() {
+    let source = "\
+Nat : [Zero, Succ(Nat)]
+Pair : [MkPair(I64, I64)]
+
+factorial : Nat -> I64
+factorial = |n| (
+    result = fold n
+        : Zero then MkPair(0, 1)
+        : Succ(rec) then
+            if rec
+                : MkPair(idx, f) then (
+                    next = idx + 1
+                    MkPair(next, next * f)
+                )
+    if result
+        : MkPair(_, f) then f
+)
+
+main : I64
+main = |arg| factorial(Succ(Succ(Succ(Succ(Succ(Zero))))))";
+
+    assert_eq!(run_i64(source, 0), 120);
+}
+
+#[test]
+fn fold_fibonacci() {
+    let source = "\
+Nat : [Zero, Succ(Nat)]
+Pair : [MkPair(I64, I64)]
+
+fibonacci : Nat -> I64
+fibonacci = |n| (
+    result = fold n
+        : Zero then MkPair(0, 1)
+        : Succ(rec) then
+            if rec
+                : MkPair(a, b) then MkPair(b, a + b)
+    if result
+        : MkPair(a, _) then a
+)
+
+main : I64
+main = |arg| fibonacci(Succ(Succ(Succ(Succ(Succ(Succ(Succ(Succ(Succ(Succ(Zero)))))))))))";
+
+    assert_eq!(run_i64(source, 0), 55);
+}
+
+// ============================================================
+// File-based fold tests
+// ============================================================
+
+#[test]
+fn program_nat_to_i64_ori() {
+    let source = std::fs::read_to_string("programs/nat_to_i64.ori").unwrap();
+    assert_eq!(run_i64(&source, 0), 3);
+}
+
+#[test]
+fn program_list_sum_ori() {
+    let source = std::fs::read_to_string("programs/list_sum.ori").unwrap();
+    assert_eq!(run_i64(&source, 0), 42);
+}
+
+#[test]
+fn program_tree_sum_ori() {
+    let source = std::fs::read_to_string("programs/tree_sum.ori").unwrap();
+    assert_eq!(run_i64(&source, 0), 6);
+}
+
+// ============================================================
+// Higher-order functions (defunctionalization)
+// ============================================================
+
+#[test]
+fn lambda_no_capture() {
+    let source = "\
+List : [Nil, Cons(I64, List)]
+
+map : List, I64 -> List
+map = |xs, f| fold xs
+    : Nil then Nil
+    : Cons(hd, rest) then Cons(f(hd), rest)
+
+list_sum : List -> I64
+list_sum = |xs| fold xs
+    : Nil then 0
+    : Cons(hd, rest) then hd + rest
+
+main : I64
+main = |arg| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + 1))";
+
+    assert_eq!(run_i64(source, 0), 9);
+}
+
+#[test]
+fn lambda_with_capture() {
+    let source = "\
+List : [Nil, Cons(I64, List)]
+
+map : List, I64 -> List
+map = |xs, f| fold xs
+    : Nil then Nil
+    : Cons(hd, rest) then Cons(f(hd), rest)
+
+list_sum : List -> I64
+list_sum = |xs| fold xs
+    : Nil then 0
+    : Cons(hd, rest) then hd + rest
+
+main : I64
+main = |n| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
+
+    assert_eq!(run_i64(source, 10), 36);
+}
+
+#[test]
+fn func_ref_as_arg() {
+    let source = "\
+List : [Nil, Cons(I64, List)]
+
+map : List, I64 -> List
+map = |xs, f| fold xs
+    : Nil then Nil
+    : Cons(hd, rest) then Cons(f(hd), rest)
+
+add1 : I64 -> I64
+add1 = |x| x + 1
+
+list_sum : List -> I64
+list_sum = |xs| fold xs
+    : Nil then 0
+    : Cons(hd, rest) then hd + rest
+
+main : I64
+main = |arg| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), add1))";
+
+    assert_eq!(run_i64(source, 0), 9);
+}
+
+#[test]
+fn multiple_lambdas_same_set() {
+    let source = "\
+apply_to : I64, I64 -> I64
+apply_to = |x, f| f(x)
+
+main : I64
+main = |x| (
+    a = apply_to(x, |y| y + 1)
+    b = apply_to(x, |y| y * 2)
+    a + b
+)";
+
+    // x=5: a = 6, b = 10, result = 16
+    assert_eq!(run_i64(source, 5), 16);
+}
+
+#[test]
+fn lambda_and_func_ref_same_set() {
+    let source = "\
+double : I64 -> I64
+double = |x| x * 2
+
+apply_to : I64, I64 -> I64
+apply_to = |x, f| f(x)
+
+main : I64
+main = |x| (
+    a = apply_to(x, double)
+    b = apply_to(x, |y| y + 10)
+    a + b
+)";
+
+    // x=3: a = 6, b = 13, result = 19
+    assert_eq!(run_i64(source, 3), 19);
+}
+
+#[test]
+fn walk_via_fold_with_lambda() {
+    // walk implemented as a user function using fold + lambda
+    let source = "\
+List : [Nil, Cons(I64, List)]
+
+walk : List, I64, I64 -> I64
+walk = |xs, init, f| fold xs
+    : Nil then init
+    : Cons(hd, acc) then f(acc, hd)
+
+main : I64
+main = |arg| walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+// ============================================================
+// Associated functions on types
+// ============================================================
+
+#[test]
+fn associated_fn_basic() {
+    let source = "\
+List : [Nil, Cons(I64, List)].(
+    sum : List -> I64
+    sum = |xs| fold xs
+        : Nil then 0
+        : Cons(hd, rest) then hd + rest
+)
+
+main : I64
+main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn associated_fn_with_lambda() {
+    let source = "\
+List : [Nil, Cons(I64, List)].(
+    map : List, I64 -> List
+    map = |xs, f| fold xs
+        : Nil then Nil
+        : Cons(hd, rest) then Cons(f(hd), rest)
+
+    sum : List -> I64
+    sum = |xs| fold xs
+        : Nil then 0
+        : Cons(hd, rest) then hd + rest
+)
+
+main : I64
+main = |n| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
+
+    assert_eq!(run_i64(source, 10), 36);
+}
+
+#[test]
+fn associated_fn_walk() {
+    let source = "\
+List : [Nil, Cons(I64, List)].(
+    walk : List, I64, I64 -> I64
+    walk = |xs, init, f| fold xs
+        : Nil then init
+        : Cons(hd, acc) then f(acc, hd)
+)
+
+main : I64
+main = |arg| List.walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn associated_fn_calling_another() {
+    let source = "\
+List : [Nil, Cons(I64, List)].(
+    map : List, I64 -> List
+    map = |xs, f| fold xs
+        : Nil then Nil
+        : Cons(hd, rest) then Cons(f(hd), rest)
+
+    sum : List -> I64
+    sum = |xs| fold xs
+        : Nil then 0
+        : Cons(hd, rest) then hd + rest
+
+    sum_doubled : List -> I64
+    sum_doubled = |xs| List.sum(List.map(xs, |x| x * 2))
+)
+
+main : I64
+main = |arg| List.sum_doubled(Cons(1, Cons(2, Cons(3, Nil))))";
+
+    assert_eq!(run_i64(source, 0), 12);
 }

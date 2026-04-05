@@ -28,7 +28,7 @@ fn main() {
     // Compile
     let tokens = token::tokenize(&source);
     let module = parse::parse(tokens);
-    let (program, input_var) = lower::lower(module);
+    let (program, input_var) = lower::lower(&module);
 
     // Read input from stdin
     let mut input = String::new();

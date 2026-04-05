@@ -85,8 +85,25 @@ impl Parser {
         };
         self.expect(&Token::Colon);
         let ty = self.parse_type_expr();
+
+        // Parse optional .() associated function block
+        let methods = if *self.peek() == Token::Dot && *self.peek_at(1) == Token::LParen {
+            self.advance(); // consume Dot
+            self.advance(); // consume LParen
+            self.skip_newlines();
+            let mut decls = Vec::new();
+            while *self.peek() != Token::RParen {
+                decls.push(self.parse_decl());
+                self.skip_newlines();
+            }
+            self.expect(&Token::RParen);
+            decls
+        } else {
+            Vec::new()
+        };
+
         self.skip_newlines();
-        Decl::TypeAnno { name, ty }
+        Decl::TypeAnno { name, ty, methods }
     }
 
     fn parse_func_def(&mut self) -> Decl {
@@ -185,10 +202,10 @@ impl Parser {
         if *self.peek() == Token::LParen {
             self.advance();
             if *self.peek() != Token::RParen {
-                fields.push(self.parse_type_expr());
+                fields.push(self.parse_type_atom());
                 while *self.peek() == Token::Comma {
                     self.advance();
-                    fields.push(self.parse_type_expr());
+                    fields.push(self.parse_type_atom());
                 }
             }
             self.expect(&Token::RParen);
@@ -233,8 +250,32 @@ impl Parser {
 
             Token::Ident(name) => {
                 self.advance();
-                // Check for function/constructor call: Name(args)
-                if *self.peek() == Token::LParen {
+                // Check for qualified call: Type.method(args)
+                if *self.peek() == Token::Dot
+                    && matches!(self.peek_at(1), Token::Ident(_))
+                    && *self.peek_at(2) == Token::LParen
+                {
+                    self.advance(); // consume Dot
+                    let Token::Ident(method) = self.advance() else {
+                        unreachable!()
+                    };
+                    self.advance(); // consume LParen
+                    let mut args = Vec::new();
+                    if *self.peek() != Token::RParen {
+                        args.push(self.parse_expr());
+                        while *self.peek() == Token::Comma {
+                            self.advance();
+                            args.push(self.parse_expr());
+                        }
+                    }
+                    self.expect(&Token::RParen);
+                    Expr::QualifiedCall {
+                        owner: name,
+                        method,
+                        args,
+                    }
+                } else if *self.peek() == Token::LParen {
+                    // Check for function/constructor call: Name(args)
                     self.advance();
                     let mut args = Vec::new();
                     if *self.peek() != Token::RParen {
@@ -259,6 +300,38 @@ impl Parser {
             Token::If => {
                 self.advance();
                 self.parse_if_expr()
+            }
+
+            Token::Fold => {
+                self.advance();
+                self.parse_fold_expr()
+            }
+
+            Token::Pipe => {
+                self.advance();
+                let mut params = Vec::new();
+                if *self.peek() != Token::Pipe {
+                    loop {
+                        let tok = self.advance();
+                        let param = match tok {
+                            Token::Ident(name) => name,
+                            Token::Underscore => "_".to_owned(),
+                            other => panic!("expected parameter name in lambda, got {other:?}"),
+                        };
+                        params.push(param);
+                        if *self.peek() == Token::Pipe {
+                            break;
+                        }
+                        self.expect(&Token::Comma);
+                    }
+                }
+                self.expect(&Token::Pipe);
+                self.skip_newlines();
+                let body = self.parse_expr();
+                Expr::Lambda {
+                    params,
+                    body: Box::new(body),
+                }
             }
 
             Token::Minus => {
@@ -342,6 +415,34 @@ impl Parser {
                 arms,
                 else_body,
             }
+        }
+    }
+
+    fn parse_fold_expr(&mut self) -> Expr {
+        let expr = self.parse_expr();
+        self.skip_newlines();
+
+        let mut arms = Vec::new();
+        while *self.peek() == Token::Colon {
+            self.advance();
+            self.skip_newlines();
+            let pattern = self.parse_pattern();
+            self.skip_newlines();
+            self.expect(&Token::Then);
+            self.skip_newlines();
+            let body = self.parse_expr();
+            self.skip_newlines();
+            arms.push(MatchArm { pattern, body });
+        }
+
+        assert!(
+            !arms.is_empty(),
+            "fold expression requires at least one : arm"
+        );
+
+        Expr::Fold {
+            expr: Box::new(expr),
+            arms,
         }
     }
 
