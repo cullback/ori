@@ -20,6 +20,13 @@ fn run_i64(source: &str, input: i64) -> i64 {
     }
 }
 
+fn run_u64(source: &str, input: i64) -> u64 {
+    match run(source, input) {
+        Value::VNum(NumVal::U64(n)) => n,
+        other => panic!("expected U64 result, got {other:?}"),
+    }
+}
+
 // ============================================================
 // Tuples
 // ============================================================

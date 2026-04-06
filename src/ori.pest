@@ -13,7 +13,9 @@ exposing_clause = { "exposing" ~ "[" ~ name ~ ("," ~ name)* ~ "]" }
 decl = { type_anno | assignment }
 
 type_anno = {
-    name ~ type_params? ~ ":" ~ type_expr ~ method_block?
+    name ~ type_params? ~ ":=" ~ type_expr ~ method_block?
+  | name ~ type_params? ~ ":=" ~ method_block
+  | name ~ type_params? ~ ":" ~ type_expr ~ method_block?
 }
 
 type_params = { "(" ~ name ~ ("," ~ name)* ~ ")" }

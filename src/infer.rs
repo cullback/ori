@@ -968,29 +968,34 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>, scope: &crate::reso
     // Register built-in List type and its operations
     ctx.register_list_builtins();
 
-    // Register List stdlib functions (map, sum, etc.)
+    // Register List stdlib Ori-implemented methods (sum, length, etc.)
     let list_stdlib_src = crate::stdlib::get("List").unwrap_or("");
     let list_stdlib = crate::parse::parse(list_stdlib_src);
     for decl in &list_stdlib.decls {
-        match decl {
-            Decl::FuncDef { name, params, .. } => {
-                let mangled = format!("List.{name}");
-                let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
-                let ret = ctx.fresh();
-                let func_ty = Type::Arrow(param_types, Box::new(ret));
-                ctx.env.insert(mangled, Scheme::mono(func_ty));
+        if let Decl::TypeAnno { methods, .. } = decl {
+            for method in methods {
+                match method {
+                    Decl::FuncDef { name, params, .. } => {
+                        let mangled = format!("List.{name}");
+                        let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
+                        let ret = ctx.fresh();
+                        let func_ty = Type::Arrow(param_types, Box::new(ret));
+                        ctx.env.insert(mangled, Scheme::mono(func_ty));
+                    }
+                    Decl::TypeAnno { name, ty, .. } => {
+                        // Body-less annotation = builtin, already registered
+                        let mangled = format!("List.{name}");
+                        ctx.type_annos.insert(mangled, ty.clone());
+                    }
+                }
             }
-            Decl::TypeAnno { name, ty, .. } => {
-                let mangled = format!("List.{name}");
-                ctx.type_annos.insert(mangled, ty.clone());
+            // Infer bodies of Ori-implemented methods
+            for method in methods {
+                if let Decl::FuncDef { name, params, body } = method {
+                    let mangled = format!("List.{name}");
+                    ctx.infer_func_body(&mangled, params, body);
+                }
             }
-        }
-    }
-    // Infer list stdlib function bodies
-    for decl in &list_stdlib.decls {
-        if let Decl::FuncDef { name, params, body } = decl {
-            let mangled = format!("List.{name}");
-            ctx.infer_func_body(&mangled, params, body);
         }
     }
 
@@ -1002,6 +1007,7 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>, scope: &crate::reso
                 type_params,
                 ty: TypeExpr::TagUnion(tags),
                 methods,
+                ..
             } => {
                 let name = *name;
                 ctx.register_type_decl(name, type_params, tags);

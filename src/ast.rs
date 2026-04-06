@@ -18,6 +18,7 @@ pub enum Decl<'src> {
         type_params: Vec<&'src str>,
         ty: TypeExpr<'src>,
         methods: Vec<Decl<'src>>,
+        nominal: bool,
     },
     FuncDef {
         name: &'src str,

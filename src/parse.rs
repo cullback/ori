@@ -62,6 +62,8 @@ fn parse_decl(pair: Pair<'_, Rule>) -> Decl<'_> {
 }
 
 fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
+    let text = pair.as_str();
+    let nominal = text.contains(":=");
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str();
 
@@ -90,11 +92,15 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
         }
     }
 
+    // For `:= .(...)` with no type expr, use a placeholder
+    let resolved_ty = ty.unwrap_or(TypeExpr::Named("_builtin"));
+
     Decl::TypeAnno {
         name,
         type_params,
-        ty: ty.expect("type annotation missing type"),
+        ty: resolved_ty,
         methods,
+        nominal,
     }
 }
 

@@ -1,9 +1,14 @@
 // List is a built-in vector-backed type.
-// walk, map, len, get, append, reverse, and empty are compiler builtins.
-// Everything else is implemented here using those primitives.
+// Methods without bodies are compiler builtins.
 
-sum : List(I64) -> I64
-sum = |xs| List.walk(xs, 0, |acc, x| acc + x)
+List := .(
+    len : List(a) -> I64
+    get : List(a), I64 -> a
+    append : List(a), a -> List(a)
+    reverse : List(a) -> List(a)
+    walk : List(a), b, (b, a -> b) -> b
+    map : List(a), (a -> a) -> List(a)
 
-length : List(a) -> I64
-length = |xs| List.len(xs)
+    sum : List(I64) -> I64
+    sum = |xs| List.walk(xs, 0, |acc, x| acc + x)
+)

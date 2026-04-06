@@ -25,10 +25,24 @@ pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Progr
     // Now that Bool is known, register comparison builtins
     ctx.register_comparison_builtins();
 
-    // Register List stdlib functions (map, sum, etc.) under List.<name>
+    // Parse List stdlib and extract Ori-implemented methods
     let list_stdlib = parse::parse(stdlib::get("List").unwrap_or(""));
-    for decl in &list_stdlib.decls {
-        if let Decl::FuncDef { name, params, .. } = decl {
+    let list_methods: Vec<&Decl<'static>> = list_stdlib
+        .decls
+        .iter()
+        .filter_map(|d| {
+            if let Decl::TypeAnno { methods, .. } = d {
+                Some(methods.iter())
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    // Register Ori-implemented List methods under List.<name>
+    for method in &list_methods {
+        if let Decl::FuncDef { name, params, .. } = method {
             let mangled = format!("List.{name}");
             let func_id = ctx.builder.func();
             ctx.funcs.insert(mangled.clone(), func_id);
@@ -65,13 +79,13 @@ pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Progr
     }
 
     // Compute reachable functions from main (skip dead code)
-    ctx.compute_reachable_with_list_stdlib(&module.decls, &list_stdlib.decls);
+    ctx.compute_reachable_with_list_stdlib(&module.decls, &list_methods);
 
     // Pass 1.5: scan reachable bodies to collect lambdas for defunctionalization
     ctx.collect_lambdas(&module.decls);
-    // Also scan list stdlib for lambdas
-    for decl in &list_stdlib.decls {
-        if let Decl::FuncDef { name, body, .. } = decl {
+    // Also scan list stdlib method bodies for lambdas
+    for method in &list_methods {
+        if let Decl::FuncDef { name, body, .. } = method {
             let mangled = format!("List.{name}");
             if ctx.reachable.contains(&mangled) {
                 ctx.scan_expr(body);
@@ -202,9 +216,9 @@ pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Progr
         }
     }
 
-    // Lower List stdlib function bodies
-    for decl in &list_stdlib.decls {
-        if let Decl::FuncDef { name, params, body } = decl {
+    // Lower List stdlib method bodies
+    for method in &list_methods {
+        if let Decl::FuncDef { name, params, body } = method {
             let name = *name;
             let mangled = format!("List.{name}");
             if !ctx.reachable.contains(&mangled) {
@@ -415,13 +429,13 @@ impl<'src> LowerCtx<'src> {
     fn compute_reachable_with_list_stdlib(
         &mut self,
         decls: &[Decl<'src>],
-        list_stdlib: &[Decl<'static>],
+        list_methods: &[&Decl<'static>],
     ) {
         // Build function name → body index
         let mut bodies: HashMap<String, &Expr<'_>> = HashMap::new();
-        // Add list stdlib functions under List.<name>
-        for decl in list_stdlib {
-            if let Decl::FuncDef { name, body, .. } = decl {
+        // Add list stdlib method bodies under List.<name>
+        for method in list_methods {
+            if let Decl::FuncDef { name, body, .. } = method {
                 bodies.insert(format!("List.{name}"), body);
             }
         }
