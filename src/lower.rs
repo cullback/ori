@@ -28,8 +28,12 @@ pub fn lower(
     // Register stdlib modules
     let bool_stdlib = ctx.register_stdlib_module("Bool");
     ctx.register_comparison_builtins();
+    let result_stdlib = ctx.register_stdlib_module("Result");
+    let maybe_stdlib = ctx.register_stdlib_module("Maybe");
     let list_stdlib = ctx.register_stdlib_module("List");
     let bool_methods = LowerCtx::extract_methods(&bool_stdlib);
+    let result_methods = LowerCtx::extract_methods(&result_stdlib);
+    let maybe_methods = LowerCtx::extract_methods(&maybe_stdlib);
     let list_methods = LowerCtx::extract_methods(&list_stdlib);
 
     // Pass 1: register user type declarations and function names
@@ -78,6 +82,8 @@ pub fn lower(
 
     // Compute reachable functions from main (skip dead code)
     let mut all_stdlib_methods = bool_methods;
+    all_stdlib_methods.extend(&result_methods);
+    all_stdlib_methods.extend(&maybe_methods);
     all_stdlib_methods.extend(&list_methods);
     ctx.compute_reachable_with_stdlib(&module.decls, &all_stdlib_methods);
 

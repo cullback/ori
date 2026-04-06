@@ -743,6 +743,8 @@ pub fn check<'src>(
 
     // Register stdlib modules
     ctx.register_stdlib_module("Bool");
+    ctx.register_stdlib_module("Result");
+    ctx.register_stdlib_module("Maybe");
     ctx.register_stdlib_module("List");
 
     // Pass 1: register all type declarations and function signatures
