@@ -6,6 +6,7 @@ use crate::ir::{
     Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, Pattern, Program, VarId,
 };
 use crate::parse;
+use crate::stdlib;
 
 const PRELUDE: &str = "Bool : [True, False]\n";
 
@@ -23,6 +24,17 @@ pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Progr
 
     // Now that Bool is known, register comparison builtins
     ctx.register_comparison_builtins();
+
+    // Register List stdlib functions (map, sum, etc.) under List.<name>
+    let list_stdlib = parse::parse(stdlib::get("List").unwrap_or(""));
+    for decl in &list_stdlib.decls {
+        if let Decl::FuncDef { name, params, .. } = decl {
+            let mangled = format!("List.{name}");
+            let func_id = ctx.builder.func();
+            ctx.funcs.insert(mangled.clone(), func_id);
+            ctx.func_arities.insert(mangled, params.len());
+        }
+    }
 
     // Pass 1: register user type declarations and function names
     ctx.register_decls(&module.decls);
@@ -53,10 +65,19 @@ pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Progr
     }
 
     // Compute reachable functions from main (skip dead code)
-    ctx.compute_reachable(&module.decls);
+    ctx.compute_reachable_with_list_stdlib(&module.decls, &list_stdlib.decls);
 
     // Pass 1.5: scan reachable bodies to collect lambdas for defunctionalization
     ctx.collect_lambdas(&module.decls);
+    // Also scan list stdlib for lambdas
+    for decl in &list_stdlib.decls {
+        if let Decl::FuncDef { name, body, .. } = decl {
+            let mangled = format!("List.{name}");
+            if ctx.reachable.contains(&mangled) {
+                ctx.scan_expr(body);
+            }
+        }
+    }
 
     // Duplicate ho_param_sets entries for qualified aliases
     let alias_entries: Vec<((String, usize), usize)> = ctx
@@ -181,6 +202,42 @@ pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Progr
         }
     }
 
+    // Lower List stdlib function bodies
+    for decl in &list_stdlib.decls {
+        if let Decl::FuncDef { name, params, body } = decl {
+            let name = *name;
+            let mangled = format!("List.{name}");
+            if !ctx.reachable.contains(&mangled) {
+                continue;
+            }
+            let func_id = ctx.funcs[&mangled];
+            let param_vars: Vec<VarId> = params
+                .iter()
+                .map(|p| {
+                    let v = ctx.builder.var();
+                    ctx.vars.insert((*p).to_owned(), v);
+                    v
+                })
+                .collect();
+            for (i, p) in params.iter().enumerate() {
+                let key = (mangled.clone(), i);
+                if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
+                    ctx.ho_vars.insert((*p).to_owned(), ls_idx);
+                }
+            }
+            let body_core = ctx.lower_expr(body);
+            for p in params {
+                ctx.vars.remove(*p);
+                ctx.ho_vars.remove(*p);
+            }
+            ctx.builder.add_func(FuncDef {
+                name: func_id,
+                params: param_vars,
+                body: body_core,
+            });
+        }
+    }
+
     // Lower main
     let params = main_params.expect("no 'main' function defined");
     let body = main_body.unwrap();
@@ -238,6 +295,9 @@ struct LowerCtx<'src> {
     constructor_fields: HashMap<String, Vec<bool>>,
     binops: HashMap<BinOp, FuncId>,
 
+    /// Built-in List function IDs.
+    list_builtins: HashMap<String, FuncId>,
+
     // Defunctionalization state
     lambda_sets: Vec<LambdaSet<'src>>,
     /// Maps (callee, param index) to lambda set index.
@@ -262,6 +322,19 @@ impl<'src> LowerCtx<'src> {
         binops.insert(BinOp::Rem, builder.builtin(Builtin::Rem));
         // Eq and Neq are registered after the prelude defines Bool
 
+        let mut list_builtins = HashMap::new();
+        list_builtins.insert("List.empty".to_owned(), builder.builtin(Builtin::ListEmpty));
+        list_builtins.insert("List.len".to_owned(), builder.builtin(Builtin::ListLen));
+        list_builtins.insert("List.get".to_owned(), builder.builtin(Builtin::ListGet));
+        list_builtins.insert(
+            "List.append".to_owned(),
+            builder.builtin(Builtin::ListAppend),
+        );
+        list_builtins.insert(
+            "List.reverse".to_owned(),
+            builder.builtin(Builtin::ListReverse),
+        );
+
         Self {
             builder,
             vars: HashMap::new(),
@@ -270,6 +343,7 @@ impl<'src> LowerCtx<'src> {
             constructors: HashMap::new(),
             constructor_fields: HashMap::new(),
             binops,
+            list_builtins,
             lambda_sets: Vec::new(),
             ho_param_sets: HashMap::new(),
             ho_vars: HashMap::new(),
@@ -338,9 +412,19 @@ impl<'src> LowerCtx<'src> {
         self.binops.insert(BinOp::Neq, neq);
     }
 
-    fn compute_reachable(&mut self, decls: &[Decl<'src>]) {
+    fn compute_reachable_with_list_stdlib(
+        &mut self,
+        decls: &[Decl<'src>],
+        list_stdlib: &[Decl<'static>],
+    ) {
         // Build function name → body index
-        let mut bodies: HashMap<String, &Expr<'src>> = HashMap::new();
+        let mut bodies: HashMap<String, &Expr<'_>> = HashMap::new();
+        // Add list stdlib functions under List.<name>
+        for decl in list_stdlib {
+            if let Decl::FuncDef { name, body, .. } = decl {
+                bodies.insert(format!("List.{name}"), body);
+            }
+        }
         for decl in decls {
             match decl {
                 Decl::FuncDef { name, body, .. } => {
@@ -451,7 +535,7 @@ impl<'src> LowerCtx<'src> {
                 }
             }
             ExprKind::FieldAccess { record, .. } => Self::collect_refs(record, refs),
-            ExprKind::Tuple(elems) => {
+            ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
                 for e in elems {
                     Self::collect_refs(e, refs);
                 }
@@ -568,7 +652,11 @@ impl<'src> LowerCtx<'src> {
             }
             ExprKind::QualifiedCall { segments, args } => {
                 let mangled = segments.join(".");
-                if self.funcs.contains_key(&mangled) {
+                let is_list_ho = mangled == "List.walk"
+                    || mangled.ends_with(".List.walk")
+                    || mangled == "List.map"
+                    || mangled.ends_with(".List.map");
+                if is_list_ho || self.funcs.contains_key(&mangled) {
                     self.scan_call_args(&mangled, args);
                 } else {
                     for arg in args {
@@ -587,7 +675,7 @@ impl<'src> LowerCtx<'src> {
             ExprKind::FieldAccess { record, .. } => {
                 self.scan_expr(record);
             }
-            ExprKind::Tuple(elems) => {
+            ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
                 for e in elems {
                     self.scan_expr(e);
                 }
@@ -720,7 +808,7 @@ impl<'src> LowerCtx<'src> {
                 }
                 self.collect_free(body, &inner, seen, free);
             }
-            ExprKind::Tuple(elems) => {
+            ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
                 for e in elems {
                     self.collect_free(e, bound, seen, free);
                 }
@@ -816,6 +904,7 @@ impl<'src> LowerCtx<'src> {
 
     // ---- Pass 2: Lower expressions ----
 
+    #[expect(clippy::too_many_lines, reason = "handles all expression forms")]
     fn lower_expr(&mut self, expr: &Expr<'src>) -> Core {
         match &expr.kind {
             ExprKind::IntLit(n) => Core::i64(*n),
@@ -927,10 +1016,56 @@ impl<'src> LowerCtx<'src> {
             ExprKind::Lambda { .. } => {
                 panic!("lambdas are only supported as direct arguments to function calls");
             }
+
+            ExprKind::ListLit(elems) => {
+                let cores: Vec<Core> = elems.iter().map(|e| self.lower_expr(e)).collect();
+                Core::list_lit(cores)
+            }
         }
     }
 
+    #[expect(
+        clippy::missing_asserts_for_indexing,
+        reason = "args length checked by assert"
+    )]
     fn lower_call(&mut self, func: &str, args: &[Expr<'src>]) -> Core {
+        // List.map is special: emits Core::ListMap with closure + apply_func
+        if func == "List.map" || func.ends_with(".List.map") {
+            assert!(args.len() >= 2, "List.map takes 2 arguments");
+            let list_core = self.lower_expr(&args[0]);
+            let key = (func.to_owned(), 1);
+            let closure_core = if self.ho_param_sets.contains_key(&key) {
+                self.lower_lambda_arg(&args[1], func, 1)
+            } else {
+                self.lower_expr(&args[1])
+            };
+            let ls_idx = self.ho_param_sets[&key];
+            let apply_func = self.lambda_sets[ls_idx].apply_func;
+            return Core::list_map(list_core, closure_core, apply_func);
+        }
+
+        // List.walk is special: emits Core::ListWalk with closure + apply_func
+        if func == "List.walk" || func.ends_with(".List.walk") {
+            assert!(args.len() >= 3, "List.walk takes 3 arguments");
+            let list_core = self.lower_expr(&args[0]);
+            let init_core = self.lower_expr(&args[1]);
+            let key = (func.to_owned(), 2);
+            let closure_core = if self.ho_param_sets.contains_key(&key) {
+                self.lower_lambda_arg(&args[2], func, 2)
+            } else {
+                self.lower_expr(&args[2])
+            };
+            let ls_idx = self.ho_param_sets[&key];
+            let apply_func = self.lambda_sets[ls_idx].apply_func;
+            return Core::list_walk(list_core, init_core, closure_core, apply_func);
+        }
+
+        // Other List builtins
+        if let Some(&builtin_id) = self.list_builtins.get(func) {
+            let arg_cores: Vec<Core> = args.iter().map(|a| self.lower_expr(a)).collect();
+            return Core::app(builtin_id, arg_cores);
+        }
+
         if let Some(&con_id) = self.constructors.get(func) {
             let arg_cores: Vec<Core> = args.iter().map(|a| self.lower_expr(a)).collect();
             Core::app(con_id, arg_cores)

@@ -1,16 +1,4 @@
-// Records, row polymorphism, type aliases, and higher-order functions
-
-List(a) : [Nil, Cons(a, List(a))].(
-    sum : List(I64) -> I64
-    sum = |xs| fold xs
-        : Nil then 0
-        : Cons(hd, rest) then hd + rest
-
-    map : List(a), (a -> a) -> List(a)
-    map = |xs, f| fold xs
-        : Nil then Nil
-        : Cons(hd, rest) then Cons(f(hd), rest)
-)
+// Records, row polymorphism, type aliases, and built-in lists
 
 // Type alias for a record type
 Person : { name: I64, age: I64 }
@@ -29,7 +17,7 @@ main = |arg| (
     total_age = get_age(alice) + get_age(bob)
 
     // Records + lists + lambdas
-    ages = Cons(alice.age, Cons(bob.age, Nil))
+    ages = [alice.age, bob.age]
     doubled = List.map(ages, |x| x * 2)
 
     total_age + List.sum(doubled)

@@ -267,6 +267,10 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Expr<'_> {
         Rule::fold_expr => parse_fold_expr(pair, span),
         Rule::lambda => parse_lambda(pair, span),
         Rule::record_literal => parse_record_literal(pair, span),
+        Rule::list_literal => {
+            let elements: Vec<Expr<'_>> = pair.into_inner().map(parse_expr).collect();
+            Expr::new(ExprKind::ListLit(elements), span)
+        }
         Rule::tuple => parse_tuple(pair, span),
         _ => panic!("unexpected expression rule: {:?}", pair.as_rule()),
     }

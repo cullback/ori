@@ -412,6 +412,99 @@ impl<'src> InferCtx<'src> {
         }
     }
 
+    // ---- Built-in List type ----
+
+    #[expect(clippy::redundant_clone, reason = "each block is independent")]
+    fn register_list_builtins(&mut self) {
+        // List.empty : List(a)
+        let a = self.fresh();
+        let Type::Var(a_var) = a else { unreachable!() };
+        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
+        self.env.insert(
+            "List.empty".to_owned(),
+            Scheme {
+                vars: vec![a_var],
+                ty: list_a.clone(),
+            },
+        );
+
+        // List.len : List(a) -> I64
+        let a = self.fresh();
+        let Type::Var(a_var) = a else { unreachable!() };
+        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
+        self.env.insert(
+            "List.len".to_owned(),
+            Scheme {
+                vars: vec![a_var],
+                ty: Type::Arrow(vec![list_a], Box::new(Type::Con("I64".to_owned()))),
+            },
+        );
+
+        // List.get : List(a), I64 -> a
+        let a = self.fresh();
+        let Type::Var(a_var) = a else { unreachable!() };
+        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
+        self.env.insert(
+            "List.get".to_owned(),
+            Scheme {
+                vars: vec![a_var],
+                ty: Type::Arrow(vec![list_a, Type::Con("I64".to_owned())], Box::new(a)),
+            },
+        );
+
+        // List.append : List(a), a -> List(a)
+        let a = self.fresh();
+        let Type::Var(a_var) = a else { unreachable!() };
+        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
+        self.env.insert(
+            "List.append".to_owned(),
+            Scheme {
+                vars: vec![a_var],
+                ty: Type::Arrow(vec![list_a.clone(), a], Box::new(list_a)),
+            },
+        );
+
+        // List.reverse : List(a) -> List(a)
+        let a = self.fresh();
+        let Type::Var(a_var) = a else { unreachable!() };
+        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
+        self.env.insert(
+            "List.reverse".to_owned(),
+            Scheme {
+                vars: vec![a_var],
+                ty: Type::Arrow(vec![list_a.clone()], Box::new(list_a)),
+            },
+        );
+
+        // List.walk : List(a), b, (b, a -> b) -> b
+        let a = self.fresh();
+        let b = self.fresh();
+        let Type::Var(a_var) = a else { unreachable!() };
+        let Type::Var(b_var) = b else { unreachable!() };
+        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
+        let step_fn = Type::Arrow(vec![b.clone(), a], Box::new(b.clone()));
+        self.env.insert(
+            "List.walk".to_owned(),
+            Scheme {
+                vars: vec![a_var, b_var],
+                ty: Type::Arrow(vec![list_a, b.clone(), step_fn], Box::new(b)),
+            },
+        );
+
+        // List.map : List(a), (a -> a) -> List(a)
+        let a = self.fresh();
+        let Type::Var(a_var) = a else { unreachable!() };
+        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
+        let map_fn = Type::Arrow(vec![a.clone()], Box::new(a));
+        self.env.insert(
+            "List.map".to_owned(),
+            Scheme {
+                vars: vec![a_var],
+                ty: Type::Arrow(vec![list_a.clone(), map_fn], Box::new(list_a)),
+            },
+        );
+    }
+
     // ---- Expression inference ----
 
     #[expect(
@@ -577,6 +670,15 @@ impl<'src> InferCtx<'src> {
             ExprKind::Tuple(elems) => {
                 let elem_types: Vec<Type> = elems.iter().map(|e| self.infer_expr(e)).collect();
                 Type::Tuple(elem_types)
+            }
+
+            ExprKind::ListLit(elems) => {
+                let elem_ty = self.fresh();
+                for e in elems {
+                    let t = self.infer_expr(e);
+                    self.unify(&elem_ty, &t);
+                }
+                Type::App("List".to_owned(), vec![elem_ty])
             }
         }
     }
@@ -862,6 +964,35 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>, scope: &crate::reso
             },
         ],
     );
+
+    // Register built-in List type and its operations
+    ctx.register_list_builtins();
+
+    // Register List stdlib functions (map, sum, etc.)
+    let list_stdlib_src = crate::stdlib::get("List").unwrap_or("");
+    let list_stdlib = crate::parse::parse(list_stdlib_src);
+    for decl in &list_stdlib.decls {
+        match decl {
+            Decl::FuncDef { name, params, .. } => {
+                let mangled = format!("List.{name}");
+                let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
+                let ret = ctx.fresh();
+                let func_ty = Type::Arrow(param_types, Box::new(ret));
+                ctx.env.insert(mangled, Scheme::mono(func_ty));
+            }
+            Decl::TypeAnno { name, ty, .. } => {
+                let mangled = format!("List.{name}");
+                ctx.type_annos.insert(mangled, ty.clone());
+            }
+        }
+    }
+    // Infer list stdlib function bodies
+    for decl in &list_stdlib.decls {
+        if let Decl::FuncDef { name, params, body } = decl {
+            let mangled = format!("List.{name}");
+            ctx.infer_func_body(&mangled, params, body);
+        }
+    }
 
     // Pass 1: register all type declarations and function signatures
     for decl in &module.decls {

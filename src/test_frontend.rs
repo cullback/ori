@@ -310,9 +310,9 @@ main = |arg| to_i64(Succ(Succ(Succ(Zero))))";
 #[test]
 fn fold_list_sum() {
     let source = "\
-List : [Nil, Cons(I64, List)]
+Lnk : [Nil, Cons(I64, Lnk)]
 
-list_sum : List -> I64
+list_sum : Lnk -> I64
 list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
@@ -326,9 +326,9 @@ main = |arg| list_sum(Cons(1, Cons(2, Cons(3, Nil))))";
 #[test]
 fn fold_list_length() {
     let source = "\
-List : [Nil, Cons(I64, List)]
+Lnk : [Nil, Cons(I64, Lnk)]
 
-list_length : List -> I64
+list_length : Lnk -> I64
 list_length = |xs| fold xs
     : Nil then 0
     : Cons(_, rest) then rest + 1
@@ -380,14 +380,14 @@ main = |arg| tree_depth(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3)))";
 #[test]
 fn fold_list_map_inc() {
     let source = "\
-List : [Nil, Cons(I64, List)]
+Lnk : [Nil, Cons(I64, Lnk)]
 
-map_inc : List -> List
+map_inc : Lnk -> Lnk
 map_inc = |xs| fold xs
     : Nil then Nil
     : Cons(hd, rest) then Cons(hd + 1, rest)
 
-list_sum : List -> I64
+list_sum : Lnk -> I64
 list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
@@ -477,14 +477,14 @@ fn program_tree_sum_ori() {
 #[test]
 fn lambda_no_capture() {
     let source = "\
-List : [Nil, Cons(I64, List)]
+Lnk : [Nil, Cons(I64, Lnk)]
 
-map : List, (I64 -> I64) -> List
+map : Lnk, (I64 -> I64) -> Lnk
 map = |xs, f| fold xs
     : Nil then Nil
     : Cons(hd, rest) then Cons(f(hd), rest)
 
-list_sum : List -> I64
+list_sum : Lnk -> I64
 list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
@@ -498,14 +498,14 @@ main = |arg| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + 1))";
 #[test]
 fn lambda_with_capture() {
     let source = "\
-List : [Nil, Cons(I64, List)]
+Lnk : [Nil, Cons(I64, Lnk)]
 
-map : List, (I64 -> I64) -> List
+map : Lnk, (I64 -> I64) -> Lnk
 map = |xs, f| fold xs
     : Nil then Nil
     : Cons(hd, rest) then Cons(f(hd), rest)
 
-list_sum : List -> I64
+list_sum : Lnk -> I64
 list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
@@ -519,9 +519,9 @@ main = |n| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
 #[test]
 fn func_ref_as_arg() {
     let source = "\
-List : [Nil, Cons(I64, List)]
+Lnk : [Nil, Cons(I64, Lnk)]
 
-map : List, (I64 -> I64) -> List
+map : Lnk, (I64 -> I64) -> Lnk
 map = |xs, f| fold xs
     : Nil then Nil
     : Cons(hd, rest) then Cons(f(hd), rest)
@@ -529,7 +529,7 @@ map = |xs, f| fold xs
 add1 : I64 -> I64
 add1 = |x| x + 1
 
-list_sum : List -> I64
+list_sum : Lnk -> I64
 list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
@@ -581,9 +581,9 @@ main = |x| (
 fn walk_via_fold_with_lambda() {
     // walk implemented as a user function using fold + lambda
     let source = "\
-List : [Nil, Cons(I64, List)]
+Lnk : [Nil, Cons(I64, Lnk)]
 
-walk : List, I64, (I64, I64 -> I64) -> I64
+walk : Lnk, I64, (I64, I64 -> I64) -> I64
 walk = |xs, init, f| fold xs
     : Nil then init
     : Cons(hd, acc) then f(acc, hd)
@@ -601,15 +601,15 @@ main = |arg| walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
 #[test]
 fn associated_fn_basic() {
     let source = "\
-List : [Nil, Cons(I64, List)].(
-    sum : List -> I64
+Lnk : [Nil, Cons(I64, Lnk)].(
+    sum : Lnk -> I64
     sum = |xs| fold xs
         : Nil then 0
         : Cons(hd, rest) then hd + rest
 )
 
 main : I64 -> I64
-main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
+main = |arg| Lnk.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 6);
 }
@@ -617,20 +617,20 @@ main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 #[test]
 fn associated_fn_with_lambda() {
     let source = "\
-List : [Nil, Cons(I64, List)].(
-    map : List, (I64 -> I64) -> List
+Lnk : [Nil, Cons(I64, Lnk)].(
+    map : Lnk, (I64 -> I64) -> Lnk
     map = |xs, f| fold xs
         : Nil then Nil
         : Cons(hd, rest) then Cons(f(hd), rest)
 
-    sum : List -> I64
+    sum : Lnk -> I64
     sum = |xs| fold xs
         : Nil then 0
         : Cons(hd, rest) then hd + rest
 )
 
 main : I64 -> I64
-main = |n| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
+main = |n| Lnk.sum(Lnk.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
 
     assert_eq!(run_i64(source, 10), 36);
 }
@@ -638,15 +638,15 @@ main = |n| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
 #[test]
 fn associated_fn_walk() {
     let source = "\
-List : [Nil, Cons(I64, List)].(
-    walk : List, I64, (I64, I64 -> I64) -> I64
+Lnk : [Nil, Cons(I64, Lnk)].(
+    walk : Lnk, I64, (I64, I64 -> I64) -> I64
     walk = |xs, init, f| fold xs
         : Nil then init
         : Cons(hd, acc) then f(acc, hd)
 )
 
 main : I64 -> I64
-main = |arg| List.walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
+main = |arg| Lnk.walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
 
     assert_eq!(run_i64(source, 0), 6);
 }
@@ -654,23 +654,23 @@ main = |arg| List.walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
 #[test]
 fn associated_fn_calling_another() {
     let source = "\
-List : [Nil, Cons(I64, List)].(
-    map : List, (I64 -> I64) -> List
+Lnk : [Nil, Cons(I64, Lnk)].(
+    map : Lnk, (I64 -> I64) -> Lnk
     map = |xs, f| fold xs
         : Nil then Nil
         : Cons(hd, rest) then Cons(f(hd), rest)
 
-    sum : List -> I64
+    sum : Lnk -> I64
     sum = |xs| fold xs
         : Nil then 0
         : Cons(hd, rest) then hd + rest
 
-    sum_doubled : List -> I64
-    sum_doubled = |xs| List.sum(List.map(xs, |x| x * 2))
+    sum_doubled : Lnk -> I64
+    sum_doubled = |xs| Lnk.sum(Lnk.map(xs, |x| x * 2))
 )
 
 main : I64 -> I64
-main = |arg| List.sum_doubled(Cons(1, Cons(2, Cons(3, Nil))))";
+main = |arg| Lnk.sum_doubled(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 12);
 }
@@ -866,124 +866,92 @@ main = |arg| unwrap_or(Just(42), 0)";
 #[test]
 fn generic_list_type() {
     let source = "\
-List(a) : [Nil, Cons(a, List(a))].(
-    sum : List(I64) -> I64
+Lnk(a) : [Nil, Cons(a, Lnk(a))].(
+    sum : Lnk(I64) -> I64
     sum = |xs| fold xs
         : Nil then 0
         : Cons(hd, rest) then hd + rest
 )
 
 main : I64 -> I64
-main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
+main = |arg| Lnk.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 6);
 }
 
 // ============================================================
-// Imports
+// Built-in List type
 // ============================================================
 
 #[test]
-fn import_list_sum() {
+fn builtin_list_literal() {
     let source = "\
-import List
-
 main : I64 -> I64
-main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
-
-    assert_eq!(run_i64(source, 0), 6);
-}
-
-#[test]
-fn import_list_map() {
-    let source = "\
-import List
-
-main : I64 -> I64
-main = |arg| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x * 2))";
-
-    assert_eq!(run_i64(source, 0), 12);
-}
-
-#[test]
-fn import_list_length() {
-    let source = "\
-import List
-
-main : I64 -> I64
-main = |arg| List.length(Cons(1, Cons(2, Cons(3, Nil))))";
+main = |arg| List.len([1, 2, 3])";
 
     assert_eq!(run_i64(source, 0), 3);
 }
 
 #[test]
-fn import_list_walk() {
+fn builtin_list_get() {
     let source = "\
-import List
-
 main : I64 -> I64
-main = |arg| List.walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
+main = |arg| List.get([10, 20, 30], 1)";
 
-    assert_eq!(run_i64(source, 0), 6);
+    assert_eq!(run_i64(source, 0), 20);
 }
 
 #[test]
-fn import_list_reverse() {
+fn builtin_list_append() {
     let source = "\
-import List
-
 main : I64 -> I64
-main = |arg| (
-    reversed = List.reverse(Cons(1, Cons(2, Cons(3, Nil))))
-    List.walk(reversed, 0, |acc, x| acc * 10 + x)
-)";
+main = |arg| List.len(List.append([1, 2], 3))";
 
-    // reversed = [3, 2, 1], walk builds 321
-    assert_eq!(run_i64(source, 0), 321);
-}
-
-// ---- Qualified module access (lowercase import) ----
-
-#[test]
-fn import_qualified_list_sum() {
-    let source = "\
-import list
-
-main : I64 -> I64
-main = |arg| list.List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
-
-    assert_eq!(run_i64(source, 0), 6);
+    assert_eq!(run_i64(source, 0), 3);
 }
 
 #[test]
-fn import_qualified_list_map() {
+fn builtin_list_walk_sum() {
     let source = "\
-import list
-
 main : I64 -> I64
-main = |arg| list.List.sum(list.List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x * 2))";
+main = |arg| List.walk([1, 2, 3, 4, 5], 0, |acc, x| acc + x)";
+
+    assert_eq!(run_i64(source, 0), 15);
+}
+
+#[test]
+fn builtin_list_reverse() {
+    let source = "\
+main : I64 -> I64
+main = |arg| List.get(List.reverse([10, 20, 30]), 0)";
+
+    // reversed = [30, 20, 10], first element is 30
+    assert_eq!(run_i64(source, 0), 30);
+}
+
+#[test]
+fn builtin_list_map() {
+    let source = "\
+main : I64 -> I64
+main = |arg| List.sum(List.map([1, 2, 3], |x| x * 2))";
 
     assert_eq!(run_i64(source, 0), 12);
 }
 
 #[test]
-fn import_exposing_list() {
+fn builtin_list_sum() {
     let source = "\
-import list exposing [List]
-
 main : I64 -> I64
-main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
+main = |arg| List.sum([1, 2, 3, 4, 5])";
 
-    assert_eq!(run_i64(source, 0), 6);
+    assert_eq!(run_i64(source, 0), 15);
 }
 
 #[test]
-fn import_exposing_list_map() {
+fn builtin_list_empty() {
     let source = "\
-import list exposing [List]
-
 main : I64 -> I64
-main = |arg| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x * 2))";
+main = |arg| List.len([])";
 
-    assert_eq!(run_i64(source, 0), 12);
+    assert_eq!(run_i64(source, 0), 0);
 }

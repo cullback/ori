@@ -102,6 +102,7 @@ pub enum ExprKind<'src> {
         field: &'src str,
     },
     Tuple(Vec<Expr<'src>>),
+    ListLit(Vec<Expr<'src>>),
 }
 
 #[derive(Debug, Clone)]

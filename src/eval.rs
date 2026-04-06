@@ -49,6 +49,38 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
                 fields: vec![],
             })
         }
+        Builtin::ListEmpty => Some(Value::VList(vec![])),
+        Builtin::ListLen => {
+            let [Value::VList(elems)] = args else {
+                panic!("List.len: expected list")
+            };
+            #[expect(clippy::cast_possible_wrap)]
+            Some(Value::VNum(NumVal::I64(elems.len() as i64)))
+        }
+        Builtin::ListGet => {
+            let [Value::VList(elems), Value::VNum(NumVal::I64(idx))] = args else {
+                panic!("List.get: expected list and index")
+            };
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let i = *idx as usize;
+            Some(elems[i].clone())
+        }
+        Builtin::ListAppend => {
+            let [Value::VList(elems), val] = args else {
+                panic!("List.append: expected list and value")
+            };
+            let mut new_list = elems.clone();
+            new_list.push(val.clone());
+            Some(Value::VList(new_list))
+        }
+        Builtin::ListReverse => {
+            let [Value::VList(elems)] = args else {
+                panic!("List.reverse: expected list")
+            };
+            let mut reversed = elems.clone();
+            reversed.reverse();
+            Some(Value::VList(reversed))
+        }
     }
 }
 
@@ -60,6 +92,29 @@ fn is_constructor(program: &Program, func: FuncId) -> bool {
         .any(|c| c.tag == func)
 }
 
+/// Call a function by `FuncId` with evaluated argument values.
+fn call_func(env: &Env, program: &Program, func: FuncId, args: &[Value]) -> Value {
+    if let Some(result) = eval_builtin(func, args, program) {
+        return result;
+    }
+    let func_def = program
+        .funcs
+        .iter()
+        .find(|f| f.name == func)
+        .unwrap_or_else(|| {
+            panic!(
+                "undefined function: {}",
+                program.debug_names.func_name(func)
+            );
+        });
+    let mut local_env = env.clone();
+    for (param, val) in func_def.params.iter().zip(args) {
+        local_env.insert(*param, val.clone());
+    }
+    eval(&local_env, program, &func_def.body)
+}
+
+#[expect(clippy::too_many_lines, reason = "handles all Core terms")]
 pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
     match core {
         Core::Var(name) => env
@@ -85,21 +140,7 @@ pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
                 };
             }
 
-            let func_def = program
-                .funcs
-                .iter()
-                .find(|f| f.name == *func)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "undefined function: {}",
-                        program.debug_names.func_name(*func)
-                    );
-                });
-            let mut local_env = env.clone();
-            for (param, val) in func_def.params.iter().zip(arg_vals) {
-                local_env.insert(*param, val);
-            }
-            eval(&local_env, program, &func_def.body)
+            call_func(env, program, *func, &arg_vals)
         }
 
         Core::Let { name, val, body } => {
@@ -147,6 +188,51 @@ pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
                 _ => panic!("field access on non-record value"),
             }
         }
+
+        Core::ListLit(elements) => {
+            let vals: Vec<Value> = elements.iter().map(|e| eval(env, program, e)).collect();
+            Value::VList(vals)
+        }
+
+        Core::ListMap {
+            list,
+            func,
+            apply_func,
+        } => {
+            let list_val = eval(env, program, list);
+            let func_closure = eval(env, program, func);
+            let Value::VList(elements) = list_val else {
+                panic!("List.map: expected list");
+            };
+            let mapped: Vec<Value> = elements
+                .into_iter()
+                .map(|elem| call_func(env, program, *apply_func, &[func_closure.clone(), elem]))
+                .collect();
+            Value::VList(mapped)
+        }
+
+        Core::ListWalk {
+            list,
+            init,
+            step,
+            apply_func,
+        } => {
+            let list_val = eval(env, program, list);
+            let mut acc = eval(env, program, init);
+            let step_closure = eval(env, program, step);
+            let Value::VList(elements) = list_val else {
+                panic!("List.walk: expected list");
+            };
+            for elem in elements {
+                acc = call_func(
+                    env,
+                    program,
+                    *apply_func,
+                    &[step_closure.clone(), acc, elem],
+                );
+            }
+            acc
+        }
     }
 }
 
@@ -163,13 +249,13 @@ fn match_pattern(val: &Value, pattern: &Pattern) -> Option<HashMap<VarId, Value>
                 .zip(vfields.iter().cloned())
                 .collect(),
         ),
-        Value::VConstruct { .. } | Value::VNum(_) | Value::VRecord { .. } => None,
+        Value::VConstruct { .. } | Value::VNum(_) | Value::VRecord { .. } | Value::VList(_) => None,
     }
 }
 
 fn fold_value(env: &Env, program: &Program, val: &Value, arms: &[FoldArm]) -> Value {
     match val {
-        Value::VNum(_) | Value::VRecord { .. } => val.clone(),
+        Value::VNum(_) | Value::VRecord { .. } | Value::VList(_) => val.clone(),
 
         Value::VConstruct { tag, fields } => {
             let arm = arms

@@ -49,12 +49,15 @@ atom = {
   | fold_expr
   | lambda
   | record_literal
+  | list_literal
   | neg_expr
   | call_or_access
   | tuple
   | block
   | int_lit
 }
+
+list_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
 
 tuple = { "(" ~ expr ~ ("," ~ expr)+ ~ ")" }
 

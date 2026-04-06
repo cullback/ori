@@ -45,6 +45,11 @@ pub enum Builtin {
     Rem,
     Max,
     Eq { true_con: FuncId, false_con: FuncId },
+    ListEmpty,
+    ListLen,
+    ListGet,
+    ListAppend,
+    ListReverse,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +130,18 @@ pub enum Core {
         record: Box<Core>,
         field: String,
     },
+    ListLit(Vec<Core>),
+    ListWalk {
+        list: Box<Core>,
+        init: Box<Core>,
+        step: Box<Core>,
+        apply_func: FuncId,
+    },
+    ListMap {
+        list: Box<Core>,
+        func: Box<Core>,
+        apply_func: FuncId,
+    },
 }
 
 #[allow(dead_code)]
@@ -177,6 +194,27 @@ impl Core {
             field,
         }
     }
+
+    pub const fn list_lit(elements: Vec<Self>) -> Self {
+        Self::ListLit(elements)
+    }
+
+    pub fn list_map(list: Self, func: Self, apply_func: FuncId) -> Self {
+        Self::ListMap {
+            list: Box::new(list),
+            func: Box::new(func),
+            apply_func,
+        }
+    }
+
+    pub fn list_walk(list: Self, init: Self, step: Self, apply_func: FuncId) -> Self {
+        Self::ListWalk {
+            list: Box::new(list),
+            init: Box::new(init),
+            step: Box::new(step),
+            apply_func,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +223,7 @@ pub enum Value {
     VNum(NumVal),
     VConstruct { tag: FuncId, fields: Vec<Value> },
     VRecord { fields: Vec<(String, Value)> },
+    VList(Vec<Value>),
 }
 
 /// Marks whether a constructor field refers back to the enclosing type.
