@@ -31,9 +31,9 @@ fn main() {
     std::panic::set_hook(Box::new(|_| {}));
     let compile_result = std::panic::catch_unwind(|| {
         let parsed = parse::parse(&source);
-        let module = resolve::resolve_imports(parsed);
-        infer::check(&source, &module);
-        lower::lower(&module)
+        let (module, scope) = resolve::resolve_imports(parsed);
+        infer::check(&source, &module, &scope);
+        lower::lower(&module, &scope)
     });
     drop(std::panic::take_hook());
     let (program, input_var) = match compile_result {

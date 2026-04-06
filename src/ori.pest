@@ -7,7 +7,8 @@ COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
 
 module = { SOI ~ import_decl* ~ decl* ~ EOI }
 
-import_decl = { "import" ~ name }
+import_decl = { "import" ~ name ~ exposing_clause? }
+exposing_clause = { "exposing" ~ "[" ~ name ~ ("," ~ name)* ~ "]" }
 
 decl = { type_anno | assignment }
 
@@ -69,7 +70,7 @@ call_or_access = {
 }
 
 // Atomic heads: no whitespace allowed before "("
-qualified_head = @{ name ~ "." ~ name ~ "(" }
+qualified_head = @{ name ~ ("." ~ name)+ ~ "(" }
 call_head      = @{ name ~ "(" }
 
 args = { expr ~ ("," ~ expr)* }
@@ -141,4 +142,4 @@ mul_op =  { "*" | "/" | "%" }
 
 name = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-keyword = { "if" | "then" | "else" | "fold" | "import" }
+keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" }

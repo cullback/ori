@@ -4,7 +4,7 @@ use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest_derive::Parser;
 
 use crate::ast::{
-    BinOp, Decl, Expr, ExprKind, MatchArm, Module, Pattern, Span, Stmt, TagDecl, TypeExpr,
+    BinOp, Decl, Expr, ExprKind, Import, MatchArm, Module, Pattern, Span, Stmt, TagDecl, TypeExpr,
 };
 
 #[derive(Parser)]
@@ -31,8 +31,19 @@ fn parse_module(pair: Pair<'_, Rule>) -> Module<'_> {
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::import_decl => {
-                let name = inner.into_inner().next().unwrap().as_str();
-                imports.push(name);
+                let mut parts = inner.into_inner();
+                let module = parts.next().unwrap().as_str();
+                let exposing = parts
+                    .find(|p| p.as_rule() == Rule::exposing_clause)
+                    .map(|clause| {
+                        clause
+                            .into_inner()
+                            .filter(|p| p.as_rule() == Rule::name)
+                            .map(|p| p.as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                imports.push(Import { module, exposing });
             }
             Rule::decl => decls.push(parse_decl(inner)),
             _ => {}
@@ -261,18 +272,6 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Expr<'_> {
     }
 }
 
-fn parse_call_head(text: &str) -> (&str, Option<(&str, &str)>) {
-    // Atomic head text like "List.sum(" or "foo(" or "Cons("
-    let without_paren = &text[..text.len() - 1];
-    if let Some(dot_pos) = without_paren.find('.') {
-        let owner = &without_paren[..dot_pos];
-        let method = &without_paren[dot_pos + 1..];
-        (owner, Some((owner, method)))
-    } else {
-        (without_paren, None)
-    }
-}
-
 fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
     let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
     let first = inner.remove(0);
@@ -280,22 +279,14 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
     match first.as_rule() {
         Rule::qualified_head => {
             let text = first.as_str();
-            let (_, Some((owner, method))) = parse_call_head(text) else {
-                unreachable!()
-            };
+            let without_paren = &text[..text.len() - 1];
+            let segments: Vec<&str> = without_paren.split('.').collect();
             let args = inner
                 .first()
                 .filter(|p| p.as_rule() == Rule::args)
                 .map(|p| p.clone().into_inner().map(parse_expr).collect())
                 .unwrap_or_default();
-            Expr::new(
-                ExprKind::QualifiedCall {
-                    owner,
-                    method,
-                    args,
-                },
-                span,
-            )
+            Expr::new(ExprKind::QualifiedCall { segments, args }, span)
         }
         Rule::call_head => {
             let text = first.as_str();

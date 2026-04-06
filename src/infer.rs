@@ -456,12 +456,8 @@ impl<'src> InferCtx<'src> {
                 self.infer_call(func, args)
             }
 
-            ExprKind::QualifiedCall {
-                owner,
-                method,
-                args,
-            } => {
-                let mangled = format!("{owner}.{method}");
+            ExprKind::QualifiedCall { segments, args } => {
+                let mangled = segments.join(".");
                 self.infer_call(&mangled, args)
             }
 
@@ -848,7 +844,7 @@ impl<'src> InferCtx<'src> {
     clippy::too_many_lines,
     reason = "multi-pass type checking orchestration"
 )]
-pub fn check<'src>(source: &'src str, module: &Module<'src>) {
+pub fn check<'src>(source: &'src str, module: &Module<'src>, scope: &crate::resolve::ModuleScope) {
     let mut ctx = InferCtx::new(source);
 
     // Register prelude: Bool : [True, False]
@@ -892,6 +888,11 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                                 params.iter().map(|_| ctx.fresh()).collect();
                             let ret = ctx.fresh();
                             let func_ty = Type::Arrow(param_types, Box::new(ret));
+                            // Dual-register: module-qualified alias
+                            if let Some(mod_name) = scope.qualified_types.get(name) {
+                                let qual = format!("{mod_name}.{mangled}");
+                                ctx.env.insert(qual, Scheme::mono(func_ty.clone()));
+                            }
                             ctx.env.insert(mangled, Scheme::mono(func_ty));
                         }
                         Decl::TypeAnno {
@@ -901,6 +902,10 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                         } => {
                             let method_name = *method_name;
                             let mangled = format!("{name}.{method_name}");
+                            if let Some(mod_name) = scope.qualified_types.get(name) {
+                                let qual = format!("{mod_name}.{mangled}");
+                                ctx.type_annos.insert(qual, ty.clone());
+                            }
                             ctx.type_annos.insert(mangled, ty.clone());
                         }
                     }
@@ -925,13 +930,15 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                         .collect();
                     let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[*p]).collect();
                     let alias_ty = ctx.type_expr_to_type(ty, &mut tvar_env);
-                    ctx.type_aliases.insert(
-                        name.to_owned(),
-                        Scheme {
-                            vars: tvars,
-                            ty: alias_ty,
-                        },
-                    );
+                    let alias_scheme = Scheme {
+                        vars: tvars,
+                        ty: alias_ty,
+                    };
+                    if let Some(mod_name) = scope.qualified_types.get(name) {
+                        let qual = format!("{mod_name}.{name}");
+                        ctx.type_aliases.insert(qual, alias_scheme.clone());
+                    }
+                    ctx.type_aliases.insert(name.to_owned(), alias_scheme);
                 } else {
                     // snake_case: value/function annotation (e.g. get_x : I64 -> I64)
                     ctx.type_annos.insert(name.to_owned(), ty.clone());
@@ -964,6 +971,13 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                     {
                         let mangled = format!("{name}.{}", *method_name);
                         ctx.infer_func_body(&mangled, params, body);
+                        // Dual-register qualified alias
+                        if let Some(mod_name) = scope.qualified_types.get(name) {
+                            let qual = format!("{mod_name}.{mangled}");
+                            if let Some(scheme) = ctx.env.get(&mangled).cloned() {
+                                ctx.env.insert(qual, scheme);
+                            }
+                        }
                     }
                 }
             }

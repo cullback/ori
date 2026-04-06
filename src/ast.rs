@@ -1,7 +1,13 @@
 #[derive(Debug, Clone)]
 pub struct Module<'src> {
-    pub imports: Vec<&'src str>,
+    pub imports: Vec<Import<'src>>,
     pub decls: Vec<Decl<'src>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Import<'src> {
+    pub module: &'src str,
+    pub exposing: Vec<&'src str>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,8 +91,7 @@ pub enum ExprKind<'src> {
         body: Box<Expr<'src>>,
     },
     QualifiedCall {
-        owner: &'src str,
-        method: &'src str,
+        segments: Vec<&'src str>,
         args: Vec<Expr<'src>>,
     },
     Record {

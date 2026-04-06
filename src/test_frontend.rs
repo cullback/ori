@@ -5,9 +5,9 @@ use crate::ir::{NumVal, Value};
 /// Compile and run an Ori program with the given I64 input.
 fn run(source: &str, input: i64) -> Value {
     let parsed = crate::parse::parse(source);
-    let module = crate::resolve::resolve_imports(parsed);
-    crate::infer::check(source, &module);
-    let (program, input_var) = crate::lower::lower(&module);
+    let (module, scope) = crate::resolve::resolve_imports(parsed);
+    crate::infer::check(source, &module, &scope);
+    let (program, input_var) = crate::lower::lower(&module, &scope);
     let mut env = HashMap::new();
     env.insert(input_var, Value::VNum(NumVal::I64(input)));
     crate::eval::eval(&env, &program, &program.main)
@@ -940,4 +940,50 @@ main = |arg| (
 
     // reversed = [3, 2, 1], walk builds 321
     assert_eq!(run_i64(source, 0), 321);
+}
+
+// ---- Qualified module access (lowercase import) ----
+
+#[test]
+fn import_qualified_list_sum() {
+    let source = "\
+import list
+
+main : I64 -> I64
+main = |arg| list.List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn import_qualified_list_map() {
+    let source = "\
+import list
+
+main : I64 -> I64
+main = |arg| list.List.sum(list.List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x * 2))";
+
+    assert_eq!(run_i64(source, 0), 12);
+}
+
+#[test]
+fn import_exposing_list() {
+    let source = "\
+import list exposing [List]
+
+main : I64 -> I64
+main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn import_exposing_list_map() {
+    let source = "\
+import list exposing [List]
+
+main : I64 -> I64
+main = |arg| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x * 2))";
+
+    assert_eq!(run_i64(source, 0), 12);
 }

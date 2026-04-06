@@ -14,7 +14,7 @@ const PRELUDE: &str = "Bool : [True, False]\n";
 /// Returns the program and the `VarId` of `main`'s input parameter
 /// (a free variable that the runtime must bind before evaluation).
 #[expect(clippy::too_many_lines, reason = "multi-pass lowering orchestration")]
-pub fn lower(module: &Module<'_>) -> (Program, VarId) {
+pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Program, VarId) {
     let mut ctx = LowerCtx::new();
 
     // Parse and register the prelude
@@ -27,11 +27,53 @@ pub fn lower(module: &Module<'_>) -> (Program, VarId) {
     // Pass 1: register user type declarations and function names
     ctx.register_decls(&module.decls);
 
+    // Register module-qualified aliases for imported types
+    for decl in &module.decls {
+        if let Decl::TypeAnno { name, methods, .. } = decl {
+            let name = *name;
+            if let Some(mod_name) = scope.qualified_types.get(name) {
+                for method_decl in methods {
+                    if let Decl::FuncDef {
+                        name: method_name, ..
+                    } = method_decl
+                    {
+                        let method_name = *method_name;
+                        let internal = format!("{name}.{method_name}");
+                        let qualified = format!("{mod_name}.{internal}");
+                        if let Some(&func_id) = ctx.funcs.get(&internal) {
+                            ctx.funcs.insert(qualified.clone(), func_id);
+                        }
+                        if let Some(&arity) = ctx.func_arities.get(&internal) {
+                            ctx.func_arities.insert(qualified, arity);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Compute reachable functions from main (skip dead code)
     ctx.compute_reachable(&module.decls);
 
     // Pass 1.5: scan reachable bodies to collect lambdas for defunctionalization
     ctx.collect_lambdas(&module.decls);
+
+    // Duplicate ho_param_sets entries for qualified aliases
+    let alias_entries: Vec<((String, usize), usize)> = ctx
+        .ho_param_sets
+        .iter()
+        .filter_map(|((name, idx), &ls_idx)| {
+            // If this is a qualified name like "list.List.map", also register "List.map"
+            ctx.funcs.iter().find_map(|(other_key, &other_fid)| {
+                (other_key != name && ctx.funcs.get(name).is_some_and(|&fid| fid == other_fid))
+                    .then(|| ((other_key.clone(), *idx), ls_idx))
+            })
+        })
+        .collect();
+    for (key, ls_idx) in alias_entries {
+        ctx.ho_param_sets.entry(key).or_insert(ls_idx);
+    }
+
     ctx.register_lambda_types();
 
     // Pass 2: lower all function bodies
@@ -332,6 +374,23 @@ impl<'src> LowerCtx<'src> {
                 Self::collect_refs(body, &mut worklist);
             }
         }
+
+        // Expand reachable: if a qualified name is reachable, its internal alias is too
+        let aliases: Vec<String> = self
+            .funcs
+            .iter()
+            .filter_map(|(key, &fid)| {
+                // If this key is reachable, find all other keys with the same FuncId
+                if self.reachable.contains(key) {
+                    self.funcs.iter().find_map(|(other_key, &other_fid)| {
+                        (other_fid == fid && other_key != key).then(|| other_key.clone())
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.reachable.extend(aliases);
     }
 
     fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>) {
@@ -342,12 +401,8 @@ impl<'src> LowerCtx<'src> {
                     Self::collect_refs(a, refs);
                 }
             }
-            ExprKind::QualifiedCall {
-                owner,
-                method,
-                args,
-            } => {
-                refs.push(format!("{owner}.{method}"));
+            ExprKind::QualifiedCall { segments, args } => {
+                refs.push(segments.join("."));
                 for a in args {
                     Self::collect_refs(a, refs);
                 }
@@ -511,12 +566,8 @@ impl<'src> LowerCtx<'src> {
                     self.scan_expr(&arm.body);
                 }
             }
-            ExprKind::QualifiedCall {
-                owner,
-                method,
-                args,
-            } => {
-                let mangled = format!("{owner}.{method}");
+            ExprKind::QualifiedCall { segments, args } => {
+                let mangled = segments.join(".");
                 if self.funcs.contains_key(&mangled) {
                     self.scan_call_args(&mangled, args);
                 } else {
@@ -765,10 +816,6 @@ impl<'src> LowerCtx<'src> {
 
     // ---- Pass 2: Lower expressions ----
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "expression lowering handles all forms"
-    )]
     fn lower_expr(&mut self, expr: &Expr<'src>) -> Core {
         match &expr.kind {
             ExprKind::IntLit(n) => Core::i64(*n),
@@ -851,12 +898,8 @@ impl<'src> LowerCtx<'src> {
                 Core::fold(scrutinee, core_arms)
             }
 
-            ExprKind::QualifiedCall {
-                owner,
-                method,
-                args,
-            } => {
-                let mangled = format!("{owner}.{method}");
+            ExprKind::QualifiedCall { segments, args } => {
+                let mangled = segments.join(".");
                 self.lower_call(&mangled, args)
             }
 
