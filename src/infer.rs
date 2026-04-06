@@ -69,6 +69,8 @@ struct InferCtx<'src> {
     type_aliases: HashMap<String, Scheme>,
     /// Declared type annotations for checking against inferred types.
     type_annos: HashMap<String, TypeExpr<'src>>,
+    /// Known type names (I64, Bool, List, user-defined types).
+    known_types: HashSet<String>,
     /// Current expression span for error reporting in unify.
     current_span: Span,
     /// Track integer literal type vars for defaulting and side table.
@@ -87,6 +89,12 @@ impl<'src> InferCtx<'src> {
             constructors: HashMap::new(),
             type_aliases: HashMap::new(),
             type_annos: HashMap::new(),
+            known_types: HashSet::from([
+                "I64".to_owned(),
+                "U64".to_owned(),
+                "F64".to_owned(),
+                "List".to_owned(),
+            ]),
             current_span: Span::default(),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
@@ -334,12 +342,18 @@ impl<'src> InferCtx<'src> {
                     let Type::Var(tv_id) = tv else { unreachable!() };
                     tvar_env.insert(name.to_owned(), tv_id);
                     tv
-                } else {
+                } else if self.known_types.contains(name) {
                     Type::Con(name.to_owned())
+                } else {
+                    panic!("type error: unknown type '{name}'");
                 }
             }
             TypeExpr::App(name, args) => {
                 let name = *name;
+                assert!(
+                    self.known_types.contains(name),
+                    "type error: unknown type '{name}'"
+                );
                 let arg_types: Vec<Type> = args
                     .iter()
                     .map(|a| self.type_expr_to_type(a, tvar_env))
@@ -383,6 +397,7 @@ impl<'src> InferCtx<'src> {
         type_params: &[&str],
         tags: &[ast::TagDecl<'src>],
     ) {
+        self.known_types.insert(name.to_owned());
         // Create type variables for each type parameter
         let mut tvar_env: HashMap<String, TypeVar> = type_params
             .iter()
@@ -1167,6 +1182,7 @@ pub fn check<'src>(
                         ctx.type_aliases.insert(qual, alias_scheme.clone());
                     }
                     ctx.type_aliases.insert(name.to_owned(), alias_scheme);
+                    ctx.known_types.insert(name.to_owned());
                 } else {
                     // snake_case: value/function annotation (e.g. get_x : I64 -> I64)
                     ctx.type_annos.insert(name.to_owned(), ty.clone());
