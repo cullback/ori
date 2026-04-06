@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::builder::Builder;
-use crate::ir::core::{
+use crate::core::builder::Builder;
+use crate::core::{
     Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, Pattern, Program, VarId,
 };
 use crate::stdlib;

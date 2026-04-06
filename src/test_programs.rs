@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use crate::ir::builder::Builder;
-use crate::ir::core::{
+use crate::core::builder::Builder;
+use crate::core::eval::eval;
+use crate::core::{
     Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, NumVal, Pattern, Program,
     Value,
 };
-use crate::ir::eval::eval;
 
 // -- Test-only helpers --
 

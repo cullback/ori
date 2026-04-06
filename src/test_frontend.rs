@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ir::core::{NumVal, Value};
+use crate::core::{NumVal, Value};
 
 /// Compile and run an Ori program with the given I64 input.
 fn run(source: &str, input: i64) -> Value {
@@ -10,7 +10,7 @@ fn run(source: &str, input: i64) -> Value {
     let (program, input_var) = crate::lower::lower(&module, &scope, &lit_types);
     let mut env = HashMap::new();
     env.insert(input_var, Value::VNum(NumVal::I64(input)));
-    crate::ir::eval::eval(&env, &program, &program.main)
+    crate::core::eval::eval(&env, &program, &program.main)
 }
 
 fn run_i64(source: &str, input: i64) -> i64 {
@@ -974,7 +974,7 @@ main : I64 -> F64
 main = |arg| 3.14 * 2.0";
 
     match run(source, 0) {
-        crate::ir::core::Value::VNum(crate::ir::core::NumVal::F64(n)) => {
+        crate::core::Value::VNum(crate::core::NumVal::F64(n)) => {
             assert!((n - 6.28).abs() < 0.001);
         }
         other => panic!("expected F64, got {other:?}"),

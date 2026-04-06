@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ir::core::{
+use crate::core::{
     Builtin, ConstructorDef, Core, DebugNames, FuncDef, FuncId, Program, TypeDef, TypeId, VarId,
 };
 

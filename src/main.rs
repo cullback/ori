@@ -1,4 +1,4 @@
-mod ir;
+mod core;
 mod lower;
 mod resolve;
 mod stdlib;
@@ -58,22 +58,17 @@ fn main() {
 
     // Evaluate
     let mut env = HashMap::new();
-    env.insert(
-        input_var,
-        ir::core::Value::VNum(ir::core::NumVal::I64(number)),
-    );
-    let result = ir::eval::eval(&env, &program, &program.main);
+    env.insert(input_var, core::Value::VNum(core::NumVal::I64(number)));
+    let result = core::eval::eval(&env, &program, &program.main);
 
     // Print result
     match result {
-        ir::core::Value::VNum(ir::core::NumVal::U8(n)) => println!("{n}"),
-        ir::core::Value::VNum(ir::core::NumVal::I8(n)) => println!("{n}"),
-        ir::core::Value::VNum(ir::core::NumVal::I64(n)) => println!("{n}"),
-        ir::core::Value::VNum(ir::core::NumVal::U64(n)) => println!("{n}"),
-        ir::core::Value::VNum(ir::core::NumVal::F64(n)) => println!("{n}"),
-        ir::core::Value::VConstruct { .. }
-        | ir::core::Value::VRecord { .. }
-        | ir::core::Value::VList(_) => {
+        core::Value::VNum(core::NumVal::U8(n)) => println!("{n}"),
+        core::Value::VNum(core::NumVal::I8(n)) => println!("{n}"),
+        core::Value::VNum(core::NumVal::I64(n)) => println!("{n}"),
+        core::Value::VNum(core::NumVal::U64(n)) => println!("{n}"),
+        core::Value::VNum(core::NumVal::F64(n)) => println!("{n}"),
+        core::Value::VConstruct { .. } | core::Value::VRecord { .. } | core::Value::VList(_) => {
             println!("{result:?}");
         }
     }

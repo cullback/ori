@@ -1,3 +1,6 @@
+pub mod builder;
+pub mod eval;
+
 use std::collections::HashMap;
 
 macro_rules! define_id {
