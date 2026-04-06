@@ -26,7 +26,7 @@ fn run_i64(source: &str, input: i64) -> i64 {
 #[test]
 fn tuple_basic() {
     let source = "\
-main : I64
+main : I64 -> I64
 main = |arg| (
     pair = (1, 2)
     (a, b) = pair
@@ -40,7 +40,7 @@ fn tuple_from_function() {
     let source = "\
 swap = |a, b| (b, a)
 
-main : I64
+main : I64 -> I64
 main = |arg| (
     (x, y) = swap(3, 7)
     x * 10 + y
@@ -51,7 +51,7 @@ main = |arg| (
 #[test]
 fn tuple_nested() {
     let source = "\
-main : I64
+main : I64 -> I64
 main = |arg| (
     t = ((1, 2), (3, 4))
     ((a, b), (c, d)) = t
@@ -66,27 +66,30 @@ main = |arg| (
 
 #[test]
 fn identity() {
-    let result = run_i64("main : I64\nmain = |x| x", 42);
+    let result = run_i64("main : I64 -> I64\nmain = |x| x", 42);
     assert_eq!(result, 42);
 }
 
 #[test]
 fn double() {
-    let result = run_i64("main : I64\nmain = |arg| (\n  c = 2 * arg\n  c\n)", 21);
+    let result = run_i64(
+        "main : I64 -> I64\nmain = |arg| (\n  c = 2 * arg\n  c\n)",
+        21,
+    );
     assert_eq!(result, 42);
 }
 
 #[test]
 fn arithmetic_precedence() {
     // 2 + 3 * 4 = 14 (not 20)
-    let result = run_i64("main : I64\nmain = |x| 2 + 3 * 4", 0);
+    let result = run_i64("main : I64 -> I64\nmain = |x| 2 + 3 * 4", 0);
     assert_eq!(result, 14);
 }
 
 #[test]
 fn nested_arithmetic() {
     let result = run_i64(
-        "main : I64\nmain = |x| (\n  a = x + 1\n  b = a * 2\n  b + 3\n)",
+        "main : I64 -> I64\nmain = |x| (\n  a = x + 1\n  b = a * 2\n  b + 3\n)",
         10,
     );
     assert_eq!(result, 25);
@@ -111,7 +114,7 @@ bool_to_i64 = |b| if b
     : True then 1
     : False then 0
 
-main : I64
+main : I64 -> I64
 main = |arg| bool_to_i64(not(True))";
 
     assert_eq!(run_i64(source, 0), 0);
@@ -132,7 +135,7 @@ bool_to_i64 = |b| if b
     : True then 1
     : False then 0
 
-main : I64
+main : I64 -> I64
 main = |arg| bool_to_i64(and(True, True))";
 
     assert_eq!(run_i64(source, 0), 1);
@@ -148,7 +151,7 @@ unwrap_or = |m, default| if m
     : Just(val) then val
     : Nothing then default
 
-main : I64
+main : I64 -> I64
 main = |arg| unwrap_or(Just(42), 0)";
 
     assert_eq!(run_i64(source, 0), 42);
@@ -164,7 +167,7 @@ unwrap_or = |m, default| if m
     : Just(val) then val
     : Nothing then default
 
-main : I64
+main : I64 -> I64
 main = |arg| unwrap_or(Nothing, 99)";
 
     assert_eq!(run_i64(source, 0), 99);
@@ -176,20 +179,20 @@ main = |arg| unwrap_or(Nothing, 99)";
 
 #[test]
 fn if_then_else_true_branch() {
-    let source = "main : I64\nmain = |x| if x == 0 then 99 else x * 2";
+    let source = "main : I64 -> I64\nmain = |x| if x == 0 then 99 else x * 2";
     assert_eq!(run_i64(source, 0), 99);
 }
 
 #[test]
 fn if_then_else_false_branch() {
-    let source = "main : I64\nmain = |x| if x == 0 then 99 else x * 2";
+    let source = "main : I64 -> I64\nmain = |x| if x == 0 then 99 else x * 2";
     assert_eq!(run_i64(source, 5), 10);
 }
 
 #[test]
 fn if_then_else_nested() {
     let source = "\
-main : I64
+main : I64 -> I64
 main = |x| (
     a = if x == 0 then 1 else 0
     b = if a == 1 then 100 else 200
@@ -201,7 +204,7 @@ main = |x| (
 
 #[test]
 fn not_equal() {
-    let source = "main : I64\nmain = |x| if x != 0 then 1 else 0";
+    let source = "main : I64 -> I64\nmain = |x| if x != 0 then 1 else 0";
     assert_eq!(run_i64(source, 0), 0);
     assert_eq!(run_i64(source, 7), 1);
 }
@@ -219,7 +222,7 @@ to_i64 = |b| if b
     : True then 1
     : False then 0
 
-main : I64
+main : I64 -> I64
 main = |arg| to_i64(True)";
 
     assert_eq!(run_i64(source, 0), 1);
@@ -238,7 +241,7 @@ add1 = |x| x + 1
 double : I64 -> I64
 double = |x| x * 2
 
-main : I64
+main : I64 -> I64
 main = |arg| double(add1(arg))";
 
     assert_eq!(run_i64(source, 10), 22);
@@ -254,7 +257,7 @@ compute = |a, b| (
     sum + product
 )
 
-main : I64
+main : I64 -> I64
 main = |arg| compute(3, 4)";
 
     assert_eq!(run_i64(source, 0), 19);
@@ -297,7 +300,7 @@ to_i64 = |n| fold n
     : Zero then 0
     : Succ(prev) then prev + 1
 
-main : I64
+main : I64 -> I64
 main = |arg| to_i64(Succ(Succ(Succ(Zero))))";
 
     assert_eq!(run_i64(source, 0), 3);
@@ -313,7 +316,7 @@ list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
 
-main : I64
+main : I64 -> I64
 main = |arg| list_sum(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 6);
@@ -329,7 +332,7 @@ list_length = |xs| fold xs
     : Nil then 0
     : Cons(_, rest) then rest + 1
 
-main : I64
+main : I64 -> I64
 main = |arg| list_length(Cons(10, Cons(20, Cons(30, Cons(40, Cons(50, Nil))))))";
 
     assert_eq!(run_i64(source, 0), 5);
@@ -345,7 +348,7 @@ tree_sum = |t| fold t
     : Leaf(val) then val
     : Branch(left, right) then left + right
 
-main : I64
+main : I64 -> I64
 main = |arg| tree_sum(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3)))";
 
     assert_eq!(run_i64(source, 0), 6);
@@ -367,7 +370,7 @@ tree_depth = |t| fold t
         m + 1
     )
 
-main : I64
+main : I64 -> I64
 main = |arg| tree_depth(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3)))";
 
     assert_eq!(run_i64(source, 0), 3);
@@ -388,7 +391,7 @@ list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
 
-main : I64
+main : I64 -> I64
 main = |arg| list_sum(map_inc(Cons(1, Cons(2, Cons(3, Nil)))))";
 
     // (1+1) + (2+1) + (3+1) = 9
@@ -415,7 +418,7 @@ factorial = |n| (
         : MkPair(_, f) then f
 )
 
-main : I64
+main : I64 -> I64
 main = |arg| factorial(Succ(Succ(Succ(Succ(Succ(Zero))))))";
 
     assert_eq!(run_i64(source, 0), 120);
@@ -438,7 +441,7 @@ fibonacci = |n| (
         : MkPair(a, _) then a
 )
 
-main : I64
+main : I64 -> I64
 main = |arg| fibonacci(Succ(Succ(Succ(Succ(Succ(Succ(Succ(Succ(Succ(Succ(Zero)))))))))))";
 
     assert_eq!(run_i64(source, 0), 55);
@@ -475,7 +478,7 @@ fn lambda_no_capture() {
     let source = "\
 List : [Nil, Cons(I64, List)]
 
-map : List, I64 -> List
+map : List, (I64 -> I64) -> List
 map = |xs, f| fold xs
     : Nil then Nil
     : Cons(hd, rest) then Cons(f(hd), rest)
@@ -485,7 +488,7 @@ list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
 
-main : I64
+main : I64 -> I64
 main = |arg| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + 1))";
 
     assert_eq!(run_i64(source, 0), 9);
@@ -496,7 +499,7 @@ fn lambda_with_capture() {
     let source = "\
 List : [Nil, Cons(I64, List)]
 
-map : List, I64 -> List
+map : List, (I64 -> I64) -> List
 map = |xs, f| fold xs
     : Nil then Nil
     : Cons(hd, rest) then Cons(f(hd), rest)
@@ -506,7 +509,7 @@ list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
 
-main : I64
+main : I64 -> I64
 main = |n| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
 
     assert_eq!(run_i64(source, 10), 36);
@@ -517,7 +520,7 @@ fn func_ref_as_arg() {
     let source = "\
 List : [Nil, Cons(I64, List)]
 
-map : List, I64 -> List
+map : List, (I64 -> I64) -> List
 map = |xs, f| fold xs
     : Nil then Nil
     : Cons(hd, rest) then Cons(f(hd), rest)
@@ -530,7 +533,7 @@ list_sum = |xs| fold xs
     : Nil then 0
     : Cons(hd, rest) then hd + rest
 
-main : I64
+main : I64 -> I64
 main = |arg| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), add1))";
 
     assert_eq!(run_i64(source, 0), 9);
@@ -539,10 +542,10 @@ main = |arg| list_sum(map(Cons(1, Cons(2, Cons(3, Nil))), add1))";
 #[test]
 fn multiple_lambdas_same_set() {
     let source = "\
-apply_to : I64, I64 -> I64
+apply_to : I64, (I64 -> I64) -> I64
 apply_to = |x, f| f(x)
 
-main : I64
+main : I64 -> I64
 main = |x| (
     a = apply_to(x, |y| y + 1)
     b = apply_to(x, |y| y * 2)
@@ -559,10 +562,10 @@ fn lambda_and_func_ref_same_set() {
 double : I64 -> I64
 double = |x| x * 2
 
-apply_to : I64, I64 -> I64
+apply_to : I64, (I64 -> I64) -> I64
 apply_to = |x, f| f(x)
 
-main : I64
+main : I64 -> I64
 main = |x| (
     a = apply_to(x, double)
     b = apply_to(x, |y| y + 10)
@@ -579,12 +582,12 @@ fn walk_via_fold_with_lambda() {
     let source = "\
 List : [Nil, Cons(I64, List)]
 
-walk : List, I64, I64 -> I64
+walk : List, I64, (I64, I64 -> I64) -> I64
 walk = |xs, init, f| fold xs
     : Nil then init
     : Cons(hd, acc) then f(acc, hd)
 
-main : I64
+main : I64 -> I64
 main = |arg| walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
 
     assert_eq!(run_i64(source, 0), 6);
@@ -604,7 +607,7 @@ List : [Nil, Cons(I64, List)].(
         : Cons(hd, rest) then hd + rest
 )
 
-main : I64
+main : I64 -> I64
 main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 6);
@@ -614,7 +617,7 @@ main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 fn associated_fn_with_lambda() {
     let source = "\
 List : [Nil, Cons(I64, List)].(
-    map : List, I64 -> List
+    map : List, (I64 -> I64) -> List
     map = |xs, f| fold xs
         : Nil then Nil
         : Cons(hd, rest) then Cons(f(hd), rest)
@@ -625,7 +628,7 @@ List : [Nil, Cons(I64, List)].(
         : Cons(hd, rest) then hd + rest
 )
 
-main : I64
+main : I64 -> I64
 main = |n| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
 
     assert_eq!(run_i64(source, 10), 36);
@@ -635,13 +638,13 @@ main = |n| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x + n))";
 fn associated_fn_walk() {
     let source = "\
 List : [Nil, Cons(I64, List)].(
-    walk : List, I64, I64 -> I64
+    walk : List, I64, (I64, I64 -> I64) -> I64
     walk = |xs, init, f| fold xs
         : Nil then init
         : Cons(hd, acc) then f(acc, hd)
 )
 
-main : I64
+main : I64 -> I64
 main = |arg| List.walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
 
     assert_eq!(run_i64(source, 0), 6);
@@ -651,7 +654,7 @@ main = |arg| List.walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
 fn associated_fn_calling_another() {
     let source = "\
 List : [Nil, Cons(I64, List)].(
-    map : List, I64 -> List
+    map : List, (I64 -> I64) -> List
     map = |xs, f| fold xs
         : Nil then Nil
         : Cons(hd, rest) then Cons(f(hd), rest)
@@ -665,7 +668,7 @@ List : [Nil, Cons(I64, List)].(
     sum_doubled = |xs| List.sum(List.map(xs, |x| x * 2))
 )
 
-main : I64
+main : I64 -> I64
 main = |arg| List.sum_doubled(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 12);
@@ -678,7 +681,7 @@ main = |arg| List.sum_doubled(Cons(1, Cons(2, Cons(3, Nil))))";
 #[test]
 fn record_literal_and_field_access() {
     let source = "\
-main : I64
+main : I64 -> I64
 main = |arg| (
     point = { x: 1, y: 2 }
     point.x + point.y
@@ -691,7 +694,7 @@ fn record_as_function_arg() {
     let source = "\
 get_x = |r| r.x
 
-main : I64
+main : I64 -> I64
 main = |arg| get_x({ x: 42, y: 0 })";
     assert_eq!(run_i64(source, 0), 42);
 }
@@ -701,7 +704,7 @@ fn record_row_polymorphism() {
     let source = "\
 get_x = |r| r.x
 
-main : I64
+main : I64 -> I64
 main = |arg| (
     a = get_x({ x: 10, y: 20 })
     b = get_x({ x: 30, z: 40 })
@@ -713,7 +716,7 @@ main = |arg| (
 #[test]
 fn nested_record_field_access() {
     let source = "\
-main : I64
+main : I64 -> I64
 main = |arg| (
     r = { inner: { val: 42 } }
     r.inner.val
@@ -726,7 +729,7 @@ fn record_returned_from_function() {
     let source = "\
 make_point = |x, y| { x: x, y: y }
 
-main : I64
+main : I64 -> I64
 main = |arg| (
     p = make_point(3, 4)
     p.x + p.y
@@ -740,7 +743,7 @@ fn record_type_error_missing_field() {
     run_i64(
         "\
 get_x = |r| r.x
-main : I64
+main : I64 -> I64
 main = |arg| get_x({ y: 1 })",
         0,
     );
@@ -753,7 +756,7 @@ main = |arg| get_x({ y: 1 })",
 #[test]
 fn record_destructure_basic() {
     let source = "\
-main : I64
+main : I64 -> I64
 main = |arg| (
     point = { x: 10, y: 20 }
     { x, y } = point
@@ -765,7 +768,7 @@ main = |arg| (
 #[test]
 fn record_destructure_rename() {
     let source = "\
-main : I64
+main : I64 -> I64
 main = |arg| (
     point = { x: 3, y: 4 }
     { x: a, y: b } = point
@@ -777,7 +780,7 @@ main = |arg| (
 #[test]
 fn record_destructure_nested() {
     let source = "\
-main : I64
+main : I64 -> I64
 main = |arg| (
     r = { inner: { val: 42 } }
     { inner } = r
@@ -799,7 +802,7 @@ Point : { x: I64, y: I64 }
 make_point : I64, I64 -> Point
 make_point = |x, y| { x: x, y: y }
 
-main : I64
+main : I64 -> I64
 main = |arg| (
     p = make_point(3, 4)
     p.x + p.y
@@ -815,7 +818,7 @@ Point : { x: I64, y: I64 }
 get_x : Point -> I64
 get_x = |p| p.x
 
-main : I64
+main : I64 -> I64
 main = |arg| get_x({ x: 42, y: 0 })";
     assert_eq!(run_i64(source, 0), 42);
 }
@@ -827,13 +830,16 @@ main = |arg| get_x({ x: 42, y: 0 })";
 #[test]
 #[should_panic(expected = "type error")]
 fn type_error_add_bool() {
-    run_i64("main : I64\nmain = |x| x + True", 0);
+    run_i64("main : I64 -> I64\nmain = |x| x + True", 0);
 }
 
 #[test]
 #[should_panic(expected = "type error")]
 fn type_error_if_branch_mismatch() {
-    run_i64("main : I64\nmain = |x| if x == 0 then 1 else True", 0);
+    run_i64(
+        "main : I64 -> I64\nmain = |x| if x == 0 then 1 else True",
+        0,
+    );
 }
 
 // ============================================================
@@ -850,7 +856,7 @@ unwrap_or = |m, default| if m
     : Just(val) then val
     : Nothing then default
 
-main : I64
+main : I64 -> I64
 main = |arg| unwrap_or(Just(42), 0)";
 
     assert_eq!(run_i64(source, 0), 42);
@@ -866,7 +872,7 @@ List(a) : [Nil, Cons(a, List(a))].(
         : Cons(hd, rest) then hd + rest
 )
 
-main : I64
+main : I64 -> I64
 main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 6);

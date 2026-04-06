@@ -966,7 +966,10 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                 let body_ty = ctx.infer_expr(body);
                 ctx.unify(&ret, &body_ty);
 
-                // TODO: enforce type annotations against inferred types
+                if let Some(anno) = ctx.type_annos.get(name).cloned() {
+                    let anno_ty = ctx.type_expr_to_type(&anno, &HashMap::new());
+                    ctx.unify(&func_ty, &anno_ty);
+                }
 
                 ctx.env = saved_env;
                 ctx.env.remove(name); // remove monomorphic binding before generalizing
@@ -1001,7 +1004,10 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                         let body_ty = ctx.infer_expr(body);
                         ctx.unify(&ret, &body_ty);
 
-                        // TODO: enforce type annotations against inferred types
+                        if let Some(anno) = ctx.type_annos.get(&mangled).cloned() {
+                            let anno_ty = ctx.type_expr_to_type(&anno, &HashMap::new());
+                            ctx.unify(&func_ty, &anno_ty);
+                        }
 
                         ctx.env = saved_env;
                         ctx.env.remove(&mangled);

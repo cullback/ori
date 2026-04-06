@@ -5,5 +5,5 @@ to_i64 = |n| fold n
     : Zero then 0
     : Succ(prev) then prev + 1
 
-main : I64
+main : I64 -> I64
 main = |arg| to_i64(Succ(Succ(Succ(Zero))))

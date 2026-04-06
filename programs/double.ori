@@ -1,4 +1,4 @@
-main : I64
+main : I64 -> I64
 main = |arg| (
   c = 2 * arg
   c

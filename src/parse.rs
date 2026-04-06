@@ -156,6 +156,10 @@ fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr<'_> {
                         inner.into_iter().map(parse_type_expr).collect();
                     TypeExpr::Tuple(elements)
                 }
+                Rule::type_expr => {
+                    // Parenthesized type expression: (A -> B)
+                    parse_type_expr(inner.into_iter().next().unwrap())
+                }
                 _ => panic!("unexpected type_atom content: {:?}", first.as_rule()),
             }
         }

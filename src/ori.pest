@@ -29,6 +29,7 @@ type_atom = {
   | "[" ~ (tag_decl ~ ("," ~ tag_decl)*)? ~ "]"
   | "{" ~ (field_type ~ ("," ~ field_type)*)? ~ "}"
   | "(" ~ type_atom ~ ("," ~ type_atom)+ ~ ")"
+  | "(" ~ type_expr ~ ")"
   | name
 }
 

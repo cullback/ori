@@ -1,5 +1,5 @@
 // if-then-else desugars to pattern match on Bool
 // == returns Bool from the prelude
 
-main : I64
+main : I64 -> I64
 main = |arg| if arg == 0 then 99 else arg * 2

@@ -6,7 +6,7 @@ List(a) : [Nil, Cons(a, List(a))].(
         : Nil then 0
         : Cons(hd, rest) then hd + rest
 
-    map : List(a), I64 -> List(a)
+    map : List(I64), (I64 -> I64) -> List(I64)
     map = |xs, f| fold xs
         : Nil then Nil
         : Cons(hd, rest) then Cons(f(hd), rest)
@@ -18,7 +18,7 @@ Person : { name: I64, age: I64 }
 // Row-polymorphic: works on any record with an `age` field
 get_age = |person| person.age
 
-main : I64
+main : I64 -> I64
 main = |arg| (
     alice : Person
     alice = { name: 1, age: 30 }

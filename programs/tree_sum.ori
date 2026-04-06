@@ -5,5 +5,5 @@ tree_sum = |t| fold t
     : Leaf(val) then val
     : Branch(left, right) then left + right
 
-main : I64
+main : I64 -> I64
 main = |arg| tree_sum(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3)))
