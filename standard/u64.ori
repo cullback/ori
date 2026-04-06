@@ -1,0 +1,8 @@
+U64 := {}.(
+    add : U64, U64 -> U64
+    sub : U64, U64 -> U64
+    mul : U64, U64 -> U64
+    rem : U64, U64 -> U64
+    eq : U64, U64 -> Bool
+    neq : U64, U64 -> Bool
+)

@@ -1,7 +1,7 @@
 // List is a built-in vector-backed type.
 // Methods without bodies are compiler builtins.
 
-List := .(
+List := {}.(
     len : List(a) -> I64
     get : List(a), I64 -> a
     append : List(a), a -> List(a)

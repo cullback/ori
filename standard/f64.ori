@@ -1,0 +1,9 @@
+F64 := {}.(
+    add : F64, F64 -> F64
+    sub : F64, F64 -> F64
+    mul : F64, F64 -> F64
+    div : F64, F64 -> F64
+    rem : F64, F64 -> F64
+    eq : F64, F64 -> Bool
+    neq : F64, F64 -> Bool
+)

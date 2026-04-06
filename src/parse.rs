@@ -92,13 +92,10 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
         }
     }
 
-    // For `:= .(...)` with no type expr, use a placeholder
-    let resolved_ty = ty.unwrap_or(TypeExpr::Named("_builtin"));
-
     Decl::TypeAnno {
         name,
         type_params,
-        ty: resolved_ty,
+        ty: ty.expect("type declaration missing type expression"),
         methods,
         nominal,
     }
@@ -149,7 +146,10 @@ fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr<'_> {
         }
         Rule::type_atom => {
             let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
-            assert!(!inner.is_empty(), "empty type_atom");
+            if inner.is_empty() {
+                // Empty record type: {} (unit type)
+                return TypeExpr::Record(vec![]);
+            }
             let first = &inner[0];
             match first.as_rule() {
                 Rule::name => {
