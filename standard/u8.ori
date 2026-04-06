@@ -1,0 +1,9 @@
+U8 := {}.(
+    add : U8, U8 -> U8
+    sub : U8, U8 -> U8
+    mul : U8, U8 -> U8
+    div : U8, U8 -> U8
+    rem : U8, U8 -> U8
+    eq : U8, U8 -> Bool
+    neq : U8, U8 -> Bool
+)

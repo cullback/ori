@@ -1020,13 +1020,15 @@ impl<'src> LowerCtx<'src> {
     #[expect(clippy::too_many_lines, reason = "handles all expression forms")]
     fn lower_expr(&mut self, expr: &Expr<'src>) -> Core {
         match &expr.kind {
+            #[expect(
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation
+            )]
             ExprKind::IntLit(n) => match self.lit_types.get(&expr.span) {
-                Some(crate::infer::NumType::U64) =>
-                {
-                    #[expect(clippy::cast_sign_loss)]
-                    Core::u64(*n as u64)
-                }
-                #[expect(clippy::cast_precision_loss)]
+                Some(crate::infer::NumType::U8) => Core::u8(*n as u8),
+                Some(crate::infer::NumType::I8) => Core::i8(*n as i8),
+                Some(crate::infer::NumType::U64) => Core::u64(*n as u64),
                 Some(crate::infer::NumType::F64) => Core::f64(*n as f64),
                 _ => Core::i64(*n),
             },

@@ -13,8 +13,17 @@ type Env = HashMap<VarId, Value>;
     clippy::float_cmp,
     reason = "builtins implement language-level arithmetic"
 )]
+#[expect(clippy::too_many_lines, reason = "dispatch over all numeric types")]
 fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value> {
     let builtin = program.builtins.get(&func)?;
+    let u8_pair = || match args {
+        [Value::VNum(NumVal::U8(a)), Value::VNum(NumVal::U8(b))] => Some((*a, *b)),
+        _ => None,
+    };
+    let i8_pair = || match args {
+        [Value::VNum(NumVal::I8(a)), Value::VNum(NumVal::I8(b))] => Some((*a, *b)),
+        _ => None,
+    };
     let u64_pair = || match args {
         [Value::VNum(NumVal::U64(a)), Value::VNum(NumVal::U64(b))] => Some((*a, *b)),
         _ => None,
@@ -28,34 +37,48 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
         _ => None,
     };
     match *builtin {
-        Builtin::Add => u64_pair()
-            .map(|(a, b)| Value::VNum(NumVal::U64(a + b)))
+        Builtin::Add => u8_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U8(a + b)))
+            .or_else(|| i8_pair().map(|(a, b)| Value::VNum(NumVal::I8(a + b))))
+            .or_else(|| u64_pair().map(|(a, b)| Value::VNum(NumVal::U64(a + b))))
             .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a + b))))
             .or_else(|| f64_pair().map(|(a, b)| Value::VNum(NumVal::F64(a + b)))),
-        Builtin::Sub => u64_pair()
-            .map(|(a, b)| Value::VNum(NumVal::U64(a - b)))
+        Builtin::Sub => u8_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U8(a - b)))
+            .or_else(|| i8_pair().map(|(a, b)| Value::VNum(NumVal::I8(a - b))))
+            .or_else(|| u64_pair().map(|(a, b)| Value::VNum(NumVal::U64(a - b))))
             .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a - b))))
             .or_else(|| f64_pair().map(|(a, b)| Value::VNum(NumVal::F64(a - b)))),
-        Builtin::Mul => u64_pair()
-            .map(|(a, b)| Value::VNum(NumVal::U64(a * b)))
+        Builtin::Mul => u8_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U8(a * b)))
+            .or_else(|| i8_pair().map(|(a, b)| Value::VNum(NumVal::I8(a * b))))
+            .or_else(|| u64_pair().map(|(a, b)| Value::VNum(NumVal::U64(a * b))))
             .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a * b))))
             .or_else(|| f64_pair().map(|(a, b)| Value::VNum(NumVal::F64(a * b)))),
-        Builtin::Div => u64_pair()
-            .map(|(a, b)| Value::VNum(NumVal::U64(a / b)))
+        Builtin::Div => u8_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U8(a / b)))
+            .or_else(|| i8_pair().map(|(a, b)| Value::VNum(NumVal::I8(a / b))))
+            .or_else(|| u64_pair().map(|(a, b)| Value::VNum(NumVal::U64(a / b))))
             .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a / b))))
             .or_else(|| f64_pair().map(|(a, b)| Value::VNum(NumVal::F64(a / b)))),
-        Builtin::Rem => u64_pair()
-            .map(|(a, b)| Value::VNum(NumVal::U64(a % b)))
+        Builtin::Rem => u8_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U8(a % b)))
+            .or_else(|| i8_pair().map(|(a, b)| Value::VNum(NumVal::I8(a % b))))
+            .or_else(|| u64_pair().map(|(a, b)| Value::VNum(NumVal::U64(a % b))))
             .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a % b)))),
-        Builtin::Max => u64_pair()
-            .map(|(a, b)| Value::VNum(NumVal::U64(a.max(b))))
+        Builtin::Max => u8_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U8(a.max(b))))
+            .or_else(|| i8_pair().map(|(a, b)| Value::VNum(NumVal::I8(a.max(b)))))
+            .or_else(|| u64_pair().map(|(a, b)| Value::VNum(NumVal::U64(a.max(b)))))
             .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a.max(b))))),
         Builtin::Eq {
             true_con,
             false_con,
         } => {
-            let equal = u64_pair()
+            let equal = u8_pair()
                 .map(|(a, b)| a == b)
+                .or_else(|| i8_pair().map(|(a, b)| a == b))
+                .or_else(|| u64_pair().map(|(a, b)| a == b))
                 .or_else(|| i64_pair().map(|(a, b)| a == b))
                 .or_else(|| f64_pair().map(|(a, b)| a == b))?;
             let tag = if equal { true_con } else { false_con };

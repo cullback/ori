@@ -66,6 +66,8 @@ fn main() {
 
     // Print result
     match result {
+        ir::Value::VNum(ir::NumVal::U8(n)) => println!("{n}"),
+        ir::Value::VNum(ir::NumVal::I8(n)) => println!("{n}"),
         ir::Value::VNum(ir::NumVal::I64(n)) => println!("{n}"),
         ir::Value::VNum(ir::NumVal::U64(n)) => println!("{n}"),
         ir::Value::VNum(ir::NumVal::F64(n)) => println!("{n}"),

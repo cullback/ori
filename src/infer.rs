@@ -5,6 +5,8 @@ use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr
 /// Resolved numeric type for a literal, used to communicate from inference to lowering.
 #[derive(Debug, Clone, Copy)]
 pub enum NumType {
+    U8,
+    I8,
     I64,
     U64,
     F64,
@@ -90,6 +92,8 @@ impl<'src> InferCtx<'src> {
             type_aliases: HashMap::new(),
             type_annos: HashMap::new(),
             known_types: HashSet::from([
+                "U8".to_owned(),
+                "I8".to_owned(),
                 "I64".to_owned(),
                 "U64".to_owned(),
                 "F64".to_owned(),
@@ -979,6 +983,8 @@ impl<'src> InferCtx<'src> {
         for &(tv, span) in &self.int_literal_vars {
             let resolved = self.resolve(&Type::Var(tv));
             let num_type = match &resolved {
+                Type::Con(name) if name == "U8" => NumType::U8,
+                Type::Con(name) if name == "I8" => NumType::I8,
                 Type::Con(name) if name == "I64" => NumType::I64,
                 Type::Con(name) if name == "U64" => NumType::U64,
                 Type::Con(name) if name == "F64" => NumType::F64,

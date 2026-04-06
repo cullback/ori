@@ -55,6 +55,8 @@ pub enum Builtin {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum NumVal {
+    U8(u8),
+    I8(i8),
     U64(u64),
     I64(i64),
     F64(f64),
@@ -143,6 +145,14 @@ pub enum Core {
 impl Core {
     pub const fn var(name: VarId) -> Self {
         Self::Var(name)
+    }
+
+    pub const fn u8(n: u8) -> Self {
+        Self::Lit(Literal::Num(NumVal::U8(n)))
+    }
+
+    pub const fn i8(n: i8) -> Self {
+        Self::Lit(Literal::Num(NumVal::I8(n)))
     }
 
     pub const fn u64(n: u64) -> Self {
