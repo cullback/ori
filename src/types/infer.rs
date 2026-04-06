@@ -543,7 +543,7 @@ impl<'src> InferCtx<'src> {
             return ret;
         }
 
-        panic!("type error: undefined function '{func}'");
+        self.type_error(span, &format!("undefined function '{func}'"));
     }
 
     // ---- Pattern inference ----
@@ -561,7 +561,9 @@ impl<'src> InferCtx<'src> {
                 let scheme = self
                     .constructors
                     .get(name)
-                    .unwrap_or_else(|| panic!("type error: unknown constructor '{name}'"))
+                    .unwrap_or_else(|| {
+                        self.type_error(span, &format!("unknown constructor '{name}'"))
+                    })
                     .clone();
                 let con_ty = self.engine.instantiate(&scheme);
 
