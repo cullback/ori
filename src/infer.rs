@@ -96,6 +96,13 @@ impl<'src> InferCtx<'src> {
 
     // ---- Convert surface TypeExpr to inference Type ----
 
+    /// Convert a type expression without pre-existing type variable bindings.
+    fn resolve_type_expr(&mut self, texpr: &TypeExpr<'src>) -> Type {
+        self.type_expr_to_type(texpr, &mut HashMap::new())
+    }
+
+    /// Convert a type expression, accumulating implicit type variable bindings
+    /// into `tvar_env` (so `a` in `a -> a` resolves to the same variable).
     fn type_expr_to_type(
         &mut self,
         texpr: &TypeExpr<'src>,
@@ -389,7 +396,7 @@ impl<'src> InferCtx<'src> {
                             let val_ty = self.infer_expr(val);
                             // If there's a type hint for this binding, enforce it
                             if let Some(hint) = pending_hints.remove(name) {
-                                let hint_ty = self.type_expr_to_type(&hint, &mut HashMap::new());
+                                let hint_ty = self.resolve_type_expr(&hint);
                                 self.unify_at(&val_ty, &hint_ty, val.span);
                             }
                             let scheme = self.engine.generalize(&val_ty, &self.env);
@@ -653,7 +660,7 @@ impl<'src> InferCtx<'src> {
         self.unify_at(&ret, &body_ty, body.span);
 
         if let Some(anno) = self.type_annos.get(name).cloned() {
-            let anno_ty = self.type_expr_to_type(&anno, &mut HashMap::new());
+            let anno_ty = self.resolve_type_expr(&anno);
             self.unify_at(&func_ty, &anno_ty, body.span);
         }
 

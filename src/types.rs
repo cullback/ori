@@ -95,17 +95,18 @@ impl TypeEngine {
 
     pub fn occurs_in(&self, tv: TypeVar, ty: &Type) -> bool {
         let resolved = self.resolve(ty);
-        if let Type::Var(v) = &resolved {
-            *v == tv
-        } else {
-            let mut found = false;
-            resolved.map_children(&mut |child| {
-                if self.occurs_in(tv, child) {
-                    found = true;
-                }
-                child.clone()
-            });
-            found
+        match &resolved {
+            Type::Var(v) => *v == tv,
+            Type::Con(_) => false,
+            Type::App(_, args) => args.iter().any(|a| self.occurs_in(tv, a)),
+            Type::Arrow(params, ret) => {
+                params.iter().any(|p| self.occurs_in(tv, p)) || self.occurs_in(tv, ret)
+            }
+            Type::Record { fields, rest } => {
+                fields.iter().any(|(_, t)| self.occurs_in(tv, t))
+                    || rest.as_ref().is_some_and(|r| self.occurs_in(tv, r))
+            }
+            Type::Tuple(elems) => elems.iter().any(|e| self.occurs_in(tv, e)),
         }
     }
 
@@ -267,16 +268,42 @@ impl TypeEngine {
     // ---- Generalization & Instantiation ----
 
     pub fn free_vars(&self, ty: &Type) -> HashSet<TypeVar> {
+        let mut fvs = HashSet::new();
+        self.collect_free_vars(ty, &mut fvs);
+        fvs
+    }
+
+    fn collect_free_vars(&self, ty: &Type, fvs: &mut HashSet<TypeVar>) {
         let resolved = self.resolve(ty);
-        if let Type::Var(v) = &resolved {
-            HashSet::from([*v])
-        } else {
-            let mut fvs = HashSet::new();
-            resolved.map_children(&mut |child| {
-                fvs.extend(self.free_vars(child));
-                child.clone()
-            });
-            fvs
+        match &resolved {
+            Type::Var(v) => {
+                fvs.insert(*v);
+            }
+            Type::Con(_) => {}
+            Type::App(_, args) => {
+                for a in args {
+                    self.collect_free_vars(a, fvs);
+                }
+            }
+            Type::Arrow(params, ret) => {
+                for p in params {
+                    self.collect_free_vars(p, fvs);
+                }
+                self.collect_free_vars(ret, fvs);
+            }
+            Type::Record { fields, rest } => {
+                for (_, t) in fields {
+                    self.collect_free_vars(t, fvs);
+                }
+                if let Some(r) = rest {
+                    self.collect_free_vars(r, fvs);
+                }
+            }
+            Type::Tuple(elems) => {
+                for e in elems {
+                    self.collect_free_vars(e, fvs);
+                }
+            }
         }
     }
 
