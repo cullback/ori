@@ -55,6 +55,7 @@ atom = {
   | call_or_access
   | tuple
   | block
+  | float_lit
   | int_lit
 }
 
@@ -105,7 +106,8 @@ lambda = { "|" ~ (lambda_param ~ ("," ~ lambda_param)*)? ~ "|" ~ expr }
 
 lambda_param = @{ "_" | name }
 
-int_lit = @{ ASCII_DIGIT+ }
+float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+int_lit   = @{ ASCII_DIGIT+ }
 
 // ---- If / Fold ----
 

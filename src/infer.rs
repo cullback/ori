@@ -2,6 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr};
 
+/// Resolved numeric type for a literal, used to communicate from inference to lowering.
+#[derive(Debug, Clone, Copy)]
+pub enum NumType {
+    I64,
+    U64,
+    F64,
+}
+
 // ---- Type representation ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,6 +71,10 @@ struct InferCtx<'src> {
     type_annos: HashMap<String, TypeExpr<'src>>,
     /// Current expression span for error reporting in unify.
     current_span: Span,
+    /// Track integer literal type vars for defaulting and side table.
+    int_literal_vars: Vec<(TypeVar, Span)>,
+    /// Track float literal type vars for defaulting and side table.
+    float_literal_vars: Vec<(TypeVar, Span)>,
 }
 
 impl<'src> InferCtx<'src> {
@@ -76,6 +88,8 @@ impl<'src> InferCtx<'src> {
             type_aliases: HashMap::new(),
             type_annos: HashMap::new(),
             current_span: Span::default(),
+            int_literal_vars: Vec::new(),
+            float_literal_vars: Vec::new(),
         }
     }
 
@@ -501,7 +515,19 @@ impl<'src> InferCtx<'src> {
     fn infer_expr(&mut self, expr: &Expr<'src>) -> Type {
         self.current_span = expr.span;
         match &expr.kind {
-            ExprKind::IntLit(_) => Type::Con("I64".to_owned()),
+            ExprKind::IntLit(_) => {
+                let ty = self.fresh();
+                let Type::Var(tv) = ty else { unreachable!() };
+                self.int_literal_vars.push((tv, expr.span));
+                ty
+            }
+
+            ExprKind::FloatLit(_) => {
+                let ty = self.fresh();
+                let Type::Var(tv) = ty else { unreachable!() };
+                self.float_literal_vars.push((tv, expr.span));
+                ty
+            }
 
             ExprKind::Name(name) => {
                 let name = *name;
@@ -517,12 +543,10 @@ impl<'src> InferCtx<'src> {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lt = self.infer_expr(lhs);
                 let rt = self.infer_expr(rhs);
-                let i64_ty = Type::Con("I64".to_owned());
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                        self.unify(&lt, &i64_ty);
-                        self.unify(&rt, &i64_ty);
-                        i64_ty
+                        self.unify(&lt, &rt);
+                        lt
                     }
                     BinOp::Eq | BinOp::Neq => {
                         self.unify(&lt, &rt);
@@ -925,6 +949,56 @@ impl<'src> InferCtx<'src> {
         let generalized = self.generalize(&resolved);
         self.env.insert(name.to_owned(), generalized);
     }
+
+    /// Default unresolved literal type vars and build the span → `NumType` side table.
+    fn resolve_literals(&mut self) -> HashMap<Span, NumType> {
+        let i64_ty = Type::Con("I64".to_owned());
+        let f64_ty = Type::Con("F64".to_owned());
+
+        // Default unresolved int literals to I64
+        for &(tv, _) in &self.int_literal_vars {
+            let resolved = self.resolve(&Type::Var(tv));
+            if matches!(resolved, Type::Var(_)) {
+                self.subst.insert(tv, i64_ty.clone());
+            }
+        }
+
+        // Default unresolved float literals to F64
+        for &(tv, _) in &self.float_literal_vars {
+            let resolved = self.resolve(&Type::Var(tv));
+            if matches!(resolved, Type::Var(_)) {
+                self.subst.insert(tv, f64_ty.clone());
+            }
+        }
+
+        // Build side table
+        let mut table = HashMap::new();
+        for &(tv, span) in &self.int_literal_vars {
+            let resolved = self.resolve(&Type::Var(tv));
+            let num_type = match &resolved {
+                Type::Con(name) if name == "I64" => NumType::I64,
+                Type::Con(name) if name == "U64" => NumType::U64,
+                Type::Con(name) if name == "F64" => NumType::F64,
+                other => panic!(
+                    "integer literal resolved to non-numeric type: {}",
+                    self.display_type(other)
+                ),
+            };
+            table.insert(span, num_type);
+        }
+        for &(tv, span) in &self.float_literal_vars {
+            let resolved = self.resolve(&Type::Var(tv));
+            let num_type = match &resolved {
+                Type::Con(name) if name == "F64" => NumType::F64,
+                other => panic!(
+                    "float literal resolved to non-numeric type: {}",
+                    self.display_type(other)
+                ),
+            };
+            table.insert(span, num_type);
+        }
+        table
+    }
 }
 
 // ---- Public API ----
@@ -933,7 +1007,11 @@ impl<'src> InferCtx<'src> {
     clippy::too_many_lines,
     reason = "multi-pass type checking orchestration"
 )]
-pub fn check<'src>(source: &'src str, module: &Module<'src>, scope: &crate::resolve::ModuleScope) {
+pub fn check<'src>(
+    source: &'src str,
+    module: &Module<'src>,
+    scope: &crate::resolve::ModuleScope,
+) -> HashMap<Span, NumType> {
     let mut ctx = InferCtx::new(source);
 
     // Register prelude: Bool : [True, False]
@@ -1107,4 +1185,6 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>, scope: &crate::reso
             }
         }
     }
+
+    ctx.resolve_literals()
 }

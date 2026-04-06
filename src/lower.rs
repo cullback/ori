@@ -15,8 +15,12 @@ const PRELUDE: &str = "Bool : [True, False]\n";
 /// Returns the program and the `VarId` of `main`'s input parameter
 /// (a free variable that the runtime must bind before evaluation).
 #[expect(clippy::too_many_lines, reason = "multi-pass lowering orchestration")]
-pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Program, VarId) {
-    let mut ctx = LowerCtx::new();
+pub fn lower(
+    module: &Module<'_>,
+    scope: &crate::resolve::ModuleScope,
+    lit_types: &HashMap<ast::Span, crate::infer::NumType>,
+) -> (Program, VarId) {
+    let mut ctx = LowerCtx::new(lit_types.clone());
 
     // Parse and register the prelude
     let prelude = parse::parse(PRELUDE);
@@ -339,17 +343,19 @@ struct LowerCtx<'src> {
     lambda_arg_counters: HashMap<(String, usize), usize>,
     /// Functions reachable from main (dead code is not lowered).
     reachable: HashSet<String>,
+    /// Resolved literal types from type inference.
+    lit_types: HashMap<ast::Span, crate::infer::NumType>,
 }
 
 impl<'src> LowerCtx<'src> {
-    fn new() -> Self {
+    fn new(lit_types: HashMap<ast::Span, crate::infer::NumType>) -> Self {
         let mut builder = Builder::new();
         let mut binops = HashMap::new();
 
         binops.insert(BinOp::Add, builder.builtin(Builtin::Add));
         binops.insert(BinOp::Sub, builder.builtin(Builtin::Sub));
         binops.insert(BinOp::Mul, builder.builtin(Builtin::Mul));
-        binops.insert(BinOp::Div, builder.builtin(Builtin::Mul)); // TODO: add Div builtin
+        binops.insert(BinOp::Div, builder.builtin(Builtin::Div));
         binops.insert(BinOp::Rem, builder.builtin(Builtin::Rem));
         // Eq and Neq are registered after the prelude defines Bool
 
@@ -380,6 +386,7 @@ impl<'src> LowerCtx<'src> {
             ho_vars: HashMap::new(),
             lambda_arg_counters: HashMap::new(),
             reachable: HashSet::new(),
+            lit_types,
         }
     }
 
@@ -571,7 +578,7 @@ impl<'src> LowerCtx<'src> {
                     Self::collect_refs(e, refs);
                 }
             }
-            ExprKind::IntLit(_) => {}
+            ExprKind::IntLit(_) | ExprKind::FloatLit(_) => {}
         }
     }
 
@@ -708,7 +715,7 @@ impl<'src> LowerCtx<'src> {
                     self.scan_expr(e);
                 }
             }
-            ExprKind::IntLit(_) | ExprKind::Name(_) => {}
+            ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::Name(_) => {}
         }
     }
 
@@ -816,7 +823,7 @@ impl<'src> LowerCtx<'src> {
                     free.push(name);
                 }
             }
-            ExprKind::IntLit(_) => {}
+            ExprKind::IntLit(_) | ExprKind::FloatLit(_) => {}
             ExprKind::BinOp { lhs, rhs, .. } => {
                 self.collect_free(lhs, bound, seen, free);
                 self.collect_free(rhs, bound, seen, free);
@@ -955,7 +962,17 @@ impl<'src> LowerCtx<'src> {
     #[expect(clippy::too_many_lines, reason = "handles all expression forms")]
     fn lower_expr(&mut self, expr: &Expr<'src>) -> Core {
         match &expr.kind {
-            ExprKind::IntLit(n) => Core::i64(*n),
+            ExprKind::IntLit(n) => match self.lit_types.get(&expr.span) {
+                Some(crate::infer::NumType::U64) =>
+                {
+                    #[expect(clippy::cast_sign_loss)]
+                    Core::u64(*n as u64)
+                }
+                #[expect(clippy::cast_precision_loss)]
+                Some(crate::infer::NumType::F64) => Core::f64(*n as f64),
+                _ => Core::i64(*n),
+            },
+            ExprKind::FloatLit(n) => Core::f64(*n),
 
             ExprKind::Name(name) => {
                 let name = *name;

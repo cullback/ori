@@ -42,6 +42,7 @@ pub enum Builtin {
     Add,
     Sub,
     Mul,
+    Div,
     Rem,
     Max,
     Eq { true_con: FuncId, false_con: FuncId },
@@ -151,6 +152,10 @@ impl Core {
 
     pub const fn i64(n: i64) -> Self {
         Self::Lit(Literal::Num(NumVal::I64(n)))
+    }
+
+    pub const fn f64(n: f64) -> Self {
+        Self::Lit(Literal::Num(NumVal::F64(n)))
     }
 
     pub const fn app(func: FuncId, args: Vec<Self>) -> Self {

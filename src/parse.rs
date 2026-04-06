@@ -252,6 +252,10 @@ fn parse_expr(pair: Pair<'_, Rule>) -> Expr<'_> {
             let inner = pair.into_inner().next().unwrap();
             parse_expr(inner)
         }
+        Rule::float_lit => {
+            let n: f64 = pair.as_str().parse().unwrap();
+            Expr::new(ExprKind::FloatLit(n), span)
+        }
         Rule::int_lit => {
             let n: i64 = pair.as_str().parse().unwrap();
             Expr::new(ExprKind::IntLit(n), span)

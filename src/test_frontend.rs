@@ -6,8 +6,8 @@ use crate::ir::{NumVal, Value};
 fn run(source: &str, input: i64) -> Value {
     let parsed = crate::parse::parse(source);
     let (module, scope) = crate::resolve::resolve_imports(parsed);
-    crate::infer::check(source, &module, &scope);
-    let (program, input_var) = crate::lower::lower(&module, &scope);
+    let lit_types = crate::infer::check(source, &module, &scope);
+    let (program, input_var) = crate::lower::lower(&module, &scope, &lit_types);
     let mut env = HashMap::new();
     env.insert(input_var, Value::VNum(NumVal::I64(input)));
     crate::eval::eval(&env, &program, &program.main)
@@ -961,4 +961,40 @@ main : I64 -> I64
 main = |arg| List.len([])";
 
     assert_eq!(run_i64(source, 0), 0);
+}
+
+// ============================================================
+// Float literals and polymorphic numbers
+// ============================================================
+
+#[test]
+fn float_literal_arithmetic() {
+    let source = "\
+main : I64 -> F64
+main = |arg| 3.14 * 2.0";
+
+    match run(source, 0) {
+        crate::ir::Value::VNum(crate::ir::NumVal::F64(n)) => {
+            assert!((n - 6.28).abs() < 0.001);
+        }
+        other => panic!("expected F64, got {other:?}"),
+    }
+}
+
+#[test]
+fn int_literal_defaults_to_i64() {
+    let source = "\
+main : I64 -> I64
+main = |arg| 1 + 2 + 3";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn int_division() {
+    let source = "\
+main : I64 -> I64
+main = |arg| 10 / 3";
+
+    assert_eq!(run_i64(source, 0), 3);
 }

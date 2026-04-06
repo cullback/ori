@@ -7,7 +7,10 @@ type Env = HashMap<VarId, Value>;
 #[expect(
     clippy::arithmetic_side_effects,
     clippy::integer_division_remainder_used,
+    clippy::integer_division,
     clippy::modulo_arithmetic,
+    clippy::float_arithmetic,
+    clippy::float_cmp,
     reason = "builtins implement language-level arithmetic"
 )]
 fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value> {
@@ -20,16 +23,27 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
         [Value::VNum(NumVal::I64(a)), Value::VNum(NumVal::I64(b))] => Some((*a, *b)),
         _ => None,
     };
+    let f64_pair = || match args {
+        [Value::VNum(NumVal::F64(a)), Value::VNum(NumVal::F64(b))] => Some((*a, *b)),
+        _ => None,
+    };
     match *builtin {
         Builtin::Add => u64_pair()
             .map(|(a, b)| Value::VNum(NumVal::U64(a + b)))
-            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a + b)))),
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a + b))))
+            .or_else(|| f64_pair().map(|(a, b)| Value::VNum(NumVal::F64(a + b)))),
         Builtin::Sub => u64_pair()
             .map(|(a, b)| Value::VNum(NumVal::U64(a - b)))
-            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a - b)))),
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a - b))))
+            .or_else(|| f64_pair().map(|(a, b)| Value::VNum(NumVal::F64(a - b)))),
         Builtin::Mul => u64_pair()
             .map(|(a, b)| Value::VNum(NumVal::U64(a * b)))
-            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a * b)))),
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a * b))))
+            .or_else(|| f64_pair().map(|(a, b)| Value::VNum(NumVal::F64(a * b)))),
+        Builtin::Div => u64_pair()
+            .map(|(a, b)| Value::VNum(NumVal::U64(a / b)))
+            .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a / b))))
+            .or_else(|| f64_pair().map(|(a, b)| Value::VNum(NumVal::F64(a / b)))),
         Builtin::Rem => u64_pair()
             .map(|(a, b)| Value::VNum(NumVal::U64(a % b)))
             .or_else(|| i64_pair().map(|(a, b)| Value::VNum(NumVal::I64(a % b)))),
@@ -42,7 +56,8 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
         } => {
             let equal = u64_pair()
                 .map(|(a, b)| a == b)
-                .or_else(|| i64_pair().map(|(a, b)| a == b))?;
+                .or_else(|| i64_pair().map(|(a, b)| a == b))
+                .or_else(|| f64_pair().map(|(a, b)| a == b))?;
             let tag = if equal { true_con } else { false_con };
             Some(Value::VConstruct {
                 tag,

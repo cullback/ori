@@ -44,7 +44,7 @@ pub struct TagDecl<'src> {
     pub fields: Vec<TypeExpr<'src>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -66,6 +66,7 @@ impl<'src> Expr<'src> {
 #[allow(dead_code)]
 pub enum ExprKind<'src> {
     IntLit(i64),
+    FloatLit(f64),
     Name(&'src str),
     BinOp {
         op: BinOp,
