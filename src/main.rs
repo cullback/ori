@@ -11,6 +11,7 @@ mod stdlib;
 mod test_frontend;
 #[cfg(test)]
 mod test_programs;
+mod types;
 
 use std::collections::HashMap;
 use std::io::Read as _;
