@@ -27,7 +27,10 @@ pub fn lower(module: &Module<'_>) -> (Program, VarId) {
     // Pass 1: register user type declarations and function names
     ctx.register_decls(&module.decls);
 
-    // Pass 1.5: scan all bodies to collect lambdas for defunctionalization
+    // Compute reachable functions from main (skip dead code)
+    ctx.compute_reachable(&module.decls);
+
+    // Pass 1.5: scan reachable bodies to collect lambdas for defunctionalization
     ctx.collect_lambdas(&module.decls);
     ctx.register_lambda_types();
 
@@ -44,6 +47,10 @@ pub fn lower(module: &Module<'_>) -> (Program, VarId) {
         if name == "main" {
             main_params = Some(params.clone());
             main_body = Some(body.clone());
+            continue;
+        }
+
+        if !ctx.reachable.contains(name) {
             continue;
         }
 
@@ -99,6 +106,9 @@ pub fn lower(module: &Module<'_>) -> (Program, VarId) {
             };
             let method_name = *method_name;
             let mangled = format!("{type_name}.{method_name}");
+            if !ctx.reachable.contains(&mangled) {
+                continue;
+            }
             let func_id = ctx.funcs[&mangled];
             let param_vars: Vec<VarId> = params
                 .iter()
@@ -194,6 +204,8 @@ struct LowerCtx<'src> {
     ho_vars: HashMap<String, usize>,
     /// Counter to match lambdas between collect and lower passes
     lambda_arg_counters: HashMap<(String, usize), usize>,
+    /// Functions reachable from main (dead code is not lowered).
+    reachable: HashSet<String>,
 }
 
 impl<'src> LowerCtx<'src> {
@@ -220,6 +232,7 @@ impl<'src> LowerCtx<'src> {
             ho_param_sets: HashMap::new(),
             ho_vars: HashMap::new(),
             lambda_arg_counters: HashMap::new(),
+            reachable: HashSet::new(),
         }
     }
 
@@ -283,6 +296,115 @@ impl<'src> LowerCtx<'src> {
         self.binops.insert(BinOp::Neq, neq);
     }
 
+    fn compute_reachable(&mut self, decls: &[Decl<'src>]) {
+        // Build function name → body index
+        let mut bodies: HashMap<String, &Expr<'src>> = HashMap::new();
+        for decl in decls {
+            match decl {
+                Decl::FuncDef { name, body, .. } => {
+                    bodies.insert((*name).to_owned(), body);
+                }
+                Decl::TypeAnno {
+                    name: type_name,
+                    methods,
+                    ..
+                } => {
+                    for m in methods {
+                        if let Decl::FuncDef {
+                            name: method_name,
+                            body,
+                            ..
+                        } = m
+                        {
+                            bodies.insert(format!("{type_name}.{method_name}"), body);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut worklist = vec!["main".to_owned()];
+        while let Some(name) = worklist.pop() {
+            if !self.reachable.insert(name.clone()) {
+                continue;
+            }
+            if let Some(body) = bodies.get(&name) {
+                Self::collect_refs(body, &mut worklist);
+            }
+        }
+    }
+
+    fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>) {
+        match &expr.kind {
+            ExprKind::Call { func, args } => {
+                refs.push((*func).to_owned());
+                for a in args {
+                    Self::collect_refs(a, refs);
+                }
+            }
+            ExprKind::QualifiedCall {
+                owner,
+                method,
+                args,
+            } => {
+                refs.push(format!("{owner}.{method}"));
+                for a in args {
+                    Self::collect_refs(a, refs);
+                }
+            }
+            ExprKind::Name(name) => {
+                refs.push((*name).to_owned());
+            }
+            ExprKind::BinOp { lhs, rhs, .. } => {
+                Self::collect_refs(lhs, refs);
+                Self::collect_refs(rhs, refs);
+            }
+            ExprKind::Block(stmts, result) => {
+                for stmt in stmts {
+                    match stmt {
+                        Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
+                            Self::collect_refs(val, refs);
+                        }
+                        Stmt::TypeHint { .. } => {}
+                    }
+                }
+                Self::collect_refs(result, refs);
+            }
+            ExprKind::If {
+                expr: e,
+                arms,
+                else_body,
+            } => {
+                Self::collect_refs(e, refs);
+                for arm in arms {
+                    Self::collect_refs(&arm.body, refs);
+                }
+                if let Some(eb) = else_body {
+                    Self::collect_refs(eb, refs);
+                }
+            }
+            ExprKind::Fold { expr: e, arms } => {
+                Self::collect_refs(e, refs);
+                for arm in arms {
+                    Self::collect_refs(&arm.body, refs);
+                }
+            }
+            ExprKind::Lambda { body, .. } => Self::collect_refs(body, refs),
+            ExprKind::Record { fields } => {
+                for (_, e) in fields {
+                    Self::collect_refs(e, refs);
+                }
+            }
+            ExprKind::FieldAccess { record, .. } => Self::collect_refs(record, refs),
+            ExprKind::Tuple(elems) => {
+                for e in elems {
+                    Self::collect_refs(e, refs);
+                }
+            }
+            ExprKind::IntLit(_) => {}
+        }
+    }
+
     fn register_tag_union(&mut self, type_name: &str, tags: &[ast::TagDecl<'src>]) {
         let mut con_defs = Vec::new();
         for tag in tags {
@@ -313,11 +435,27 @@ impl<'src> LowerCtx<'src> {
     fn collect_lambdas(&mut self, decls: &[Decl<'src>]) {
         for decl in decls {
             match decl {
-                Decl::FuncDef { body, .. } => self.scan_expr(body),
-                Decl::TypeAnno { methods, .. } => {
+                Decl::FuncDef { name, body, .. } => {
+                    if self.reachable.contains(*name) {
+                        self.scan_expr(body);
+                    }
+                }
+                Decl::TypeAnno {
+                    name: type_name,
+                    methods,
+                    ..
+                } => {
                     for method_decl in methods {
-                        if let Decl::FuncDef { body, .. } = method_decl {
-                            self.scan_expr(body);
+                        if let Decl::FuncDef {
+                            name: method_name,
+                            body,
+                            ..
+                        } = method_decl
+                        {
+                            let mangled = format!("{type_name}.{method_name}");
+                            if self.reachable.contains(&mangled) {
+                                self.scan_expr(body);
+                            }
                         }
                     }
                 }

@@ -1,0 +1,8 @@
+import List
+
+main : I64 -> I64
+main = |arg| (
+    xs = Cons(1, Cons(2, Cons(3, Cons(4, Cons(5, Nil)))))
+    doubled = List.map(xs, |x| x * 2)
+    List.sum(doubled)
+)

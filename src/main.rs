@@ -5,6 +5,8 @@ mod infer;
 mod ir;
 mod lower;
 mod parse;
+mod resolve;
+mod stdlib;
 #[cfg(test)]
 mod test_frontend;
 #[cfg(test)]
@@ -28,7 +30,8 @@ fn main() {
     // Compile (catch panics from parser/type checker and print cleanly)
     std::panic::set_hook(Box::new(|_| {}));
     let compile_result = std::panic::catch_unwind(|| {
-        let module = parse::parse(&source);
+        let parsed = parse::parse(&source);
+        let module = resolve::resolve_imports(parsed);
         infer::check(&source, &module);
         lower::lower(&module)
     });

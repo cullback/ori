@@ -6,7 +6,7 @@ List(a) : [Nil, Cons(a, List(a))].(
         : Nil then 0
         : Cons(hd, rest) then hd + rest
 
-    map : List(I64), (I64 -> I64) -> List(I64)
+    map : List(a), (a -> a) -> List(a)
     map = |xs, f| fold xs
         : Nil then Nil
         : Cons(hd, rest) then Cons(f(hd), rest)

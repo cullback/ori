@@ -4,7 +4,8 @@ use crate::ir::{NumVal, Value};
 
 /// Compile and run an Ori program with the given I64 input.
 fn run(source: &str, input: i64) -> Value {
-    let module = crate::parse::parse(source);
+    let parsed = crate::parse::parse(source);
+    let module = crate::resolve::resolve_imports(parsed);
     crate::infer::check(source, &module);
     let (program, input_var) = crate::lower::lower(&module);
     let mut env = HashMap::new();
@@ -876,4 +877,67 @@ main : I64 -> I64
 main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 
     assert_eq!(run_i64(source, 0), 6);
+}
+
+// ============================================================
+// Imports
+// ============================================================
+
+#[test]
+fn import_list_sum() {
+    let source = "\
+import List
+
+main : I64 -> I64
+main = |arg| List.sum(Cons(1, Cons(2, Cons(3, Nil))))";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn import_list_map() {
+    let source = "\
+import List
+
+main : I64 -> I64
+main = |arg| List.sum(List.map(Cons(1, Cons(2, Cons(3, Nil))), |x| x * 2))";
+
+    assert_eq!(run_i64(source, 0), 12);
+}
+
+#[test]
+fn import_list_length() {
+    let source = "\
+import List
+
+main : I64 -> I64
+main = |arg| List.length(Cons(1, Cons(2, Cons(3, Nil))))";
+
+    assert_eq!(run_i64(source, 0), 3);
+}
+
+#[test]
+fn import_list_walk() {
+    let source = "\
+import List
+
+main : I64 -> I64
+main = |arg| List.walk(Cons(1, Cons(2, Cons(3, Nil))), 0, |acc, x| acc + x)";
+
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn import_list_reverse() {
+    let source = "\
+import List
+
+main : I64 -> I64
+main = |arg| (
+    reversed = List.reverse(Cons(1, Cons(2, Cons(3, Nil))))
+    List.walk(reversed, 0, |acc, x| acc * 10 + x)
+)";
+
+    // reversed = [3, 2, 1], walk builds 321
+    assert_eq!(run_i64(source, 0), 321);
 }

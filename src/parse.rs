@@ -26,13 +26,19 @@ pub fn parse(source: &str) -> Module<'_> {
 }
 
 fn parse_module(pair: Pair<'_, Rule>) -> Module<'_> {
+    let mut imports = Vec::new();
     let mut decls = Vec::new();
     for inner in pair.into_inner() {
-        if inner.as_rule() == Rule::decl {
-            decls.push(parse_decl(inner));
+        match inner.as_rule() {
+            Rule::import_decl => {
+                let name = inner.into_inner().next().unwrap().as_str();
+                imports.push(name);
+            }
+            Rule::decl => decls.push(parse_decl(inner)),
+            _ => {}
         }
     }
-    Module { decls }
+    Module { imports, decls }
 }
 
 fn parse_decl(pair: Pair<'_, Rule>) -> Decl<'_> {

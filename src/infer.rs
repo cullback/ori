@@ -340,7 +340,7 @@ impl<'src> InferCtx<'src> {
     fn type_expr_to_type(
         &mut self,
         texpr: &TypeExpr<'src>,
-        tvar_env: &HashMap<String, TypeVar>,
+        tvar_env: &mut HashMap<String, TypeVar>,
     ) -> Type {
         match texpr {
             TypeExpr::Named(name) => {
@@ -349,6 +349,12 @@ impl<'src> InferCtx<'src> {
                     Type::Var(tv)
                 } else if let Some(scheme) = self.type_aliases.get(name).cloned() {
                     self.instantiate(&scheme)
+                } else if name.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    // Lowercase names are implicit type variables
+                    let tv = self.fresh();
+                    let Type::Var(tv_id) = tv else { unreachable!() };
+                    tvar_env.insert(name.to_owned(), tv_id);
+                    tv
                 } else {
                     Type::Con(name.to_owned())
                 }
@@ -399,7 +405,7 @@ impl<'src> InferCtx<'src> {
         tags: &[ast::TagDecl<'src>],
     ) {
         // Create type variables for each type parameter
-        let tvar_env: HashMap<String, TypeVar> = type_params
+        let mut tvar_env: HashMap<String, TypeVar> = type_params
             .iter()
             .map(|p| {
                 let tv = self.fresh();
@@ -427,7 +433,7 @@ impl<'src> InferCtx<'src> {
                 let field_types: Vec<Type> = tag
                     .fields
                     .iter()
-                    .map(|f| self.type_expr_to_type(f, &tvar_env))
+                    .map(|f| self.type_expr_to_type(f, &mut tvar_env))
                     .collect();
                 Type::Arrow(field_types, Box::new(return_type.clone()))
             };
@@ -508,7 +514,7 @@ impl<'src> InferCtx<'src> {
                             let val_ty = self.infer_expr(val);
                             // If there's a type hint for this binding, enforce it
                             if let Some(hint) = pending_hints.remove(name) {
-                                let hint_ty = self.type_expr_to_type(&hint, &HashMap::new());
+                                let hint_ty = self.type_expr_to_type(&hint, &mut HashMap::new());
                                 self.unify(&val_ty, &hint_ty);
                             }
                             let scheme = self.generalize(&val_ty);
@@ -914,7 +920,7 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                 let name = *name;
                 if name.starts_with(|c: char| c.is_ascii_uppercase()) {
                     // CamelCase: type alias (e.g. Point : { x: I64, y: I64 })
-                    let tvar_env: HashMap<String, TypeVar> = type_params
+                    let mut tvar_env: HashMap<String, TypeVar> = type_params
                         .iter()
                         .map(|p| {
                             let t = ctx.fresh();
@@ -923,7 +929,7 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                         })
                         .collect();
                     let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[*p]).collect();
-                    let alias_ty = ctx.type_expr_to_type(ty, &tvar_env);
+                    let alias_ty = ctx.type_expr_to_type(ty, &mut tvar_env);
                     ctx.type_aliases.insert(
                         name.to_owned(),
                         Scheme {
@@ -967,7 +973,7 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                 ctx.unify(&ret, &body_ty);
 
                 if let Some(anno) = ctx.type_annos.get(name).cloned() {
-                    let anno_ty = ctx.type_expr_to_type(&anno, &HashMap::new());
+                    let anno_ty = ctx.type_expr_to_type(&anno, &mut HashMap::new());
                     ctx.unify(&func_ty, &anno_ty);
                 }
 
@@ -1005,7 +1011,7 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                         ctx.unify(&ret, &body_ty);
 
                         if let Some(anno) = ctx.type_annos.get(&mangled).cloned() {
-                            let anno_ty = ctx.type_expr_to_type(&anno, &HashMap::new());
+                            let anno_ty = ctx.type_expr_to_type(&anno, &mut HashMap::new());
                             ctx.unify(&func_ty, &anno_ty);
                         }
 

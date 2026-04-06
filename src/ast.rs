@@ -1,5 +1,6 @@
 #[derive(Debug, Clone)]
 pub struct Module<'src> {
+    pub imports: Vec<&'src str>,
     pub decls: Vec<Decl<'src>>,
 }
 

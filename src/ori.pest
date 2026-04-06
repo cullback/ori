@@ -5,7 +5,9 @@ COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
 
 // ---- Module ----
 
-module = { SOI ~ decl* ~ EOI }
+module = { SOI ~ import_decl* ~ decl* ~ EOI }
+
+import_decl = { "import" ~ name }
 
 decl = { type_anno | assignment }
 
@@ -139,4 +141,4 @@ mul_op =  { "*" | "/" | "%" }
 
 name = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-keyword = { "if" | "then" | "else" | "fold" }
+keyword = { "if" | "then" | "else" | "fold" | "import" }
