@@ -14,9 +14,12 @@ pub enum Type {
     Con(String),
     App(String, Vec<Type>),
     Arrow(Vec<Type>, Box<Type>),
-    Record(Box<Type>),
-    RowEmpty,
-    RowExtend(String, Box<Type>, Box<Type>),
+    /// Record type with named fields and an optional rest (open row variable).
+    /// `rest: None` means a closed record; `rest: Some(Var(tv))` means open (row polymorphic).
+    Record {
+        fields: Vec<(String, Type)>,
+        rest: Option<Box<Type>>,
+    },
     Tuple(Vec<Type>),
 }
 
@@ -24,15 +27,18 @@ impl Type {
     /// Apply a function to each direct child type, preserving structure.
     pub fn map_children<F: FnMut(&Self) -> Self>(&self, f: &mut F) -> Self {
         match self {
-            Self::Var(_) | Self::Con(_) | Self::RowEmpty => self.clone(),
+            Self::Var(_) | Self::Con(_) => self.clone(),
             Self::App(name, args) => Self::App(name.clone(), args.iter().map(&mut *f).collect()),
             Self::Arrow(params, ret) => {
                 Self::Arrow(params.iter().map(&mut *f).collect(), Box::new(f(ret)))
             }
-            Self::Record(row) => Self::Record(Box::new(f(row))),
-            Self::RowExtend(label, field_ty, rest) => {
-                Self::RowExtend(label.clone(), Box::new(f(field_ty)), Box::new(f(rest)))
-            }
+            Self::Record { fields, rest } => Self::Record {
+                fields: fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), f(ty)))
+                    .collect(),
+                rest: rest.as_ref().map(|r| Box::new(f(r))),
+            },
             Self::Tuple(elems) => Self::Tuple(elems.iter().map(f).collect()),
         }
     }
@@ -105,100 +111,156 @@ impl TypeEngine {
 
     // ---- Unification ----
 
-    pub fn unify(&mut self, t1: &Type, t2: &Type) {
+    pub fn unify(&mut self, t1: &Type, t2: &Type) -> Result<(), String> {
         let lhs = self.resolve(t1);
         let rhs = self.resolve(t2);
 
         match (&lhs, &rhs) {
-            (Type::Var(a), Type::Var(b)) if a == b => {}
+            (Type::Var(a), Type::Var(b)) if a == b => Ok(()),
             (Type::Var(a), _) => {
-                assert!(
-                    !self.occurs_in(*a, &rhs),
-                    "infinite type: {a:?} occurs in {rhs:?}"
-                );
+                if self.occurs_in(*a, &rhs) {
+                    return Err(format!("infinite type: {a:?} occurs in {rhs:?}"));
+                }
                 self.subst.insert(*a, rhs);
+                Ok(())
             }
             (_, Type::Var(_)) => self.unify(&rhs, &lhs),
             (Type::Con(a), Type::Con(b)) => {
-                assert!(a == b, "type error: cannot unify {a} with {b}");
+                if a != b {
+                    return Err(format!("cannot unify {a} with {b}"));
+                }
+                Ok(())
             }
             (Type::App(n1, a1), Type::App(n2, a2)) => {
-                assert!(
-                    n1 == n2 && a1.len() == a2.len(),
-                    "type error: cannot unify {n1} with {n2}"
-                );
-                for (x, y) in a1.iter().zip(a2.iter()) {
-                    self.unify(x, y);
+                if n1 != n2 || a1.len() != a2.len() {
+                    return Err(format!("cannot unify {n1} with {n2}"));
                 }
+                for (x, y) in a1.iter().zip(a2.iter()) {
+                    self.unify(x, y)?;
+                }
+                Ok(())
             }
             (Type::Arrow(p1, r1), Type::Arrow(p2, r2)) => {
-                assert!(
-                    p1.len() == p2.len(),
-                    "type error: function arity mismatch: {} vs {}",
-                    p1.len(),
-                    p2.len()
-                );
-                for (x, y) in p1.iter().zip(p2.iter()) {
-                    self.unify(x, y);
+                if p1.len() != p2.len() {
+                    return Err(format!(
+                        "function arity mismatch: {} vs {}",
+                        p1.len(),
+                        p2.len()
+                    ));
                 }
-                self.unify(r1, r2);
+                for (x, y) in p1.iter().zip(p2.iter()) {
+                    self.unify(x, y)?;
+                }
+                self.unify(r1, r2)
             }
             (Type::Tuple(a), Type::Tuple(b)) => {
-                assert!(
-                    a.len() == b.len(),
-                    "type error: tuple length mismatch: {} vs {}",
-                    a.len(),
-                    b.len()
-                );
-                for (x, y) in a.iter().zip(b.iter()) {
-                    self.unify(x, y);
+                if a.len() != b.len() {
+                    return Err(format!("tuple length mismatch: {} vs {}", a.len(), b.len()));
                 }
+                for (x, y) in a.iter().zip(b.iter()) {
+                    self.unify(x, y)?;
+                }
+                Ok(())
             }
-            (Type::Record(r1), Type::Record(r2)) => self.unify(r1, r2),
-            (Type::RowEmpty, Type::RowEmpty) => {}
-            (Type::RowExtend(label, ty, rest), _) => {
-                let (other_ty, other_rest) = self.rewrite_row(&rhs, label);
-                self.unify(ty, &other_ty);
-                self.unify(rest, &other_rest);
-            }
-            (_, Type::RowExtend(..)) => self.unify(&rhs, &lhs),
-            _ => {
-                panic!(
-                    "type error: cannot unify {} with {}",
-                    self.display_type(&lhs),
-                    self.display_type(&rhs)
-                );
-            }
+            (
+                Type::Record {
+                    fields: f1,
+                    rest: r1,
+                },
+                Type::Record {
+                    fields: f2,
+                    rest: r2,
+                },
+            ) => self.unify_records(f1, r1.as_deref(), f2, r2.as_deref()),
+            _ => Err(format!(
+                "cannot unify {} with {}",
+                self.display_type(&lhs),
+                self.display_type(&rhs)
+            )),
         }
     }
 
-    // ---- Row rewriting ----
+    // ---- Record unification ----
 
-    pub fn rewrite_row(&mut self, row: &Type, label: &str) -> (Type, Type) {
-        let resolved = self.resolve(row);
-        match resolved {
-            Type::RowEmpty => panic!("type error: record has no field '{label}'"),
-            Type::RowExtend(l, ty, rest) if l == label => (*ty, *rest),
-            Type::RowExtend(l, ty, rest) => {
-                let (field_ty, new_rest) = self.rewrite_row(&rest, label);
-                (field_ty, Type::RowExtend(l, ty, Box::new(new_rest)))
+    /// Unify two record types. Matches fields by name, and handles open/closed rows.
+    fn unify_records(
+        &mut self,
+        f1: &[(String, Type)],
+        r1: Option<&Type>,
+        f2: &[(String, Type)],
+        r2: Option<&Type>,
+    ) -> Result<(), String> {
+        // Partition fields into: common (in both), only-in-lhs, only-in-rhs
+        let names1: HashSet<&str> = f1.iter().map(|(n, _)| n.as_str()).collect();
+        let names2: HashSet<&str> = f2.iter().map(|(n, _)| n.as_str()).collect();
+
+        // Unify common fields
+        for (name, ty1) in f1 {
+            if let Some((_, ty2)) = f2.iter().find(|(n, _)| n == name) {
+                self.unify(ty1, ty2)?;
             }
-            Type::Var(tv) => {
-                let field_ty = self.fresh();
+        }
+
+        let only_lhs: Vec<(String, Type)> = f1
+            .iter()
+            .filter(|(n, _)| !names2.contains(n.as_str()))
+            .cloned()
+            .collect();
+        let only_rhs: Vec<(String, Type)> = f2
+            .iter()
+            .filter(|(n, _)| !names1.contains(n.as_str()))
+            .cloned()
+            .collect();
+
+        match (r1, r2) {
+            // Both closed: all fields must match exactly
+            (None, None) => {
+                if !only_lhs.is_empty() || !only_rhs.is_empty() {
+                    let extra: Vec<&str> = only_lhs
+                        .iter()
+                        .chain(only_rhs.iter())
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    return Err(format!("record field mismatch: extra fields {extra:?}"));
+                }
+                Ok(())
+            }
+            // LHS is open: extra RHS fields + common → constrain the LHS rest var
+            (Some(rest_var), None) => {
+                if !only_lhs.is_empty() {
+                    return Err(format!("record has no field '{}'", only_lhs[0].0));
+                }
+                let tail = Type::Record {
+                    fields: only_rhs,
+                    rest: None,
+                };
+                self.unify(rest_var, &tail)
+            }
+            // RHS is open: symmetric case
+            (None, Some(rest_var)) => {
+                if !only_rhs.is_empty() {
+                    return Err(format!("record has no field '{}'", only_rhs[0].0));
+                }
+                let tail = Type::Record {
+                    fields: only_lhs,
+                    rest: None,
+                };
+                self.unify(rest_var, &tail)
+            }
+            // Both open: unify rest vars with records of the other's extras
+            (Some(rv1), Some(rv2)) => {
                 let new_rest = self.fresh();
-                let new_row = Type::RowExtend(
-                    label.to_owned(),
-                    Box::new(field_ty.clone()),
-                    Box::new(new_rest.clone()),
-                );
-                assert!(!self.occurs_in(tv, &new_row), "infinite row type");
-                self.subst.insert(tv, new_row);
-                (field_ty, new_rest)
+                let tail1 = Type::Record {
+                    fields: only_rhs,
+                    rest: Some(Box::new(new_rest.clone())),
+                };
+                let tail2 = Type::Record {
+                    fields: only_lhs,
+                    rest: Some(Box::new(new_rest)),
+                };
+                self.unify(rv1, &tail1)?;
+                self.unify(rv2, &tail2)
             }
-            _ => panic!(
-                "type error: expected row, got {}",
-                self.display_type(&resolved)
-            ),
         }
     }
 
@@ -286,31 +348,15 @@ impl TypeEngine {
                 let param_strs: Vec<String> = params.iter().map(|p| self.display_type(p)).collect();
                 format!("{} -> {}", param_strs.join(", "), self.display_type(ret))
             }
-            Type::Record(row) => {
-                let mut field_strs = Vec::new();
-                let mut current = self.resolve(row);
-                loop {
-                    match current {
-                        Type::RowExtend(label, field_ty, rest) => {
-                            field_strs.push(format!("{label}: {}", self.display_type(&field_ty)));
-                            current = self.resolve(&rest);
-                        }
-                        Type::RowEmpty => break,
-                        _ => {
-                            field_strs.push("..".to_owned());
-                            break;
-                        }
-                    }
+            Type::Record { fields, rest } => {
+                let mut field_strs: Vec<String> = fields
+                    .iter()
+                    .map(|(label, field_ty)| format!("{label}: {}", self.display_type(field_ty)))
+                    .collect();
+                if rest.is_some() {
+                    field_strs.push("..".to_owned());
                 }
                 format!("{{ {} }}", field_strs.join(", "))
-            }
-            Type::RowEmpty => "{}".to_owned(),
-            Type::RowExtend(label, field_ty, rest) => {
-                format!(
-                    "{{ {label}: {} | {} }}",
-                    self.display_type(field_ty),
-                    self.display_type(rest)
-                )
             }
             Type::Tuple(elems) => {
                 let elem_strs: Vec<String> = elems.iter().map(|e| self.display_type(e)).collect();

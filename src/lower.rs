@@ -8,6 +8,11 @@ use crate::ir::{
 use crate::parse;
 use crate::stdlib;
 
+/// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
+fn method_key(type_name: &str, method: &str) -> String {
+    format!("{type_name}.{method}")
+}
+
 /// Lower a parsed AST module into a Core IR program.
 ///
 /// Returns the program and the `VarId` of `main`'s input parameter
@@ -20,37 +25,12 @@ pub fn lower(
 ) -> (Program, VarId) {
     let mut ctx = LowerCtx::new(lit_types.clone());
 
-    // Parse and register Bool from stdlib
-    let bool_stdlib = parse::parse(stdlib::get("Bool").unwrap_or(""));
-    ctx.register_decls(&bool_stdlib.decls);
-
-    // Now that Bool is known, register comparison builtins
+    // Register stdlib modules
+    let bool_stdlib = ctx.register_stdlib_module("Bool");
     ctx.register_comparison_builtins();
-
-    // Parse List stdlib and extract Ori-implemented methods
-    let list_stdlib = parse::parse(stdlib::get("List").unwrap_or(""));
-    let list_methods: Vec<&Decl<'static>> = list_stdlib
-        .decls
-        .iter()
-        .filter_map(|d| {
-            if let Decl::TypeAnno { methods, .. } = d {
-                Some(methods.iter())
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .collect();
-
-    // Register Ori-implemented List methods under List.<name>
-    for method in &list_methods {
-        if let Decl::FuncDef { name, params, .. } = method {
-            let mangled = format!("List.{name}");
-            let func_id = ctx.builder.func();
-            ctx.funcs.insert(mangled.clone(), func_id);
-            ctx.func_arities.insert(mangled, params.len());
-        }
-    }
+    let list_stdlib = ctx.register_stdlib_module("List");
+    let bool_methods = LowerCtx::extract_methods(&bool_stdlib);
+    let list_methods = LowerCtx::extract_methods(&list_stdlib);
 
     // Pass 1: register user type declarations and function names
     ctx.register_decls(&module.decls);
@@ -66,7 +46,7 @@ pub fn lower(
                     } = method_decl
                     {
                         let method_name = *method_name;
-                        let internal = format!("{name}.{method_name}");
+                        let internal = method_key(name, method_name);
                         let qualified = format!("{mod_name}.{internal}");
                         if let Some(&func_id) = ctx.funcs.get(&internal) {
                             ctx.funcs.insert(qualified.clone(), func_id);
@@ -80,34 +60,20 @@ pub fn lower(
         }
     }
 
-    // Extract Bool stdlib methods
-    let bool_methods: Vec<&Decl<'static>> = bool_stdlib
-        .decls
-        .iter()
-        .filter_map(|d| {
-            if let Decl::TypeAnno { methods, .. } = d {
-                Some(methods.iter())
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .collect();
-
     // Compute reachable functions from main (skip dead code)
-    let mut all_stdlib_methods: Vec<&Decl<'static>> = bool_methods;
+    let mut all_stdlib_methods = bool_methods;
     all_stdlib_methods.extend(&list_methods);
-    ctx.compute_reachable_with_list_stdlib(&module.decls, &all_stdlib_methods);
+    ctx.compute_reachable_with_stdlib(&module.decls, &all_stdlib_methods);
 
     // Pass 1.5: scan reachable bodies to collect lambdas for defunctionalization
     ctx.collect_lambdas(&module.decls);
-    // Also scan list stdlib method bodies for lambdas
-    for method in &list_methods {
+    // Also scan stdlib method bodies for lambdas
+    for &(type_name, method) in &all_stdlib_methods {
         if let Decl::FuncDef {
             name, params, body, ..
         } = method
         {
-            let mangled = format!("List.{name}");
+            let mangled = method_key(type_name, name);
             if ctx.reachable.contains(&mangled) {
                 // Mark higher-order params so captured closures are tracked
                 for (i, p) in params.iter().enumerate() {
@@ -213,7 +179,7 @@ pub fn lower(
                 continue;
             };
             let method_name = *method_name;
-            let mangled = format!("{type_name}.{method_name}");
+            let mangled = method_key(type_name, method_name);
             if !ctx.reachable.contains(&mangled) {
                 continue;
             }
@@ -247,86 +213,8 @@ pub fn lower(
         }
     }
 
-    // Lower Bool stdlib method bodies
-    for decl in &bool_stdlib.decls {
-        if let Decl::TypeAnno {
-            name: type_name,
-            methods,
-            ..
-        } = decl
-        {
-            let type_name = *type_name;
-            for method_decl in methods {
-                let Decl::FuncDef {
-                    name: method_name,
-                    params,
-                    body,
-                } = method_decl
-                else {
-                    continue;
-                };
-                let method_name = *method_name;
-                let mangled = format!("{type_name}.{method_name}");
-                if !ctx.reachable.contains(&mangled) {
-                    continue;
-                }
-                let func_id = ctx.funcs[&mangled];
-                let param_vars: Vec<VarId> = params
-                    .iter()
-                    .map(|p| {
-                        let v = ctx.builder.var();
-                        ctx.vars.insert((*p).to_owned(), v);
-                        v
-                    })
-                    .collect();
-                let body_core = ctx.lower_expr(body);
-                for p in params {
-                    ctx.vars.remove(*p);
-                }
-                ctx.builder.add_func(FuncDef {
-                    name: func_id,
-                    params: param_vars,
-                    body: body_core,
-                });
-            }
-        }
-    }
-
-    // Lower List stdlib method bodies
-    for method in &list_methods {
-        if let Decl::FuncDef { name, params, body } = method {
-            let name = *name;
-            let mangled = format!("List.{name}");
-            if !ctx.reachable.contains(&mangled) {
-                continue;
-            }
-            let func_id = ctx.funcs[&mangled];
-            let param_vars: Vec<VarId> = params
-                .iter()
-                .map(|p| {
-                    let v = ctx.builder.var();
-                    ctx.vars.insert((*p).to_owned(), v);
-                    v
-                })
-                .collect();
-            for (i, p) in params.iter().enumerate() {
-                let key = (mangled.clone(), i);
-                if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
-                    ctx.ho_vars.insert((*p).to_owned(), ls_idx);
-                }
-            }
-            let body_core = ctx.lower_expr(body);
-            for p in params {
-                ctx.vars.remove(*p);
-                ctx.ho_vars.remove(*p);
-            }
-            ctx.builder.add_func(FuncDef {
-                name: func_id,
-                params: param_vars,
-                body: body_core,
-            });
-        }
-    }
+    // Lower stdlib method bodies
+    ctx.lower_stdlib_methods(&all_stdlib_methods);
 
     // Lower main
     let params = main_params.expect("no 'main' function defined");
@@ -448,6 +336,31 @@ impl<'src> LowerCtx<'src> {
         }
     }
 
+    /// Parse a stdlib module and register its types, constructors, and method signatures.
+    fn register_stdlib_module(&mut self, module_name: &str) -> Module<'static> {
+        let stdlib = parse::parse(stdlib::get(module_name).unwrap_or(""));
+        self.register_decls(&stdlib.decls);
+        stdlib
+    }
+
+    /// Extract `(type_name, method_decl)` pairs from a parsed stdlib module.
+    fn extract_methods<'a>(stdlib: &'a Module<'static>) -> Vec<(&'static str, &'a Decl<'static>)> {
+        let mut methods = Vec::new();
+        for decl in &stdlib.decls {
+            if let Decl::TypeAnno {
+                name,
+                methods: type_methods,
+                ..
+            } = decl
+            {
+                for m in type_methods {
+                    methods.push((*name, m));
+                }
+            }
+        }
+        methods
+    }
+
     // ---- Pass 1: Register declarations ----
 
     fn register_decls(&mut self, decls: &[Decl<'src>]) {
@@ -469,20 +382,76 @@ impl<'src> LowerCtx<'src> {
                         } = method_decl
                         {
                             let method_name = *method_name;
-                            let mangled = format!("{name}.{method_name}");
+                            let mangled = method_key(name, method_name);
                             let func_id = self.builder.func();
                             self.funcs.insert(mangled.clone(), func_id);
                             self.func_arities.insert(mangled, params.len());
                         }
                     }
                 }
-                Decl::TypeAnno { .. } => {}
+                Decl::TypeAnno { name, methods, .. } => {
+                    // Non-TagUnion type with methods (e.g. List)
+                    let name = *name;
+                    for method_decl in methods {
+                        if let Decl::FuncDef {
+                            name: method_name,
+                            params,
+                            ..
+                        } = method_decl
+                        {
+                            let method_name = *method_name;
+                            let mangled = method_key(name, method_name);
+                            if !self.funcs.contains_key(&mangled) {
+                                let func_id = self.builder.func();
+                                self.funcs.insert(mangled.clone(), func_id);
+                                self.func_arities.insert(mangled, params.len());
+                            }
+                        }
+                    }
+                }
                 Decl::FuncDef { name, params, .. } => {
                     let name = *name;
                     let func_id = self.builder.func();
                     self.funcs.insert(name.to_owned(), func_id);
                     self.func_arities.insert(name.to_owned(), params.len());
                 }
+            }
+        }
+    }
+
+    /// Lower the bodies of stdlib methods that are reachable.
+    fn lower_stdlib_methods(&mut self, methods: &[(&str, &Decl<'src>)]) {
+        for &(type_name, method) in methods {
+            if let Decl::FuncDef { name, params, body } = method {
+                let mangled = method_key(type_name, name);
+                if !self.reachable.contains(&mangled) {
+                    continue;
+                }
+                let func_id = self.funcs[&mangled];
+                let param_vars: Vec<VarId> = params
+                    .iter()
+                    .map(|p| {
+                        let v = self.builder.var();
+                        self.vars.insert((*p).to_owned(), v);
+                        v
+                    })
+                    .collect();
+                for (i, p) in params.iter().enumerate() {
+                    let key = (mangled.clone(), i);
+                    if let Some(&ls_idx) = self.ho_param_sets.get(&key) {
+                        self.ho_vars.insert((*p).to_owned(), ls_idx);
+                    }
+                }
+                let body_core = self.lower_expr(body);
+                for p in params {
+                    self.vars.remove(*p);
+                    self.ho_vars.remove(*p);
+                }
+                self.builder.add_func(FuncDef {
+                    name: func_id,
+                    params: param_vars,
+                    body: body_core,
+                });
             }
         }
     }
@@ -508,17 +477,17 @@ impl<'src> LowerCtx<'src> {
         self.binops.insert(BinOp::Neq, neq);
     }
 
-    fn compute_reachable_with_list_stdlib(
+    fn compute_reachable_with_stdlib(
         &mut self,
         decls: &[Decl<'src>],
-        list_methods: &[&Decl<'static>],
+        stdlib_methods: &[(&str, &Decl<'static>)],
     ) {
         // Build function name → body index
         let mut bodies: HashMap<String, &Expr<'_>> = HashMap::new();
-        // Add list stdlib method bodies under List.<name>
-        for method in list_methods {
+        // Add stdlib method bodies under Type.method
+        for &(type_name, method) in stdlib_methods {
             if let Decl::FuncDef { name, body, .. } = method {
-                bodies.insert(format!("List.{name}"), body);
+                bodies.insert(method_key(type_name, name), body);
             }
         }
         for decl in decls {
@@ -538,7 +507,7 @@ impl<'src> LowerCtx<'src> {
                             ..
                         } = m
                         {
-                            bodies.insert(format!("{type_name}.{method_name}"), body);
+                            bodies.insert(method_key(type_name, method_name), body);
                         }
                     }
                 }
@@ -687,7 +656,7 @@ impl<'src> LowerCtx<'src> {
                             ..
                         } = method_decl
                         {
-                            let mangled = format!("{type_name}.{method_name}");
+                            let mangled = method_key(type_name, method_name);
                             if self.reachable.contains(&mangled) {
                                 self.scan_expr(body);
                             }
@@ -891,7 +860,7 @@ impl<'src> LowerCtx<'src> {
                 if !bound.contains(func)
                     && !self.constructors.contains_key(*func)
                     && !self.funcs.contains_key(*func)
-                    && !self.list_builtins.contains_key(&format!("List.{func}"))
+                    && !self.list_builtins.contains_key(&method_key("List", func))
                     && !seen.contains(func)
                 {
                     seen.insert(func);

@@ -3,6 +3,11 @@ use std::collections::HashMap;
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr};
 use crate::types::{Scheme, Type, TypeEngine, TypeVar};
 
+/// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
+fn method_key(type_name: &str, method: &str) -> String {
+    format!("{type_name}.{method}")
+}
+
 /// Resolved numeric type for a literal, used to communicate from inference to lowering.
 #[derive(Debug, Clone, Copy)]
 pub enum NumType {
@@ -26,8 +31,6 @@ struct InferCtx<'src> {
     type_annos: HashMap<String, TypeExpr<'src>>,
     /// Known type names (I64, Bool, List, user-defined types).
     known_types: std::collections::HashSet<String>,
-    /// Current expression span for error reporting in unify.
-    current_span: Span,
     /// Track integer literal type vars for defaulting and side table.
     int_literal_vars: Vec<(TypeVar, Span)>,
     /// Track float literal type vars for defaulting and side table.
@@ -51,7 +54,6 @@ impl<'src> InferCtx<'src> {
                 "F64".to_owned(),
                 "List".to_owned(),
             ]),
-            current_span: Span::default(),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
         }
@@ -84,6 +86,12 @@ impl<'src> InferCtx<'src> {
         panic!(
             "\n --> {line}:{col}\n    | \n{line:>3} | {src_line}\n    | {pad}{carets}\n    | type error: {msg}"
         );
+    }
+
+    fn unify_at(&mut self, t1: &Type, t2: &Type, span: Span) {
+        if let Err(msg) = self.engine.unify(t1, t2) {
+            self.type_error(span, &msg);
+        }
     }
 
     // ---- Convert surface TypeExpr to inference Type ----
@@ -136,12 +144,17 @@ impl<'src> InferCtx<'src> {
                 self.engine.fresh()
             }
             TypeExpr::Record(fields) => {
-                let mut row = Type::RowEmpty;
-                for (name, field_texpr) in fields.iter().rev() {
-                    let field_ty = self.type_expr_to_type(field_texpr, tvar_env);
-                    row = Type::RowExtend((*name).to_owned(), Box::new(field_ty), Box::new(row));
+                let type_fields: Vec<(String, Type)> = fields
+                    .iter()
+                    .map(|(name, field_texpr)| {
+                        let field_ty = self.type_expr_to_type(field_texpr, tvar_env);
+                        ((*name).to_owned(), field_ty)
+                    })
+                    .collect();
+                Type::Record {
+                    fields: type_fields,
+                    rest: None,
                 }
-                Type::Record(Box::new(row))
             }
             TypeExpr::Tuple(elems) => {
                 let elem_types: Vec<Type> = elems
@@ -205,72 +218,103 @@ impl<'src> InferCtx<'src> {
         }
     }
 
-    // ---- Built-in List type ----
+    // ---- Stdlib module registration ----
 
-    #[expect(clippy::redundant_clone, reason = "each block is independent")]
-    fn register_list_builtins(&mut self) {
-        // List.len : List(a) -> I64
-        let a = self.engine.fresh();
-        let Type::Var(a_var) = a else { unreachable!() };
-        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
-        self.env.insert(
-            "List.len".to_owned(),
-            Scheme {
-                vars: vec![a_var],
-                ty: Type::Arrow(vec![list_a], Box::new(Type::Con("I64".to_owned()))),
-            },
-        );
+    /// Parse and register a stdlib module: types, constructors, method signatures, and bodies.
+    fn register_stdlib_module(&mut self, module_name: &str) {
+        let src = crate::stdlib::get(module_name).unwrap_or("");
+        let stdlib = crate::parse::parse(src);
 
-        // List.get : List(a), I64 -> a
-        let a = self.engine.fresh();
-        let Type::Var(a_var) = a else { unreachable!() };
-        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
-        self.env.insert(
-            "List.get".to_owned(),
-            Scheme {
-                vars: vec![a_var],
-                ty: Type::Arrow(vec![list_a, Type::Con("I64".to_owned())], Box::new(a)),
-            },
-        );
+        for decl in &stdlib.decls {
+            match decl {
+                Decl::TypeAnno {
+                    name,
+                    type_params,
+                    ty: TypeExpr::TagUnion(tags),
+                    methods,
+                    ..
+                } => {
+                    let name = *name;
+                    self.register_type_decl(name, type_params, tags);
+                    self.register_methods(name, methods);
+                    self.infer_method_bodies(name, methods);
+                }
+                Decl::TypeAnno { name, methods, .. } => {
+                    let name = *name;
+                    self.register_methods(name, methods);
+                    self.infer_method_bodies(name, methods);
+                }
+                Decl::FuncDef { name, params, .. } => {
+                    let name = *name;
+                    let param_types: Vec<Type> =
+                        params.iter().map(|_| self.engine.fresh()).collect();
+                    let ret = self.engine.fresh();
+                    let func_ty = Type::Arrow(param_types, Box::new(ret));
+                    self.env.insert(name.to_owned(), Scheme::mono(func_ty));
+                }
+            }
+        }
 
-        // List.append : List(a), a -> List(a)
-        let a = self.engine.fresh();
-        let Type::Var(a_var) = a else { unreachable!() };
-        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
-        self.env.insert(
-            "List.append".to_owned(),
-            Scheme {
-                vars: vec![a_var],
-                ty: Type::Arrow(vec![list_a.clone(), a], Box::new(list_a)),
-            },
-        );
+        // Infer free function bodies
+        for decl in &stdlib.decls {
+            if let Decl::FuncDef { name, params, body } = decl {
+                self.infer_func_body(name, params, body);
+            }
+        }
+    }
 
-        // List.reverse : List(a) -> List(a)
-        let a = self.engine.fresh();
-        let Type::Var(a_var) = a else { unreachable!() };
-        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
-        self.env.insert(
-            "List.reverse".to_owned(),
-            Scheme {
-                vars: vec![a_var],
-                ty: Type::Arrow(vec![list_a.clone()], Box::new(list_a)),
-            },
-        );
+    /// Register method signatures and type annotations for methods on a type.
+    fn register_methods(&mut self, type_name: &str, methods: &[Decl<'src>]) {
+        for method in methods {
+            match method {
+                Decl::FuncDef {
+                    name: method_name,
+                    params,
+                    ..
+                } => {
+                    let method_name = *method_name;
+                    let mangled = method_key(type_name, method_name);
+                    let param_types: Vec<Type> =
+                        params.iter().map(|_| self.engine.fresh()).collect();
+                    let ret = self.engine.fresh();
+                    let func_ty = Type::Arrow(param_types, Box::new(ret));
+                    self.env.insert(mangled, Scheme::mono(func_ty));
+                }
+                Decl::TypeAnno {
+                    name: method_name,
+                    ty,
+                    ..
+                } => {
+                    let method_name = *method_name;
+                    let mangled = method_key(type_name, method_name);
+                    // Body-less annotation: convert to a proper scheme for builtins
+                    let mut tvar_env = HashMap::new();
+                    let anno_ty = self.type_expr_to_type(ty, &mut tvar_env);
+                    let tvars: Vec<crate::types::TypeVar> = tvar_env.into_values().collect();
+                    let scheme = Scheme {
+                        vars: tvars,
+                        ty: anno_ty,
+                    };
+                    self.env.insert(mangled.clone(), scheme);
+                    self.type_annos.insert(mangled, ty.clone());
+                }
+            }
+        }
+    }
 
-        // List.walk : List(a), b, (b, a -> b) -> b
-        let a = self.engine.fresh();
-        let b = self.engine.fresh();
-        let Type::Var(a_var) = a else { unreachable!() };
-        let Type::Var(b_var) = b else { unreachable!() };
-        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
-        let step_fn = Type::Arrow(vec![b.clone(), a], Box::new(b.clone()));
-        self.env.insert(
-            "List.walk".to_owned(),
-            Scheme {
-                vars: vec![a_var, b_var],
-                ty: Type::Arrow(vec![list_a, b.clone(), step_fn], Box::new(b)),
-            },
-        );
+    /// Infer bodies of Ori-implemented methods on a type.
+    fn infer_method_bodies(&mut self, type_name: &str, methods: &[Decl<'src>]) {
+        for method in methods {
+            if let Decl::FuncDef {
+                name: method_name,
+                params,
+                body,
+            } = method
+            {
+                let mangled = method_key(type_name, method_name);
+                self.infer_func_body(&mangled, params, body);
+            }
+        }
     }
 
     // ---- Expression inference ----
@@ -280,7 +324,6 @@ impl<'src> InferCtx<'src> {
         reason = "expression inference handles all forms"
     )]
     fn infer_expr(&mut self, expr: &Expr<'src>) -> Type {
-        self.current_span = expr.span;
         match &expr.kind {
             ExprKind::IntLit(_) => {
                 let ty = self.engine.fresh();
@@ -312,11 +355,11 @@ impl<'src> InferCtx<'src> {
                 let rt = self.infer_expr(rhs);
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                        self.engine.unify(&lt, &rt);
+                        self.unify_at(&lt, &rt, expr.span);
                         lt
                     }
                     BinOp::Eq | BinOp::Neq => {
-                        self.engine.unify(&lt, &rt);
+                        self.unify_at(&lt, &rt, expr.span);
                         Type::Con("Bool".to_owned())
                     }
                 }
@@ -324,12 +367,12 @@ impl<'src> InferCtx<'src> {
 
             ExprKind::Call { func, args } => {
                 let func = *func;
-                self.infer_call(func, args)
+                self.infer_call(func, args, expr.span)
             }
 
             ExprKind::QualifiedCall { segments, args } => {
                 let mangled = segments.join(".");
-                self.infer_call(&mangled, args)
+                self.infer_call(&mangled, args, expr.span)
             }
 
             ExprKind::Block(stmts, result) => {
@@ -347,14 +390,14 @@ impl<'src> InferCtx<'src> {
                             // If there's a type hint for this binding, enforce it
                             if let Some(hint) = pending_hints.remove(name) {
                                 let hint_ty = self.type_expr_to_type(&hint, &mut HashMap::new());
-                                self.engine.unify(&val_ty, &hint_ty);
+                                self.unify_at(&val_ty, &hint_ty, val.span);
                             }
                             let scheme = self.engine.generalize(&val_ty, &self.env);
                             self.env.insert(name.to_owned(), scheme);
                         }
                         Stmt::Destructure { pattern, val } => {
                             let val_ty = self.infer_expr(val);
-                            let bindings = self.infer_pattern(pattern, &val_ty);
+                            let bindings = self.infer_pattern(pattern, &val_ty, val.span, None);
                             for (name, ty) in bindings {
                                 let scheme = self.engine.generalize(&ty, &self.env);
                                 self.env.insert(name, scheme);
@@ -375,13 +418,13 @@ impl<'src> InferCtx<'src> {
                 let scrutinee_ty = self.infer_expr(scrutinee);
                 let result_ty = self.engine.fresh();
                 for arm in arms {
-                    let bindings = self.infer_pattern(&arm.pattern, &scrutinee_ty);
+                    let bindings = self.infer_pattern(&arm.pattern, &scrutinee_ty, expr.span, None);
                     let saved_env = self.env.clone();
                     for (name, ty) in bindings {
                         self.env.insert(name, Scheme::mono(ty));
                     }
                     let body_ty = self.infer_expr(&arm.body);
-                    self.engine.unify(&result_ty, &body_ty);
+                    self.unify_at(&result_ty, &body_ty, arm.body.span);
                     self.env = saved_env;
                 }
                 result_ty
@@ -395,25 +438,35 @@ impl<'src> InferCtx<'src> {
                 let result_ty = self.engine.fresh();
                 for arm in arms {
                     // In fold, recursive fields bind to the result type, not the scrutinee type
-                    let bindings = self.infer_fold_pattern(&arm.pattern, &scrutinee_ty, &result_ty);
+                    let bindings = self.infer_pattern(
+                        &arm.pattern,
+                        &scrutinee_ty,
+                        expr.span,
+                        Some(&result_ty),
+                    );
                     let saved_env = self.env.clone();
                     for (name, ty) in bindings {
                         self.env.insert(name, Scheme::mono(ty));
                     }
                     let body_ty = self.infer_expr(&arm.body);
-                    self.engine.unify(&result_ty, &body_ty);
+                    self.unify_at(&result_ty, &body_ty, arm.body.span);
                     self.env = saved_env;
                 }
                 result_ty
             }
 
             ExprKind::Record { fields } => {
-                let mut row = Type::RowEmpty;
-                for (name, field_expr) in fields.iter().rev() {
-                    let field_ty = self.infer_expr(field_expr);
-                    row = Type::RowExtend((*name).to_owned(), Box::new(field_ty), Box::new(row));
+                let type_fields: Vec<(String, Type)> = fields
+                    .iter()
+                    .map(|(name, field_expr)| {
+                        let field_ty = self.infer_expr(field_expr);
+                        ((*name).to_owned(), field_ty)
+                    })
+                    .collect();
+                Type::Record {
+                    fields: type_fields,
+                    rest: None,
                 }
-                Type::Record(Box::new(row))
             }
 
             ExprKind::FieldAccess { record, field } => {
@@ -421,12 +474,11 @@ impl<'src> InferCtx<'src> {
                 let record_ty = self.infer_expr(record);
                 let field_ty = self.engine.fresh();
                 let rest_row = self.engine.fresh();
-                let expected = Type::Record(Box::new(Type::RowExtend(
-                    field.to_owned(),
-                    Box::new(field_ty.clone()),
-                    Box::new(rest_row),
-                )));
-                self.engine.unify(&record_ty, &expected);
+                let expected = Type::Record {
+                    fields: vec![(field.to_owned(), field_ty.clone())],
+                    rest: Some(Box::new(rest_row)),
+                };
+                self.unify_at(&record_ty, &expected, expr.span);
                 field_ty
             }
 
@@ -454,14 +506,14 @@ impl<'src> InferCtx<'src> {
                 let elem_ty = self.engine.fresh();
                 for e in elems {
                     let t = self.infer_expr(e);
-                    self.engine.unify(&elem_ty, &t);
+                    self.unify_at(&elem_ty, &t, e.span);
                 }
                 Type::App("List".to_owned(), vec![elem_ty])
             }
         }
     }
 
-    fn infer_call(&mut self, func: &str, args: &[Expr<'src>]) -> Type {
+    fn infer_call(&mut self, func: &str, args: &[Expr<'src>], span: Span) -> Type {
         let arg_types: Vec<Type> = args.iter().map(|a| self.infer_expr(a)).collect();
         let ret = self.engine.fresh();
 
@@ -472,14 +524,14 @@ impl<'src> InferCtx<'src> {
                 return con_ty;
             }
             let expected = Type::Arrow(arg_types, Box::new(ret.clone()));
-            self.engine.unify(&con_ty, &expected);
+            self.unify_at(&con_ty, &expected, span);
             return ret;
         }
 
         if let Some(scheme) = self.env.get(func).cloned() {
             let func_ty = self.engine.instantiate(&scheme);
             let expected = Type::Arrow(arg_types, Box::new(ret.clone()));
-            self.engine.unify(&func_ty, &expected);
+            self.unify_at(&func_ty, &expected, span);
             return ret;
         }
 
@@ -488,86 +540,12 @@ impl<'src> InferCtx<'src> {
 
     // ---- Pattern inference ----
 
-    fn infer_pattern(&mut self, pat: &ast::Pattern<'src>, expected: &Type) -> Vec<(String, Type)> {
-        match pat {
-            ast::Pattern::Constructor { name, fields } => {
-                let name = *name;
-                let scheme = self
-                    .constructors
-                    .get(name)
-                    .unwrap_or_else(|| panic!("type error: unknown constructor '{name}'"))
-                    .clone();
-                let con_ty = self.engine.instantiate(&scheme);
-
-                if fields.is_empty() {
-                    // Nullary constructor
-                    self.engine.unify(&con_ty, expected);
-                    vec![]
-                } else {
-                    // Constructor with fields
-                    let field_types: Vec<Type> =
-                        fields.iter().map(|_| self.engine.fresh()).collect();
-                    let con_ret = self.engine.fresh();
-                    let arrow = Type::Arrow(field_types.clone(), Box::new(con_ret.clone()));
-                    self.engine.unify(&con_ty, &arrow);
-                    self.engine.unify(&con_ret, expected);
-
-                    let mut bindings = Vec::new();
-                    for (field_pat, field_ty) in fields.iter().zip(field_types.iter()) {
-                        match field_pat {
-                            ast::Pattern::Binding(n) => {
-                                bindings.push(((*n).to_owned(), field_ty.clone()));
-                            }
-                            ast::Pattern::Wildcard => {}
-                            ast::Pattern::Constructor { .. }
-                            | ast::Pattern::Record { .. }
-                            | ast::Pattern::Tuple(_) => {
-                                bindings.extend(self.infer_pattern(field_pat, field_ty));
-                            }
-                        }
-                    }
-                    bindings
-                }
-            }
-            ast::Pattern::Record { fields } => {
-                let mut row = self.engine.fresh(); // open rest
-                let mut bindings = Vec::new();
-                for (field_name, field_pat) in fields.iter().rev() {
-                    let field_ty = self.engine.fresh();
-                    row = Type::RowExtend(
-                        (*field_name).to_owned(),
-                        Box::new(field_ty.clone()),
-                        Box::new(row),
-                    );
-                    bindings.extend(self.infer_pattern(field_pat, &field_ty));
-                }
-                let expected_record = Type::Record(Box::new(row));
-                self.engine.unify(&expected_record, expected);
-                bindings
-            }
-            ast::Pattern::Tuple(elems) => {
-                let elem_types: Vec<Type> = elems.iter().map(|_| self.engine.fresh()).collect();
-                let tuple_ty = Type::Tuple(elem_types.clone());
-                self.engine.unify(&tuple_ty, expected);
-                let mut bindings = Vec::new();
-                for (elem_pat, elem_ty) in elems.iter().zip(elem_types.iter()) {
-                    bindings.extend(self.infer_pattern(elem_pat, elem_ty));
-                }
-                bindings
-            }
-            ast::Pattern::Binding(name) => {
-                vec![((*name).to_owned(), expected.clone())]
-            }
-            ast::Pattern::Wildcard => vec![],
-        }
-    }
-
-    /// Like `infer_pattern` but for fold arms: recursive fields get the result type.
-    fn infer_fold_pattern(
+    fn infer_pattern(
         &mut self,
         pat: &ast::Pattern<'src>,
-        scrutinee_ty: &Type,
-        result_ty: &Type,
+        expected: &Type,
+        span: Span,
+        rec_subst: Option<&Type>,
     ) -> Vec<(String, Type)> {
         match pat {
             ast::Pattern::Constructor { name, fields } => {
@@ -580,25 +558,30 @@ impl<'src> InferCtx<'src> {
                 let con_ty = self.engine.instantiate(&scheme);
 
                 if fields.is_empty() {
-                    self.engine.unify(&con_ty, scrutinee_ty);
+                    // Nullary constructor
+                    self.unify_at(&con_ty, expected, span);
                     vec![]
                 } else {
+                    // Constructor with fields
                     let field_types: Vec<Type> =
                         fields.iter().map(|_| self.engine.fresh()).collect();
                     let con_ret = self.engine.fresh();
                     let arrow = Type::Arrow(field_types.clone(), Box::new(con_ret.clone()));
-                    self.engine.unify(&con_ty, &arrow);
-                    self.engine.unify(&con_ret, scrutinee_ty);
+                    self.unify_at(&con_ty, &arrow, span);
+                    self.unify_at(&con_ret, expected, span);
 
-                    // Determine which fields are recursive (same type as the scrutinee)
                     let mut bindings = Vec::new();
                     for (field_pat, field_ty) in fields.iter().zip(field_types.iter()) {
-                        let resolved = self.engine.resolve(field_ty);
-                        let scrutinee_resolved = self.engine.resolve(scrutinee_ty);
-                        // If the field type unifies with the scrutinee type, it is recursive —
-                        // bind to the result type instead.
-                        let bind_ty = if self.engine.types_match(&resolved, &scrutinee_resolved) {
-                            result_ty.clone()
+                        // For fold patterns: if field type matches scrutinee and rec_subst
+                        // is Some, use the substitution type instead.
+                        let bind_ty = if let Some(result_ty) = rec_subst {
+                            let resolved = self.engine.resolve(field_ty);
+                            let scrutinee_resolved = self.engine.resolve(expected);
+                            if self.engine.types_match(&resolved, &scrutinee_resolved) {
+                                result_ty.clone()
+                            } else {
+                                field_ty.clone()
+                            }
                         } else {
                             field_ty.clone()
                         };
@@ -607,18 +590,47 @@ impl<'src> InferCtx<'src> {
                                 bindings.push(((*n).to_owned(), bind_ty));
                             }
                             ast::Pattern::Wildcard => {}
-                            ast::Pattern::Constructor { .. } => {
-                                panic!("nested constructor patterns not supported in fold");
-                            }
-                            ast::Pattern::Record { .. } | ast::Pattern::Tuple(_) => {
-                                bindings.extend(self.infer_pattern(field_pat, &bind_ty));
+                            ast::Pattern::Constructor { .. }
+                            | ast::Pattern::Record { .. }
+                            | ast::Pattern::Tuple(_) => {
+                                bindings
+                                    .extend(self.infer_pattern(field_pat, &bind_ty, span, None));
                             }
                         }
                     }
                     bindings
                 }
             }
-            _ => panic!("fold arms must use constructor patterns"),
+            ast::Pattern::Record { fields } => {
+                let rest = self.engine.fresh(); // open rest for row polymorphism
+                let mut type_fields = Vec::new();
+                let mut bindings = Vec::new();
+                for (field_name, field_pat) in fields {
+                    let field_ty = self.engine.fresh();
+                    type_fields.push(((*field_name).to_owned(), field_ty.clone()));
+                    bindings.extend(self.infer_pattern(field_pat, &field_ty, span, None));
+                }
+                let expected_record = Type::Record {
+                    fields: type_fields,
+                    rest: Some(Box::new(rest)),
+                };
+                self.unify_at(&expected_record, expected, span);
+                bindings
+            }
+            ast::Pattern::Tuple(elems) => {
+                let elem_types: Vec<Type> = elems.iter().map(|_| self.engine.fresh()).collect();
+                let tuple_ty = Type::Tuple(elem_types.clone());
+                self.unify_at(&tuple_ty, expected, span);
+                let mut bindings = Vec::new();
+                for (elem_pat, elem_ty) in elems.iter().zip(elem_types.iter()) {
+                    bindings.extend(self.infer_pattern(elem_pat, elem_ty, span, None));
+                }
+                bindings
+            }
+            ast::Pattern::Binding(name) => {
+                vec![((*name).to_owned(), expected.clone())]
+            }
+            ast::Pattern::Wildcard => vec![],
         }
     }
 
@@ -632,17 +644,17 @@ impl<'src> InferCtx<'src> {
         let param_types: Vec<Type> = params.iter().map(|_| self.engine.fresh()).collect();
         let ret = self.engine.fresh();
         let expected = Type::Arrow(param_types.clone(), Box::new(ret.clone()));
-        self.engine.unify(&func_ty, &expected);
+        self.unify_at(&func_ty, &expected, body.span);
 
         for (p, ty) in params.iter().zip(param_types.iter()) {
             self.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
         }
         let body_ty = self.infer_expr(body);
-        self.engine.unify(&ret, &body_ty);
+        self.unify_at(&ret, &body_ty, body.span);
 
         if let Some(anno) = self.type_annos.get(name).cloned() {
             let anno_ty = self.type_expr_to_type(&anno, &mut HashMap::new());
-            self.engine.unify(&func_ty, &anno_ty);
+            self.unify_at(&func_ty, &anno_ty, body.span);
         }
 
         self.env = saved_env;
@@ -719,95 +731,9 @@ pub fn check<'src>(
 ) -> HashMap<Span, NumType> {
     let mut ctx = InferCtx::new(source);
 
-    // Register Bool from stdlib
-    let bool_stdlib = crate::parse::parse(crate::stdlib::get("Bool").unwrap_or(""));
-    for decl in &bool_stdlib.decls {
-        if let Decl::TypeAnno {
-            name,
-            type_params,
-            ty: TypeExpr::TagUnion(tags),
-            methods,
-            ..
-        } = decl
-        {
-            ctx.register_type_decl(name, type_params, tags);
-            for method in methods {
-                match method {
-                    Decl::FuncDef {
-                        name: method_name,
-                        params,
-                        ..
-                    } => {
-                        let mangled = format!("{name}.{method_name}");
-                        let param_types: Vec<Type> =
-                            params.iter().map(|_| ctx.engine.fresh()).collect();
-                        let ret = ctx.engine.fresh();
-                        let func_ty = Type::Arrow(param_types, Box::new(ret));
-                        ctx.env.insert(mangled, Scheme::mono(func_ty));
-                    }
-                    Decl::TypeAnno {
-                        name: method_name,
-                        ty,
-                        ..
-                    } => {
-                        let mangled = format!("{name}.{method_name}");
-                        ctx.type_annos.insert(mangled, ty.clone());
-                    }
-                }
-            }
-        }
-    }
-    // Infer Bool method bodies
-    for decl in &bool_stdlib.decls {
-        if let Decl::TypeAnno { name, methods, .. } = decl {
-            for method in methods {
-                if let Decl::FuncDef {
-                    name: method_name,
-                    params,
-                    body,
-                } = method
-                {
-                    let mangled = format!("{name}.{method_name}");
-                    ctx.infer_func_body(&mangled, params, body);
-                }
-            }
-        }
-    }
-
-    // Register built-in List type and its operations
-    ctx.register_list_builtins();
-
-    // Register List stdlib Ori-implemented methods (sum, length, etc.)
-    let list_stdlib_src = crate::stdlib::get("List").unwrap_or("");
-    let list_stdlib = crate::parse::parse(list_stdlib_src);
-    for decl in &list_stdlib.decls {
-        if let Decl::TypeAnno { methods, .. } = decl {
-            for method in methods {
-                match method {
-                    Decl::FuncDef { name, params, .. } => {
-                        let mangled = format!("List.{name}");
-                        let param_types: Vec<Type> =
-                            params.iter().map(|_| ctx.engine.fresh()).collect();
-                        let ret = ctx.engine.fresh();
-                        let func_ty = Type::Arrow(param_types, Box::new(ret));
-                        ctx.env.insert(mangled, Scheme::mono(func_ty));
-                    }
-                    Decl::TypeAnno { name, ty, .. } => {
-                        // Body-less annotation = builtin, already registered
-                        let mangled = format!("List.{name}");
-                        ctx.type_annos.insert(mangled, ty.clone());
-                    }
-                }
-            }
-            // Infer bodies of Ori-implemented methods
-            for method in methods {
-                if let Decl::FuncDef { name, params, body } = method {
-                    let mangled = format!("List.{name}");
-                    ctx.infer_func_body(&mangled, params, body);
-                }
-            }
-        }
-    }
+    // Register stdlib modules
+    ctx.register_stdlib_module("Bool");
+    ctx.register_stdlib_module("List");
 
     // Pass 1: register all type declarations and function signatures
     for decl in &module.decls {
@@ -830,7 +756,7 @@ pub fn check<'src>(
                             ..
                         } => {
                             let method_name = *method_name;
-                            let mangled = format!("{name}.{method_name}");
+                            let mangled = method_key(name, method_name);
                             let param_types: Vec<Type> =
                                 params.iter().map(|_| ctx.engine.fresh()).collect();
                             let ret = ctx.engine.fresh();
@@ -848,7 +774,7 @@ pub fn check<'src>(
                             ..
                         } => {
                             let method_name = *method_name;
-                            let mangled = format!("{name}.{method_name}");
+                            let mangled = method_key(name, method_name);
                             if let Some(mod_name) = scope.qualified_types.get(name) {
                                 let qual = format!("{mod_name}.{mangled}");
                                 ctx.type_annos.insert(qual, ty.clone());
@@ -917,7 +843,7 @@ pub fn check<'src>(
                         body,
                     } = method
                     {
-                        let mangled = format!("{name}.{}", *method_name);
+                        let mangled = method_key(name, method_name);
                         ctx.infer_func_body(&mangled, params, body);
                         // Dual-register qualified alias
                         if let Some(mod_name) = scope.qualified_types.get(name) {
