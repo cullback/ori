@@ -19,13 +19,13 @@ fn span_of(pair: &Pair<'_, Rule>) -> Span {
     }
 }
 
-pub fn parse(source: &str) -> Module {
+pub fn parse(source: &str) -> Module<'_> {
     let pairs = OriParser::parse(Rule::module, source).unwrap_or_else(|e| panic!("{e}"));
     let module_pair = pairs.into_iter().next().unwrap();
     parse_module(module_pair)
 }
 
-fn parse_module(pair: Pair<'_, Rule>) -> Module {
+fn parse_module(pair: Pair<'_, Rule>) -> Module<'_> {
     let mut decls = Vec::new();
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::decl {
@@ -35,7 +35,7 @@ fn parse_module(pair: Pair<'_, Rule>) -> Module {
     Module { decls }
 }
 
-fn parse_decl(pair: Pair<'_, Rule>) -> Decl {
+fn parse_decl(pair: Pair<'_, Rule>) -> Decl<'_> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
         Rule::type_anno => parse_type_anno(inner),
@@ -44,9 +44,9 @@ fn parse_decl(pair: Pair<'_, Rule>) -> Decl {
     }
 }
 
-fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl {
+fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_owned();
+    let name = inner.next().unwrap().as_str();
 
     let mut type_params = Vec::new();
     let mut ty = None;
@@ -56,7 +56,7 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl {
         match part.as_rule() {
             Rule::type_params => {
                 for p in part.into_inner() {
-                    type_params.push(p.as_str().to_owned());
+                    type_params.push(p.as_str());
                 }
             }
             Rule::type_expr | Rule::type_atom => {
@@ -81,10 +81,10 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl {
     }
 }
 
-fn parse_assignment_as_decl(pair: Pair<'_, Rule>) -> Decl {
+fn parse_assignment_as_decl(pair: Pair<'_, Rule>) -> Decl<'_> {
     let mut inner = pair.into_inner();
     let lhs = inner.next().unwrap(); // irrefutable
-    let name = lhs.as_str().trim().to_owned();
+    let name = lhs.as_str().trim();
     let body = parse_expr(inner.next().unwrap());
 
     // If the body is a lambda, extract its params as the function's params
@@ -109,14 +109,14 @@ fn parse_assignment_as_decl(pair: Pair<'_, Rule>) -> Decl {
 
 // ---- Type expressions ----
 
-fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr {
+fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr<'_> {
     match pair.as_rule() {
         Rule::type_expr => {
             let mut parts: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
             // Check if last element is a type_expr (Arrow return type)
             if parts.len() >= 2 && parts.last().is_some_and(|p| p.as_rule() == Rule::type_expr) {
                 let ret = parse_type_expr(parts.pop().unwrap());
-                let params: Vec<TypeExpr> = parts.into_iter().map(parse_type_expr).collect();
+                let params: Vec<TypeExpr<'_>> = parts.into_iter().map(parse_type_expr).collect();
                 TypeExpr::Arrow(params, Box::new(ret))
             } else if parts.len() == 1 {
                 parse_type_expr(parts.pop().unwrap())
@@ -130,28 +130,30 @@ fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr {
             let first = &inner[0];
             match first.as_rule() {
                 Rule::name => {
-                    let name = first.as_str().to_owned();
+                    let name = first.as_str();
                     if inner.len() == 1 {
                         TypeExpr::Named(name)
                     } else if inner[1].as_rule() == Rule::type_atom {
-                        let args: Vec<TypeExpr> = inner.drain(1..).map(parse_type_expr).collect();
+                        let args: Vec<TypeExpr<'_>> =
+                            inner.drain(1..).map(parse_type_expr).collect();
                         TypeExpr::App(name, args)
                     } else {
                         panic!("unexpected type_atom after name");
                     }
                 }
                 Rule::tag_decl => {
-                    let tags: Vec<TagDecl> = inner.into_iter().map(parse_tag_decl).collect();
+                    let tags: Vec<TagDecl<'_>> = inner.into_iter().map(parse_tag_decl).collect();
                     TypeExpr::TagUnion(tags)
                 }
                 Rule::field_type => {
-                    let fields: Vec<(String, TypeExpr)> =
+                    let fields: Vec<(&str, TypeExpr<'_>)> =
                         inner.into_iter().map(parse_field_type).collect();
                     TypeExpr::Record(fields)
                 }
                 Rule::type_atom => {
                     // Tuple type: all children are type_atoms
-                    let elements: Vec<TypeExpr> = inner.into_iter().map(parse_type_expr).collect();
+                    let elements: Vec<TypeExpr<'_>> =
+                        inner.into_iter().map(parse_type_expr).collect();
                     TypeExpr::Tuple(elements)
                 }
                 _ => panic!("unexpected type_atom content: {:?}", first.as_rule()),
@@ -161,16 +163,16 @@ fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr {
     }
 }
 
-fn parse_tag_decl(pair: Pair<'_, Rule>) -> TagDecl {
+fn parse_tag_decl(pair: Pair<'_, Rule>) -> TagDecl<'_> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_owned();
-    let fields: Vec<TypeExpr> = inner.map(parse_type_expr).collect();
+    let name = inner.next().unwrap().as_str();
+    let fields: Vec<TypeExpr<'_>> = inner.map(parse_type_expr).collect();
     TagDecl { name, fields }
 }
 
-fn parse_field_type(pair: Pair<'_, Rule>) -> (String, TypeExpr) {
+fn parse_field_type(pair: Pair<'_, Rule>) -> (&str, TypeExpr<'_>) {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_owned();
+    let name = inner.next().unwrap().as_str();
     let ty = parse_type_expr(inner.next().unwrap());
     (name, ty)
 }
@@ -184,7 +186,7 @@ fn pratt_parser() -> PrattParser<Rule> {
         .op(Op::infix(Rule::mul_op, Assoc::Left))
 }
 
-fn parse_expr(pair: Pair<'_, Rule>) -> Expr {
+fn parse_expr(pair: Pair<'_, Rule>) -> Expr<'_> {
     let span = span_of(&pair);
     match pair.as_rule() {
         Rule::expr => {
@@ -261,7 +263,7 @@ fn parse_call_head(text: &str) -> (&str, Option<(&str, &str)>) {
     }
 }
 
-fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
+fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
     let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
     let first = inner.remove(0);
 
@@ -278,8 +280,8 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
                 .unwrap_or_default();
             Expr::new(
                 ExprKind::QualifiedCall {
-                    owner: owner.to_owned(),
-                    method: method.to_owned(),
+                    owner,
+                    method,
                     args,
                 },
                 span,
@@ -287,7 +289,7 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
         }
         Rule::call_head => {
             let text = first.as_str();
-            let func = text[..text.len() - 1].to_owned();
+            let func = &text[..text.len() - 1];
             let args = inner
                 .first()
                 .filter(|p| p.as_rule() == Rule::args)
@@ -296,7 +298,7 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
             Expr::new(ExprKind::Call { func, args }, span)
         }
         Rule::name => {
-            let first_name = first.as_str().to_owned();
+            let first_name = first.as_str();
             if inner.is_empty() {
                 return Expr::new(ExprKind::Name(first_name), span);
             }
@@ -307,7 +309,7 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
                     result = Expr::new(
                         ExprKind::FieldAccess {
                             record: Box::new(result),
-                            field: field.as_str().to_owned(),
+                            field: field.as_str(),
                         },
                         span,
                     );
@@ -319,7 +321,7 @@ fn parse_call_or_access(pair: Pair<'_, Rule>, span: Span) -> Expr {
     }
 }
 
-fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
+fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
     let mut stmts = Vec::new();
     let mut result_expr = None;
 
@@ -350,7 +352,7 @@ fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
                     }
                     Rule::type_hint => {
                         let mut parts = stmt_inner.into_inner();
-                        let name = parts.next().unwrap().as_str().to_owned();
+                        let name = parts.next().unwrap().as_str();
                         let ty = parse_type_expr(parts.next().unwrap());
                         stmts.push(Stmt::TypeHint { name, ty });
                     }
@@ -372,7 +374,7 @@ fn parse_block(pair: Pair<'_, Rule>, span: Span) -> Expr {
     }
 }
 
-fn parse_if_expr(pair: Pair<'_, Rule>, span: Span) -> Expr {
+fn parse_if_expr(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
     let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
 
     // Check if it's boolean if-then-else or multi-arm match
@@ -409,14 +411,14 @@ fn parse_if_expr(pair: Pair<'_, Rule>, span: Span) -> Expr {
                 arms: vec![
                     MatchArm {
                         pattern: Pattern::Constructor {
-                            name: "True".to_owned(),
+                            name: "True",
                             fields: vec![],
                         },
                         body: then_body,
                     },
                     MatchArm {
                         pattern: Pattern::Constructor {
-                            name: "False".to_owned(),
+                            name: "False",
                             fields: vec![],
                         },
                         body: else_body,
@@ -429,10 +431,10 @@ fn parse_if_expr(pair: Pair<'_, Rule>, span: Span) -> Expr {
     }
 }
 
-fn parse_fold_expr(pair: Pair<'_, Rule>, span: Span) -> Expr {
+fn parse_fold_expr(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
     let mut inner = pair.into_inner();
     let scrutinee = parse_expr(inner.next().unwrap());
-    let arms: Vec<MatchArm> = inner.map(parse_match_arm).collect();
+    let arms: Vec<MatchArm<'_>> = inner.map(parse_match_arm).collect();
     Expr::new(
         ExprKind::Fold {
             expr: Box::new(scrutinee),
@@ -442,20 +444,20 @@ fn parse_fold_expr(pair: Pair<'_, Rule>, span: Span) -> Expr {
     )
 }
 
-fn parse_match_arm(pair: Pair<'_, Rule>) -> MatchArm {
+fn parse_match_arm(pair: Pair<'_, Rule>) -> MatchArm<'_> {
     let mut inner = pair.into_inner();
     let pattern = parse_pattern(inner.next().unwrap());
     let body = parse_expr(inner.next().unwrap());
     MatchArm { pattern, body }
 }
 
-fn parse_lambda(pair: Pair<'_, Rule>, span: Span) -> Expr {
+fn parse_lambda(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
     let mut inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
     let body = parse_expr(inner.pop().unwrap());
-    let params: Vec<String> = inner
+    let params: Vec<&str> = inner
         .into_iter()
         .filter(|p| p.as_rule() == Rule::lambda_param)
-        .map(|p| p.as_str().to_owned())
+        .map(|p| p.as_str())
         .collect();
     Expr::new(
         ExprKind::Lambda {
@@ -466,12 +468,12 @@ fn parse_lambda(pair: Pair<'_, Rule>, span: Span) -> Expr {
     )
 }
 
-fn parse_record_literal(pair: Pair<'_, Rule>, span: Span) -> Expr {
-    let fields: Vec<(String, Expr)> = pair
+fn parse_record_literal(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
+    let fields: Vec<(&str, Expr<'_>)> = pair
         .into_inner()
         .map(|fi| {
             let mut inner = fi.into_inner();
-            let name = inner.next().unwrap().as_str().to_owned();
+            let name = inner.next().unwrap().as_str();
             let val = parse_expr(inner.next().unwrap());
             (name, val)
         })
@@ -479,7 +481,7 @@ fn parse_record_literal(pair: Pair<'_, Rule>, span: Span) -> Expr {
     Expr::new(ExprKind::Record { fields }, span)
 }
 
-fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern {
+fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern<'_> {
     let text = pair.as_str().trim();
     if text == "_" {
         return Pattern::Wildcard;
@@ -489,16 +491,16 @@ fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern {
         if text == "_" {
             return Pattern::Wildcard;
         }
-        return Pattern::Binding(text.to_owned());
+        return Pattern::Binding(text);
     }
     if inner.len() == 1 && inner[0].as_rule() == Rule::name {
-        return Pattern::Binding(inner[0].as_str().to_owned());
+        return Pattern::Binding(inner[0].as_str());
     }
     let first = &inner[0];
     match first.as_rule() {
         Rule::irrefutable => {
             // Tuple pattern: (a, b)
-            let sub_pats: Vec<Pattern> = inner
+            let sub_pats: Vec<Pattern<'_>> = inner
                 .into_iter()
                 .filter(|p| p.as_rule() == Rule::irrefutable)
                 .map(parse_irrefutable)
@@ -507,15 +509,15 @@ fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern {
         }
         Rule::field_irrefutable => {
             // Record pattern: { x, y: z }
-            let fields: Vec<(String, Pattern)> = inner
+            let fields: Vec<(&str, Pattern<'_>)> = inner
                 .into_iter()
                 .map(|fi| {
                     let mut fi_inner = fi.into_inner();
-                    let name = fi_inner.next().unwrap().as_str().to_owned();
+                    let name = fi_inner.next().unwrap().as_str();
                     if let Some(pat) = fi_inner.next() {
                         (name, parse_irrefutable(pat))
                     } else {
-                        (name.clone(), Pattern::Binding(name))
+                        (name, Pattern::Binding(name))
                     }
                 })
                 .collect();
@@ -525,8 +527,8 @@ fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern {
     }
 }
 
-fn parse_tuple(pair: Pair<'_, Rule>, span: Span) -> Expr {
-    let elements: Vec<Expr> = pair.into_inner().map(parse_expr).collect();
+fn parse_tuple(pair: Pair<'_, Rule>, span: Span) -> Expr<'_> {
+    let elements: Vec<Expr<'_>> = pair.into_inner().map(parse_expr).collect();
     Expr::new(ExprKind::Tuple(elements), span)
 }
 
@@ -536,7 +538,7 @@ fn is_constructor_name(s: &str) -> bool {
     s.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
-fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
+fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern<'_> {
     let text = pair.as_str().trim();
     let inner: Vec<Pair<'_, Rule>> = pair.into_inner().collect();
 
@@ -550,12 +552,13 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
     let first = &inner[0];
     match first.as_rule() {
         Rule::name => {
-            let name = first.as_str().to_owned();
+            let name = first.as_str();
             if inner.len() > 1 {
                 // Constructor with fields: Name(pat, ...)
-                let fields: Vec<Pattern> = inner.into_iter().skip(1).map(parse_pattern).collect();
+                let fields: Vec<Pattern<'_>> =
+                    inner.into_iter().skip(1).map(parse_pattern).collect();
                 Pattern::Constructor { name, fields }
-            } else if is_constructor_name(&name) {
+            } else if is_constructor_name(name) {
                 // Bare uppercase name: nullary constructor
                 Pattern::Constructor {
                     name,
@@ -566,13 +569,13 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
             }
         }
         Rule::field_pattern => {
-            let fields: Vec<(String, Pattern)> =
+            let fields: Vec<(&str, Pattern<'_>)> =
                 inner.into_iter().map(parse_field_pattern).collect();
             Pattern::Record { fields }
         }
         Rule::pattern => {
             // Tuple pattern: all children are sub-patterns
-            let elements: Vec<Pattern> = inner.into_iter().map(parse_pattern).collect();
+            let elements: Vec<Pattern<'_>> = inner.into_iter().map(parse_pattern).collect();
             Pattern::Tuple(elements)
         }
         _ => {
@@ -585,12 +588,12 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern {
     }
 }
 
-fn parse_field_pattern(pair: Pair<'_, Rule>) -> (String, Pattern) {
+fn parse_field_pattern(pair: Pair<'_, Rule>) -> (&str, Pattern<'_>) {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_owned();
+    let name = inner.next().unwrap().as_str();
     if let Some(pat) = inner.next() {
         (name, parse_pattern(pat))
     } else {
-        (name.clone(), Pattern::Binding(name))
+        (name, Pattern::Binding(name))
     }
 }

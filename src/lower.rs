@@ -14,7 +14,7 @@ const PRELUDE: &str = "Bool : [True, False]\n";
 /// Returns the program and the `VarId` of `main`'s input parameter
 /// (a free variable that the runtime must bind before evaluation).
 #[expect(clippy::too_many_lines, reason = "multi-pass lowering orchestration")]
-pub fn lower(module: &Module) -> (Program, VarId) {
+pub fn lower(module: &Module<'_>) -> (Program, VarId) {
     let mut ctx = LowerCtx::new();
 
     // Parse and register the prelude
@@ -39,6 +39,7 @@ pub fn lower(module: &Module) -> (Program, VarId) {
         let Decl::FuncDef { name, params, body } = decl else {
             continue;
         };
+        let name = *name;
 
         if name == "main" {
             main_params = Some(params.clone());
@@ -51,23 +52,23 @@ pub fn lower(module: &Module) -> (Program, VarId) {
             .iter()
             .map(|p| {
                 let v = ctx.builder.var();
-                ctx.vars.insert(p.clone(), v);
+                ctx.vars.insert((*p).to_owned(), v);
                 v
             })
             .collect();
 
         // Mark higher-order parameters
         for (i, p) in params.iter().enumerate() {
-            let key = (name.clone(), i);
+            let key = (name.to_owned(), i);
             if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
-                ctx.ho_vars.insert(p.clone(), ls_idx);
+                ctx.ho_vars.insert((*p).to_owned(), ls_idx);
             }
         }
 
         let body_core = ctx.lower_expr(body);
         for p in params {
-            ctx.vars.remove(p);
-            ctx.ho_vars.remove(p);
+            ctx.vars.remove(*p);
+            ctx.ho_vars.remove(*p);
         }
         ctx.builder.add_func(FuncDef {
             name: func_id,
@@ -86,6 +87,7 @@ pub fn lower(module: &Module) -> (Program, VarId) {
         else {
             continue;
         };
+        let type_name = *type_name;
         for method_decl in methods {
             let Decl::FuncDef {
                 name: method_name,
@@ -95,13 +97,14 @@ pub fn lower(module: &Module) -> (Program, VarId) {
             else {
                 continue;
             };
+            let method_name = *method_name;
             let mangled = format!("{type_name}.{method_name}");
             let func_id = ctx.funcs[&mangled];
             let param_vars: Vec<VarId> = params
                 .iter()
                 .map(|p| {
                     let v = ctx.builder.var();
-                    ctx.vars.insert(p.clone(), v);
+                    ctx.vars.insert((*p).to_owned(), v);
                     v
                 })
                 .collect();
@@ -109,14 +112,14 @@ pub fn lower(module: &Module) -> (Program, VarId) {
             for (i, p) in params.iter().enumerate() {
                 let key = (mangled.clone(), i);
                 if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
-                    ctx.ho_vars.insert(p.clone(), ls_idx);
+                    ctx.ho_vars.insert((*p).to_owned(), ls_idx);
                 }
             }
 
             let body_core = ctx.lower_expr(body);
             for p in params {
-                ctx.vars.remove(p);
-                ctx.ho_vars.remove(p);
+                ctx.vars.remove(*p);
+                ctx.ho_vars.remove(*p);
             }
             ctx.builder.add_func(FuncDef {
                 name: func_id,
@@ -136,13 +139,13 @@ pub fn lower(module: &Module) -> (Program, VarId) {
     );
 
     let input_var = ctx.builder.var();
-    ctx.vars.insert(params[0].clone(), input_var);
+    ctx.vars.insert(params[0].to_owned(), input_var);
 
     // Mark main's higher-order params (unlikely but consistent)
     for (i, p) in params.iter().enumerate() {
         let key = ("main".to_owned(), i);
         if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
-            ctx.ho_vars.insert(p.clone(), ls_idx);
+            ctx.ho_vars.insert((*p).to_owned(), ls_idx);
         }
     }
 
@@ -157,23 +160,23 @@ pub fn lower(module: &Module) -> (Program, VarId) {
 
 // ---- Defunctionalization data structures ----
 
-struct LambdaEntry {
+struct LambdaEntry<'src> {
     tag: FuncId,
-    captures: Vec<String>,
-    params: Vec<String>,
-    body: Option<Expr>,
+    captures: Vec<&'src str>,
+    params: Vec<&'src str>,
+    body: Option<Expr<'src>>,
     func_ref: Option<FuncId>,
 }
 
-struct LambdaSet {
+struct LambdaSet<'src> {
     apply_func: FuncId,
-    entries: Vec<LambdaEntry>,
+    entries: Vec<LambdaEntry<'src>>,
     arity: usize,
 }
 
 // ---- Lowering context ----
 
-struct LowerCtx {
+struct LowerCtx<'src> {
     builder: Builder,
     vars: HashMap<String, VarId>,
     funcs: HashMap<String, FuncId>,
@@ -184,7 +187,7 @@ struct LowerCtx {
     binops: HashMap<BinOp, FuncId>,
 
     // Defunctionalization state
-    lambda_sets: Vec<LambdaSet>,
+    lambda_sets: Vec<LambdaSet<'src>>,
     /// Maps (callee, param index) to lambda set index.
     ho_param_sets: HashMap<(String, usize), usize>,
     /// Maps higher-order parameter names to their lambda set index.
@@ -193,7 +196,7 @@ struct LowerCtx {
     lambda_arg_counters: HashMap<(String, usize), usize>,
 }
 
-impl LowerCtx {
+impl<'src> LowerCtx<'src> {
     fn new() -> Self {
         let mut builder = Builder::new();
         let mut binops = HashMap::new();
@@ -222,7 +225,7 @@ impl LowerCtx {
 
     // ---- Pass 1: Register declarations ----
 
-    fn register_decls(&mut self, decls: &[Decl]) {
+    fn register_decls(&mut self, decls: &[Decl<'src>]) {
         for decl in decls {
             match decl {
                 Decl::TypeAnno {
@@ -231,6 +234,7 @@ impl LowerCtx {
                     methods,
                     ..
                 } => {
+                    let name = *name;
                     self.register_tag_union(name, tags);
                     for method_decl in methods {
                         if let Decl::FuncDef {
@@ -239,6 +243,7 @@ impl LowerCtx {
                             ..
                         } = method_decl
                         {
+                            let method_name = *method_name;
                             let mangled = format!("{name}.{method_name}");
                             let func_id = self.builder.func();
                             self.funcs.insert(mangled.clone(), func_id);
@@ -248,9 +253,10 @@ impl LowerCtx {
                 }
                 Decl::TypeAnno { .. } => {}
                 Decl::FuncDef { name, params, .. } => {
+                    let name = *name;
                     let func_id = self.builder.func();
-                    self.funcs.insert(name.clone(), func_id);
-                    self.func_arities.insert(name.clone(), params.len());
+                    self.funcs.insert(name.to_owned(), func_id);
+                    self.func_arities.insert(name.to_owned(), params.len());
                 }
             }
         }
@@ -277,20 +283,20 @@ impl LowerCtx {
         self.binops.insert(BinOp::Neq, neq);
     }
 
-    fn register_tag_union(&mut self, type_name: &str, tags: &[ast::TagDecl]) {
+    fn register_tag_union(&mut self, type_name: &str, tags: &[ast::TagDecl<'src>]) {
         let mut con_defs = Vec::new();
         for tag in tags {
             let con_id = self.builder.func();
-            self.constructors.insert(tag.name.clone(), con_id);
+            self.constructors.insert(tag.name.to_owned(), con_id);
             let recursive_flags: Vec<bool> = tag
                 .fields
                 .iter()
                 .map(|field_ty| {
-                    matches!(field_ty, TypeExpr::Named(name) | TypeExpr::App(name, _) if name == type_name)
+                    matches!(field_ty, TypeExpr::Named(name) | TypeExpr::App(name, _) if *name == type_name)
                 })
                 .collect();
             self.constructor_fields
-                .insert(tag.name.clone(), recursive_flags.clone());
+                .insert(tag.name.to_owned(), recursive_flags.clone());
             con_defs.push(ConstructorDef {
                 tag: con_id,
                 fields: recursive_flags
@@ -304,7 +310,7 @@ impl LowerCtx {
 
     // ---- Pass 1.5: Collect lambdas for defunctionalization ----
 
-    fn collect_lambdas(&mut self, decls: &[Decl]) {
+    fn collect_lambdas(&mut self, decls: &[Decl<'src>]) {
         for decl in decls {
             match decl {
                 Decl::FuncDef { body, .. } => self.scan_expr(body),
@@ -319,9 +325,9 @@ impl LowerCtx {
         }
     }
 
-    fn scan_expr(&mut self, expr: &Expr) {
+    fn scan_expr(&mut self, expr: &Expr<'src>) {
         match &expr.kind {
-            ExprKind::Call { func, args } if self.funcs.contains_key(func) => {
+            ExprKind::Call { func, args } if self.funcs.contains_key(*func) => {
                 self.scan_call_args(func, args);
             }
             ExprKind::Call { args, .. } => {
@@ -401,26 +407,27 @@ impl LowerCtx {
         }
     }
 
-    fn scan_call_args(&mut self, func_name: &str, args: &[Expr]) {
+    fn scan_call_args(&mut self, func_name: &str, args: &[Expr<'src>]) {
         for (i, arg) in args.iter().enumerate() {
             match &arg.kind {
                 ExprKind::Lambda { params, body } => {
                     let free = self.compute_free_vars(body, params);
                     self.register_lambda(func_name, i, params.clone(), Some(body), free, None);
                 }
-                ExprKind::Name(name)
-                    if self.funcs.contains_key(name) && !self.constructors.contains_key(name) =>
-                {
-                    let func_id = self.funcs[name];
-                    let arity = self.func_arities[name];
-                    self.register_lambda(
-                        func_name,
-                        i,
-                        Vec::new(),
-                        None,
-                        Vec::new(),
-                        Some((func_id, arity)),
-                    );
+                ExprKind::Name(name) => {
+                    let name = *name;
+                    if self.funcs.contains_key(name) && !self.constructors.contains_key(name) {
+                        let func_id = self.funcs[name];
+                        let arity = self.func_arities[name];
+                        self.register_lambda(
+                            func_name,
+                            i,
+                            Vec::new(),
+                            None,
+                            Vec::new(),
+                            Some((func_id, arity)),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -432,9 +439,9 @@ impl LowerCtx {
         &mut self,
         callee_func: &str,
         arg_index: usize,
-        params: Vec<String>,
-        body: Option<&Expr>,
-        captures: Vec<String>,
+        params: Vec<&'src str>,
+        body: Option<&Expr<'src>>,
+        captures: Vec<&'src str>,
         func_ref: Option<(FuncId, usize)>,
     ) {
         let key = (callee_func.to_owned(), arg_index);
@@ -472,30 +479,31 @@ impl LowerCtx {
         });
     }
 
-    fn compute_free_vars(&self, body: &Expr, params: &[String]) -> Vec<String> {
+    fn compute_free_vars(&self, body: &Expr<'src>, params: &[&'src str]) -> Vec<&'src str> {
         let mut free = Vec::new();
         let mut seen = HashSet::new();
-        let bound: HashSet<&str> = params.iter().map(String::as_str).collect();
+        let bound: HashSet<&str> = params.iter().copied().collect();
         self.collect_free(body, &bound, &mut seen, &mut free);
         free
     }
 
-    fn collect_free<'a>(
+    fn collect_free(
         &self,
-        expr: &'a Expr,
-        bound: &HashSet<&str>,
-        seen: &mut HashSet<&'a str>,
-        free: &mut Vec<String>,
+        expr: &Expr<'src>,
+        bound: &HashSet<&'src str>,
+        seen: &mut HashSet<&'src str>,
+        free: &mut Vec<&'src str>,
     ) {
         match &expr.kind {
             ExprKind::Name(name) => {
-                if !bound.contains(name.as_str())
+                let name = *name;
+                if !bound.contains(name)
                     && !self.constructors.contains_key(name)
                     && !self.funcs.contains_key(name)
-                    && !seen.contains(name.as_str())
+                    && !seen.contains(name)
                 {
                     seen.insert(name);
-                    free.push(name.clone());
+                    free.push(name);
                 }
             }
             ExprKind::IntLit(_) => {}
@@ -574,7 +582,7 @@ impl LowerCtx {
         }
     }
 
-    fn pattern_names<'a>(pat: &'a ast::Pattern, bound: &mut HashSet<&'a str>) {
+    fn pattern_names(pat: &ast::Pattern<'src>, bound: &mut HashSet<&'src str>) {
         match pat {
             ast::Pattern::Constructor { fields, .. } => {
                 for f in fields {
@@ -623,11 +631,12 @@ impl LowerCtx {
         clippy::too_many_lines,
         reason = "expression lowering handles all forms"
     )]
-    fn lower_expr(&mut self, expr: &Expr) -> Core {
+    fn lower_expr(&mut self, expr: &Expr<'src>) -> Core {
         match &expr.kind {
             ExprKind::IntLit(n) => Core::i64(*n),
 
             ExprKind::Name(name) => {
+                let name = *name;
                 if let Some(&var_id) = self.vars.get(name) {
                     return Core::var(var_id);
                 }
@@ -649,9 +658,10 @@ impl LowerCtx {
                 for stmt in stmts {
                     match stmt {
                         Stmt::Let { name, val } => {
+                            let name = *name;
                             let val_core = self.lower_expr(val);
                             let var_id = self.builder.var();
-                            self.vars.insert(name.clone(), var_id);
+                            self.vars.insert(name.to_owned(), var_id);
                             bindings.push((var_id, val_core));
                         }
                         Stmt::TypeHint { .. } => {} // handled by type checker
@@ -715,13 +725,13 @@ impl LowerCtx {
             ExprKind::Record { fields } => {
                 let core_fields: Vec<(String, Core)> = fields
                     .iter()
-                    .map(|(name, field_expr)| (name.clone(), self.lower_expr(field_expr)))
+                    .map(|(name, field_expr)| ((*name).to_owned(), self.lower_expr(field_expr)))
                     .collect();
                 Core::record(core_fields)
             }
 
             ExprKind::FieldAccess { record, field } => {
-                Core::field_access(self.lower_expr(record), field.clone())
+                Core::field_access(self.lower_expr(record), (*field).to_owned())
             }
 
             ExprKind::Tuple(elems) => {
@@ -739,7 +749,7 @@ impl LowerCtx {
         }
     }
 
-    fn lower_call(&mut self, func: &str, args: &[Expr]) -> Core {
+    fn lower_call(&mut self, func: &str, args: &[Expr<'src>]) -> Core {
         if let Some(&con_id) = self.constructors.get(func) {
             let arg_cores: Vec<Core> = args.iter().map(|a| self.lower_expr(a)).collect();
             Core::app(con_id, arg_cores)
@@ -777,7 +787,7 @@ impl LowerCtx {
         clippy::arithmetic_side_effects,
         reason = "index counter for lambda matching"
     )]
-    fn lower_lambda_arg(&mut self, arg: &Expr, callee: &str, arg_idx: usize) -> Core {
+    fn lower_lambda_arg(&mut self, arg: &Expr<'src>, callee: &str, arg_idx: usize) -> Core {
         let key = (callee.to_owned(), arg_idx);
         let ls_idx = self.ho_param_sets[&key];
         let counter = self.lambda_arg_counters.entry(key).or_insert(0);
@@ -786,7 +796,7 @@ impl LowerCtx {
 
         let entry = &self.lambda_sets[ls_idx].entries[entry_idx];
         let tag = entry.tag;
-        let captures: Vec<String> = entry.captures.clone();
+        let captures: Vec<&'src str> = entry.captures.clone();
 
         match &arg.kind {
             ExprKind::Lambda { .. } => {
@@ -795,7 +805,7 @@ impl LowerCtx {
                     .map(|name| {
                         let &var_id = self
                             .vars
-                            .get(name)
+                            .get(*name)
                             .unwrap_or_else(|| panic!("captured variable '{name}' not in scope"));
                         Core::var(var_id)
                     })
@@ -814,7 +824,7 @@ impl LowerCtx {
 
     fn generate_apply_functions(&mut self) {
         // Clone lambda sets to avoid borrow conflict with self.lower_expr
-        let sets: Vec<LambdaSet> = std::mem::take(&mut self.lambda_sets);
+        let sets: Vec<LambdaSet<'src>> = std::mem::take(&mut self.lambda_sets);
 
         for ls in &sets {
             let closure_var = self.builder.var();
@@ -841,19 +851,19 @@ impl LowerCtx {
                         let pattern = Pattern::con(entry.tag, cap_vars.clone());
 
                         for (cap_name, &cap_var) in entry.captures.iter().zip(&cap_vars) {
-                            self.vars.insert(cap_name.clone(), cap_var);
+                            self.vars.insert((*cap_name).to_owned(), cap_var);
                         }
                         for (param_name, &arg_var) in entry.params.iter().zip(&arg_vars) {
-                            self.vars.insert(param_name.clone(), arg_var);
+                            self.vars.insert((*param_name).to_owned(), arg_var);
                         }
 
                         let body_core = self.lower_expr(entry.body.as_ref().unwrap());
 
                         for cap_name in &entry.captures {
-                            self.vars.remove(cap_name);
+                            self.vars.remove(*cap_name);
                         }
                         for param_name in &entry.params {
-                            self.vars.remove(param_name);
+                            self.vars.remove(*param_name);
                         }
 
                         (pattern, body_core)
@@ -879,7 +889,7 @@ impl LowerCtx {
 
     fn lower_destructure(
         &mut self,
-        pattern: &ast::Pattern,
+        pattern: &ast::Pattern<'src>,
         source_var: VarId,
         bindings: &mut Vec<(VarId, Core)>,
     ) {
@@ -895,7 +905,7 @@ impl LowerCtx {
             ast::Pattern::Record { fields } => {
                 for (name, elem) in fields {
                     let field_var = self.builder.var();
-                    let access = Core::field_access(Core::var(source_var), name.clone());
+                    let access = Core::field_access(Core::var(source_var), (*name).to_owned());
                     bindings.push((field_var, access));
                     self.lower_destructure_elem(elem, field_var, bindings);
                 }
@@ -906,13 +916,13 @@ impl LowerCtx {
 
     fn lower_destructure_elem(
         &mut self,
-        elem: &ast::Pattern,
+        elem: &ast::Pattern<'src>,
         var: VarId,
         bindings: &mut Vec<(VarId, Core)>,
     ) {
         match elem {
             ast::Pattern::Binding(name) => {
-                self.vars.insert(name.clone(), var);
+                self.vars.insert((*name).to_owned(), var);
             }
             ast::Pattern::Tuple(_) | ast::Pattern::Record { .. } => {
                 self.lower_destructure(elem, var, bindings);
@@ -924,10 +934,11 @@ impl LowerCtx {
 
     // ---- Fold lowering ----
 
-    fn lower_fold_arm(&mut self, arm: &ast::MatchArm) -> FoldArm {
+    fn lower_fold_arm(&mut self, arm: &ast::MatchArm<'src>) -> FoldArm {
         let ast::Pattern::Constructor { name: con_name, .. } = &arm.pattern else {
             panic!("fold arms must use constructor patterns");
         };
+        let con_name = *con_name;
         let recursive_flags = self
             .constructor_fields
             .get(con_name)
@@ -973,9 +984,10 @@ impl LowerCtx {
 
     // ---- Pattern lowering ----
 
-    fn lower_pattern(&mut self, pat: &ast::Pattern) -> (Pattern, Vec<(String, VarId)>) {
+    fn lower_pattern(&mut self, pat: &ast::Pattern<'src>) -> (Pattern, Vec<(String, VarId)>) {
         match pat {
             ast::Pattern::Constructor { name, fields } => {
+                let name = *name;
                 let con_id = *self
                     .constructors
                     .get(name)
@@ -987,7 +999,7 @@ impl LowerCtx {
                         ast::Pattern::Binding(binding_name) => {
                             let var_id = self.builder.var();
                             field_vars.push(var_id);
-                            bindings.push((binding_name.clone(), var_id));
+                            bindings.push(((*binding_name).to_owned(), var_id));
                         }
                         ast::Pattern::Wildcard => {
                             let var_id = self.builder.var();

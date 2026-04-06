@@ -1,39 +1,39 @@
 #[derive(Debug, Clone)]
-pub struct Module {
-    pub decls: Vec<Decl>,
+pub struct Module<'src> {
+    pub decls: Vec<Decl<'src>>,
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub enum Decl {
+pub enum Decl<'src> {
     TypeAnno {
-        name: String,
-        type_params: Vec<String>,
-        ty: TypeExpr,
-        methods: Vec<Decl>,
+        name: &'src str,
+        type_params: Vec<&'src str>,
+        ty: TypeExpr<'src>,
+        methods: Vec<Decl<'src>>,
     },
     FuncDef {
-        name: String,
-        params: Vec<String>,
-        body: Expr,
+        name: &'src str,
+        params: Vec<&'src str>,
+        body: Expr<'src>,
     },
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub enum TypeExpr {
-    Named(String),
-    App(String, Vec<TypeExpr>),
-    TagUnion(Vec<TagDecl>),
-    Arrow(Vec<TypeExpr>, Box<TypeExpr>),
-    Record(Vec<(String, TypeExpr)>),
-    Tuple(Vec<TypeExpr>),
+pub enum TypeExpr<'src> {
+    Named(&'src str),
+    App(&'src str, Vec<TypeExpr<'src>>),
+    TagUnion(Vec<TagDecl<'src>>),
+    Arrow(Vec<TypeExpr<'src>>, Box<TypeExpr<'src>>),
+    Record(Vec<(&'src str, TypeExpr<'src>)>),
+    Tuple(Vec<TypeExpr<'src>>),
 }
 
 #[derive(Debug, Clone)]
-pub struct TagDecl {
-    pub name: String,
-    pub fields: Vec<TypeExpr>,
+pub struct TagDecl<'src> {
+    pub name: &'src str,
+    pub fields: Vec<TypeExpr<'src>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,82 +43,96 @@ pub struct Span {
 }
 
 #[derive(Debug, Clone)]
-pub struct Expr {
-    pub kind: ExprKind,
+pub struct Expr<'src> {
+    pub kind: ExprKind<'src>,
     pub span: Span,
 }
 
-impl Expr {
-    pub const fn new(kind: ExprKind, span: Span) -> Self {
+impl<'src> Expr<'src> {
+    pub const fn new(kind: ExprKind<'src>, span: Span) -> Self {
         Self { kind, span }
     }
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub enum ExprKind {
+pub enum ExprKind<'src> {
     IntLit(i64),
-    Name(String),
+    Name(&'src str),
     BinOp {
         op: BinOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
+        lhs: Box<Expr<'src>>,
+        rhs: Box<Expr<'src>>,
     },
     Call {
-        func: String,
-        args: Vec<Expr>,
+        func: &'src str,
+        args: Vec<Expr<'src>>,
     },
-    Block(Vec<Stmt>, Box<Expr>),
+    Block(Vec<Stmt<'src>>, Box<Expr<'src>>),
     If {
-        expr: Box<Expr>,
-        arms: Vec<MatchArm>,
+        expr: Box<Expr<'src>>,
+        arms: Vec<MatchArm<'src>>,
         #[allow(dead_code)]
-        else_body: Option<Box<Expr>>,
+        else_body: Option<Box<Expr<'src>>>,
     },
     Fold {
-        expr: Box<Expr>,
-        arms: Vec<MatchArm>,
+        expr: Box<Expr<'src>>,
+        arms: Vec<MatchArm<'src>>,
     },
     Lambda {
-        params: Vec<String>,
-        body: Box<Expr>,
+        params: Vec<&'src str>,
+        body: Box<Expr<'src>>,
     },
     QualifiedCall {
-        owner: String,
-        method: String,
-        args: Vec<Expr>,
+        owner: &'src str,
+        method: &'src str,
+        args: Vec<Expr<'src>>,
     },
     Record {
-        fields: Vec<(String, Expr)>,
+        fields: Vec<(&'src str, Expr<'src>)>,
     },
     FieldAccess {
-        record: Box<Expr>,
-        field: String,
+        record: Box<Expr<'src>>,
+        field: &'src str,
     },
-    Tuple(Vec<Expr>),
+    Tuple(Vec<Expr<'src>>),
 }
 
 #[derive(Debug, Clone)]
-pub struct MatchArm {
-    pub pattern: Pattern,
-    pub body: Expr,
+pub struct MatchArm<'src> {
+    pub pattern: Pattern<'src>,
+    pub body: Expr<'src>,
 }
 
 #[derive(Debug, Clone)]
-pub enum Pattern {
-    Constructor { name: String, fields: Vec<Pattern> },
-    Record { fields: Vec<(String, Pattern)> },
-    Tuple(Vec<Pattern>),
+pub enum Pattern<'src> {
+    Constructor {
+        name: &'src str,
+        fields: Vec<Pattern<'src>>,
+    },
+    Record {
+        fields: Vec<(&'src str, Pattern<'src>)>,
+    },
+    Tuple(Vec<Pattern<'src>>),
     Wildcard,
-    Binding(String),
+    Binding(&'src str),
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub enum Stmt {
-    Let { name: String, val: Expr },
-    TypeHint { name: String, ty: TypeExpr },
-    Destructure { pattern: Pattern, val: Expr },
+pub enum Stmt<'src> {
+    Let {
+        name: &'src str,
+        val: Expr<'src>,
+    },
+    TypeHint {
+        name: &'src str,
+        ty: TypeExpr<'src>,
+    },
+    Destructure {
+        pattern: Pattern<'src>,
+        val: Expr<'src>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -33,8 +33,8 @@ impl Scheme {
 
 // ---- Inference context ----
 
-struct InferCtx {
-    source: String,
+struct InferCtx<'src> {
+    source: &'src str,
     next_var: usize,
     subst: HashMap<TypeVar, Type>,
     env: HashMap<String, Scheme>,
@@ -42,15 +42,15 @@ struct InferCtx {
     /// Type aliases: Name -> Scheme (e.g. Point -> { x: I64, y: I64 })
     type_aliases: HashMap<String, Scheme>,
     /// Declared type annotations for checking against inferred types.
-    type_annos: HashMap<String, TypeExpr>,
+    type_annos: HashMap<String, TypeExpr<'src>>,
     /// Current expression span for error reporting in unify.
     current_span: Span,
 }
 
-impl InferCtx {
-    fn new(source: &str) -> Self {
+impl<'src> InferCtx<'src> {
+    fn new(source: &'src str) -> Self {
         Self {
-            source: source.to_owned(),
+            source,
             next_var: 0,
             subst: HashMap::new(),
             env: HashMap::new(),
@@ -74,10 +74,9 @@ impl InferCtx {
 
     #[expect(clippy::arithmetic_side_effects, reason = "line/col counting")]
     fn type_error(&self, span: Span, msg: &str) -> ! {
-        let src = &self.source;
         let mut line = 1_usize;
         let mut col = 1_usize;
-        for (i, ch) in src.char_indices() {
+        for (i, ch) in self.source.char_indices() {
             if i >= span.start {
                 break;
             }
@@ -88,11 +87,13 @@ impl InferCtx {
                 col += 1;
             }
         }
-        let line_start = src[..span.start].rfind('\n').map_or(0_usize, |i| i + 1);
-        let line_end = src[span.start..]
+        let line_start = self.source[..span.start]
+            .rfind('\n')
+            .map_or(0_usize, |i| i + 1);
+        let line_end = self.source[span.start..]
             .find('\n')
-            .map_or(src.len(), |i| span.start + i);
-        let src_line = &src[line_start..line_end];
+            .map_or(self.source.len(), |i| span.start + i);
+        let src_line = &self.source[line_start..line_end];
         let pad = " ".repeat(col - 1);
         let carets = "^".repeat((span.end - span.start).max(1));
         panic!(
@@ -336,23 +337,29 @@ impl InferCtx {
 
     // ---- Convert surface TypeExpr to inference Type ----
 
-    fn type_expr_to_type(&mut self, texpr: &TypeExpr, tvar_env: &HashMap<String, TypeVar>) -> Type {
+    fn type_expr_to_type(
+        &mut self,
+        texpr: &TypeExpr<'src>,
+        tvar_env: &HashMap<String, TypeVar>,
+    ) -> Type {
         match texpr {
             TypeExpr::Named(name) => {
+                let name = *name;
                 if let Some(&tv) = tvar_env.get(name) {
                     Type::Var(tv)
                 } else if let Some(scheme) = self.type_aliases.get(name).cloned() {
                     self.instantiate(&scheme)
                 } else {
-                    Type::Con(name.clone())
+                    Type::Con(name.to_owned())
                 }
             }
             TypeExpr::App(name, args) => {
+                let name = *name;
                 let arg_types: Vec<Type> = args
                     .iter()
                     .map(|a| self.type_expr_to_type(a, tvar_env))
                     .collect();
-                Type::App(name.clone(), arg_types)
+                Type::App(name.to_owned(), arg_types)
             }
             TypeExpr::Arrow(params, ret) => {
                 let param_types: Vec<Type> = params
@@ -369,7 +376,7 @@ impl InferCtx {
                 let mut row = Type::RowEmpty;
                 for (name, field_texpr) in fields.iter().rev() {
                     let field_ty = self.type_expr_to_type(field_texpr, tvar_env);
-                    row = Type::RowExtend(name.clone(), Box::new(field_ty), Box::new(row));
+                    row = Type::RowExtend((*name).to_owned(), Box::new(field_ty), Box::new(row));
                 }
                 Type::Record(Box::new(row))
             }
@@ -385,18 +392,23 @@ impl InferCtx {
 
     // ---- Register type declarations ----
 
-    fn register_type_decl(&mut self, name: &str, type_params: &[String], tags: &[ast::TagDecl]) {
+    fn register_type_decl(
+        &mut self,
+        name: &str,
+        type_params: &[&str],
+        tags: &[ast::TagDecl<'src>],
+    ) {
         // Create type variables for each type parameter
         let tvar_env: HashMap<String, TypeVar> = type_params
             .iter()
             .map(|p| {
                 let tv = self.fresh();
                 let Type::Var(tv_id) = tv else { unreachable!() };
-                (p.clone(), tv_id)
+                ((*p).to_owned(), tv_id)
             })
             .collect();
 
-        let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[p]).collect();
+        let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[*p]).collect();
 
         // The return type for constructors of this type
         let return_type = if tvars.is_empty() {
@@ -420,7 +432,7 @@ impl InferCtx {
                 Type::Arrow(field_types, Box::new(return_type.clone()))
             };
             self.constructors.insert(
-                tag.name.clone(),
+                tag.name.to_owned(),
                 Scheme {
                     vars: tvars.clone(),
                     ty: con_type,
@@ -435,12 +447,13 @@ impl InferCtx {
         clippy::too_many_lines,
         reason = "expression inference handles all forms"
     )]
-    fn infer_expr(&mut self, expr: &Expr) -> Type {
+    fn infer_expr(&mut self, expr: &Expr<'src>) -> Type {
         self.current_span = expr.span;
         match &expr.kind {
             ExprKind::IntLit(_) => Type::Con("I64".to_owned()),
 
             ExprKind::Name(name) => {
+                let name = *name;
                 if let Some(scheme) = self.env.get(name).cloned() {
                     return self.instantiate(&scheme);
                 }
@@ -467,7 +480,10 @@ impl InferCtx {
                 }
             }
 
-            ExprKind::Call { func, args } => self.infer_call(func, args),
+            ExprKind::Call { func, args } => {
+                let func = *func;
+                self.infer_call(func, args)
+            }
 
             ExprKind::QualifiedCall {
                 owner,
@@ -480,13 +496,15 @@ impl InferCtx {
 
             ExprKind::Block(stmts, result) => {
                 let saved_env = self.env.clone();
-                let mut pending_hints: HashMap<String, TypeExpr> = HashMap::new();
+                let mut pending_hints: HashMap<String, TypeExpr<'src>> = HashMap::new();
                 for stmt in stmts {
                     match stmt {
                         Stmt::TypeHint { name, ty } => {
-                            pending_hints.insert(name.clone(), ty.clone());
+                            let name = *name;
+                            pending_hints.insert(name.to_owned(), ty.clone());
                         }
                         Stmt::Let { name, val } => {
+                            let name = *name;
                             let val_ty = self.infer_expr(val);
                             // If there's a type hint for this binding, enforce it
                             if let Some(hint) = pending_hints.remove(name) {
@@ -494,7 +512,7 @@ impl InferCtx {
                                 self.unify(&val_ty, &hint_ty);
                             }
                             let scheme = self.generalize(&val_ty);
-                            self.env.insert(name.clone(), scheme);
+                            self.env.insert(name.to_owned(), scheme);
                         }
                         Stmt::Destructure { pattern, val } => {
                             let val_ty = self.infer_expr(val);
@@ -555,17 +573,18 @@ impl InferCtx {
                 let mut row = Type::RowEmpty;
                 for (name, field_expr) in fields.iter().rev() {
                     let field_ty = self.infer_expr(field_expr);
-                    row = Type::RowExtend(name.clone(), Box::new(field_ty), Box::new(row));
+                    row = Type::RowExtend((*name).to_owned(), Box::new(field_ty), Box::new(row));
                 }
                 Type::Record(Box::new(row))
             }
 
             ExprKind::FieldAccess { record, field } => {
+                let field = *field;
                 let record_ty = self.infer_expr(record);
                 let field_ty = self.fresh();
                 let rest_row = self.fresh();
                 let expected = Type::Record(Box::new(Type::RowExtend(
-                    field.clone(),
+                    field.to_owned(),
                     Box::new(field_ty.clone()),
                     Box::new(rest_row),
                 )));
@@ -579,7 +598,7 @@ impl InferCtx {
                     .iter()
                     .map(|p| {
                         let ty = self.fresh();
-                        self.env.insert(p.clone(), Scheme::mono(ty.clone()));
+                        self.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
                         ty
                     })
                     .collect();
@@ -595,7 +614,7 @@ impl InferCtx {
         }
     }
 
-    fn infer_call(&mut self, func: &str, args: &[Expr]) -> Type {
+    fn infer_call(&mut self, func: &str, args: &[Expr<'src>]) -> Type {
         let arg_types: Vec<Type> = args.iter().map(|a| self.infer_expr(a)).collect();
         let ret = self.fresh();
 
@@ -622,9 +641,10 @@ impl InferCtx {
 
     // ---- Pattern inference ----
 
-    fn infer_pattern(&mut self, pat: &ast::Pattern, expected: &Type) -> Vec<(String, Type)> {
+    fn infer_pattern(&mut self, pat: &ast::Pattern<'src>, expected: &Type) -> Vec<(String, Type)> {
         match pat {
             ast::Pattern::Constructor { name, fields } => {
+                let name = *name;
                 let scheme = self
                     .constructors
                     .get(name)
@@ -648,7 +668,7 @@ impl InferCtx {
                     for (field_pat, field_ty) in fields.iter().zip(field_types.iter()) {
                         match field_pat {
                             ast::Pattern::Binding(n) => {
-                                bindings.push((n.clone(), field_ty.clone()));
+                                bindings.push(((*n).to_owned(), field_ty.clone()));
                             }
                             ast::Pattern::Wildcard => {}
                             ast::Pattern::Constructor { .. }
@@ -667,7 +687,7 @@ impl InferCtx {
                 for (field_name, field_pat) in fields.iter().rev() {
                     let field_ty = self.fresh();
                     row = Type::RowExtend(
-                        field_name.clone(),
+                        (*field_name).to_owned(),
                         Box::new(field_ty.clone()),
                         Box::new(row),
                     );
@@ -688,7 +708,7 @@ impl InferCtx {
                 bindings
             }
             ast::Pattern::Binding(name) => {
-                vec![(name.clone(), expected.clone())]
+                vec![((*name).to_owned(), expected.clone())]
             }
             ast::Pattern::Wildcard => vec![],
         }
@@ -697,12 +717,13 @@ impl InferCtx {
     /// Like `infer_pattern` but for fold arms: recursive fields get the result type.
     fn infer_fold_pattern(
         &mut self,
-        pat: &ast::Pattern,
+        pat: &ast::Pattern<'src>,
         scrutinee_ty: &Type,
         result_ty: &Type,
     ) -> Vec<(String, Type)> {
         match pat {
             ast::Pattern::Constructor { name, fields } => {
+                let name = *name;
                 let scheme = self
                     .constructors
                     .get(name)
@@ -734,7 +755,7 @@ impl InferCtx {
                         };
                         match field_pat {
                             ast::Pattern::Binding(n) => {
-                                bindings.push((n.clone(), bind_ty));
+                                bindings.push(((*n).to_owned(), bind_ty));
                             }
                             ast::Pattern::Wildcard => {}
                             ast::Pattern::Constructor { .. } => {
@@ -826,7 +847,7 @@ impl InferCtx {
     clippy::too_many_lines,
     reason = "multi-pass type checking orchestration"
 )]
-pub fn check(source: &str, module: &Module) {
+pub fn check<'src>(source: &'src str, module: &Module<'src>) {
     let mut ctx = InferCtx::new(source);
 
     // Register prelude: Bool : [True, False]
@@ -835,11 +856,11 @@ pub fn check(source: &str, module: &Module) {
         &[],
         &[
             ast::TagDecl {
-                name: "True".to_owned(),
+                name: "True",
                 fields: vec![],
             },
             ast::TagDecl {
-                name: "False".to_owned(),
+                name: "False",
                 fields: vec![],
             },
         ],
@@ -854,6 +875,7 @@ pub fn check(source: &str, module: &Module) {
                 ty: TypeExpr::TagUnion(tags),
                 methods,
             } => {
+                let name = *name;
                 ctx.register_type_decl(name, type_params, tags);
                 // Register method signatures and collect method annotations
                 for method in methods {
@@ -863,6 +885,7 @@ pub fn check(source: &str, module: &Module) {
                             params,
                             ..
                         } => {
+                            let method_name = *method_name;
                             let mangled = format!("{name}.{method_name}");
                             let param_types: Vec<Type> =
                                 params.iter().map(|_| ctx.fresh()).collect();
@@ -875,6 +898,7 @@ pub fn check(source: &str, module: &Module) {
                             ty,
                             ..
                         } => {
+                            let method_name = *method_name;
                             let mangled = format!("{name}.{method_name}");
                             ctx.type_annos.insert(mangled, ty.clone());
                         }
@@ -887,6 +911,7 @@ pub fn check(source: &str, module: &Module) {
                 ty,
                 ..
             } => {
+                let name = *name;
                 if name.starts_with(|c: char| c.is_ascii_uppercase()) {
                     // CamelCase: type alias (e.g. Point : { x: I64, y: I64 })
                     let tvar_env: HashMap<String, TypeVar> = type_params
@@ -894,13 +919,13 @@ pub fn check(source: &str, module: &Module) {
                         .map(|p| {
                             let t = ctx.fresh();
                             let Type::Var(tv) = t else { unreachable!() };
-                            (p.clone(), tv)
+                            ((*p).to_owned(), tv)
                         })
                         .collect();
-                    let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[p]).collect();
+                    let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[*p]).collect();
                     let alias_ty = ctx.type_expr_to_type(ty, &tvar_env);
                     ctx.type_aliases.insert(
-                        name.clone(),
+                        name.to_owned(),
                         Scheme {
                             vars: tvars,
                             ty: alias_ty,
@@ -908,14 +933,15 @@ pub fn check(source: &str, module: &Module) {
                     );
                 } else {
                     // snake_case: value/function annotation (e.g. get_x : I64 -> I64)
-                    ctx.type_annos.insert(name.clone(), ty.clone());
+                    ctx.type_annos.insert(name.to_owned(), ty.clone());
                 }
             }
             Decl::FuncDef { name, params, .. } => {
+                let name = *name;
                 let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
                 let ret = ctx.fresh();
                 let func_ty = Type::Arrow(param_types, Box::new(ret));
-                ctx.env.insert(name.clone(), Scheme::mono(func_ty));
+                ctx.env.insert(name.to_owned(), Scheme::mono(func_ty));
             }
         }
     }
@@ -924,6 +950,7 @@ pub fn check(source: &str, module: &Module) {
     for decl in &module.decls {
         match decl {
             Decl::FuncDef { name, params, body } => {
+                let name = *name;
                 let saved_env = ctx.env.clone();
                 let pre_scheme = ctx.env[name].clone();
                 let func_ty = ctx.instantiate(&pre_scheme);
@@ -934,7 +961,7 @@ pub fn check(source: &str, module: &Module) {
                 ctx.unify(&func_ty, &expected);
 
                 for (p, ty) in params.iter().zip(param_types.iter()) {
-                    ctx.env.insert(p.clone(), Scheme::mono(ty.clone()));
+                    ctx.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
                 }
                 let body_ty = ctx.infer_expr(body);
                 ctx.unify(&ret, &body_ty);
@@ -946,9 +973,10 @@ pub fn check(source: &str, module: &Module) {
 
                 let resolved = ctx.resolve(&func_ty);
                 let generalized = ctx.generalize(&resolved);
-                ctx.env.insert(name.clone(), generalized);
+                ctx.env.insert(name.to_owned(), generalized);
             }
             Decl::TypeAnno { name, methods, .. } => {
+                let name = *name;
                 for method in methods {
                     if let Decl::FuncDef {
                         name: method_name,
@@ -956,6 +984,7 @@ pub fn check(source: &str, module: &Module) {
                         body,
                     } = method
                     {
+                        let method_name = *method_name;
                         let mangled = format!("{name}.{method_name}");
                         let saved_env = ctx.env.clone();
                         let pre_scheme = ctx.env[&mangled].clone();
@@ -967,7 +996,7 @@ pub fn check(source: &str, module: &Module) {
                         ctx.unify(&func_ty, &expected);
 
                         for (p, ty) in params.iter().zip(param_types.iter()) {
-                            ctx.env.insert(p.clone(), Scheme::mono(ty.clone()));
+                            ctx.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
                         }
                         let body_ty = ctx.infer_expr(body);
                         ctx.unify(&ret, &body_ty);
