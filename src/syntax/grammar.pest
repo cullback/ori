@@ -5,7 +5,9 @@ COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
 
 // ---- Module ----
 
-module = { SOI ~ import_decl* ~ decl* ~ EOI }
+module = { SOI ~ exports_decl? ~ import_decl* ~ decl* ~ EOI }
+
+exports_decl = { "exports" ~ "[" ~ name ~ ("," ~ name)* ~ "]" }
 
 import_decl = { "import" ~ name ~ exposing_clause? }
 exposing_clause = { "exposing" ~ "[" ~ name ~ ("," ~ name)* ~ "]" }
@@ -148,4 +150,4 @@ mul_op =  { "*" | "/" | "%" }
 
 name = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" }
+keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" | "exports" }

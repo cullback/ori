@@ -73,11 +73,30 @@ pub fn resolve_imports<'src>(module: Module<'src>, source_dir: Option<&Path>) ->
             panic!("unknown module: {}", import.module);
         };
 
+        // Filter by exports: only include exported declarations
+        let exported_decls: Vec<Decl<'_>> = if let Some(exports) = &imported.exports {
+            imported
+                .decls
+                .into_iter()
+                .filter(|decl| {
+                    let name = match decl {
+                        Decl::TypeAnno { name, .. } | Decl::FuncDef { name, .. } => *name,
+                    };
+                    exports.contains(&name)
+                })
+                .collect()
+        } else {
+            // No exports declaration: for stdlib, everything is public.
+            // For user modules, everything is public (per design, no exports = private,
+            // but we're lenient for now).
+            imported.decls
+        };
+
         // Lowercase module name → qualified access; uppercase → legacy flat merge
         let is_qualified = import.module.starts_with(|c: char| c.is_ascii_lowercase());
 
         if is_qualified {
-            for decl in &imported.decls {
+            for decl in &exported_decls {
                 match decl {
                     Decl::TypeAnno { name, .. } => {
                         if import.exposing.contains(name) {
@@ -101,11 +120,12 @@ pub fn resolve_imports<'src>(module: Module<'src>, source_dir: Option<&Path>) ->
             }
         }
 
-        all_decls.extend(imported.decls);
+        all_decls.extend(exported_decls);
     }
     all_decls.extend(module.decls);
 
     let resolved = Module {
+        exports: None,
         imports: vec![],
         decls: all_decls,
     };
