@@ -3,12 +3,12 @@ use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest_derive::Parser;
 
-use crate::ast::{
+use crate::syntax::ast::{
     BinOp, Decl, Expr, ExprKind, Import, MatchArm, Module, Pattern, Span, Stmt, TagDecl, TypeExpr,
 };
 
 #[derive(Parser)]
-#[grammar = "ori.pest"]
+#[grammar = "syntax/grammar.pest"]
 struct OriParser;
 
 fn span_of(pair: &Pair<'_, Rule>) -> Span {

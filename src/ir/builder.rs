@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 
-use crate::ir::{
-    Builtin, ConstructorDef, DebugNames, FuncDef, FuncId, Program, TypeDef, TypeId, VarId,
+use crate::ir::core::{
+    Builtin, ConstructorDef, Core, DebugNames, FuncDef, FuncId, Program, TypeDef, TypeId, VarId,
 };
-
-use crate::ir::Core;
 
 #[derive(Debug, Default)]
 pub struct Builder {

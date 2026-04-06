@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Stmt, TypeExpr};
-use crate::builder::Builder;
-use crate::ir::{
+use crate::ir::builder::Builder;
+use crate::ir::core::{
     Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, Pattern, Program, VarId,
 };
-use crate::parse;
 use crate::stdlib;
+use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Stmt, TypeExpr};
+use crate::syntax::parse;
 
 /// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
 fn method_key(type_name: &str, method: &str) -> String {
@@ -21,7 +21,7 @@ fn method_key(type_name: &str, method: &str) -> String {
 pub fn lower(
     module: &Module<'_>,
     scope: &crate::resolve::ModuleScope,
-    lit_types: &HashMap<ast::Span, crate::infer::NumType>,
+    lit_types: &HashMap<ast::Span, crate::types::infer::NumType>,
 ) -> (Program, VarId) {
     let mut ctx = LowerCtx::new(lit_types.clone());
 
@@ -291,11 +291,11 @@ struct LowerCtx<'src> {
     /// Functions reachable from main (dead code is not lowered).
     reachable: HashSet<String>,
     /// Resolved literal types from type inference.
-    lit_types: HashMap<ast::Span, crate::infer::NumType>,
+    lit_types: HashMap<ast::Span, crate::types::infer::NumType>,
 }
 
 impl<'src> LowerCtx<'src> {
-    fn new(lit_types: HashMap<ast::Span, crate::infer::NumType>) -> Self {
+    fn new(lit_types: HashMap<ast::Span, crate::types::infer::NumType>) -> Self {
         let mut builder = Builder::new();
         let mut binops = HashMap::new();
 
@@ -995,10 +995,10 @@ impl<'src> LowerCtx<'src> {
                 clippy::cast_possible_truncation
             )]
             ExprKind::IntLit(n) => match self.lit_types.get(&expr.span) {
-                Some(crate::infer::NumType::U8) => Core::u8(*n as u8),
-                Some(crate::infer::NumType::I8) => Core::i8(*n as i8),
-                Some(crate::infer::NumType::U64) => Core::u64(*n as u64),
-                Some(crate::infer::NumType::F64) => Core::f64(*n as f64),
+                Some(crate::types::infer::NumType::U8) => Core::u8(*n as u8),
+                Some(crate::types::infer::NumType::I8) => Core::i8(*n as i8),
+                Some(crate::types::infer::NumType::U64) => Core::u64(*n as u64),
+                Some(crate::types::infer::NumType::F64) => Core::f64(*n as f64),
                 _ => Core::i64(*n),
             },
             ExprKind::FloatLit(n) => Core::f64(*n),

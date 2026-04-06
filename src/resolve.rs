@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Decl, Module};
-use crate::{parse, stdlib};
+use crate::stdlib;
+use crate::syntax::ast::{Decl, Module};
+use crate::syntax::parse;
 
 /// Tracks which imported types need module qualification.
 pub struct ModuleScope {

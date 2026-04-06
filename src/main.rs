@@ -1,12 +1,8 @@
-mod ast;
-mod builder;
-mod eval;
-mod infer;
 mod ir;
 mod lower;
-mod parse;
 mod resolve;
 mod stdlib;
+mod syntax;
 #[cfg(test)]
 mod test_frontend;
 #[cfg(test)]
@@ -31,9 +27,9 @@ fn main() {
     // Compile (catch panics from parser/type checker and print cleanly)
     std::panic::set_hook(Box::new(|_| {}));
     let compile_result = std::panic::catch_unwind(|| {
-        let parsed = parse::parse(&source);
+        let parsed = syntax::parse::parse(&source);
         let (module, scope) = resolve::resolve_imports(parsed);
-        let lit_types = infer::check(&source, &module, &scope);
+        let lit_types = types::infer::check(&source, &module, &scope);
         lower::lower(&module, &scope, &lit_types)
     });
     drop(std::panic::take_hook());
@@ -62,17 +58,22 @@ fn main() {
 
     // Evaluate
     let mut env = HashMap::new();
-    env.insert(input_var, ir::Value::VNum(ir::NumVal::I64(number)));
-    let result = eval::eval(&env, &program, &program.main);
+    env.insert(
+        input_var,
+        ir::core::Value::VNum(ir::core::NumVal::I64(number)),
+    );
+    let result = ir::eval::eval(&env, &program, &program.main);
 
     // Print result
     match result {
-        ir::Value::VNum(ir::NumVal::U8(n)) => println!("{n}"),
-        ir::Value::VNum(ir::NumVal::I8(n)) => println!("{n}"),
-        ir::Value::VNum(ir::NumVal::I64(n)) => println!("{n}"),
-        ir::Value::VNum(ir::NumVal::U64(n)) => println!("{n}"),
-        ir::Value::VNum(ir::NumVal::F64(n)) => println!("{n}"),
-        ir::Value::VConstruct { .. } | ir::Value::VRecord { .. } | ir::Value::VList(_) => {
+        ir::core::Value::VNum(ir::core::NumVal::U8(n)) => println!("{n}"),
+        ir::core::Value::VNum(ir::core::NumVal::I8(n)) => println!("{n}"),
+        ir::core::Value::VNum(ir::core::NumVal::I64(n)) => println!("{n}"),
+        ir::core::Value::VNum(ir::core::NumVal::U64(n)) => println!("{n}"),
+        ir::core::Value::VNum(ir::core::NumVal::F64(n)) => println!("{n}"),
+        ir::core::Value::VConstruct { .. }
+        | ir::core::Value::VRecord { .. }
+        | ir::core::Value::VList(_) => {
             println!("{result:?}");
         }
     }

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::ir::{Builtin, Core, FoldArm, FuncId, Literal, NumVal, Pattern, Program, Value, VarId};
+use crate::ir::core::{
+    Builtin, Core, FoldArm, FuncId, Literal, NumVal, Pattern, Program, Value, VarId,
+};
 
 type Env = HashMap<VarId, Value>;
 

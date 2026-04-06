@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr};
-use crate::types::{Scheme, Type, TypeEngine, TypeVar};
+use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr};
+use crate::types::engine::{Scheme, Type, TypeEngine, TypeVar};
 
 /// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
 fn method_key(type_name: &str, method: &str) -> String {
@@ -230,7 +230,7 @@ impl<'src> InferCtx<'src> {
     /// Parse and register a stdlib module: types, constructors, method signatures, and bodies.
     fn register_stdlib_module(&mut self, module_name: &str) {
         let src = crate::stdlib::get(module_name).unwrap_or("");
-        let stdlib = crate::parse::parse(src);
+        let stdlib = crate::syntax::parse::parse(src);
 
         for decl in &stdlib.decls {
             match decl {
@@ -297,7 +297,8 @@ impl<'src> InferCtx<'src> {
                     // Body-less annotation: convert to a proper scheme for builtins
                     let mut tvar_env = HashMap::new();
                     let anno_ty = self.type_expr_to_type(ty, &mut tvar_env);
-                    let tvars: Vec<crate::types::TypeVar> = tvar_env.into_values().collect();
+                    let tvars: Vec<crate::types::engine::TypeVar> =
+                        tvar_env.into_values().collect();
                     let scheme = Scheme {
                         vars: tvars,
                         ty: anno_ty,
