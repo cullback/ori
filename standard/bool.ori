@@ -1,1 +1,6 @@
-Bool := [True, False]
+Bool := [True, False].(
+    not : Bool -> Bool
+    not = |b| if b
+        : True then False
+        : False then True
+)
