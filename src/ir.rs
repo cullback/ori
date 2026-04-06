@@ -137,11 +137,6 @@ pub enum Core {
         step: Box<Core>,
         apply_func: FuncId,
     },
-    ListMap {
-        list: Box<Core>,
-        func: Box<Core>,
-        apply_func: FuncId,
-    },
 }
 
 #[allow(dead_code)]
@@ -197,14 +192,6 @@ impl Core {
 
     pub const fn list_lit(elements: Vec<Self>) -> Self {
         Self::ListLit(elements)
-    }
-
-    pub fn list_map(list: Self, func: Self, apply_func: FuncId) -> Self {
-        Self::ListMap {
-            list: Box::new(list),
-            func: Box::new(func),
-            apply_func,
-        }
     }
 
     pub fn list_walk(list: Self, init: Self, step: Self, apply_func: FuncId) -> Self {

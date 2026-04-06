@@ -7,7 +7,9 @@ List := .(
     append : List(a), a -> List(a)
     reverse : List(a) -> List(a)
     walk : List(a), b, (b, a -> b) -> b
+
     map : List(a), (a -> a) -> List(a)
+    map = |xs, f| List.walk(xs, [], |acc, x| List.append(acc, f(x)))
 
     sum : List(I64) -> I64
     sum = |xs| List.walk(xs, 0, |acc, x| acc + x)

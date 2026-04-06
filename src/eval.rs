@@ -114,7 +114,6 @@ fn call_func(env: &Env, program: &Program, func: FuncId, args: &[Value]) -> Valu
     eval(&local_env, program, &func_def.body)
 }
 
-#[expect(clippy::too_many_lines, reason = "handles all Core terms")]
 pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
     match core {
         Core::Var(name) => env
@@ -192,23 +191,6 @@ pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
         Core::ListLit(elements) => {
             let vals: Vec<Value> = elements.iter().map(|e| eval(env, program, e)).collect();
             Value::VList(vals)
-        }
-
-        Core::ListMap {
-            list,
-            func,
-            apply_func,
-        } => {
-            let list_val = eval(env, program, list);
-            let func_closure = eval(env, program, func);
-            let Value::VList(elements) = list_val else {
-                panic!("List.map: expected list");
-            };
-            let mapped: Vec<Value> = elements
-                .into_iter()
-                .map(|elem| call_func(env, program, *apply_func, &[func_closure.clone(), elem]))
-                .collect();
-            Value::VList(mapped)
         }
 
         Core::ListWalk {

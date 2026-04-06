@@ -490,19 +490,6 @@ impl<'src> InferCtx<'src> {
                 ty: Type::Arrow(vec![list_a, b.clone(), step_fn], Box::new(b)),
             },
         );
-
-        // List.map : List(a), (a -> a) -> List(a)
-        let a = self.fresh();
-        let Type::Var(a_var) = a else { unreachable!() };
-        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
-        let map_fn = Type::Arrow(vec![a.clone()], Box::new(a));
-        self.env.insert(
-            "List.map".to_owned(),
-            Scheme {
-                vars: vec![a_var],
-                ty: Type::Arrow(vec![list_a.clone(), map_fn], Box::new(list_a)),
-            },
-        );
     }
 
     // ---- Expression inference ----

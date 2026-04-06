@@ -85,10 +85,23 @@ pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Progr
     ctx.collect_lambdas(&module.decls);
     // Also scan list stdlib method bodies for lambdas
     for method in &list_methods {
-        if let Decl::FuncDef { name, body, .. } = method {
+        if let Decl::FuncDef {
+            name, params, body, ..
+        } = method
+        {
             let mangled = format!("List.{name}");
             if ctx.reachable.contains(&mangled) {
+                // Mark higher-order params so captured closures are tracked
+                for (i, p) in params.iter().enumerate() {
+                    let key = (mangled.clone(), i);
+                    if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
+                        ctx.ho_vars.insert((*p).to_owned(), ls_idx);
+                    }
+                }
                 ctx.scan_expr(body);
+                for p in params {
+                    ctx.ho_vars.remove(*p);
+                }
             }
         }
     }
@@ -283,14 +296,18 @@ pub fn lower(module: &Module<'_>, scope: &crate::resolve::ModuleScope) -> (Progr
 
 // ---- Defunctionalization data structures ----
 
+#[derive(Clone)]
 struct LambdaEntry<'src> {
     tag: FuncId,
     captures: Vec<&'src str>,
+    /// For each capture, if it's a higher-order variable, the lambda set index.
+    capture_ho: Vec<Option<usize>>,
     params: Vec<&'src str>,
     body: Option<Expr<'src>>,
     func_ref: Option<FuncId>,
 }
 
+#[derive(Clone)]
 struct LambdaSet<'src> {
     apply_func: FuncId,
     entries: Vec<LambdaEntry<'src>>,
@@ -666,10 +683,7 @@ impl<'src> LowerCtx<'src> {
             }
             ExprKind::QualifiedCall { segments, args } => {
                 let mangled = segments.join(".");
-                let is_list_ho = mangled == "List.walk"
-                    || mangled.ends_with(".List.walk")
-                    || mangled == "List.map"
-                    || mangled.ends_with(".List.map");
+                let is_list_ho = mangled == "List.walk" || mangled.ends_with(".List.walk");
                 if is_list_ho || self.funcs.contains_key(&mangled) {
                     self.scan_call_args(&mangled, args);
                 } else {
@@ -760,9 +774,14 @@ impl<'src> LowerCtx<'src> {
             idx
         };
 
+        let capture_ho: Vec<Option<usize>> = captures
+            .iter()
+            .map(|name| self.ho_vars.get(*name).copied())
+            .collect();
         let tag = self.builder.func();
         self.lambda_sets[ls_idx].entries.push(LambdaEntry {
             tag,
+            capture_ho,
             captures,
             params,
             body: body.cloned(),
@@ -802,7 +821,22 @@ impl<'src> LowerCtx<'src> {
                 self.collect_free(lhs, bound, seen, free);
                 self.collect_free(rhs, bound, seen, free);
             }
-            ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
+            ExprKind::Call { func, args } => {
+                // func might be a captured variable used as a function
+                if !bound.contains(func)
+                    && !self.constructors.contains_key(*func)
+                    && !self.funcs.contains_key(*func)
+                    && !self.list_builtins.contains_key(&format!("List.{func}"))
+                    && !seen.contains(func)
+                {
+                    seen.insert(func);
+                    free.push(func);
+                }
+                for arg in args {
+                    self.collect_free(arg, bound, seen, free);
+                }
+            }
+            ExprKind::QualifiedCall { args, .. } => {
                 for arg in args {
                     self.collect_free(arg, bound, seen, free);
                 }
@@ -1038,26 +1072,7 @@ impl<'src> LowerCtx<'src> {
         }
     }
 
-    #[expect(
-        clippy::missing_asserts_for_indexing,
-        reason = "args length checked by assert"
-    )]
     fn lower_call(&mut self, func: &str, args: &[Expr<'src>]) -> Core {
-        // List.map is special: emits Core::ListMap with closure + apply_func
-        if func == "List.map" || func.ends_with(".List.map") {
-            assert!(args.len() >= 2, "List.map takes 2 arguments");
-            let list_core = self.lower_expr(&args[0]);
-            let key = (func.to_owned(), 1);
-            let closure_core = if self.ho_param_sets.contains_key(&key) {
-                self.lower_lambda_arg(&args[1], func, 1)
-            } else {
-                self.lower_expr(&args[1])
-            };
-            let ls_idx = self.ho_param_sets[&key];
-            let apply_func = self.lambda_sets[ls_idx].apply_func;
-            return Core::list_map(list_core, closure_core, apply_func);
-        }
-
         // List.walk is special: emits Core::ListWalk with closure + apply_func
         if func == "List.walk" || func.ends_with(".List.walk") {
             assert!(args.len() >= 3, "List.walk takes 3 arguments");
@@ -1153,8 +1168,8 @@ impl<'src> LowerCtx<'src> {
     // ---- Generate apply functions ----
 
     fn generate_apply_functions(&mut self) {
-        // Clone lambda sets to avoid borrow conflict with self.lower_expr
-        let sets: Vec<LambdaSet<'src>> = std::mem::take(&mut self.lambda_sets);
+        // Clone lambda sets — we need them accessible during body lowering
+        let sets: Vec<LambdaSet<'src>> = self.lambda_sets.clone();
 
         for ls in &sets {
             let closure_var = self.builder.var();
@@ -1183,6 +1198,13 @@ impl<'src> LowerCtx<'src> {
                         for (cap_name, &cap_var) in entry.captures.iter().zip(&cap_vars) {
                             self.vars.insert((*cap_name).to_owned(), cap_var);
                         }
+                        // Wire up ho_vars for captured higher-order variables
+                        for (cap_name, ho_idx) in entry.captures.iter().zip(entry.capture_ho.iter())
+                        {
+                            if let Some(ls_idx) = ho_idx {
+                                self.ho_vars.insert((*cap_name).to_owned(), *ls_idx);
+                            }
+                        }
                         for (param_name, &arg_var) in entry.params.iter().zip(&arg_vars) {
                             self.vars.insert((*param_name).to_owned(), arg_var);
                         }
@@ -1191,6 +1213,7 @@ impl<'src> LowerCtx<'src> {
 
                         for cap_name in &entry.captures {
                             self.vars.remove(*cap_name);
+                            self.ho_vars.remove(*cap_name);
                         }
                         for param_name in &entry.params {
                             self.vars.remove(*param_name);
