@@ -8,8 +8,6 @@ use crate::ir::{
 use crate::parse;
 use crate::stdlib;
 
-const PRELUDE: &str = "Bool : [True, False]\n";
-
 /// Lower a parsed AST module into a Core IR program.
 ///
 /// Returns the program and the `VarId` of `main`'s input parameter
@@ -22,9 +20,9 @@ pub fn lower(
 ) -> (Program, VarId) {
     let mut ctx = LowerCtx::new(lit_types.clone());
 
-    // Parse and register the prelude
-    let prelude = parse::parse(PRELUDE);
-    ctx.register_decls(&prelude.decls);
+    // Parse and register Bool from stdlib
+    let bool_stdlib = parse::parse(stdlib::get("Bool").unwrap_or(""));
+    ctx.register_decls(&bool_stdlib.decls);
 
     // Now that Bool is known, register comparison builtins
     ctx.register_comparison_builtins();
@@ -82,8 +80,24 @@ pub fn lower(
         }
     }
 
+    // Extract Bool stdlib methods
+    let bool_methods: Vec<&Decl<'static>> = bool_stdlib
+        .decls
+        .iter()
+        .filter_map(|d| {
+            if let Decl::TypeAnno { methods, .. } = d {
+                Some(methods.iter())
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
     // Compute reachable functions from main (skip dead code)
-    ctx.compute_reachable_with_list_stdlib(&module.decls, &list_methods);
+    let mut all_stdlib_methods: Vec<&Decl<'static>> = bool_methods;
+    all_stdlib_methods.extend(&list_methods);
+    ctx.compute_reachable_with_list_stdlib(&module.decls, &all_stdlib_methods);
 
     // Pass 1.5: scan reachable bodies to collect lambdas for defunctionalization
     ctx.collect_lambdas(&module.decls);
@@ -230,6 +244,51 @@ pub fn lower(
                 params: param_vars,
                 body: body_core,
             });
+        }
+    }
+
+    // Lower Bool stdlib method bodies
+    for decl in &bool_stdlib.decls {
+        if let Decl::TypeAnno {
+            name: type_name,
+            methods,
+            ..
+        } = decl
+        {
+            let type_name = *type_name;
+            for method_decl in methods {
+                let Decl::FuncDef {
+                    name: method_name,
+                    params,
+                    body,
+                } = method_decl
+                else {
+                    continue;
+                };
+                let method_name = *method_name;
+                let mangled = format!("{type_name}.{method_name}");
+                if !ctx.reachable.contains(&mangled) {
+                    continue;
+                }
+                let func_id = ctx.funcs[&mangled];
+                let param_vars: Vec<VarId> = params
+                    .iter()
+                    .map(|p| {
+                        let v = ctx.builder.var();
+                        ctx.vars.insert((*p).to_owned(), v);
+                        v
+                    })
+                    .collect();
+                let body_core = ctx.lower_expr(body);
+                for p in params {
+                    ctx.vars.remove(*p);
+                }
+                ctx.builder.add_func(FuncDef {
+                    name: func_id,
+                    params: param_vars,
+                    body: body_core,
+                });
+            }
         }
     }
 

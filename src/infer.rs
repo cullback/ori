@@ -1014,21 +1014,59 @@ pub fn check<'src>(
 ) -> HashMap<Span, NumType> {
     let mut ctx = InferCtx::new(source);
 
-    // Register prelude: Bool : [True, False]
-    ctx.register_type_decl(
-        "Bool",
-        &[],
-        &[
-            ast::TagDecl {
-                name: "True",
-                fields: vec![],
-            },
-            ast::TagDecl {
-                name: "False",
-                fields: vec![],
-            },
-        ],
-    );
+    // Register Bool from stdlib
+    let bool_stdlib = crate::parse::parse(crate::stdlib::get("Bool").unwrap_or(""));
+    for decl in &bool_stdlib.decls {
+        if let Decl::TypeAnno {
+            name,
+            type_params,
+            ty: TypeExpr::TagUnion(tags),
+            methods,
+            ..
+        } = decl
+        {
+            ctx.register_type_decl(name, type_params, tags);
+            for method in methods {
+                match method {
+                    Decl::FuncDef {
+                        name: method_name,
+                        params,
+                        ..
+                    } => {
+                        let mangled = format!("{name}.{method_name}");
+                        let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
+                        let ret = ctx.fresh();
+                        let func_ty = Type::Arrow(param_types, Box::new(ret));
+                        ctx.env.insert(mangled, Scheme::mono(func_ty));
+                    }
+                    Decl::TypeAnno {
+                        name: method_name,
+                        ty,
+                        ..
+                    } => {
+                        let mangled = format!("{name}.{method_name}");
+                        ctx.type_annos.insert(mangled, ty.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Infer Bool method bodies
+    for decl in &bool_stdlib.decls {
+        if let Decl::TypeAnno { name, methods, .. } = decl {
+            for method in methods {
+                if let Decl::FuncDef {
+                    name: method_name,
+                    params,
+                    body,
+                } = method
+                {
+                    let mangled = format!("{name}.{method_name}");
+                    ctx.infer_func_body(&mangled, params, body);
+                }
+            }
+        }
+    }
 
     // Register built-in List type and its operations
     ctx.register_list_builtins();
