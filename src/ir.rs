@@ -46,7 +46,6 @@ pub enum Builtin {
     Rem,
     Max,
     Eq { true_con: FuncId, false_con: FuncId },
-    ListEmpty,
     ListLen,
     ListGet,
     ListAppend,

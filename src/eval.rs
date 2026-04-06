@@ -64,7 +64,6 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
                 fields: vec![],
             })
         }
-        Builtin::ListEmpty => Some(Value::VList(vec![])),
         Builtin::ListLen => {
             let [Value::VList(elems)] = args else {
                 panic!("List.len: expected list")

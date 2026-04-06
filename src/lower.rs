@@ -419,7 +419,6 @@ impl<'src> LowerCtx<'src> {
         // Eq and Neq are registered after the prelude defines Bool
 
         let mut list_builtins = HashMap::new();
-        list_builtins.insert("List.empty".to_owned(), builder.builtin(Builtin::ListEmpty));
         list_builtins.insert("List.len".to_owned(), builder.builtin(Builtin::ListLen));
         list_builtins.insert("List.get".to_owned(), builder.builtin(Builtin::ListGet));
         list_builtins.insert(

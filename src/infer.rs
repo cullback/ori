@@ -430,18 +430,6 @@ impl<'src> InferCtx<'src> {
 
     #[expect(clippy::redundant_clone, reason = "each block is independent")]
     fn register_list_builtins(&mut self) {
-        // List.empty : List(a)
-        let a = self.fresh();
-        let Type::Var(a_var) = a else { unreachable!() };
-        let list_a = Type::App("List".to_owned(), vec![a.clone()]);
-        self.env.insert(
-            "List.empty".to_owned(),
-            Scheme {
-                vars: vec![a_var],
-                ty: list_a.clone(),
-            },
-        );
-
         // List.len : List(a) -> I64
         let a = self.fresh();
         let Type::Var(a_var) = a else { unreachable!() };
