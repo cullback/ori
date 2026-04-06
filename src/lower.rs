@@ -60,6 +60,22 @@ pub fn lower(
         }
     }
 
+    // Register module-qualified aliases for imported free functions
+    for decl in &module.decls {
+        if let Decl::FuncDef { name, .. } = decl {
+            let name = *name;
+            if let Some(mod_name) = scope.qualified_funcs.get(name) {
+                let qualified = format!("{mod_name}.{name}");
+                if let Some(&func_id) = ctx.funcs.get(name) {
+                    ctx.funcs.insert(qualified.clone(), func_id);
+                }
+                if let Some(&arity) = ctx.func_arities.get(name) {
+                    ctx.func_arities.insert(qualified, arity);
+                }
+            }
+        }
+    }
+
     // Compute reachable functions from main (skip dead code)
     let mut all_stdlib_methods = bool_methods;
     all_stdlib_methods.extend(&list_methods);

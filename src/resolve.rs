@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::stdlib;
 use crate::syntax::ast::{Decl, Module};
@@ -8,46 +9,93 @@ use crate::syntax::parse;
 pub struct ModuleScope {
     /// type name → module name, for types that need `module.Type` qualification
     pub qualified_types: HashMap<String, String>,
+    /// free function name → module name, for functions that need `module.func` qualification
+    pub qualified_funcs: HashMap<String, String>,
     /// Types brought into bare scope via `exposing`
     pub exposed_types: HashSet<String>,
+    /// Free functions brought into bare scope via `exposing`
+    pub exposed_funcs: HashSet<String>,
 }
 
 impl ModuleScope {
     fn new() -> Self {
         Self {
             qualified_types: HashMap::new(),
+            qualified_funcs: HashMap::new(),
             exposed_types: HashSet::new(),
+            exposed_funcs: HashSet::new(),
         }
     }
 }
 
+/// Resolved module with owned sources for file-based imports.
+/// The `sources` field keeps file contents alive so the module can borrow from them.
+pub struct Resolved<'src> {
+    pub module: Module<'src>,
+    pub scope: ModuleScope,
+    /// Owned file contents for file-based imports (must outlive `module`).
+    pub _sources: Vec<String>,
+}
+
 /// Resolve imports by prepending imported declarations to the module.
-/// Returns the flattened module and a scope describing how names are qualified.
-pub fn resolve_imports(module: Module<'_>) -> (Module<'_>, ModuleScope) {
+/// Checks stdlib first, then looks for `.ori` files relative to `source_dir`.
+pub fn resolve_imports<'src>(module: Module<'src>, source_dir: Option<&Path>) -> Resolved<'src> {
     let mut scope = ModuleScope::new();
 
     if module.imports.is_empty() {
-        return (module, scope);
+        return Resolved {
+            module,
+            scope,
+            _sources: vec![],
+        };
     }
 
-    let mut all_decls = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
+    let mut all_decls: Vec<Decl<'src>> = Vec::new();
+
     for import in &module.imports {
-        let src = stdlib::get(import.module)
-            .unwrap_or_else(|| panic!("unknown module: {}", import.module));
-        let imported = parse::parse(src);
+        // Try stdlib first, then file system
+        let imported = if let Some(stdlib_src) = stdlib::get(import.module) {
+            parse::parse(stdlib_src)
+        } else if let Some(dir) = source_dir {
+            // Try name.ori relative to the source file's directory
+            let path = dir.join(format!("{}.ori", import.module));
+            let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("cannot import '{}': {e}", import.module);
+            });
+            sources.push(content);
+            // SAFETY: the source string lives in `sources` which is returned alongside
+            // the module, so the borrow is valid for the lifetime of Resolved.
+            let src_ref: &str =
+                unsafe { &*std::ptr::from_ref::<str>(sources.last().unwrap().as_str()) };
+            parse::parse(src_ref)
+        } else {
+            panic!("unknown module: {}", import.module);
+        };
 
         // Lowercase module name → qualified access; uppercase → legacy flat merge
         let is_qualified = import.module.starts_with(|c: char| c.is_ascii_lowercase());
 
         if is_qualified {
             for decl in &imported.decls {
-                if let Decl::TypeAnno { name, .. } = decl {
-                    if import.exposing.contains(name) {
-                        scope.exposed_types.insert((*name).to_owned());
-                    } else {
-                        scope
-                            .qualified_types
-                            .insert((*name).to_owned(), import.module.to_owned());
+                match decl {
+                    Decl::TypeAnno { name, .. } => {
+                        if import.exposing.contains(name) {
+                            scope.exposed_types.insert((*name).to_owned());
+                        } else {
+                            scope
+                                .qualified_types
+                                .insert((*name).to_owned(), import.module.to_owned());
+                        }
+                    }
+                    Decl::FuncDef { name, .. } => {
+                        if import.exposing.contains(name) {
+                            scope.exposed_funcs.insert((*name).to_owned());
+                        } else {
+                            scope
+                                .qualified_funcs
+                                .insert((*name).to_owned(), import.module.to_owned());
+                        }
                     }
                 }
             }
@@ -61,5 +109,9 @@ pub fn resolve_imports(module: Module<'_>) -> (Module<'_>, ModuleScope) {
         imports: vec![],
         decls: all_decls,
     };
-    (resolved, scope)
+    Resolved {
+        module: resolved,
+        scope,
+        _sources: sources,
+    }
 }

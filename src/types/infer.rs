@@ -831,6 +831,11 @@ pub fn check<'src>(
                 let param_types: Vec<Type> = params.iter().map(|_| ctx.engine.fresh()).collect();
                 let ret = ctx.engine.fresh();
                 let func_ty = Type::Arrow(param_types, Box::new(ret));
+                // Dual-register qualified alias for imported free functions
+                if let Some(mod_name) = scope.qualified_funcs.get(name) {
+                    let qual = format!("{mod_name}.{name}");
+                    ctx.env.insert(qual, Scheme::mono(func_ty.clone()));
+                }
                 ctx.env.insert(name.to_owned(), Scheme::mono(func_ty));
             }
         }
@@ -841,6 +846,13 @@ pub fn check<'src>(
         match decl {
             Decl::FuncDef { name, params, body } => {
                 ctx.infer_func_body(name, params, body);
+                // Dual-register qualified alias after inference
+                if let Some(mod_name) = scope.qualified_funcs.get(*name) {
+                    let qual = format!("{mod_name}.{name}");
+                    if let Some(scheme) = ctx.env.get(*name).cloned() {
+                        ctx.env.insert(qual, scheme);
+                    }
+                }
             }
             Decl::TypeAnno { name, methods, .. } => {
                 let name = *name;

@@ -26,11 +26,12 @@ fn main() {
 
     // Compile (catch panics from parser/type checker and print cleanly)
     std::panic::set_hook(Box::new(|_| {}));
+    let source_dir = std::path::Path::new(&args[1]).parent();
     let compile_result = std::panic::catch_unwind(|| {
         let parsed = syntax::parse::parse(&source);
-        let (module, scope) = resolve::resolve_imports(parsed);
-        let lit_types = types::infer::check(&source, &module, &scope);
-        lower::lower(&module, &scope, &lit_types)
+        let resolved = resolve::resolve_imports(parsed, source_dir);
+        let lit_types = types::infer::check(&source, &resolved.module, &resolved.scope);
+        lower::lower(&resolved.module, &resolved.scope, &lit_types)
     });
     drop(std::panic::take_hook());
     let (program, input_var) = match compile_result {

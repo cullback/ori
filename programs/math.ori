@@ -1,0 +1,5 @@
+square : I64 -> I64
+square = |x| x * x
+
+double : I64 -> I64
+double = |x| x + x

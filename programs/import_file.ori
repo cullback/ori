@@ -1,0 +1,4 @@
+import math
+
+main : I64 -> I64
+main = |arg| math.square(5) + math.double(3)
