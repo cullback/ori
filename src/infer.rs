@@ -19,6 +19,24 @@ enum Type {
     Tuple(Vec<Type>),
 }
 
+impl Type {
+    /// Apply a function to each direct child type, preserving structure.
+    fn map_children(&self, f: &mut impl FnMut(&Self) -> Self) -> Self {
+        match self {
+            Self::Var(_) | Self::Con(_) | Self::RowEmpty => self.clone(),
+            Self::App(name, args) => Self::App(name.clone(), args.iter().map(&mut *f).collect()),
+            Self::Arrow(params, ret) => {
+                Self::Arrow(params.iter().map(&mut *f).collect(), Box::new(f(ret)))
+            }
+            Self::Record(row) => Self::Record(Box::new(f(row))),
+            Self::RowExtend(label, field_ty, rest) => {
+                Self::RowExtend(label.clone(), Box::new(f(field_ty)), Box::new(f(rest)))
+            }
+            Self::Tuple(elems) => Self::Tuple(elems.iter().map(f).collect()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Scheme {
     vars: Vec<TypeVar>,
@@ -105,46 +123,27 @@ impl<'src> InferCtx<'src> {
 
     fn resolve(&self, ty: &Type) -> Type {
         match ty {
-            Type::Var(tv) => {
-                if let Some(t) = self.subst.get(tv) {
-                    self.resolve(t)
-                } else {
-                    ty.clone()
-                }
-            }
-            Type::Con(_) => ty.clone(),
-            Type::App(name, args) => {
-                Type::App(name.clone(), args.iter().map(|a| self.resolve(a)).collect())
-            }
-            Type::Arrow(params, ret) => Type::Arrow(
-                params.iter().map(|p| self.resolve(p)).collect(),
-                Box::new(self.resolve(ret)),
-            ),
-            Type::Record(row) => Type::Record(Box::new(self.resolve(row))),
-            Type::RowEmpty => Type::RowEmpty,
-            Type::RowExtend(label, field_ty, rest) => Type::RowExtend(
-                label.clone(),
-                Box::new(self.resolve(field_ty)),
-                Box::new(self.resolve(rest)),
-            ),
-            Type::Tuple(elems) => Type::Tuple(elems.iter().map(|e| self.resolve(e)).collect()),
+            Type::Var(tv) => match self.subst.get(tv) {
+                Some(t) => self.resolve(t),
+                None => ty.clone(),
+            },
+            _ => ty.map_children(&mut |child| self.resolve(child)),
         }
     }
 
     fn occurs_in(&self, tv: TypeVar, ty: &Type) -> bool {
         let resolved = self.resolve(ty);
-        match &resolved {
-            Type::Var(v) => *v == tv,
-            Type::Con(_) | Type::RowEmpty => false,
-            Type::App(_, args) => args.iter().any(|a| self.occurs_in(tv, a)),
-            Type::Arrow(params, ret) => {
-                params.iter().any(|p| self.occurs_in(tv, p)) || self.occurs_in(tv, ret)
-            }
-            Type::Record(row) => self.occurs_in(tv, row),
-            Type::RowExtend(_, field_ty, rest) => {
-                self.occurs_in(tv, field_ty) || self.occurs_in(tv, rest)
-            }
-            Type::Tuple(elems) => elems.iter().any(|e| self.occurs_in(tv, e)),
+        if let Type::Var(v) = &resolved {
+            *v == tv
+        } else {
+            let mut found = false;
+            resolved.map_children(&mut |child| {
+                if self.occurs_in(tv, child) {
+                    found = true;
+                }
+                child.clone()
+            });
+            found
         }
     }
 
@@ -255,23 +254,15 @@ impl<'src> InferCtx<'src> {
 
     fn free_vars(&self, ty: &Type) -> HashSet<TypeVar> {
         let resolved = self.resolve(ty);
-        match &resolved {
-            Type::Var(v) => HashSet::from([*v]),
-            Type::Con(_) | Type::RowEmpty => HashSet::new(),
-            Type::App(_, args) => args.iter().flat_map(|a| self.free_vars(a)).collect(),
-            Type::Arrow(params, ret) => {
-                let mut fvs: HashSet<TypeVar> =
-                    params.iter().flat_map(|p| self.free_vars(p)).collect();
-                fvs.extend(self.free_vars(ret));
-                fvs
-            }
-            Type::Record(row) => self.free_vars(row),
-            Type::RowExtend(_, field_ty, rest) => {
-                let mut fvs = self.free_vars(field_ty);
-                fvs.extend(self.free_vars(rest));
-                fvs
-            }
-            Type::Tuple(elems) => elems.iter().flat_map(|e| self.free_vars(e)).collect(),
+        if let Type::Var(v) = &resolved {
+            HashSet::from([*v])
+        } else {
+            let mut fvs = HashSet::new();
+            resolved.map_children(&mut |child| {
+                fvs.extend(self.free_vars(child));
+                child.clone()
+            });
+            fvs
         }
     }
 
@@ -305,33 +296,7 @@ impl<'src> InferCtx<'src> {
     fn apply_mapping(ty: &Type, mapping: &HashMap<TypeVar, Type>) -> Type {
         match ty {
             Type::Var(v) => mapping.get(v).cloned().unwrap_or_else(|| ty.clone()),
-            Type::Con(_) => ty.clone(),
-            Type::App(name, args) => Type::App(
-                name.clone(),
-                args.iter()
-                    .map(|a| Self::apply_mapping(a, mapping))
-                    .collect(),
-            ),
-            Type::Arrow(params, ret) => Type::Arrow(
-                params
-                    .iter()
-                    .map(|p| Self::apply_mapping(p, mapping))
-                    .collect(),
-                Box::new(Self::apply_mapping(ret, mapping)),
-            ),
-            Type::Record(row) => Type::Record(Box::new(Self::apply_mapping(row, mapping))),
-            Type::RowEmpty => Type::RowEmpty,
-            Type::RowExtend(label, field_ty, rest) => Type::RowExtend(
-                label.clone(),
-                Box::new(Self::apply_mapping(field_ty, mapping)),
-                Box::new(Self::apply_mapping(rest, mapping)),
-            ),
-            Type::Tuple(elems) => Type::Tuple(
-                elems
-                    .iter()
-                    .map(|e| Self::apply_mapping(e, mapping))
-                    .collect(),
-            ),
+            _ => ty.map_children(&mut |child| Self::apply_mapping(child, mapping)),
         }
     }
 
@@ -845,6 +810,36 @@ impl<'src> InferCtx<'src> {
             }
         }
     }
+    // ---- Function body inference ----
+
+    fn infer_func_body(&mut self, name: &str, params: &[&'src str], body: &Expr<'src>) {
+        let saved_env = self.env.clone();
+        let pre_scheme = self.env[name].clone();
+        let func_ty = self.instantiate(&pre_scheme);
+
+        let param_types: Vec<Type> = params.iter().map(|_| self.fresh()).collect();
+        let ret = self.fresh();
+        let expected = Type::Arrow(param_types.clone(), Box::new(ret.clone()));
+        self.unify(&func_ty, &expected);
+
+        for (p, ty) in params.iter().zip(param_types.iter()) {
+            self.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
+        }
+        let body_ty = self.infer_expr(body);
+        self.unify(&ret, &body_ty);
+
+        if let Some(anno) = self.type_annos.get(name).cloned() {
+            let anno_ty = self.type_expr_to_type(&anno, &mut HashMap::new());
+            self.unify(&func_ty, &anno_ty);
+        }
+
+        self.env = saved_env;
+        self.env.remove(name);
+
+        let resolved = self.resolve(&func_ty);
+        let generalized = self.generalize(&resolved);
+        self.env.insert(name.to_owned(), generalized);
+    }
 }
 
 // ---- Public API ----
@@ -956,33 +951,7 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
     for decl in &module.decls {
         match decl {
             Decl::FuncDef { name, params, body } => {
-                let name = *name;
-                let saved_env = ctx.env.clone();
-                let pre_scheme = ctx.env[name].clone();
-                let func_ty = ctx.instantiate(&pre_scheme);
-
-                let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
-                let ret = ctx.fresh();
-                let expected = Type::Arrow(param_types.clone(), Box::new(ret.clone()));
-                ctx.unify(&func_ty, &expected);
-
-                for (p, ty) in params.iter().zip(param_types.iter()) {
-                    ctx.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
-                }
-                let body_ty = ctx.infer_expr(body);
-                ctx.unify(&ret, &body_ty);
-
-                if let Some(anno) = ctx.type_annos.get(name).cloned() {
-                    let anno_ty = ctx.type_expr_to_type(&anno, &mut HashMap::new());
-                    ctx.unify(&func_ty, &anno_ty);
-                }
-
-                ctx.env = saved_env;
-                ctx.env.remove(name); // remove monomorphic binding before generalizing
-
-                let resolved = ctx.resolve(&func_ty);
-                let generalized = ctx.generalize(&resolved);
-                ctx.env.insert(name.to_owned(), generalized);
+                ctx.infer_func_body(name, params, body);
             }
             Decl::TypeAnno { name, methods, .. } => {
                 let name = *name;
@@ -993,34 +962,8 @@ pub fn check<'src>(source: &'src str, module: &Module<'src>) {
                         body,
                     } = method
                     {
-                        let method_name = *method_name;
-                        let mangled = format!("{name}.{method_name}");
-                        let saved_env = ctx.env.clone();
-                        let pre_scheme = ctx.env[&mangled].clone();
-                        let func_ty = ctx.instantiate(&pre_scheme);
-
-                        let param_types: Vec<Type> = params.iter().map(|_| ctx.fresh()).collect();
-                        let ret = ctx.fresh();
-                        let expected = Type::Arrow(param_types.clone(), Box::new(ret.clone()));
-                        ctx.unify(&func_ty, &expected);
-
-                        for (p, ty) in params.iter().zip(param_types.iter()) {
-                            ctx.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
-                        }
-                        let body_ty = ctx.infer_expr(body);
-                        ctx.unify(&ret, &body_ty);
-
-                        if let Some(anno) = ctx.type_annos.get(&mangled).cloned() {
-                            let anno_ty = ctx.type_expr_to_type(&anno, &mut HashMap::new());
-                            ctx.unify(&func_ty, &anno_ty);
-                        }
-
-                        ctx.env = saved_env;
-                        ctx.env.remove(&mangled);
-
-                        let resolved = ctx.resolve(&func_ty);
-                        let generalized = ctx.generalize(&resolved);
-                        ctx.env.insert(mangled, generalized);
+                        let mangled = format!("{name}.{}", *method_name);
+                        ctx.infer_func_body(&mangled, params, body);
                     }
                 }
             }
