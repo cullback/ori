@@ -28,6 +28,10 @@ impl CompileError {
         let Some(span) = self.span else {
             return self.message.clone();
         };
+        // If span is out of bounds (e.g., from an imported file), show message only
+        if span.start >= source.len() || span.end > source.len() {
+            return self.message.clone();
+        }
         let mut line = 1_usize;
         let mut col = 1_usize;
         for (i, ch) in source.char_indices() {
