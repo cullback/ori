@@ -81,7 +81,10 @@ pub fn resolve_imports<'src>(
         };
 
         // Filter by exports: only include exported declarations
-        let exported_decls: Vec<Decl<'_>> = if let Some(exports) = &imported.exports {
+        let exported_decls: Vec<Decl<'_>> = if imported.exports.is_empty() {
+            // No exports declaration: everything is public
+            imported.decls
+        } else {
             imported
                 .decls
                 .into_iter()
@@ -89,14 +92,9 @@ pub fn resolve_imports<'src>(
                     let name = match decl {
                         Decl::TypeAnno { name, .. } | Decl::FuncDef { name, .. } => *name,
                     };
-                    exports.contains(&name)
+                    imported.exports.contains(&name)
                 })
                 .collect()
-        } else {
-            // No exports declaration: for stdlib, everything is public.
-            // For user modules, everything is public (per design, no exports = private,
-            // but we're lenient for now).
-            imported.decls
         };
 
         // Lowercase module name → qualified access; uppercase → legacy flat merge
@@ -132,7 +130,7 @@ pub fn resolve_imports<'src>(
     all_decls.extend(module.decls);
 
     let resolved = Module {
-        exports: None,
+        exports: vec![],
         imports: vec![],
         decls: all_decls,
     };

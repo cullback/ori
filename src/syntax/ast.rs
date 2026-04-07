@@ -1,6 +1,6 @@
 #[derive(Debug, Clone)]
 pub struct Module<'src> {
-    pub exports: Option<Vec<&'src str>>,
+    pub exports: Vec<&'src str>,
     pub imports: Vec<Import<'src>>,
     pub decls: Vec<Decl<'src>>,
 }
