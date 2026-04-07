@@ -935,6 +935,7 @@ pub fn check<'src>(
                 name,
                 type_params,
                 ty,
+                methods,
                 ..
             } => {
                 let name = *name;
@@ -961,6 +962,33 @@ pub fn check<'src>(
                     }
                     ctx.type_aliases.insert(name.to_owned(), alias_scheme);
                     ctx.known_types.insert(name.to_owned());
+                    // Register methods on non-TagUnion types (e.g. Foo := U64.(new = ...))
+                    for method in methods {
+                        match method {
+                            Decl::FuncDef {
+                                name: method_name,
+                                params,
+                                ..
+                            } => {
+                                let method_name = *method_name;
+                                let mangled = method_key(name, method_name);
+                                let param_types: Vec<Type> =
+                                    params.iter().map(|_| ctx.engine.fresh()).collect();
+                                let ret = ctx.engine.fresh();
+                                let func_ty = Type::Arrow(param_types, Box::new(ret));
+                                ctx.env.insert(mangled, Scheme::mono(func_ty));
+                            }
+                            Decl::TypeAnno {
+                                name: method_name,
+                                ty: method_ty,
+                                ..
+                            } => {
+                                let method_name = *method_name;
+                                let mangled = method_key(name, method_name);
+                                ctx.type_annos.insert(mangled, method_ty.clone());
+                            }
+                        }
+                    }
                 } else {
                     // snake_case: value/function annotation (e.g. get_x : I64 -> I64)
                     ctx.type_annos.insert(name.to_owned(), ty.clone());

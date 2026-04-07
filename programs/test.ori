@@ -1,0 +1,14 @@
+
+
+Foo := U64.(
+	new = |a| Foo(a)
+)
+
+
+main = |arg| (
+	c = Foo.new(3)
+	0
+)
+
+
+
