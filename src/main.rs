@@ -1,4 +1,5 @@
 mod core;
+mod error;
 mod lower;
 mod resolve;
 mod stdlib;
@@ -13,6 +14,18 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use std::process;
 
+use error::CompileError;
+
+fn compile(
+    source: &str,
+    source_dir: Option<&std::path::Path>,
+) -> Result<(crate::core::Program, crate::core::VarId), CompileError> {
+    let parsed = syntax::parse::parse(source)?;
+    let resolved = resolve::resolve_imports(parsed, source_dir)?;
+    let infer_result = types::infer::check(source, &resolved.module, &resolved.scope)?;
+    lower::lower(&resolved.module, &resolved.scope, &infer_result)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -24,27 +37,11 @@ fn main() {
         process::exit(1);
     });
 
-    // Compile (catch panics from parser/type checker and print cleanly)
-    std::panic::set_hook(Box::new(|_| {}));
     let source_dir = std::path::Path::new(&args[1]).parent();
-    let compile_result = std::panic::catch_unwind(|| {
-        let parsed = syntax::parse::parse(&source);
-        let resolved = resolve::resolve_imports(parsed, source_dir);
-        let infer_result = types::infer::check(&source, &resolved.module, &resolved.scope);
-        lower::lower(&resolved.module, &resolved.scope, &infer_result)
-    });
-    drop(std::panic::take_hook());
-    let (program, input_var) = match compile_result {
+    let (program, input_var) = match compile(&source, source_dir) {
         Ok(result) => result,
         Err(e) => {
-            let msg = if let Some(s) = e.downcast_ref::<String>() {
-                s.as_str()
-            } else if let Some(s) = e.downcast_ref::<&str>() {
-                s
-            } else {
-                "unknown error"
-            };
-            eprintln!("{msg}");
+            eprintln!("{}", e.format(&source));
             process::exit(1);
         }
     };

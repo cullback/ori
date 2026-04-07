@@ -3,6 +3,7 @@ use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest_derive::Parser;
 
+use crate::error::CompileError;
 use crate::syntax::ast::{
     BinOp, ConstraintDecl, Decl, Expr, ExprKind, Import, MatchArm, Module, Pattern, Span, Stmt,
     TagDecl, TypeExpr,
@@ -20,10 +21,11 @@ fn span_of(pair: &Pair<'_, Rule>) -> Span {
     }
 }
 
-pub fn parse(source: &str) -> Module<'_> {
-    let pairs = OriParser::parse(Rule::module, source).unwrap_or_else(|e| panic!("{e}"));
+pub fn parse(source: &str) -> Result<Module<'_>, CompileError> {
+    let pairs =
+        OriParser::parse(Rule::module, source).map_err(|e| CompileError::new(e.to_string()))?;
     let module_pair = pairs.into_iter().next().unwrap();
-    parse_module(module_pair)
+    Ok(parse_module(module_pair))
 }
 
 fn parse_module(pair: Pair<'_, Rule>) -> Module<'_> {

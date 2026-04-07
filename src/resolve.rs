@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::error::CompileError;
 use crate::stdlib;
 use crate::syntax::ast::{Decl, Module};
 use crate::syntax::parse;
@@ -39,15 +40,18 @@ pub struct Resolved<'src> {
 
 /// Resolve imports by prepending imported declarations to the module.
 /// Checks stdlib first, then looks for `.ori` files relative to `source_dir`.
-pub fn resolve_imports<'src>(module: Module<'src>, source_dir: Option<&Path>) -> Resolved<'src> {
+pub fn resolve_imports<'src>(
+    module: Module<'src>,
+    source_dir: Option<&Path>,
+) -> Result<Resolved<'src>, CompileError> {
     let mut scope = ModuleScope::new();
 
     if module.imports.is_empty() {
-        return Resolved {
+        return Ok(Resolved {
             module,
             scope,
             _sources: vec![],
-        };
+        });
     }
 
     let mut sources: Vec<String> = Vec::new();
@@ -56,21 +60,24 @@ pub fn resolve_imports<'src>(module: Module<'src>, source_dir: Option<&Path>) ->
     for import in &module.imports {
         // Try stdlib first, then file system
         let imported = if let Some(stdlib_src) = stdlib::get(import.module) {
-            parse::parse(stdlib_src)
+            parse::parse(stdlib_src)?
         } else if let Some(dir) = source_dir {
             // Try name.ori relative to the source file's directory
             let path = dir.join(format!("{}.ori", import.module));
-            let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                panic!("cannot import '{}': {e}", import.module);
-            });
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                CompileError::new(format!("cannot import '{}': {e}", import.module))
+            })?;
             sources.push(content);
             // SAFETY: the source string lives in `sources` which is returned alongside
             // the module, so the borrow is valid for the lifetime of Resolved.
             let src_ref: &str =
                 unsafe { &*std::ptr::from_ref::<str>(sources.last().unwrap().as_str()) };
-            parse::parse(src_ref)
+            parse::parse(src_ref)?
         } else {
-            panic!("unknown module: {}", import.module);
+            return Err(CompileError::new(format!(
+                "unknown module: {}",
+                import.module
+            )));
         };
 
         // Filter by exports: only include exported declarations
@@ -129,9 +136,9 @@ pub fn resolve_imports<'src>(module: Module<'src>, source_dir: Option<&Path>) ->
         imports: vec![],
         decls: all_decls,
     };
-    Resolved {
+    Ok(Resolved {
         module: resolved,
         scope,
         _sources: sources,
-    }
+    })
 }

@@ -4,11 +4,12 @@ use crate::core::{NumVal, Value};
 
 /// Compile and run an Ori program with the given I64 input.
 fn run(source: &str, input: i64) -> Value {
-    let parsed = crate::syntax::parse::parse(source);
-    let resolved = crate::resolve::resolve_imports(parsed, None);
-    let infer_result = crate::types::infer::check(source, &resolved.module, &resolved.scope);
+    let parsed = crate::syntax::parse::parse(source).unwrap();
+    let resolved = crate::resolve::resolve_imports(parsed, None).unwrap();
+    let infer_result =
+        crate::types::infer::check(source, &resolved.module, &resolved.scope).unwrap();
     let (program, input_var) =
-        crate::lower::lower(&resolved.module, &resolved.scope, &infer_result);
+        crate::lower::lower(&resolved.module, &resolved.scope, &infer_result).unwrap();
     let mut env = HashMap::new();
     env.insert(input_var, Value::VNum(NumVal::I64(input)));
     crate::core::eval::eval(&env, &program, &program.main)

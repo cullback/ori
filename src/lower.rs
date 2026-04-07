@@ -4,6 +4,7 @@ use crate::core::builder::Builder;
 use crate::core::{
     Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, Pattern, Program, VarId,
 };
+use crate::error::CompileError;
 use crate::stdlib;
 use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Stmt, TypeExpr};
 use crate::syntax::parse;
@@ -22,7 +23,7 @@ pub fn lower(
     module: &Module<'_>,
     scope: &crate::resolve::ModuleScope,
     infer_result: &crate::types::infer::InferResult,
-) -> (Program, VarId) {
+) -> Result<(Program, VarId), CompileError> {
     let mut ctx = LowerCtx::new(infer_result);
 
     // Register stdlib modules
@@ -243,13 +244,14 @@ pub fn lower(
     ctx.lower_stdlib_methods(&all_stdlib_methods);
 
     // Lower main
-    let params = main_params.expect("no 'main' function defined");
+    let params = main_params.ok_or_else(|| CompileError::new("no 'main' function defined"))?;
     let body = main_body.unwrap();
-    assert!(
-        params.len() == 1,
-        "main must take exactly one parameter, got {}",
-        params.len()
-    );
+    if params.len() != 1 {
+        return Err(CompileError::new(format!(
+            "main must take exactly one parameter, got {}",
+            params.len()
+        )));
+    }
 
     let input_var = ctx.builder.var();
     ctx.vars.insert(params[0].to_owned(), input_var);
@@ -268,7 +270,7 @@ pub fn lower(
     ctx.generate_apply_functions();
 
     let program = ctx.builder.build(main_core);
-    (program, input_var)
+    Ok((program, input_var))
 }
 
 // ---- Defunctionalization data structures ----
@@ -366,7 +368,8 @@ impl<'src> LowerCtx<'src> {
 
     /// Parse a stdlib module and register its types, constructors, and method signatures.
     fn register_stdlib_module(&mut self, module_name: &str) -> Module<'static> {
-        let stdlib = parse::parse(stdlib::get(module_name).unwrap_or(""));
+        let stdlib = parse::parse(stdlib::get(module_name).unwrap_or(""))
+            .expect("stdlib module should always parse successfully");
         self.register_decls(&stdlib.decls);
         stdlib
     }
