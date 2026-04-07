@@ -1,3 +1,5 @@
+use crate::source::FileId;
+
 #[derive(Debug, Clone)]
 pub struct Module<'src> {
     pub exports: Vec<&'src str>,
@@ -59,6 +61,7 @@ pub struct TagDecl<'src> {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Span {
+    pub file: FileId,
     pub start: usize,
     pub end: usize,
 }

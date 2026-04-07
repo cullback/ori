@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 
 use crate::core::{NumVal, Value};
+use crate::source::SourceArena;
 
 /// Compile and run an Ori program with the given I64 input.
 fn run(source: &str, input: i64) -> Value {
-    let parsed = crate::syntax::parse::parse(source).unwrap();
-    let resolved = crate::resolve::resolve_imports(parsed, None).unwrap();
+    let arena = SourceArena::new();
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    let resolved = crate::resolve::resolve_imports(parsed, &arena, None).unwrap();
     let infer_result =
-        crate::types::infer::check(source, &resolved.module, &resolved.scope).unwrap();
+        crate::types::infer::check(&arena, &resolved.module, &resolved.scope).unwrap();
     let (program, input_var) =
-        crate::lower::lower(&resolved.module, &resolved.scope, &infer_result).unwrap();
+        crate::lower::lower(&arena, &resolved.module, &resolved.scope, &infer_result).unwrap();
     let mut env = HashMap::new();
     env.insert(input_var, Value::VNum(NumVal::I64(input)));
     crate::core::eval::eval(&env, &program, &program.main)
@@ -834,7 +837,7 @@ main = |arg| get_x({ x: 42, y: 0 })";
 }
 
 // ============================================================
-// Type inference — error detection
+// Type inference -- error detection
 // ============================================================
 
 #[test]
@@ -853,7 +856,7 @@ fn type_error_if_branch_mismatch() {
 }
 
 // ============================================================
-// Type inference — parametric polymorphism
+// Type inference -- parametric polymorphism
 // ============================================================
 
 #[test]
@@ -1020,7 +1023,7 @@ main = |arg| add_twice(10, 3)";
 
 #[test]
 fn constraint_where_clause_parses() {
-    // Explicit where clause — just verifies it parses and checks
+    // Explicit where clause -- just verifies it parses and checks
     let source = "\
 add_twice : a, a -> a where [a.add]
 add_twice = |x, y| x + y + y
@@ -1033,7 +1036,7 @@ main = |arg| add_twice(10, 3)";
 
 #[test]
 fn constraint_method_on_concrete_type() {
-    // x.not() where x is Bool — resolves to Bool.not
+    // x.not() where x is Bool -- resolves to Bool.not
     let source = "\
 main : I64 -> I64
 main = |arg| (

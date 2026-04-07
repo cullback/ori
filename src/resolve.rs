@@ -2,15 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::CompileError;
+use crate::source::SourceArena;
 use crate::stdlib;
 use crate::syntax::ast::{Decl, Module};
 use crate::syntax::parse;
 
 /// Tracks which imported types need module qualification.
 pub struct ModuleScope {
-    /// type name → module name, for types that need `module.Type` qualification
+    /// type name -> module name, for types that need `module.Type` qualification
     pub qualified_types: HashMap<String, String>,
-    /// free function name → module name, for functions that need `module.func` qualification
+    /// free function name -> module name, for functions that need `module.func` qualification
     pub qualified_funcs: HashMap<String, String>,
     /// Types brought into bare scope via `exposing`
     pub exposed_types: HashSet<String>,
@@ -29,13 +30,10 @@ impl ModuleScope {
     }
 }
 
-/// Resolved module with owned sources for file-based imports.
-/// The `sources` field keeps file contents alive so the module can borrow from them.
+/// Resolved module.
 pub struct Resolved<'src> {
     pub module: Module<'src>,
     pub scope: ModuleScope,
-    /// Owned file contents for file-based imports (must outlive `module`).
-    pub _sources: Vec<String>,
 }
 
 /// Resolve imports by prepending imported declarations to the module.
@@ -43,37 +41,30 @@ pub struct Resolved<'src> {
 #[expect(clippy::too_many_lines, reason = "import resolution with validation")]
 pub fn resolve_imports<'src>(
     module: Module<'src>,
+    arena: &'src SourceArena,
     source_dir: Option<&Path>,
 ) -> Result<Resolved<'src>, CompileError> {
     let mut scope = ModuleScope::new();
 
     if module.imports.is_empty() {
-        return Ok(Resolved {
-            module,
-            scope,
-            _sources: vec![],
-        });
+        return Ok(Resolved { module, scope });
     }
 
-    let mut sources: Vec<String> = Vec::new();
     let mut all_decls: Vec<Decl<'src>> = Vec::new();
 
     for import in &module.imports {
         // Try stdlib first, then file system
         let imported = if let Some(stdlib_src) = stdlib::get(import.module) {
-            parse::parse(stdlib_src)?
+            let file_id = arena.add(format!("<stdlib:{}>", import.module), stdlib_src.to_owned());
+            parse::parse(arena.content(file_id), file_id)?
         } else if let Some(dir) = source_dir {
             // Try name.ori relative to the source file's directory
             let path = dir.join(format!("{}.ori", import.module));
             let content = std::fs::read_to_string(&path).map_err(|e| {
                 CompileError::new(format!("cannot import '{}': {e}", import.module))
             })?;
-            sources.push(content);
-            // SAFETY: the source string lives in `sources` which is returned alongside
-            // the module, so the borrow is valid for the lifetime of Resolved.
-            let src_ref: &str =
-                unsafe { &*std::ptr::from_ref::<str>(sources.last().unwrap().as_str()) };
-            parse::parse(src_ref)?
+            let file_id = arena.add(path.display().to_string(), content);
+            parse::parse(arena.content(file_id), file_id)?
         } else {
             return Err(CompileError::new(format!(
                 "unknown module: {}",
@@ -84,8 +75,6 @@ pub fn resolve_imports<'src>(
         // Check for body-less method declarations in user modules
         let is_stdlib = stdlib::get(import.module).is_some();
         if !is_stdlib {
-            let import_source = sources.last().map_or("", String::as_str);
-            let import_file = format!("{}.ori", import.module);
             for decl in &imported.decls {
                 if let Decl::TypeAnno { methods, name, .. } = decl {
                     let func_names: std::collections::HashSet<&str> = methods
@@ -109,8 +98,7 @@ pub fn resolve_imports<'src>(
                             return Err(CompileError::at(
                                 *span,
                                 format!("method '{name}.{method_name}' declared but not defined"),
-                            )
-                            .in_file(import_file, import_source.to_owned()));
+                            ));
                         }
                     }
                 }
@@ -137,7 +125,7 @@ pub fn resolve_imports<'src>(
                 .collect()
         };
 
-        // Lowercase module name → qualified access; uppercase → legacy flat merge
+        // Lowercase module name -> qualified access; uppercase -> legacy flat merge
         let is_qualified = import.module.starts_with(|c: char| c.is_ascii_lowercase());
 
         if is_qualified {
@@ -177,6 +165,5 @@ pub fn resolve_imports<'src>(
     Ok(Resolved {
         module: resolved,
         scope,
-        _sources: sources,
     })
 }

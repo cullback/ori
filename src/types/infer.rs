@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::CompileError;
+use crate::source::SourceArena;
 use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr};
 use crate::types::engine::{Constraint, Scheme, Type, TypeEngine, TypeVar};
 
@@ -218,9 +219,14 @@ impl<'src> InferCtx<'src> {
     // ---- Stdlib module registration ----
 
     /// Parse and register a stdlib module: types, constructors, method signatures, and bodies.
-    fn register_stdlib_module(&mut self, module_name: &str) -> Result<(), CompileError> {
+    fn register_stdlib_module(
+        &mut self,
+        arena: &'src SourceArena,
+        module_name: &str,
+    ) -> Result<(), CompileError> {
         let src = crate::stdlib::get(module_name).unwrap_or("");
-        let stdlib = crate::syntax::parse::parse(src)?;
+        let file_id = arena.add(format!("<stdlib:{module_name}>"), src.to_owned());
+        let stdlib = crate::syntax::parse::parse(arena.content(file_id), file_id)?;
 
         for decl in &stdlib.decls {
             match decl {
@@ -896,16 +902,16 @@ impl<'src> InferCtx<'src> {
     reason = "multi-pass type checking orchestration"
 )]
 pub fn check<'src>(
-    _source: &'src str,
+    arena: &'src SourceArena,
     module: &Module<'src>,
     scope: &crate::resolve::ModuleScope,
 ) -> Result<InferResult, CompileError> {
     let mut ctx = InferCtx::new();
 
     // Register stdlib modules
-    ctx.register_stdlib_module("Bool")?;
-    ctx.register_stdlib_module("Result")?;
-    ctx.register_stdlib_module("List")?;
+    ctx.register_stdlib_module(arena, "Bool")?;
+    ctx.register_stdlib_module(arena, "Result")?;
+    ctx.register_stdlib_module(arena, "List")?;
 
     // Pass 1: register all type declarations and function signatures
     for decl in &module.decls {

@@ -1,3 +1,4 @@
+use crate::source::SourceArena;
 use crate::syntax::ast::Span;
 
 /// A compiler error with an optional source location.
@@ -5,10 +6,6 @@ use crate::syntax::ast::Span;
 pub struct CompileError {
     pub message: String,
     pub span: Option<Span>,
-    /// Source text for the span (when different from the main file, e.g. imported modules).
-    pub source: Option<String>,
-    /// File path for the span (when from an imported file).
-    pub file: Option<String>,
 }
 
 impl CompileError {
@@ -16,8 +13,6 @@ impl CompileError {
         Self {
             message: message.into(),
             span: None,
-            source: None,
-            file: None,
         }
     }
 
@@ -25,26 +20,17 @@ impl CompileError {
         Self {
             message: message.into(),
             span: Some(span),
-            source: None,
-            file: None,
         }
-    }
-
-    /// Attach the source text and file path for errors from imported modules.
-    pub fn in_file(mut self, file: String, source: String) -> Self {
-        self.file = Some(file);
-        self.source = Some(source);
-        self
     }
 
     /// Format the error with source context (line, column, carets).
     #[expect(clippy::arithmetic_side_effects, reason = "line/col counting")]
-    pub fn format(&self, main_source: &str) -> String {
+    pub fn format(&self, arena: &SourceArena) -> String {
         let Some(span) = self.span else {
             return self.message.clone();
         };
-        // Use the error's own source if available, otherwise the main source
-        let source = self.source.as_deref().unwrap_or(main_source);
+        let source = arena.content(span.file);
+        let path = arena.path(span.file);
         if span.start >= source.len() || span.end > source.len() {
             return self.message.clone();
         }
@@ -68,10 +54,11 @@ impl CompileError {
         let src_line = &source[line_start..line_end];
         let pad = " ".repeat(col - 1);
         let carets = "^".repeat((span.end - span.start).max(1));
-        let location = self
-            .file
-            .as_deref()
-            .map_or(String::new(), |f| format!("{f}:"));
+        let location = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}:")
+        };
         format!(
             "\n --> {location}{line}:{col}\n    | \n{line:>3} | {src_line}\n    | {pad}{carets}\n    | {}",
             self.message

@@ -5,6 +5,7 @@ use crate::core::{
     Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, Pattern, Program, VarId,
 };
 use crate::error::CompileError;
+use crate::source::SourceArena;
 use crate::stdlib;
 use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Stmt, TypeExpr};
 use crate::syntax::parse;
@@ -19,18 +20,19 @@ fn method_key(type_name: &str, method: &str) -> String {
 /// Returns the program and the `VarId` of `main`'s input parameter
 /// (a free variable that the runtime must bind before evaluation).
 #[expect(clippy::too_many_lines, reason = "multi-pass lowering orchestration")]
-pub fn lower(
-    module: &Module<'_>,
+pub fn lower<'src>(
+    arena: &'src SourceArena,
+    module: &Module<'src>,
     scope: &crate::resolve::ModuleScope,
     infer_result: &crate::types::infer::InferResult,
 ) -> Result<(Program, VarId), CompileError> {
     let mut ctx = LowerCtx::new(infer_result);
 
     // Register stdlib modules
-    let bool_stdlib = ctx.register_stdlib_module("Bool");
+    let bool_stdlib = ctx.register_stdlib_module(arena, "Bool");
     ctx.register_comparison_builtins();
-    let result_stdlib = ctx.register_stdlib_module("Result");
-    let list_stdlib = ctx.register_stdlib_module("List");
+    let result_stdlib = ctx.register_stdlib_module(arena, "Result");
+    let list_stdlib = ctx.register_stdlib_module(arena, "List");
     let bool_methods = LowerCtx::extract_methods(&bool_stdlib);
     let result_methods = LowerCtx::extract_methods(&result_stdlib);
     let list_methods = LowerCtx::extract_methods(&list_stdlib);
@@ -368,15 +370,21 @@ impl<'src> LowerCtx<'src> {
     }
 
     /// Parse a stdlib module and register its types, constructors, and method signatures.
-    fn register_stdlib_module(&mut self, module_name: &str) -> Module<'static> {
-        let stdlib = parse::parse(stdlib::get(module_name).unwrap_or(""))
+    fn register_stdlib_module(
+        &mut self,
+        arena: &'src SourceArena,
+        module_name: &str,
+    ) -> Module<'src> {
+        let src = stdlib::get(module_name).unwrap_or("");
+        let file_id = arena.add(format!("<stdlib:{module_name}>"), src.to_owned());
+        let stdlib = parse::parse(arena.content(file_id), file_id)
             .expect("stdlib module should always parse successfully");
         self.register_decls(&stdlib.decls);
         stdlib
     }
 
     /// Extract `(type_name, method_decl)` pairs from a parsed stdlib module.
-    fn extract_methods<'a>(stdlib: &'a Module<'static>) -> Vec<(&'static str, &'a Decl<'static>)> {
+    fn extract_methods<'a, 'b>(stdlib: &'a Module<'b>) -> Vec<(&'b str, &'a Decl<'b>)> {
         let mut methods = Vec::new();
         for decl in &stdlib.decls {
             if let Decl::TypeAnno {
@@ -515,7 +523,7 @@ impl<'src> LowerCtx<'src> {
     fn compute_reachable_with_stdlib(
         &mut self,
         decls: &[Decl<'src>],
-        stdlib_methods: &[(&str, &Decl<'static>)],
+        stdlib_methods: &[(&'src str, &Decl<'src>)],
     ) {
         // Build function name → body index
         let mut bodies: HashMap<String, &Expr<'_>> = HashMap::new();
