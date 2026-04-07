@@ -1,4 +1,4 @@
-// Bool : [True, False] is provided by the prelude
+# Bool : [True, False] is provided by the prelude
 
 not : Bool -> Bool
 not = |b| if b

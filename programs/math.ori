@@ -6,6 +6,6 @@ square = |x| x * x
 double : I64 -> I64
 double = |x| x + x
 
-// Not exported — private helper
+# Not exported — private helper
 triple : I64 -> I64
 triple = |x| x + x + x

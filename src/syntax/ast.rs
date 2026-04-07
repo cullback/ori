@@ -22,6 +22,17 @@ pub struct ConstraintDecl<'src> {
     pub method_type: Option<TypeExpr<'src>>,
 }
 
+/// How a type was declared: alias (`:`), transparent nominal (`:=`), or opaque (`::`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeDeclKind {
+    /// `:` — just a name for an existing type, no distinct type, no `.()` block.
+    Alias,
+    /// `:=` — distinct type, internals visible everywhere, `.()` block allowed.
+    Transparent,
+    /// `::` — distinct type, internals hidden outside `.()` block.
+    Opaque,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum Decl<'src> {
@@ -32,13 +43,15 @@ pub enum Decl<'src> {
         ty: TypeExpr<'src>,
         where_clause: Vec<ConstraintDecl<'src>>,
         methods: Vec<Decl<'src>>,
-        nominal: bool,
+        kind: TypeDeclKind,
+        doc: Option<String>,
     },
     FuncDef {
         span: Span,
         name: &'src str,
         params: Vec<&'src str>,
         body: Expr<'src>,
+        doc: Option<String>,
     },
 }
 

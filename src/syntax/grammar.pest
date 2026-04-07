@@ -1,7 +1,7 @@
 // ---- Ori grammar (whitespace-agnostic) ----
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
-COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
+COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* }
 
 // ---- Module ----
 
@@ -14,15 +14,22 @@ exposing_clause = { "exposing" ~ "[" ~ name ~ ("," ~ name)* ~ "]" }
 
 decl = { type_anno | assignment }
 
+// Atomic: no space before "(" in type params (e.g. List(a), not List (a))
+type_head = @{ name ~ "(" }
+
 type_anno = {
-    name ~ type_params? ~ ":=" ~ type_expr ~ method_block?
-  | name ~ type_params? ~ ":" ~ type_expr ~ where_clause? ~ method_block?
+    type_head ~ type_params ~ ")" ~ ":=" ~ type_expr ~ method_block?
+  | type_head ~ type_params ~ ")" ~ "::" ~ type_expr ~ method_block?
+  | type_head ~ type_params ~ ")" ~ ":" ~ type_expr ~ where_clause? ~ method_block?
+  | name ~ ":=" ~ type_expr ~ method_block?
+  | name ~ "::" ~ type_expr ~ method_block?
+  | name ~ ":" ~ type_expr ~ where_clause? ~ method_block?
 }
 
 where_clause = { "where" ~ "[" ~ constraint_decl ~ ("," ~ constraint_decl)* ~ "]" }
 constraint_decl = { name ~ "." ~ name ~ (":" ~ type_expr)? }
 
-type_params = { "(" ~ name ~ ("," ~ name)* ~ ")" }
+type_params = { name ~ ("," ~ name)* }
 
 method_block = { ".(" ~ decl* ~ ")" }
 

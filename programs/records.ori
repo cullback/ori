@@ -1,9 +1,9 @@
-// Records, row polymorphism, type aliases, and built-in lists
+# Records, row polymorphism, type aliases, and built-in lists
 
-// Type alias for a record type
+# Type alias for a record type
 Person : { name: I64, age: I64 }
 
-// Row-polymorphic: works on any record with an `age` field
+# Row-polymorphic: works on any record with an `age` field
 get_age = |person| person.age
 
 main : I64 -> I64
@@ -13,10 +13,10 @@ main = |arg| (
 
     bob = { age: 25, location: 2 }
 
-    // get_age works on both records despite different shapes
+    # get_age works on both records despite different shapes
     total_age = get_age(alice) + get_age(bob)
 
-    // Records + lists + lambdas
+    # Records + lists + lambdas
     ages = [alice.age, bob.age]
     doubled = List.map(ages, |x| x * 2)
 

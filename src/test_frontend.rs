@@ -1072,3 +1072,120 @@ main = |arg| (
 
     assert_eq!(run_i64(source, 0), 0);
 }
+
+// ============================================================
+// Type declaration kinds (alias, transparent, opaque)
+// ============================================================
+
+#[test]
+fn transparent_nominal_visible_outside() {
+    // :=  transparent — internals visible everywhere
+    // A function outside the .() block can accept/return the underlying type
+    let source = "\
+Foo := I64.(
+    new : I64 -> Foo
+    new = |x| x
+)
+
+unwrap : Foo -> I64
+unwrap = |f| f
+
+main : I64 -> I64
+main = |arg| unwrap(Foo.new(42))";
+
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+#[test]
+#[should_panic(expected = "unify")]
+fn opaque_hidden_outside() {
+    // :: opaque — internals hidden outside .() block
+    // A function outside the block cannot treat Foo as I64
+    let source = "\
+Foo :: I64.(
+    new : I64 -> Foo
+    new = |x| x
+)
+
+unwrap : Foo -> I64
+unwrap = |f| f
+
+main : I64 -> I64
+main = |arg| unwrap(Foo.new(42))";
+
+    run_i64(source, 0);
+}
+
+// ============================================================
+// Doc comments
+// ============================================================
+
+#[test]
+fn doc_comment_attached_to_decl() {
+    let source = "\
+# Doubles a number.
+double : I64 -> I64
+double = |x| x + x
+
+main : I64 -> I64
+main = |arg| double(arg)";
+
+    // Verify it parses and runs correctly with # comments
+    assert_eq!(run_i64(source, 5), 10);
+
+    // Verify the doc comment is attached to the type annotation
+    let mut arena = crate::source::SourceArena::new();
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    let first_decl = &parsed.decls[0];
+    match first_decl {
+        crate::syntax::ast::Decl::TypeAnno { doc, .. } => {
+            assert_eq!(doc.as_deref(), Some("Doubles a number."));
+        }
+        _ => panic!("expected TypeAnno"),
+    }
+}
+
+#[test]
+fn doc_comment_multiline() {
+    let source = "\
+# First line.
+# Second line.
+double : I64 -> I64
+double = |x| x + x
+
+main : I64 -> I64
+main = |arg| double(arg)";
+
+    let mut arena = crate::source::SourceArena::new();
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    match &parsed.decls[0] {
+        crate::syntax::ast::Decl::TypeAnno { doc, .. } => {
+            assert_eq!(doc.as_deref(), Some("First line.\nSecond line."));
+        }
+        _ => panic!("expected TypeAnno"),
+    }
+}
+
+#[test]
+fn blank_line_breaks_doc_comment() {
+    let source = "\
+# This is NOT a doc comment because of the blank line.
+
+double : I64 -> I64
+double = |x| x + x
+
+main : I64 -> I64
+main = |arg| double(arg)";
+
+    let mut arena = crate::source::SourceArena::new();
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    match &parsed.decls[0] {
+        crate::syntax::ast::Decl::TypeAnno { doc, .. } => {
+            assert!(doc.is_none());
+        }
+        _ => panic!("expected TypeAnno"),
+    }
+}

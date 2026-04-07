@@ -1,20 +1,35 @@
-// List is a built-in vector-backed type.
-// Methods without bodies are compiler builtins.
-
+# Built-in vector-backed ordered collection.
+# Methods without bodies are compiler builtins.
 List := {}.(
+    # Returns the number of elements in the list.
     len : List(a) -> I64
+
+    # Returns the element at the given index.
     get : List(a), I64 -> a
+
+    # Returns a new list with the element at the given index replaced.
     set : List(a), I64, a -> List(a)
+
+    # Returns a new list with the element appended to the end.
     append : List(a), a -> List(a)
+
+    # Reduces the list from left to right, threading an accumulator
+    # through each element.
     walk : List(a), b, (b, a -> b) -> b
+
+    # Reduces the list from right to left, threading an accumulator
+    # through each element.
     walk_backwards : List(a), b, (b, a -> b) -> b
 
+    # Returns a new list with the elements in reverse order.
     reverse : List(a) -> List(a)
     reverse = |xs| List.walk_backwards(xs, [], |acc, x| List.append(acc, x))
 
+    # Applies a function to every element, returning a new list.
     map : List(a), (a -> a) -> List(a)
     map = |xs, f| List.walk(xs, [], |acc, x| List.append(acc, f(x)))
 
+    # Returns the sum of all elements.
     sum : List(I64) -> I64
     sum = |xs| List.walk(xs, 0, |acc, x| acc + x)
 )

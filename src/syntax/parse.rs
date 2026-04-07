@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use pest::Parser as _;
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
@@ -7,7 +9,7 @@ use crate::error::CompileError;
 use crate::source::FileId;
 use crate::syntax::ast::{
     BinOp, ConstraintDecl, Decl, Expr, ExprKind, Import, MatchArm, Module, Pattern, Span, Stmt,
-    TagDecl, TypeExpr,
+    TagDecl, TypeDeclKind, TypeExpr,
 };
 
 #[derive(Parser)]
@@ -16,14 +18,50 @@ struct OriParser;
 
 struct ParseCtx {
     file: FileId,
+    /// Maps byte offset of the first non-comment token after a comment block
+    /// to the accumulated doc string.
+    doc_comments: HashMap<usize, String>,
 }
 
 pub fn parse(source: &str, file: FileId) -> Result<Module<'_>, CompileError> {
     let pairs =
         OriParser::parse(Rule::module, source).map_err(|e| CompileError::new(e.to_string()))?;
     let module_pair = pairs.into_iter().next().unwrap();
-    let ctx = ParseCtx { file };
+    let doc_comments = extract_doc_comments(source);
+    let ctx = ParseCtx { file, doc_comments };
     Ok(ctx.parse_module(module_pair))
+}
+
+/// Pre-pass: collect `#` comment blocks and map them to the byte offset of
+/// the next non-blank, non-comment line. The parser attaches these as doc
+/// comments to any `Decl` whose span starts at that offset.
+fn extract_doc_comments(source: &str) -> HashMap<usize, String> {
+    let mut docs = HashMap::new();
+    let mut comment_lines: Vec<String> = Vec::new();
+    let mut offset = 0;
+
+    for line in source.split('\n') {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            // Strip one leading space after # if present
+            let content = rest.strip_prefix(' ').unwrap_or(rest);
+            comment_lines.push(content.to_owned());
+        } else if trimmed.is_empty() {
+            // Blank line breaks the doc comment block
+            comment_lines.clear();
+        } else if !comment_lines.is_empty() {
+            // Non-blank, non-comment line: record the doc comment at
+            // the byte offset of the first non-whitespace character
+            let leading = line.len() - line.trim_start().len();
+            let target = offset + leading;
+            docs.insert(target, comment_lines.join("\n"));
+            comment_lines.clear();
+        } else {
+            // Non-blank, non-comment line with no preceding comment block
+        }
+        offset += line.len() + 1; // +1 for the \n
+    }
+    docs
 }
 
 impl ParseCtx {
@@ -34,6 +72,10 @@ impl ParseCtx {
             start: pest_span.start(),
             end: pest_span.end(),
         }
+    }
+
+    fn doc_at(&self, span: &Span) -> Option<String> {
+        self.doc_comments.get(&span.start).cloned()
     }
 
     fn parse_module<'src>(&self, pair: Pair<'src, Rule>) -> Module<'src> {
@@ -86,10 +128,24 @@ impl ParseCtx {
 
     fn parse_type_anno<'src>(&self, pair: Pair<'src, Rule>) -> Decl<'src> {
         let span = self.span_of(&pair);
+        let doc = self.doc_at(&span);
         let text = pair.as_str();
-        let nominal = text.contains(":=");
+        let kind = if text.contains(":=") {
+            TypeDeclKind::Transparent
+        } else if text.contains("::") {
+            TypeDeclKind::Opaque
+        } else {
+            TypeDeclKind::Alias
+        };
         let mut inner = pair.into_inner();
-        let name = inner.next().unwrap().as_str();
+        let first = inner.next().unwrap();
+        let name = match first.as_rule() {
+            Rule::type_head => {
+                let text = first.as_str();
+                &text[..text.len() - 1] // strip trailing "("
+            }
+            _ => first.as_str(), // plain name
+        };
 
         let mut type_params = Vec::new();
         let mut ty = None;
@@ -131,12 +187,14 @@ impl ParseCtx {
             ty: ty.expect("type declaration missing type expression"),
             where_clause,
             methods,
-            nominal,
+            kind,
+            doc,
         }
     }
 
     fn parse_assignment_as_decl<'src>(&self, pair: Pair<'src, Rule>) -> Decl<'src> {
         let span = self.span_of(&pair);
+        let doc = self.doc_at(&span);
         let mut inner = pair.into_inner();
         let lhs = inner.next().unwrap(); // irrefutable
         let name = lhs.as_str().trim();
@@ -153,6 +211,7 @@ impl ParseCtx {
                 name,
                 params,
                 body: *lam_body,
+                doc,
             }
         } else {
             Decl::FuncDef {
@@ -160,6 +219,7 @@ impl ParseCtx {
                 name,
                 params: vec![],
                 body,
+                doc,
             }
         }
     }

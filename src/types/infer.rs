@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use crate::error::CompileError;
 use crate::source::SourceArena;
-use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr};
+use crate::syntax::ast::{
+    self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeDeclKind, TypeExpr,
+};
 use crate::types::engine::{Constraint, Scheme, Type, TypeEngine, TypeVar};
 
 /// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
@@ -970,12 +972,14 @@ pub fn check<'src>(
                 type_params,
                 ty,
                 methods,
-                nominal,
+                kind,
                 ..
             } => {
                 let name = *name;
-                if name.starts_with(|c: char| c.is_ascii_uppercase()) && *nominal {
-                    // Nominal type (:=) — distinct type, not an alias
+                if name.starts_with(|c: char| c.is_ascii_uppercase())
+                    && *kind != TypeDeclKind::Alias
+                {
+                    // Nominal type (:= or ::) — distinct type, not an alias
                     ctx.known_types.insert(name.to_owned());
                     // Register methods
                     for method in methods {
@@ -1065,14 +1069,15 @@ pub fn check<'src>(
             Decl::TypeAnno {
                 name,
                 ty,
-                nominal,
+                kind,
                 methods,
                 ..
             } => {
                 let name = *name;
-                // For nominal types, make the type transparent during method inference
-                // so method bodies can convert between the nominal and underlying type
-                if *nominal {
+                // For nominal types (:= and ::), make the type transparent
+                // so method bodies can convert between the nominal and underlying type.
+                // For transparent (:=), this persists. For opaque (::), removed after.
+                if *kind != TypeDeclKind::Alias {
                     let underlying = ctx.resolve_type_expr(ty)?;
                     ctx.engine.transparent.insert(name.to_owned(), underlying);
                 }
@@ -1121,8 +1126,9 @@ pub fn check<'src>(
                         }
                     }
                 }
-                // Remove transparency so external code can't see through
-                if *nominal {
+                // Opaque (::): remove transparency so external code can't see through.
+                // Transparent (:=): keep — internals visible everywhere.
+                if *kind == TypeDeclKind::Opaque {
                     ctx.engine.transparent.remove(name);
                 }
             }
