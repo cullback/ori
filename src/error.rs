@@ -53,7 +53,9 @@ impl CompileError {
             .map_or(source.len(), |i| span.start + i);
         let src_line = &source[line_start..line_end];
         let pad = " ".repeat(col - 1);
-        let carets = "^".repeat((span.end - span.start).max(1));
+        // Clamp carets to the displayed line (span may extend across lines)
+        let caret_end = span.end.min(line_end);
+        let carets = "^".repeat((caret_end - span.start).max(1));
         let location = if path.is_empty() {
             String::new()
         } else {
