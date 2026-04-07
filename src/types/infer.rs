@@ -1,11 +1,19 @@
 use std::collections::HashMap;
 
 use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeExpr};
-use crate::types::engine::{Scheme, Type, TypeEngine, TypeVar};
+use crate::types::engine::{Constraint, Scheme, Type, TypeEngine, TypeVar};
 
 /// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
 fn method_key(type_name: &str, method: &str) -> String {
     format!("{type_name}.{method}")
+}
+
+/// Results of type inference, communicated to the lowerer.
+pub struct InferResult {
+    /// Resolved numeric types for literals (by span).
+    pub lit_types: HashMap<Span, NumType>,
+    /// Resolved method calls: span of qualified call → resolved mangled name.
+    pub method_resolutions: HashMap<Span, String>,
 }
 
 /// Resolved numeric type for a literal, used to communicate from inference to lowering.
@@ -35,6 +43,8 @@ struct InferCtx<'src> {
     int_literal_vars: Vec<(TypeVar, Span)>,
     /// Track float literal type vars for defaulting and side table.
     float_literal_vars: Vec<(TypeVar, Span)>,
+    /// Resolved method calls: span → mangled method name.
+    method_resolutions: HashMap<Span, String>,
 }
 
 impl<'src> InferCtx<'src> {
@@ -56,6 +66,7 @@ impl<'src> InferCtx<'src> {
             ]),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
+            method_resolutions: HashMap::new(),
         }
     }
 
@@ -219,6 +230,7 @@ impl<'src> InferCtx<'src> {
                 tag.name.to_owned(),
                 Scheme {
                     vars: tvars.clone(),
+                    constraints: vec![],
                     ty: con_type,
                 },
             );
@@ -301,6 +313,7 @@ impl<'src> InferCtx<'src> {
                         tvar_env.into_values().collect();
                     let scheme = Scheme {
                         vars: tvars,
+                        constraints: vec![],
                         ty: anno_ty,
                     };
                     self.env.insert(mangled.clone(), scheme);
@@ -543,6 +556,42 @@ impl<'src> InferCtx<'src> {
             return ret;
         }
 
+        // Method call on a type variable: x.method(args) → generate constraint
+        if let Some(dot_pos) = func.find('.') {
+            let var_name = &func[..dot_pos];
+            let method_name = &func[dot_pos + 1..];
+            if let Some(scheme) = self.env.get(var_name).cloned() {
+                let var_ty = self.engine.instantiate(&scheme);
+                let resolved = self.engine.resolve(&var_ty);
+                if let Type::Var(tv) = resolved {
+                    // Generate constraint: tv.method_name : (tv, args...) -> ret
+                    let mut param_types = vec![Type::Var(tv)];
+                    param_types.extend(arg_types);
+                    let method_type = Type::Arrow(param_types, Box::new(ret.clone()));
+                    self.engine.constraints.push(Constraint {
+                        type_var: tv,
+                        method_name: method_name.to_owned(),
+                        method_type,
+                    });
+                    return ret;
+                }
+                // Resolved to a concrete type: look up Type.method
+                if let Type::Con(concrete_name) | Type::App(concrete_name, _) = &resolved {
+                    let mangled = format!("{concrete_name}.{method_name}");
+                    if let Some(scheme) = self.env.get(&mangled).cloned() {
+                        let func_ty = self.engine.instantiate(&scheme);
+                        let mut full_args = vec![var_ty];
+                        full_args.extend(arg_types);
+                        let expected = Type::Arrow(full_args, Box::new(ret.clone()));
+                        self.unify_at(&func_ty, &expected, span);
+                        // Record resolution for the lowerer
+                        self.method_resolutions.insert(span, mangled);
+                        return ret;
+                    }
+                }
+            }
+        }
+
         self.type_error(span, &format!("undefined function '{func}'"));
     }
 
@@ -738,7 +787,7 @@ pub fn check<'src>(
     source: &'src str,
     module: &Module<'src>,
     scope: &crate::resolve::ModuleScope,
-) -> HashMap<Span, NumType> {
+) -> InferResult {
     let mut ctx = InferCtx::new(source);
 
     // Register stdlib modules
@@ -817,6 +866,7 @@ pub fn check<'src>(
                     let alias_ty = ctx.type_expr_to_type(ty, &mut tvar_env);
                     let alias_scheme = Scheme {
                         vars: tvars,
+                        constraints: vec![],
                         ty: alias_ty,
                     };
                     if let Some(mod_name) = scope.qualified_types.get(name) {
@@ -882,5 +932,9 @@ pub fn check<'src>(
         }
     }
 
-    ctx.resolve_literals()
+    let lit_types = ctx.resolve_literals();
+    InferResult {
+        lit_types,
+        method_resolutions: ctx.method_resolutions,
+    }
 }

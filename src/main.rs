@@ -30,8 +30,8 @@ fn main() {
     let compile_result = std::panic::catch_unwind(|| {
         let parsed = syntax::parse::parse(&source);
         let resolved = resolve::resolve_imports(parsed, source_dir);
-        let lit_types = types::infer::check(&source, &resolved.module, &resolved.scope);
-        lower::lower(&resolved.module, &resolved.scope, &lit_types)
+        let infer_result = types::infer::check(&source, &resolved.module, &resolved.scope);
+        lower::lower(&resolved.module, &resolved.scope, &infer_result)
     });
     drop(std::panic::take_hook());
     let (program, input_var) = match compile_result {

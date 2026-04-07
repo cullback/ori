@@ -21,9 +21,9 @@ fn method_key(type_name: &str, method: &str) -> String {
 pub fn lower(
     module: &Module<'_>,
     scope: &crate::resolve::ModuleScope,
-    lit_types: &HashMap<ast::Span, crate::types::infer::NumType>,
+    infer_result: &crate::types::infer::InferResult,
 ) -> (Program, VarId) {
-    let mut ctx = LowerCtx::new(lit_types.clone());
+    let mut ctx = LowerCtx::new(infer_result);
 
     // Register stdlib modules
     let bool_stdlib = ctx.register_stdlib_module("Bool");
@@ -86,6 +86,10 @@ pub fn lower(
     all_stdlib_methods.extend(&maybe_methods);
     all_stdlib_methods.extend(&list_methods);
     ctx.compute_reachable_with_stdlib(&module.decls, &all_stdlib_methods);
+
+    // Add method-resolved functions to reachable set
+    let resolved_methods: Vec<String> = ctx.method_resolutions.values().cloned().collect();
+    ctx.reachable.extend(resolved_methods);
 
     // Pass 1.5: scan reachable bodies to collect lambdas for defunctionalization
     ctx.collect_lambdas(&module.decls);
@@ -314,10 +318,11 @@ struct LowerCtx<'src> {
     reachable: HashSet<String>,
     /// Resolved literal types from type inference.
     lit_types: HashMap<ast::Span, crate::types::infer::NumType>,
+    method_resolutions: HashMap<ast::Span, String>,
 }
 
 impl<'src> LowerCtx<'src> {
-    fn new(lit_types: HashMap<ast::Span, crate::types::infer::NumType>) -> Self {
+    fn new(infer_result: &crate::types::infer::InferResult) -> Self {
         let mut builder = Builder::new();
         let mut binops = HashMap::new();
 
@@ -354,7 +359,8 @@ impl<'src> LowerCtx<'src> {
             ho_vars: HashMap::new(),
             lambda_arg_counters: HashMap::new(),
             reachable: HashSet::new(),
-            lit_types,
+            lit_types: infer_result.lit_types.clone(),
+            method_resolutions: infer_result.method_resolutions.clone(),
         }
     }
 
@@ -1104,8 +1110,26 @@ impl<'src> LowerCtx<'src> {
             }
 
             ExprKind::QualifiedCall { segments, args } => {
-                let mangled = segments.join(".");
-                self.lower_call(&mangled, args)
+                // Check if inference resolved this to a method call (e.g., b.not → Bool.not)
+                if let Some(resolved) = self.method_resolutions.get(&expr.span).cloned() {
+                    // Method call: segments[0] is the receiver variable
+                    let receiver_name = segments[0];
+                    let receiver_core = if let Some(&var_id) = self.vars.get(receiver_name) {
+                        Core::var(var_id)
+                    } else if let Some(&con_id) = self.constructors.get(receiver_name) {
+                        Core::app(con_id, vec![])
+                    } else {
+                        panic!("undefined receiver: {receiver_name}");
+                    };
+                    // Prepend receiver to args
+                    let mut full_args = vec![receiver_core];
+                    full_args.extend(args.iter().map(|a| self.lower_expr(a)));
+                    let func_id = self.funcs[&resolved];
+                    Core::app(func_id, full_args)
+                } else {
+                    let mangled = segments.join(".");
+                    self.lower_call(&mangled, args)
+                }
             }
 
             ExprKind::Record { fields } => {

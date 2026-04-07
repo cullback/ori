@@ -6,8 +6,9 @@ use crate::core::{NumVal, Value};
 fn run(source: &str, input: i64) -> Value {
     let parsed = crate::syntax::parse::parse(source);
     let resolved = crate::resolve::resolve_imports(parsed, None);
-    let lit_types = crate::types::infer::check(source, &resolved.module, &resolved.scope);
-    let (program, input_var) = crate::lower::lower(&resolved.module, &resolved.scope, &lit_types);
+    let infer_result = crate::types::infer::check(source, &resolved.module, &resolved.scope);
+    let (program, input_var) =
+        crate::lower::lower(&resolved.module, &resolved.scope, &infer_result);
     let mut env = HashMap::new();
     env.insert(input_var, Value::VNum(NumVal::I64(input)));
     crate::core::eval::eval(&env, &program, &program.main)
@@ -997,4 +998,24 @@ main : I64 -> I64
 main = |arg| 10 / 3";
 
     assert_eq!(run_i64(source, 0), 3);
+}
+
+// ============================================================
+// Constraints (structural method dispatch)
+// ============================================================
+
+#[test]
+fn constraint_method_on_concrete_type() {
+    // x.not() where x is Bool — resolves to Bool.not
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    b = True
+    result = b.not()
+    if result
+        : True then 1
+        : False then 0
+)";
+
+    assert_eq!(run_i64(source, 0), 0);
 }

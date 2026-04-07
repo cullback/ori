@@ -44,15 +44,28 @@ impl Type {
     }
 }
 
+/// A structural constraint: a type variable must have a method with a given type.
+#[derive(Debug, Clone)]
+pub struct Constraint {
+    pub type_var: TypeVar,
+    pub method_name: String,
+    pub method_type: Type,
+}
+
 #[derive(Debug, Clone)]
 pub struct Scheme {
     pub vars: Vec<TypeVar>,
+    pub constraints: Vec<Constraint>,
     pub ty: Type,
 }
 
 impl Scheme {
     pub const fn mono(ty: Type) -> Self {
-        Self { vars: vec![], ty }
+        Self {
+            vars: vec![],
+            constraints: vec![],
+            ty,
+        }
     }
 }
 
@@ -60,6 +73,8 @@ impl Scheme {
 pub struct TypeEngine {
     pub next_var: usize,
     pub subst: HashMap<TypeVar, Type>,
+    /// Accumulated constraints during inference.
+    pub constraints: Vec<Constraint>,
 }
 
 impl TypeEngine {
@@ -67,6 +82,7 @@ impl TypeEngine {
         Self {
             next_var: 0,
             subst: HashMap::new(),
+            constraints: Vec::new(),
         }
     }
 
@@ -321,8 +337,23 @@ impl TypeEngine {
         let fvs = self.free_vars(ty);
         let env_fvs = self.free_vars_in_env(env);
         let vars: Vec<TypeVar> = fvs.into_iter().filter(|v| !env_fvs.contains(v)).collect();
+        let var_set: HashSet<TypeVar> = vars.iter().copied().collect();
+        // Bundle constraints that reference the generalized vars
+        let constraints: Vec<Constraint> = self
+            .constraints
+            .iter()
+            .filter(|c| {
+                let resolved = self.resolve(&Type::Var(c.type_var));
+                match resolved {
+                    Type::Var(tv) => var_set.contains(&tv),
+                    _ => false, // already resolved to concrete type, constraint was checked
+                }
+            })
+            .cloned()
+            .collect();
         Scheme {
             vars,
+            constraints,
             ty: self.resolve(ty),
         }
     }
@@ -330,6 +361,17 @@ impl TypeEngine {
     pub fn instantiate(&mut self, scheme: &Scheme) -> Type {
         let mapping: HashMap<TypeVar, Type> =
             scheme.vars.iter().map(|&v| (v, self.fresh())).collect();
+        // Re-add constraints with remapped type vars
+        for c in &scheme.constraints {
+            let Type::Var(new_tv) = Self::apply_mapping(&Type::Var(c.type_var), &mapping) else {
+                continue;
+            };
+            self.constraints.push(Constraint {
+                type_var: new_tv,
+                method_name: c.method_name.clone(),
+                method_type: Self::apply_mapping(&c.method_type, &mapping),
+            });
+        }
         Self::apply_mapping(&scheme.ty, &mapping)
     }
 
