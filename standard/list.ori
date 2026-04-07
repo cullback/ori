@@ -2,13 +2,13 @@
 # Methods without bodies are compiler builtins.
 List := {}.(
     # Returns the number of elements in the list.
-    len : List(a) -> I64
+    len : List(a) -> U64
 
     # Returns the element at the given index.
-    get : List(a), I64 -> a
+    get : List(a), U64 -> a
 
     # Returns a new list with the element at the given index replaced.
-    set : List(a), I64, a -> List(a)
+    set : List(a), U64, a -> List(a)
 
     # Returns a new list with the element appended to the end.
     append : List(a), a -> List(a)

@@ -93,22 +93,21 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
             let [Value::VList(elems)] = args else {
                 panic!("List.len: expected list")
             };
-            #[expect(clippy::cast_possible_wrap)]
-            Some(Value::VNum(NumVal::I64(elems.len() as i64)))
+            Some(Value::VNum(NumVal::U64(elems.len() as u64)))
         }
         Builtin::ListGet => {
-            let [Value::VList(elems), Value::VNum(NumVal::I64(idx))] = args else {
-                panic!("List.get: expected list and index")
+            let [Value::VList(elems), Value::VNum(NumVal::U64(idx))] = args else {
+                panic!("List.get: expected list and U64 index")
             };
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[expect(clippy::cast_possible_truncation)]
             let i = *idx as usize;
             Some(elems[i].clone())
         }
         Builtin::ListSet => {
-            let [Value::VList(elems), Value::VNum(NumVal::I64(idx)), val] = args else {
-                panic!("List.set: expected list, index, and value")
+            let [Value::VList(elems), Value::VNum(NumVal::U64(idx)), val] = args else {
+                panic!("List.set: expected list, U64 index, and value")
             };
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            #[expect(clippy::cast_possible_truncation)]
             let i = *idx as usize;
             let mut new_list = elems.clone();
             new_list[i] = val.clone();

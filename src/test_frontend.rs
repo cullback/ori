@@ -902,10 +902,10 @@ main = |arg| Lnk.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 #[test]
 fn builtin_list_literal() {
     let source = "\
-main : I64 -> I64
+main : I64 -> U64
 main = |arg| List.len([1, 2, 3])";
 
-    assert_eq!(run_i64(source, 0), 3);
+    assert_eq!(run_u64(source, 0), 3);
 }
 
 #[test]
@@ -920,10 +920,10 @@ main = |arg| List.get([10, 20, 30], 1)";
 #[test]
 fn builtin_list_append() {
     let source = "\
-main : I64 -> I64
+main : I64 -> U64
 main = |arg| List.len(List.append([1, 2], 3))";
 
-    assert_eq!(run_i64(source, 0), 3);
+    assert_eq!(run_u64(source, 0), 3);
 }
 
 #[test]
@@ -985,10 +985,10 @@ main = |arg| List.sum([1, 2, 3, 4, 5])";
 #[test]
 fn builtin_list_empty() {
     let source = "\
-main : I64 -> I64
+main : I64 -> U64
 main = |arg| List.len([])";
 
-    assert_eq!(run_i64(source, 0), 0);
+    assert_eq!(run_u64(source, 0), 0);
 }
 
 // ============================================================
