@@ -104,6 +104,16 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
             let i = *idx as usize;
             Some(elems[i].clone())
         }
+        Builtin::ListSet => {
+            let [Value::VList(elems), Value::VNum(NumVal::I64(idx)), val] = args else {
+                panic!("List.set: expected list, index, and value")
+            };
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let i = *idx as usize;
+            let mut new_list = elems.clone();
+            new_list[i] = val.clone();
+            Some(Value::VList(new_list))
+        }
         Builtin::ListAppend => {
             let [Value::VList(elems), val] = args else {
                 panic!("List.append: expected list and value")
@@ -111,14 +121,6 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
             let mut new_list = elems.clone();
             new_list.push(val.clone());
             Some(Value::VList(new_list))
-        }
-        Builtin::ListReverse => {
-            let [Value::VList(elems)] = args else {
-                panic!("List.reverse: expected list")
-            };
-            let mut reversed = elems.clone();
-            reversed.reverse();
-            Some(Value::VList(reversed))
         }
     }
 }
@@ -153,6 +155,7 @@ fn call_func(env: &Env, program: &Program, func: FuncId, args: &[Value]) -> Valu
     eval(&local_env, program, &func_def.body)
 }
 
+#[expect(clippy::too_many_lines, reason = "dispatch over all core terms")]
 pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
     match core {
         Core::Var(name) => env
@@ -237,6 +240,7 @@ pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
             init,
             step,
             apply_func,
+            backwards,
         } => {
             let list_val = eval(env, program, list);
             let mut acc = eval(env, program, init);
@@ -244,13 +248,24 @@ pub fn eval(env: &Env, program: &Program, core: &Core) -> Value {
             let Value::VList(elements) = list_val else {
                 panic!("List.walk: expected list");
             };
-            for elem in elements {
-                acc = call_func(
-                    env,
-                    program,
-                    *apply_func,
-                    &[step_closure.clone(), acc, elem],
-                );
+            if *backwards {
+                for elem in elements.into_iter().rev() {
+                    acc = call_func(
+                        env,
+                        program,
+                        *apply_func,
+                        &[step_closure.clone(), acc, elem],
+                    );
+                }
+            } else {
+                for elem in elements {
+                    acc = call_func(
+                        env,
+                        program,
+                        *apply_func,
+                        &[step_closure.clone(), acc, elem],
+                    );
+                }
             }
             acc
         }

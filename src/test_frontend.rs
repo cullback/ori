@@ -946,6 +946,25 @@ main = |arg| List.get(List.reverse([10, 20, 30]), 0)";
 }
 
 #[test]
+fn builtin_list_set() {
+    let source = "\
+main : I64 -> I64
+main = |arg| List.get(List.set([10, 20, 30], 1, 99), 1)";
+
+    assert_eq!(run_i64(source, 0), 99);
+}
+
+#[test]
+fn builtin_list_walk_backwards() {
+    // walk_backwards accumulates right-to-left: 0 + 3*100 + 2*10 + 1*1 = 321
+    let source = "\
+main : I64 -> I64
+main = |arg| List.walk_backwards([1, 2, 3], 0, |acc, x| acc * 10 + x)";
+
+    assert_eq!(run_i64(source, 0), 321);
+}
+
+#[test]
 fn builtin_list_map() {
     let source = "\
 main : I64 -> I64

@@ -51,8 +51,8 @@ pub enum Builtin {
     Eq { true_con: FuncId, false_con: FuncId },
     ListLen,
     ListGet,
+    ListSet,
     ListAppend,
-    ListReverse,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,6 +141,7 @@ pub enum Core {
         init: Box<Core>,
         step: Box<Core>,
         apply_func: FuncId,
+        backwards: bool,
     },
 }
 
@@ -211,12 +212,19 @@ impl Core {
         Self::ListLit(elements)
     }
 
-    pub fn list_walk(list: Self, init: Self, step: Self, apply_func: FuncId) -> Self {
+    pub fn list_walk(
+        list: Self,
+        init: Self,
+        step: Self,
+        apply_func: FuncId,
+        backwards: bool,
+    ) -> Self {
         Self::ListWalk {
             list: Box::new(list),
             init: Box::new(init),
             step: Box::new(step),
             apply_func,
+            backwards,
         }
     }
 }

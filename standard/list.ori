@@ -4,9 +4,13 @@
 List := {}.(
     len : List(a) -> I64
     get : List(a), I64 -> a
+    set : List(a), I64, a -> List(a)
     append : List(a), a -> List(a)
-    reverse : List(a) -> List(a)
     walk : List(a), b, (b, a -> b) -> b
+    walk_backwards : List(a), b, (b, a -> b) -> b
+
+    reverse : List(a) -> List(a)
+    reverse = |xs| List.walk_backwards(xs, [], |acc, x| List.append(acc, x))
 
     map : List(a), (a -> a) -> List(a)
     map = |xs, f| List.walk(xs, [], |acc, x| List.append(acc, f(x)))

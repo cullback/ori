@@ -340,13 +340,10 @@ impl<'src> LowerCtx<'src> {
         let mut list_builtins = HashMap::new();
         list_builtins.insert("List.len".to_owned(), builder.builtin(Builtin::ListLen));
         list_builtins.insert("List.get".to_owned(), builder.builtin(Builtin::ListGet));
+        list_builtins.insert("List.set".to_owned(), builder.builtin(Builtin::ListSet));
         list_builtins.insert(
             "List.append".to_owned(),
             builder.builtin(Builtin::ListAppend),
-        );
-        list_builtins.insert(
-            "List.reverse".to_owned(),
-            builder.builtin(Builtin::ListReverse),
         );
 
         Self {
@@ -760,7 +757,10 @@ impl<'src> LowerCtx<'src> {
             }
             ExprKind::QualifiedCall { segments, args } => {
                 let mangled = segments.join(".");
-                let is_list_ho = mangled == "List.walk" || mangled.ends_with(".List.walk");
+                let is_list_ho = mangled == "List.walk"
+                    || mangled.ends_with(".List.walk")
+                    || mangled == "List.walk_backwards"
+                    || mangled.ends_with(".List.walk_backwards");
                 if is_list_ho || self.funcs.contains_key(&mangled) {
                     self.scan_call_args(&mangled, args);
                 } else {
@@ -1197,8 +1197,10 @@ impl<'src> LowerCtx<'src> {
     }
 
     fn lower_call(&mut self, func: &str, args: &[Expr<'src>]) -> Core {
-        // List.walk is special: emits Core::ListWalk with closure + apply_func
-        if func == "List.walk" || func.ends_with(".List.walk") {
+        // List.walk / List.walk_backwards: emits Core::ListWalk with closure + apply_func
+        let is_walk = func == "List.walk" || func.ends_with(".List.walk");
+        let is_walk_back = func == "List.walk_backwards" || func.ends_with(".List.walk_backwards");
+        if is_walk || is_walk_back {
             assert!(args.len() >= 3, "List.walk takes 3 arguments");
             let list_core = self.lower_expr(&args[0]);
             let init_core = self.lower_expr(&args[1]);
@@ -1210,7 +1212,7 @@ impl<'src> LowerCtx<'src> {
             };
             let ls_idx = self.ho_param_sets[&key];
             let apply_func = self.lambda_sets[ls_idx].apply_func;
-            return Core::list_walk(list_core, init_core, closure_core, apply_func);
+            return Core::list_walk(list_core, init_core, closure_core, apply_func, is_walk_back);
         }
 
         // Other List builtins
