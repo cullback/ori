@@ -5,6 +5,10 @@ use crate::syntax::ast::Span;
 pub struct CompileError {
     pub message: String,
     pub span: Option<Span>,
+    /// Source text for the span (when different from the main file, e.g. imported modules).
+    pub source: Option<String>,
+    /// File path for the span (when from an imported file).
+    pub file: Option<String>,
 }
 
 impl CompileError {
@@ -12,6 +16,8 @@ impl CompileError {
         Self {
             message: message.into(),
             span: None,
+            source: None,
+            file: None,
         }
     }
 
@@ -19,16 +25,26 @@ impl CompileError {
         Self {
             message: message.into(),
             span: Some(span),
+            source: None,
+            file: None,
         }
+    }
+
+    /// Attach the source text and file path for errors from imported modules.
+    pub fn in_file(mut self, file: String, source: String) -> Self {
+        self.file = Some(file);
+        self.source = Some(source);
+        self
     }
 
     /// Format the error with source context (line, column, carets).
     #[expect(clippy::arithmetic_side_effects, reason = "line/col counting")]
-    pub fn format(&self, source: &str) -> String {
+    pub fn format(&self, main_source: &str) -> String {
         let Some(span) = self.span else {
             return self.message.clone();
         };
-        // If span is out of bounds (e.g., from an imported file), show message only
+        // Use the error's own source if available, otherwise the main source
+        let source = self.source.as_deref().unwrap_or(main_source);
         if span.start >= source.len() || span.end > source.len() {
             return self.message.clone();
         }
@@ -52,8 +68,12 @@ impl CompileError {
         let src_line = &source[line_start..line_end];
         let pad = " ".repeat(col - 1);
         let carets = "^".repeat((span.end - span.start).max(1));
+        let location = self
+            .file
+            .as_deref()
+            .map_or(String::new(), |f| format!("{f}:"));
         format!(
-            "\n --> {line}:{col}\n    | \n{line:>3} | {src_line}\n    | {pad}{carets}\n    | {}",
+            "\n --> {location}{line}:{col}\n    | \n{line:>3} | {src_line}\n    | {pad}{carets}\n    | {}",
             self.message
         )
     }

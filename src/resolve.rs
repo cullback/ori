@@ -40,6 +40,7 @@ pub struct Resolved<'src> {
 
 /// Resolve imports by prepending imported declarations to the module.
 /// Checks stdlib first, then looks for `.ori` files relative to `source_dir`.
+#[expect(clippy::too_many_lines, reason = "import resolution with validation")]
 pub fn resolve_imports<'src>(
     module: Module<'src>,
     source_dir: Option<&Path>,
@@ -79,6 +80,42 @@ pub fn resolve_imports<'src>(
                 import.module
             )));
         };
+
+        // Check for body-less method declarations in user modules
+        let is_stdlib = stdlib::get(import.module).is_some();
+        if !is_stdlib {
+            let import_source = sources.last().map_or("", String::as_str);
+            let import_file = format!("{}.ori", import.module);
+            for decl in &imported.decls {
+                if let Decl::TypeAnno { methods, name, .. } = decl {
+                    let func_names: std::collections::HashSet<&str> = methods
+                        .iter()
+                        .filter_map(|m| {
+                            if let Decl::FuncDef { name, .. } = m {
+                                Some(*name)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for method in methods {
+                        if let Decl::TypeAnno {
+                            span,
+                            name: method_name,
+                            ..
+                        } = method
+                            && !func_names.contains(method_name)
+                        {
+                            return Err(CompileError::at(
+                                *span,
+                                format!("method '{name}.{method_name}' declared but not defined"),
+                            )
+                            .in_file(import_file, import_source.to_owned()));
+                        }
+                    }
+                }
+            }
+        }
 
         // Filter by exports: only include exported declarations
         // No exports = fully private (nothing importable)
