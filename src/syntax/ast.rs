@@ -96,6 +96,7 @@ impl<'src> Expr<'src> {
 pub enum ExprKind<'src> {
     IntLit(i64),
     FloatLit(f64),
+    StrLit(Vec<u8>),
     Name(&'src str),
     BinOp {
         op: BinOp,

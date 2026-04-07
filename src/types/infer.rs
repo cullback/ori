@@ -374,6 +374,8 @@ impl<'src> InferCtx<'src> {
                 Ok(ty)
             }
 
+            ExprKind::StrLit(_) => Ok(Type::Con("Str".to_owned())),
+
             ExprKind::FloatLit(_) => {
                 let ty = self.engine.fresh();
                 let Type::Var(tv) = ty else { unreachable!() };

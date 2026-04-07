@@ -648,7 +648,7 @@ impl<'src> LowerCtx<'src> {
                     Self::collect_refs(e, refs);
                 }
             }
-            ExprKind::IntLit(_) | ExprKind::FloatLit(_) => {}
+            ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
         }
     }
 
@@ -789,7 +789,10 @@ impl<'src> LowerCtx<'src> {
                     self.scan_expr(e);
                 }
             }
-            ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::Name(_) => {}
+            ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::StrLit(_)
+            | ExprKind::Name(_) => {}
         }
     }
 
@@ -897,7 +900,7 @@ impl<'src> LowerCtx<'src> {
                     free.push(name);
                 }
             }
-            ExprKind::IntLit(_) | ExprKind::FloatLit(_) => {}
+            ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
             ExprKind::BinOp { lhs, rhs, .. } => {
                 self.collect_free(lhs, bound, seen, free);
                 self.collect_free(rhs, bound, seen, free);
@@ -1049,6 +1052,11 @@ impl<'src> LowerCtx<'src> {
                 _ => Core::i64(*n),
             },
             ExprKind::FloatLit(n) => Core::f64(*n),
+
+            ExprKind::StrLit(bytes) => {
+                let elements: Vec<Core> = bytes.iter().map(|&b| Core::u8(b)).collect();
+                Core::list_lit(elements)
+            }
 
             ExprKind::Name(name) => {
                 let name = *name;

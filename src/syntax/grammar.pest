@@ -67,6 +67,7 @@ atom = {
   | call_or_access
   | tuple
   | block
+  | string_lit
   | float_lit
   | int_lit
 }
@@ -117,6 +118,9 @@ field_init = { name ~ ":" ~ expr }
 lambda = { "|" ~ (lambda_param ~ ("," ~ lambda_param)*)? ~ "|" ~ expr }
 
 lambda_param = @{ "_" | name }
+
+string_lit = @{ "\"" ~ string_inner* ~ "\"" }
+string_inner = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
 
 float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 int_lit   = @{ ASCII_DIGIT+ }

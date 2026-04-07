@@ -264,6 +264,13 @@ impl ParseCtx {
                 let inner = pair.into_inner().next().unwrap();
                 self.parse_expr(inner)
             }
+            Rule::string_lit => {
+                let raw = pair.as_str();
+                // Strip surrounding quotes
+                let inner = &raw[1..raw.len() - 1];
+                let bytes = unescape_string(inner);
+                Expr::new(ExprKind::StrLit(bytes), span)
+            }
             Rule::float_lit => {
                 let n: f64 = pair.as_str().parse().unwrap();
                 Expr::new(ExprKind::FloatLit(n), span)
@@ -725,4 +732,31 @@ fn parse_field_pattern(pair: Pair<'_, Rule>) -> (&str, Pattern<'_>) {
     } else {
         (name, Pattern::Binding(name))
     }
+}
+
+/// Process escape sequences in a string literal and return UTF-8 bytes.
+fn unescape_string(s: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => bytes.push(b'\n'),
+                Some('t') => bytes.push(b'\t'),
+                Some('r') => bytes.push(b'\r'),
+                Some('0') => bytes.push(0),
+                Some('"') => bytes.push(b'"'),
+                Some('\\') | None => bytes.push(b'\\'),
+                Some(other) => {
+                    bytes.push(b'\\');
+                    let mut buf = [0_u8; 4];
+                    bytes.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        } else {
+            let mut buf = [0_u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    bytes
 }

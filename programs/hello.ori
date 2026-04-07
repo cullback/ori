@@ -1,0 +1,3 @@
+# Outputs "hello world" to stdout.
+main : Str -> Result(Str, Str)
+main = |_| Ok("hello world\n")

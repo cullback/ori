@@ -999,7 +999,7 @@ main = |arg| List.len([])";
 fn str_count_bytes() {
     let source = "\
 main : I64 -> U64
-main = |arg| Str.count_bytes(Str.from_bytes([72, 101, 108, 108, 111]))";
+main = |arg| Str.count_bytes(\"hello\")";
 
     assert_eq!(run_u64(source, 0), 5);
 }
@@ -1008,21 +1008,32 @@ main = |arg| Str.count_bytes(Str.from_bytes([72, 101, 108, 108, 111]))";
 fn str_append() {
     let source = "\
 main : I64 -> U64
-main = |arg| Str.count_bytes(Str.append(Str.from_bytes([72, 105]), Str.from_bytes([33])))";
+main = |arg| Str.count_bytes(Str.append(\"hi\", \"!\"))";
 
     assert_eq!(run_u64(source, 0), 3);
 }
 
 #[test]
 fn str_get_byte() {
+    // 'H' = 72 in ASCII/UTF-8
     let source = "\
 main : I64 -> U8
-main = |arg| Str.get(Str.from_bytes([72, 101, 108]), 0)";
+main = |arg| Str.get(\"Hello\", 0)";
 
     match run(source, 0) {
         Value::VNum(NumVal::U8(n)) => assert_eq!(n, 72),
         other => panic!("expected U8, got {other:?}"),
     }
+}
+
+#[test]
+fn str_literal_escape() {
+    let source = "\
+main : I64 -> U64
+main = |arg| Str.count_bytes(\"line1\\nline2\")";
+
+    // "line1\nline2" = 11 bytes
+    assert_eq!(run_u64(source, 0), 11);
 }
 
 // ============================================================
