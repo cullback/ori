@@ -629,6 +629,24 @@ impl<'src> InferCtx<'src> {
                         self.method_resolutions.insert(span, mangled);
                         return Ok(ret);
                     }
+                    // Numeric builtins: arithmetic methods on numeric types
+                    if Self::NUMERIC_TYPES.contains(&concrete_name.as_str())
+                        && Self::ARITHMETIC_METHODS.contains(&method_name)
+                    {
+                        // Builtin arithmetic: both args same type, result same type
+                        let concrete_ty = resolved.clone();
+                        self.unify_at(&var_ty, &concrete_ty, span)?;
+                        for arg_ty in &arg_types {
+                            self.unify_at(arg_ty, &concrete_ty, span)?;
+                        }
+                        // Record as a builtin method resolution for the lowerer
+                        self.method_resolutions
+                            .insert(span, format!("__builtin.{method_name}"));
+                        if method_name == "eq" || method_name == "neq" {
+                            return Ok(Type::Con("Bool".to_owned()));
+                        }
+                        return Ok(concrete_ty);
+                    }
                 }
             }
         }

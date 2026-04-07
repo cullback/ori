@@ -1112,7 +1112,6 @@ impl<'src> LowerCtx<'src> {
             ExprKind::QualifiedCall { segments, args } => {
                 // Check if inference resolved this to a method call (e.g., b.not → Bool.not)
                 if let Some(resolved) = self.method_resolutions.get(&expr.span).cloned() {
-                    // Method call: segments[0] is the receiver variable
                     let receiver_name = segments[0];
                     let receiver_core = if let Some(&var_id) = self.vars.get(receiver_name) {
                         Core::var(var_id)
@@ -1121,11 +1120,29 @@ impl<'src> LowerCtx<'src> {
                     } else {
                         panic!("undefined receiver: {receiver_name}");
                     };
-                    // Prepend receiver to args
-                    let mut full_args = vec![receiver_core];
-                    full_args.extend(args.iter().map(|a| self.lower_expr(a)));
-                    let func_id = self.funcs[&resolved];
-                    Core::app(func_id, full_args)
+                    if let Some(builtin_name) = resolved.strip_prefix("__builtin.") {
+                        // Builtin arithmetic: x.add(y) → Add(x, y)
+                        let op = match builtin_name {
+                            "add" => BinOp::Add,
+                            "sub" => BinOp::Sub,
+                            "mul" => BinOp::Mul,
+                            "div" => BinOp::Div,
+                            "rem" => BinOp::Rem,
+                            "eq" => BinOp::Eq,
+                            "neq" => BinOp::Neq,
+                            _ => panic!("unknown builtin: {builtin_name}"),
+                        };
+                        let func_id = self.binops[&op];
+                        let mut full_args = vec![receiver_core];
+                        full_args.extend(args.iter().map(|a| self.lower_expr(a)));
+                        Core::app(func_id, full_args)
+                    } else {
+                        // Method call: receiver.method(args) → Type.method(receiver, args)
+                        let mut full_args = vec![receiver_core];
+                        full_args.extend(args.iter().map(|a| self.lower_expr(a)));
+                        let func_id = self.funcs[&resolved];
+                        Core::app(func_id, full_args)
+                    }
                 } else {
                     let mangled = segments.join(".");
                     self.lower_call(&mangled, args)
