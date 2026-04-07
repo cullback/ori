@@ -1,8 +1,8 @@
 # UTF-8 encoded string, backed by a byte list.
 Str := List(U8).(
     # Returns the number of bytes in the string.
-    len : Str -> U64
-    len = |s| List.len(s)
+    count_bytes : Str -> U64
+    count_bytes = |s| List.len(s)
 
     # Returns the byte at the given index.
     get : Str, U64 -> U8

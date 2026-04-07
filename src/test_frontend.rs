@@ -996,10 +996,10 @@ main = |arg| List.len([])";
 // ============================================================
 
 #[test]
-fn str_len() {
+fn str_count_bytes() {
     let source = "\
 main : I64 -> U64
-main = |arg| Str.len(Str.from_bytes([72, 101, 108, 108, 111]))";
+main = |arg| Str.count_bytes(Str.from_bytes([72, 101, 108, 108, 111]))";
 
     assert_eq!(run_u64(source, 0), 5);
 }
@@ -1008,7 +1008,7 @@ main = |arg| Str.len(Str.from_bytes([72, 101, 108, 108, 111]))";
 fn str_append() {
     let source = "\
 main : I64 -> U64
-main = |arg| Str.len(Str.append(Str.from_bytes([72, 105]), Str.from_bytes([33])))";
+main = |arg| Str.count_bytes(Str.append(Str.from_bytes([72, 105]), Str.from_bytes([33])))";
 
     assert_eq!(run_u64(source, 0), 3);
 }
