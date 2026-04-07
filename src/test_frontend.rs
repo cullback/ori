@@ -992,6 +992,40 @@ main = |arg| List.len([])";
 }
 
 // ============================================================
+// Str type
+// ============================================================
+
+#[test]
+fn str_len() {
+    let source = "\
+main : I64 -> U64
+main = |arg| Str.len(Str.from_bytes([72, 101, 108, 108, 111]))";
+
+    assert_eq!(run_u64(source, 0), 5);
+}
+
+#[test]
+fn str_append() {
+    let source = "\
+main : I64 -> U64
+main = |arg| Str.len(Str.append(Str.from_bytes([72, 105]), Str.from_bytes([33])))";
+
+    assert_eq!(run_u64(source, 0), 3);
+}
+
+#[test]
+fn str_get_byte() {
+    let source = "\
+main : I64 -> U8
+main = |arg| Str.get(Str.from_bytes([72, 101, 108]), 0)";
+
+    match run(source, 0) {
+        Value::VNum(NumVal::U8(n)) => assert_eq!(n, 72),
+        other => panic!("expected U8, got {other:?}"),
+    }
+}
+
+// ============================================================
 // Float literals and polymorphic numbers
 // ============================================================
 

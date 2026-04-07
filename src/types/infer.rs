@@ -65,6 +65,7 @@ impl<'src> InferCtx<'src> {
                 "U64".to_owned(),
                 "F64".to_owned(),
                 "List".to_owned(),
+                "Str".to_owned(),
             ]),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
@@ -247,10 +248,26 @@ impl<'src> InferCtx<'src> {
                     self.register_methods(name, methods)?;
                     self.infer_method_bodies(name, methods)?;
                 }
-                Decl::TypeAnno { name, methods, .. } => {
+                Decl::TypeAnno {
+                    name,
+                    ty,
+                    kind,
+                    methods,
+                    ..
+                } => {
                     let name = *name;
+                    // For nominal types, add transparency so method bodies
+                    // can convert between the nominal and underlying type.
+                    if *kind != TypeDeclKind::Alias {
+                        let underlying = self.resolve_type_expr(ty)?;
+                        self.engine.transparent.insert(name.to_owned(), underlying);
+                    }
                     self.register_methods(name, methods)?;
                     self.infer_method_bodies(name, methods)?;
+                    // Opaque: remove transparency after method block
+                    if *kind == TypeDeclKind::Opaque {
+                        self.engine.transparent.remove(name);
+                    }
                 }
                 Decl::FuncDef { name, params, .. } => {
                     let name = *name;
@@ -917,6 +934,7 @@ pub fn check<'src>(
     ctx.register_stdlib_module(arena, "Bool")?;
     ctx.register_stdlib_module(arena, "Result")?;
     ctx.register_stdlib_module(arena, "List")?;
+    ctx.register_stdlib_module(arena, "Str")?;
 
     // Pass 1: register all type declarations and function signatures
     for decl in &module.decls {

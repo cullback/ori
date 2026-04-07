@@ -3,6 +3,7 @@ pub fn get(name: &str) -> Option<&'static str> {
         "list" | "List" => Some(include_str!("../standard/list.ori")),
         "bool" | "Bool" => Some(include_str!("../standard/bool.ori")),
         "result" | "Result" => Some(include_str!("../standard/result.ori")),
+        "str" | "Str" => Some(include_str!("../standard/str.ori")),
         _ => None,
     }
 }
@@ -14,5 +15,6 @@ pub fn all() -> Vec<(&'static str, &'static str)> {
         ("Bool", include_str!("../standard/bool.ori")),
         ("Result", include_str!("../standard/result.ori")),
         ("List", include_str!("../standard/list.ori")),
+        ("Str", include_str!("../standard/str.ori")),
     ]
 }

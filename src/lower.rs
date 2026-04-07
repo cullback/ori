@@ -32,9 +32,11 @@ pub fn lower<'src>(
     ctx.register_comparison_builtins();
     let result_stdlib = ctx.register_stdlib_module(arena, "Result");
     let list_stdlib = ctx.register_stdlib_module(arena, "List");
+    let str_stdlib = ctx.register_stdlib_module(arena, "Str");
     let bool_methods = LowerCtx::extract_methods(&bool_stdlib);
     let result_methods = LowerCtx::extract_methods(&result_stdlib);
     let list_methods = LowerCtx::extract_methods(&list_stdlib);
+    let str_methods = LowerCtx::extract_methods(&str_stdlib);
 
     // Pass 1: register user type declarations and function names
     ctx.register_decls(&module.decls);
@@ -84,6 +86,7 @@ pub fn lower<'src>(
     let mut all_stdlib_methods = bool_methods;
     all_stdlib_methods.extend(&result_methods);
     all_stdlib_methods.extend(&list_methods);
+    all_stdlib_methods.extend(&str_methods);
     ctx.compute_reachable_with_stdlib(&module.decls, &all_stdlib_methods);
 
     // Add method-resolved functions to reachable set

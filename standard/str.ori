@@ -1,0 +1,22 @@
+# UTF-8 encoded string, backed by a byte list.
+Str := List(U8).(
+    # Returns the number of bytes in the string.
+    len : Str -> U64
+    len = |s| List.len(s)
+
+    # Returns the byte at the given index.
+    get : Str, U64 -> U8
+    get = |s, i| List.get(s, i)
+
+    # Concatenates two strings.
+    append : Str, Str -> Str
+    append = |a, b| List.walk(b, a, |acc, byte| List.append(acc, byte))
+
+    # Wraps a byte list as a string.
+    from_bytes : List(U8) -> Str
+    from_bytes = |bytes| bytes
+
+    # Returns the underlying byte list.
+    to_bytes : Str -> List(U8)
+    to_bytes = |s| s
+)

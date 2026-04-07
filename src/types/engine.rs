@@ -200,6 +200,27 @@ impl TypeEngine {
                     rest: r2,
                 },
             ) => self.unify_records(f1, r1.as_deref(), f2, r2.as_deref()),
+            // Transparent nominal: Con vs non-Con (e.g. Str vs List(U8))
+            (Type::Con(a), _) => {
+                if let Some(underlying) = self.transparent.get(a).cloned() {
+                    return self.unify(&underlying, &rhs);
+                }
+                Err(format!(
+                    "cannot unify {} with {}",
+                    self.display_type(&lhs),
+                    self.display_type(&rhs)
+                ))
+            }
+            (_, Type::Con(b)) => {
+                if let Some(underlying) = self.transparent.get(b).cloned() {
+                    return self.unify(&lhs, &underlying);
+                }
+                Err(format!(
+                    "cannot unify {} with {}",
+                    self.display_type(&lhs),
+                    self.display_type(&rhs)
+                ))
+            }
             _ => Err(format!(
                 "cannot unify {} with {}",
                 self.display_type(&lhs),
