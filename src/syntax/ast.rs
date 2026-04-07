@@ -11,6 +11,15 @@ pub struct Import<'src> {
     pub exposing: Vec<&'src str>,
 }
 
+/// Constraint declaration in a `where` clause: `a.method` or `a.method : type`
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ConstraintDecl<'src> {
+    pub type_var: &'src str,
+    pub method: &'src str,
+    pub method_type: Option<TypeExpr<'src>>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum Decl<'src> {
@@ -18,6 +27,7 @@ pub enum Decl<'src> {
         name: &'src str,
         type_params: Vec<&'src str>,
         ty: TypeExpr<'src>,
+        where_clause: Vec<ConstraintDecl<'src>>,
         methods: Vec<Decl<'src>>,
         nominal: bool,
     },

@@ -377,10 +377,49 @@ impl<'src> InferCtx<'src> {
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                         self.unify_at(&lt, &rt, expr.span);
+                        // If operand is a type var, generate an arithmetic constraint
+                        let resolved = self.engine.resolve(&lt);
+                        if let Type::Var(tv) = resolved {
+                            let method_name = match op {
+                                BinOp::Add => "add",
+                                BinOp::Sub => "sub",
+                                BinOp::Mul => "mul",
+                                BinOp::Div => "div",
+                                BinOp::Rem => "rem",
+                                BinOp::Eq | BinOp::Neq => unreachable!(),
+                            };
+                            let method_type = Type::Arrow(
+                                vec![Type::Var(tv), Type::Var(tv)],
+                                Box::new(Type::Var(tv)),
+                            );
+                            self.engine.constraints.push(Constraint {
+                                type_var: tv,
+                                method_name: method_name.to_owned(),
+                                method_type,
+                            });
+                        }
                         lt
                     }
                     BinOp::Eq | BinOp::Neq => {
                         self.unify_at(&lt, &rt, expr.span);
+                        // If operand is a type var, generate eq/neq constraint
+                        let resolved = self.engine.resolve(&lt);
+                        if let Type::Var(tv) = resolved {
+                            let method_name = match op {
+                                BinOp::Eq => "eq",
+                                BinOp::Neq => "neq",
+                                _ => unreachable!(),
+                            };
+                            let method_type = Type::Arrow(
+                                vec![Type::Var(tv), Type::Var(tv)],
+                                Box::new(Type::Con("Bool".to_owned())),
+                            );
+                            self.engine.constraints.push(Constraint {
+                                type_var: tv,
+                                method_name: method_name.to_owned(),
+                                method_type,
+                            });
+                        }
                         Type::Con("Bool".to_owned())
                     }
                 }
@@ -724,6 +763,33 @@ impl<'src> InferCtx<'src> {
         self.env.insert(name.to_owned(), generalized);
     }
 
+    /// Numeric types that implicitly satisfy arithmetic constraints.
+    const NUMERIC_TYPES: &'static [&'static str] = &["I8", "U8", "I64", "U64", "F64"];
+    const ARITHMETIC_METHODS: &'static [&'static str] =
+        &["add", "sub", "mul", "div", "rem", "eq", "neq"];
+
+    /// Verify constraints whose type vars resolved to concrete types.
+    fn verify_constraints(&self) {
+        for c in &self.engine.constraints {
+            let resolved = self.engine.resolve(&Type::Var(c.type_var));
+            let (Type::Con(type_name) | Type::App(type_name, _)) = &resolved else {
+                continue; // still polymorphic or structural, stays as constraint
+            };
+            // Numeric types implicitly have arithmetic methods
+            if Self::NUMERIC_TYPES.contains(&type_name.as_str())
+                && Self::ARITHMETIC_METHODS.contains(&c.method_name.as_str())
+            {
+                continue;
+            }
+            let mangled = format!("{type_name}.{}", c.method_name);
+            assert!(
+                self.env.contains_key(&mangled),
+                "type error: {type_name} has no method '{}'",
+                c.method_name
+            );
+        }
+    }
+
     /// Default unresolved literal type vars and build the span -> `NumType` side table.
     fn resolve_literals(&mut self) -> HashMap<Span, NumType> {
         let i64_ty = Type::Con("I64".to_owned());
@@ -933,6 +999,8 @@ pub fn check<'src>(
     }
 
     let lit_types = ctx.resolve_literals();
+    ctx.verify_constraints();
+
     InferResult {
         lit_types,
         method_resolutions: ctx.method_resolutions,

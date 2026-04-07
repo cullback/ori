@@ -1005,6 +1005,32 @@ main = |arg| 10 / 3";
 // ============================================================
 
 #[test]
+fn constraint_inferred_from_addition() {
+    // add_twice is polymorphic with an inferred `add` constraint
+    // When called with I64 args, constraint is satisfied
+    let source = "\
+add_twice = |x, y| x + y + y
+
+main : I64 -> I64
+main = |arg| add_twice(10, 3)";
+
+    assert_eq!(run_i64(source, 0), 16);
+}
+
+#[test]
+fn constraint_where_clause_parses() {
+    // Explicit where clause — just verifies it parses and checks
+    let source = "\
+add_twice : a, a -> a where [a.add]
+add_twice = |x, y| x + y + y
+
+main : I64 -> I64
+main = |arg| add_twice(10, 3)";
+
+    assert_eq!(run_i64(source, 0), 16);
+}
+
+#[test]
 fn constraint_method_on_concrete_type() {
     // x.not() where x is Bool — resolves to Bool.not
     let source = "\

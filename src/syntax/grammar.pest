@@ -16,8 +16,11 @@ decl = { type_anno | assignment }
 
 type_anno = {
     name ~ type_params? ~ ":=" ~ type_expr ~ method_block?
-  | name ~ type_params? ~ ":" ~ type_expr ~ method_block?
+  | name ~ type_params? ~ ":" ~ type_expr ~ where_clause? ~ method_block?
 }
+
+where_clause = { "where" ~ "[" ~ constraint_decl ~ ("," ~ constraint_decl)* ~ "]" }
+constraint_decl = { name ~ "." ~ name ~ (":" ~ type_expr)? }
 
 type_params = { "(" ~ name ~ ("," ~ name)* ~ ")" }
 
@@ -150,4 +153,4 @@ mul_op =  { "*" | "/" | "%" }
 
 name = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" | "exports" }
+keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" | "exports" | "where" }

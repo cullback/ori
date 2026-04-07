@@ -4,7 +4,8 @@ use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest_derive::Parser;
 
 use crate::syntax::ast::{
-    BinOp, Decl, Expr, ExprKind, Import, MatchArm, Module, Pattern, Span, Stmt, TagDecl, TypeExpr,
+    BinOp, ConstraintDecl, Decl, Expr, ExprKind, Import, MatchArm, Module, Pattern, Span, Stmt,
+    TagDecl, TypeExpr,
 };
 
 #[derive(Parser)]
@@ -83,6 +84,7 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
 
     let mut type_params = Vec::new();
     let mut ty = None;
+    let mut where_clause = Vec::new();
     let mut methods = Vec::new();
 
     for part in inner {
@@ -94,6 +96,13 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
             }
             Rule::type_expr | Rule::type_atom => {
                 ty = Some(parse_type_expr(part));
+            }
+            Rule::where_clause => {
+                for constraint in part.into_inner() {
+                    if constraint.as_rule() == Rule::constraint_decl {
+                        where_clause.push(parse_constraint_decl(constraint));
+                    }
+                }
             }
             Rule::method_block => {
                 for method_pair in part.into_inner() {
@@ -110,8 +119,21 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
         name,
         type_params,
         ty: ty.expect("type declaration missing type expression"),
+        where_clause,
         methods,
         nominal,
+    }
+}
+
+fn parse_constraint_decl(pair: Pair<'_, Rule>) -> ConstraintDecl<'_> {
+    let mut inner = pair.into_inner();
+    let type_var = inner.next().unwrap().as_str();
+    let method = inner.next().unwrap().as_str();
+    let method_type = inner.next().map(parse_type_expr);
+    ConstraintDecl {
+        type_var,
+        method,
+        method_type,
     }
 }
 
