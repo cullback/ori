@@ -1,56 +1,37 @@
-use std::cell::RefCell;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FileId(pub usize);
 
-struct SourceFile {
-    path: String,
-    content: String,
-}
-
 /// An arena that owns all source texts.
 ///
-/// Uses `RefCell` so that `add()` can be called with `&self`, avoiding
-/// conflicts with outstanding `&str` borrows from `content()`. Each file
-/// is heap-allocated (in a `Box`) so its heap address is stable across
-/// `add()` calls.
+/// Source strings are leaked (`Box::leak`) so that `&str` references
+/// are valid for `'static`. This is fine for a compiler — it runs once,
+/// allocates source texts, and exits.
 pub struct SourceArena {
-    #[allow(clippy::vec_box)]
-    files: RefCell<Vec<Box<SourceFile>>>,
+    files: Vec<(&'static str, &'static str)>, // (path, content)
 }
 
 impl SourceArena {
     pub const fn new() -> Self {
-        Self {
-            files: RefCell::new(Vec::new()),
-        }
+        Self { files: Vec::new() }
     }
 
-    pub fn add(&self, path: String, content: String) -> FileId {
-        let mut files = self.files.borrow_mut();
-        let id = FileId(files.len());
-        files.push(Box::new(SourceFile { path, content }));
+    pub fn add(&mut self, path: String, content: String) -> FileId {
+        let id = FileId(self.files.len());
+        let leaked_path: &'static str = Box::leak(path.into_boxed_str());
+        let leaked_content: &'static str = Box::leak(content.into_boxed_str());
+        self.files.push((leaked_path, leaked_content));
         id
     }
 
-    /// Get the content of a file.
-    ///
-    /// # Safety rationale
-    /// Each `SourceFile` is `Box`-allocated, so its heap address is stable
-    /// even when the `Vec` grows. The arena never removes or replaces files,
-    /// so the returned `&str` remains valid for the lifetime of `&self`.
-    pub fn content(&self, id: FileId) -> &str {
-        let files = self.files.borrow();
-        let ptr: *const str = &raw const *files[id.0].content;
-        // SAFETY: The Box ensures stable heap address; arena is append-only.
-        unsafe { &*ptr }
+    pub fn content(&self, id: FileId) -> &'static str {
+        self.files[id.0].1
     }
 
-    /// Get the path of a file.
-    pub fn path(&self, id: FileId) -> &str {
-        let files = self.files.borrow();
-        let ptr: *const str = &raw const *files[id.0].path;
-        // SAFETY: Same as content() — Box ensures stable heap address.
-        unsafe { &*ptr }
+    pub fn path(&self, id: FileId) -> &'static str {
+        self.files[id.0].0
+    }
+
+    pub fn find_by_path(&self, path: &str) -> Option<FileId> {
+        self.files.iter().position(|(p, _)| *p == path).map(FileId)
     }
 }

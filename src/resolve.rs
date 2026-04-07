@@ -41,7 +41,7 @@ pub struct Resolved<'src> {
 #[expect(clippy::too_many_lines, reason = "import resolution with validation")]
 pub fn resolve_imports<'src>(
     module: Module<'src>,
-    arena: &'src SourceArena,
+    arena: &mut SourceArena,
     source_dir: Option<&Path>,
 ) -> Result<Resolved<'src>, CompileError> {
     let mut scope = ModuleScope::new();

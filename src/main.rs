@@ -19,12 +19,18 @@ use error::CompileError;
 use source::SourceArena;
 
 fn compile(
-    arena: &SourceArena,
+    arena: &mut SourceArena,
     main_file: source::FileId,
     source_dir: Option<&std::path::Path>,
 ) -> Result<(crate::core::Program, crate::core::VarId), CompileError> {
+    // Pre-load stdlib into arena
+    for (name, src) in stdlib::all() {
+        arena.add(format!("<stdlib:{name}>"), src.to_owned());
+    }
+
     let parsed = syntax::parse::parse(arena.content(main_file), main_file)?;
     let resolved = resolve::resolve_imports(parsed, arena, source_dir)?;
+    // Arena is done growing — check and lower only read
     let infer_result = types::infer::check(arena, &resolved.module, &resolved.scope)?;
     lower::lower(arena, &resolved.module, &resolved.scope, &infer_result)
 }
@@ -40,11 +46,11 @@ fn main() {
         process::exit(1);
     });
 
-    let arena = SourceArena::new();
+    let mut arena = SourceArena::new();
     let main_file = arena.add(args[1].clone(), content);
 
     let source_dir = std::path::Path::new(&args[1]).parent();
-    let (program, input_var) = match compile(&arena, main_file, source_dir) {
+    let (program, input_var) = match compile(&mut arena, main_file, source_dir) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("{}", e.format(&arena));

@@ -6,7 +6,6 @@ use crate::core::{
 };
 use crate::error::CompileError;
 use crate::source::SourceArena;
-use crate::stdlib;
 use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Stmt, TypeExpr};
 use crate::syntax::parse;
 
@@ -375,8 +374,9 @@ impl<'src> LowerCtx<'src> {
         arena: &'src SourceArena,
         module_name: &str,
     ) -> Module<'src> {
-        let src = stdlib::get(module_name).unwrap_or("");
-        let file_id = arena.add(format!("<stdlib:{module_name}>"), src.to_owned());
+        let file_id = arena
+            .find_by_path(&format!("<stdlib:{module_name}>"))
+            .unwrap_or_else(|| panic!("stdlib module '{module_name}' not loaded in arena"));
         let stdlib = parse::parse(arena.content(file_id), file_id)
             .expect("stdlib module should always parse successfully");
         self.register_decls(&stdlib.decls);

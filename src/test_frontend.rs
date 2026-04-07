@@ -5,10 +5,14 @@ use crate::source::SourceArena;
 
 /// Compile and run an Ori program with the given I64 input.
 fn run(source: &str, input: i64) -> Value {
-    let arena = SourceArena::new();
+    let mut arena = SourceArena::new();
+    // Pre-load stdlib
+    for (name, src) in crate::stdlib::all() {
+        arena.add(format!("<stdlib:{name}>"), src.to_owned());
+    }
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let resolved = crate::resolve::resolve_imports(parsed, &arena, None).unwrap();
+    let resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     let infer_result =
         crate::types::infer::check(&arena, &resolved.module, &resolved.scope).unwrap();
     let (program, input_var) =

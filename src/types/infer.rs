@@ -224,8 +224,11 @@ impl<'src> InferCtx<'src> {
         arena: &'src SourceArena,
         module_name: &str,
     ) -> Result<(), CompileError> {
-        let src = crate::stdlib::get(module_name).unwrap_or("");
-        let file_id = arena.add(format!("<stdlib:{module_name}>"), src.to_owned());
+        let file_id = arena
+            .find_by_path(&format!("<stdlib:{module_name}>"))
+            .ok_or_else(|| {
+                CompileError::new(format!("stdlib module '{module_name}' not loaded in arena"))
+            })?;
         let stdlib = crate::syntax::parse::parse(arena.content(file_id), file_id)?;
 
         for decl in &stdlib.decls {
