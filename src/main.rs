@@ -13,6 +13,7 @@ mod types;
 
 use std::collections::HashMap;
 use std::io::Read as _;
+use std::io::Write as _;
 use std::process;
 
 use error::CompileError;
@@ -33,6 +34,32 @@ fn compile(
     // Arena is done growing — check and lower only read
     let infer_result = types::infer::check(arena, &resolved.module, &resolved.scope)?;
     lower::lower(arena, &resolved.module, &resolved.scope, &infer_result)
+}
+
+/// Convert a Str value (List(U8)) to a Rust byte vector.
+fn value_to_bytes(val: &core::Value) -> Vec<u8> {
+    let core::Value::VList(elems) = val else {
+        panic!("expected Str (List(U8)), got {val:?}");
+    };
+    elems
+        .iter()
+        .map(|e| {
+            let core::Value::VNum(core::NumVal::U8(b)) = e else {
+                panic!("expected U8 in Str, got {e:?}");
+            };
+            *b
+        })
+        .collect()
+}
+
+/// Convert a Rust byte slice to a Str value (List(U8)).
+fn bytes_to_value(bytes: &[u8]) -> core::Value {
+    core::Value::VList(
+        bytes
+            .iter()
+            .map(|&b| core::Value::VNum(core::NumVal::U8(b)))
+            .collect(),
+    )
 }
 
 fn main() {
@@ -58,27 +85,36 @@ fn main() {
         }
     };
 
-    // Read input from stdin
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input).unwrap();
-    let number: i64 = input.trim().parse().unwrap_or_else(|e| {
-        eprintln!("error parsing input: {e}");
-        process::exit(1);
-    });
+    // Read stdin as bytes → Str
+    let mut input_bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut input_bytes).unwrap();
+    let input_str = bytes_to_value(&input_bytes);
 
-    // Evaluate
+    // Evaluate: main : Str -> Result(Str, Str)
     let mut env = HashMap::new();
-    env.insert(input_var, core::Value::VNum(core::NumVal::I64(number)));
+    env.insert(input_var, input_str);
     let result = core::eval::eval(&env, &program, &program.main);
 
-    // Print result
-    match result {
-        core::Value::VNum(core::NumVal::U8(n)) => println!("{n}"),
-        core::Value::VNum(core::NumVal::I8(n)) => println!("{n}"),
-        core::Value::VNum(core::NumVal::I64(n)) => println!("{n}"),
-        core::Value::VNum(core::NumVal::U64(n)) => println!("{n}"),
-        core::Value::VNum(core::NumVal::F64(n)) => println!("{n}"),
-        core::Value::VConstruct { .. } | core::Value::VRecord { .. } | core::Value::VList(_) => {
+    // Handle Result(Str, Str) output
+    match &result {
+        core::Value::VConstruct { tag, fields } => {
+            let name = program.debug_names.func_name(*tag);
+            match name {
+                "Ok" => {
+                    let bytes = value_to_bytes(&fields[0]);
+                    std::io::stdout().write_all(&bytes).unwrap();
+                }
+                "Err" => {
+                    let bytes = value_to_bytes(&fields[0]);
+                    std::io::stderr().write_all(&bytes).unwrap();
+                    process::exit(1);
+                }
+                _ => {
+                    println!("{result:?}");
+                }
+            }
+        }
+        _ => {
             println!("{result:?}");
         }
     }

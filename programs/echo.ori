@@ -1,0 +1,3 @@
+# Echoes stdin to stdout.
+main : Str -> Result(Str, Str)
+main = |input| Ok(input)

@@ -44,6 +44,10 @@ impl Builder {
         id
     }
 
+    pub fn debug_name_func(&mut self, id: FuncId, name: String) {
+        self.debug_names.funcs.insert(id, name);
+    }
+
     pub fn builtin(&mut self, op: Builtin) -> FuncId {
         let id = self.func();
         self.builtins.insert(id, op);

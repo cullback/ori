@@ -656,6 +656,7 @@ impl<'src> LowerCtx<'src> {
         let mut con_defs = Vec::new();
         for tag in tags {
             let con_id = self.builder.func();
+            self.builder.debug_name_func(con_id, tag.name.to_owned());
             self.constructors.insert(tag.name.to_owned(), con_id);
             let recursive_flags: Vec<bool> = tag
                 .fields
