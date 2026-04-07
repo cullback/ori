@@ -1,3 +1,6 @@
-# Echoes stdin to stdout.
-main : Str -> Result(Str, Str)
-main = |input| Ok(input)
+# Echoes the first command line argument.
+main : List(Str) -> Result(Str, Str)
+main = |args|
+    if List.is_empty(args)
+        then Ok("\n")
+        else Ok(Str.concat(List.get(args, 0), "\n"))

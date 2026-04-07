@@ -12,7 +12,6 @@ mod test_programs;
 mod types;
 
 use std::collections::HashMap;
-use std::io::Read as _;
 use std::io::Write as _;
 use std::process;
 
@@ -85,14 +84,16 @@ fn main() {
         }
     };
 
-    // Read stdin as bytes → Str
-    let mut input_bytes = Vec::new();
-    std::io::stdin().read_to_end(&mut input_bytes).unwrap();
-    let input_str = bytes_to_value(&input_bytes);
+    // Build List(Str) from command line args (skip binary name and source file)
+    let cli_args: Vec<core::Value> = args[2..]
+        .iter()
+        .map(|a| bytes_to_value(a.as_bytes()))
+        .collect();
+    let args_value = core::Value::VList(cli_args);
 
-    // Evaluate: main : Str -> Result(Str, Str)
+    // Evaluate: main : List(Str) -> Result(Str, Str)
     let mut env = HashMap::new();
-    env.insert(input_var, input_str);
+    env.insert(input_var, args_value);
     let result = core::eval::eval(&env, &program, &program.main);
 
     // Handle Result(Str, Str) output
