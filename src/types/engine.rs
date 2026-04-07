@@ -75,6 +75,9 @@ pub struct TypeEngine {
     pub subst: HashMap<TypeVar, Type>,
     /// Accumulated constraints during inference.
     pub constraints: Vec<Constraint>,
+    /// Nominal types currently transparent (name → underlying type).
+    /// During method body inference, the nominal type unifies with its underlying type.
+    pub transparent: HashMap<String, Type>,
 }
 
 impl TypeEngine {
@@ -83,6 +86,7 @@ impl TypeEngine {
             next_var: 0,
             subst: HashMap::new(),
             constraints: Vec::new(),
+            transparent: HashMap::new(),
         }
     }
 
@@ -143,10 +147,17 @@ impl TypeEngine {
             }
             (_, Type::Var(_)) => self.unify(&rhs, &lhs),
             (Type::Con(a), Type::Con(b)) => {
-                if a != b {
-                    return Err(format!("cannot unify {a} with {b}"));
+                if a == b {
+                    return Ok(());
                 }
-                Ok(())
+                // Check if one is a transparent nominal type
+                if let Some(underlying) = self.transparent.get(a).cloned() {
+                    return self.unify(&underlying, &rhs);
+                }
+                if let Some(underlying) = self.transparent.get(b).cloned() {
+                    return self.unify(&lhs, &underlying);
+                }
+                Err(format!("cannot unify {a} with {b}"))
             }
             (Type::App(n1, a1), Type::App(n2, a2)) => {
                 if n1 != n2 || a1.len() != a2.len() {

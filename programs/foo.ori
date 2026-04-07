@@ -1,0 +1,9 @@
+exports [Foo]
+
+Foo := U64.(
+    new : U64 -> Foo
+    new = |a| a
+
+    add : Foo, Foo -> Foo
+    add = |a, b| a + b
+)

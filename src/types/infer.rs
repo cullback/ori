@@ -776,16 +776,19 @@ impl<'src> InferCtx<'src> {
         let body_ty = self.infer_expr(body)?;
         self.unify_at(&ret, &body_ty, body.span)?;
 
-        if let Some(anno) = self.type_annos.get(name).cloned() {
+        // If there's an annotation, unify with it and use it as the external type
+        let external_ty = if let Some(anno) = self.type_annos.get(name).cloned() {
             let anno_ty = self.resolve_type_expr(&anno)?;
             self.unify_at(&func_ty, &anno_ty, body.span)?;
-        }
+            anno_ty
+        } else {
+            self.engine.resolve(&func_ty)
+        };
 
         self.env = saved_env;
         self.env.remove(name);
 
-        let resolved = self.engine.resolve(&func_ty);
-        let generalized = self.engine.generalize(&resolved, &self.env);
+        let generalized = self.engine.generalize(&external_ty, &self.env);
         self.env.insert(name.to_owned(), generalized);
         Ok(())
     }
@@ -954,33 +957,14 @@ pub fn check<'src>(
                 type_params,
                 ty,
                 methods,
+                nominal,
                 ..
             } => {
                 let name = *name;
-                if name.starts_with(|c: char| c.is_ascii_uppercase()) {
-                    // CamelCase: type alias (e.g. Point : { x: I64, y: I64 })
-                    let mut tvar_env: HashMap<String, TypeVar> = type_params
-                        .iter()
-                        .map(|p| {
-                            let t = ctx.engine.fresh();
-                            let Type::Var(tv) = t else { unreachable!() };
-                            ((*p).to_owned(), tv)
-                        })
-                        .collect();
-                    let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[*p]).collect();
-                    let alias_ty = ctx.type_expr_to_type(ty, &mut tvar_env)?;
-                    let alias_scheme = Scheme {
-                        vars: tvars,
-                        constraints: vec![],
-                        ty: alias_ty,
-                    };
-                    if let Some(mod_name) = scope.qualified_types.get(name) {
-                        let qual = format!("{mod_name}.{name}");
-                        ctx.type_aliases.insert(qual, alias_scheme.clone());
-                    }
-                    ctx.type_aliases.insert(name.to_owned(), alias_scheme);
+                if name.starts_with(|c: char| c.is_ascii_uppercase()) && *nominal {
+                    // Nominal type (:=) — distinct type, not an alias
                     ctx.known_types.insert(name.to_owned());
-                    // Register methods on non-TagUnion types (e.g. Foo := U64.(new = ...))
+                    // Register methods
                     for method in methods {
                         match method {
                             Decl::FuncDef {
@@ -1007,6 +991,29 @@ pub fn check<'src>(
                             }
                         }
                     }
+                } else if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    // CamelCase alias (:) — type alias (e.g. Point : { x: I64, y: I64 })
+                    let mut tvar_env: HashMap<String, TypeVar> = type_params
+                        .iter()
+                        .map(|p| {
+                            let t = ctx.engine.fresh();
+                            let Type::Var(tv) = t else { unreachable!() };
+                            ((*p).to_owned(), tv)
+                        })
+                        .collect();
+                    let tvars: Vec<TypeVar> = type_params.iter().map(|p| tvar_env[*p]).collect();
+                    let alias_ty = ctx.type_expr_to_type(ty, &mut tvar_env)?;
+                    let alias_scheme = Scheme {
+                        vars: tvars,
+                        constraints: vec![],
+                        ty: alias_ty,
+                    };
+                    if let Some(mod_name) = scope.qualified_types.get(name) {
+                        let qual = format!("{mod_name}.{name}");
+                        ctx.type_aliases.insert(qual, alias_scheme.clone());
+                    }
+                    ctx.type_aliases.insert(name.to_owned(), alias_scheme);
+                    ctx.known_types.insert(name.to_owned());
                 } else {
                     // snake_case: value/function annotation (e.g. get_x : I64 -> I64)
                     ctx.type_annos.insert(name.to_owned(), ty.clone());
@@ -1040,8 +1047,20 @@ pub fn check<'src>(
                     }
                 }
             }
-            Decl::TypeAnno { name, methods, .. } => {
+            Decl::TypeAnno {
+                name,
+                ty,
+                nominal,
+                methods,
+                ..
+            } => {
                 let name = *name;
+                // For nominal types, make the type transparent during method inference
+                // so method bodies can convert between the nominal and underlying type
+                if *nominal {
+                    let underlying = ctx.resolve_type_expr(ty)?;
+                    ctx.engine.transparent.insert(name.to_owned(), underlying);
+                }
                 for method in methods {
                     if let Decl::FuncDef {
                         name: method_name,
@@ -1059,6 +1078,10 @@ pub fn check<'src>(
                             }
                         }
                     }
+                }
+                // Remove transparency so external code can't see through
+                if *nominal {
+                    ctx.engine.transparent.remove(name);
                 }
             }
         }

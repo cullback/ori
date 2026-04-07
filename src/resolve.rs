@@ -81,9 +81,12 @@ pub fn resolve_imports<'src>(
         };
 
         // Filter by exports: only include exported declarations
+        // No exports = fully private (nothing importable)
         let exported_decls: Vec<Decl<'_>> = if imported.exports.is_empty() {
-            // No exports declaration: everything is public
-            imported.decls
+            return Err(CompileError::new(format!(
+                "module '{}' has no exports",
+                import.module
+            )));
         } else {
             imported
                 .decls

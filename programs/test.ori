@@ -1,12 +1,8 @@
-Foo := U64.(
-    new : U64 -> Foo
-    new = |a| a
-    add = |a, b| a + b
-)
+import foo exposing [Foo]
 
-main : I64 -> U64
+main : I64 -> Foo
 main = |arg| (
-    c = Foo.new(3)
-    d = c.add(4)
-    d
+    a = Foo.new(3)
+    b = Foo.new(4)
+    Foo.add(a, b)
 )
