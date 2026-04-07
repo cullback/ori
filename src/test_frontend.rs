@@ -1008,7 +1008,7 @@ main = |arg| Str.count_bytes(\"hello\")";
 fn str_append() {
     let source = "\
 main : I64 -> U64
-main = |arg| Str.count_bytes(Str.append(\"hi\", \"!\"))";
+main = |arg| Str.count_bytes(Str.concat(\"hi\", \"!\"))";
 
     assert_eq!(run_u64(source, 0), 3);
 }

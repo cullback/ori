@@ -21,6 +21,10 @@ List := {}.(
     # through each element.
     walk_backwards : List(a), b, (b, a -> b) -> b
 
+    # Returns True if the list has no elements.
+    is_empty : List(a) -> Bool
+    is_empty = |xs| List.len(xs) == 0
+
     # Returns a new list with the elements in reverse order.
     reverse : List(a) -> List(a)
     reverse = |xs| List.walk_backwards(xs, [], |acc, x| List.append(acc, x))

@@ -8,9 +8,13 @@ Str := List(U8).(
     get : Str, U64 -> U8
     get = |s, i| List.get(s, i)
 
+    # Returns True if the string has no bytes.
+    is_empty : Str -> Bool
+    is_empty = |s| List.is_empty(s)
+
     # Concatenates two strings.
-    append : Str, Str -> Str
-    append = |a, b| List.walk(b, a, |acc, byte| List.append(acc, byte))
+    concat : Str, Str -> Str
+    concat = |a, b| List.walk(b, a, |acc, byte| List.append(acc, byte))
 
     # Wraps a byte list as a string.
     from_bytes : List(U8) -> Str
