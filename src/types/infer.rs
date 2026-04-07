@@ -1061,6 +1061,29 @@ pub fn check<'src>(
                     let underlying = ctx.resolve_type_expr(ty)?;
                     ctx.engine.transparent.insert(name.to_owned(), underlying);
                 }
+                // Check for body-less declarations (only valid in stdlib builtins)
+                let func_names: std::collections::HashSet<&str> = methods
+                    .iter()
+                    .filter_map(|m| {
+                        if let Decl::FuncDef { name, .. } = m {
+                            Some(*name)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for method in methods {
+                    if let Decl::TypeAnno {
+                        name: method_name, ..
+                    } = method
+                        && !func_names.contains(method_name)
+                    {
+                        return Err(CompileError::new(format!(
+                            "method '{name}.{method_name}' declared but not defined"
+                        )));
+                    }
+                }
+
                 for method in methods {
                     if let Decl::FuncDef {
                         name: method_name,

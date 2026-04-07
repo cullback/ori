@@ -5,5 +5,5 @@ Foo := U64.(
     new = |a| a
 
     add : Foo, Foo -> Foo
-    add = |a, b| a + b
+    // add = |a, b| a + b
 )

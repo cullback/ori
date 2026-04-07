@@ -4,5 +4,5 @@ main : I64 -> Foo
 main = |arg| (
     a = Foo.new(3)
     b = Foo.new(4)
-    Foo.add(a, b)
+    a.add(b)
 )
