@@ -77,6 +77,7 @@ fn parse_decl(pair: Pair<'_, Rule>) -> Decl<'_> {
 }
 
 fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
+    let span = span_of(&pair);
     let text = pair.as_str();
     let nominal = text.contains(":=");
     let mut inner = pair.into_inner();
@@ -116,6 +117,7 @@ fn parse_type_anno(pair: Pair<'_, Rule>) -> Decl<'_> {
     }
 
     Decl::TypeAnno {
+        span,
         name,
         type_params,
         ty: ty.expect("type declaration missing type expression"),
@@ -138,6 +140,7 @@ fn parse_constraint_decl(pair: Pair<'_, Rule>) -> ConstraintDecl<'_> {
 }
 
 fn parse_assignment_as_decl(pair: Pair<'_, Rule>) -> Decl<'_> {
+    let span = span_of(&pair);
     let mut inner = pair.into_inner();
     let lhs = inner.next().unwrap(); // irrefutable
     let name = lhs.as_str().trim();
@@ -150,12 +153,14 @@ fn parse_assignment_as_decl(pair: Pair<'_, Rule>) -> Decl<'_> {
     } = body.kind
     {
         Decl::FuncDef {
+            span,
             name,
             params,
             body: *lam_body,
         }
     } else {
         Decl::FuncDef {
+            span,
             name,
             params: vec![],
             body,

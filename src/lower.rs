@@ -137,7 +137,10 @@ pub fn lower(
     let mut main_body = None;
 
     for decl in &module.decls {
-        let Decl::FuncDef { name, params, body } = decl else {
+        let Decl::FuncDef {
+            name, params, body, ..
+        } = decl
+        else {
             continue;
         };
         let name = *name;
@@ -198,6 +201,7 @@ pub fn lower(
                 name: method_name,
                 params,
                 body,
+                ..
             } = method_decl
             else {
                 continue;
@@ -450,7 +454,10 @@ impl<'src> LowerCtx<'src> {
     /// Lower the bodies of stdlib methods that are reachable.
     fn lower_stdlib_methods(&mut self, methods: &[(&str, &Decl<'src>)]) {
         for &(type_name, method) in methods {
-            if let Decl::FuncDef { name, params, body } = method {
+            if let Decl::FuncDef {
+                name, params, body, ..
+            } = method
+            {
                 let mangled = method_key(type_name, name);
                 if !self.reachable.contains(&mangled) {
                     continue;

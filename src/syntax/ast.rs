@@ -24,6 +24,7 @@ pub struct ConstraintDecl<'src> {
 #[allow(dead_code)]
 pub enum Decl<'src> {
     TypeAnno {
+        span: Span,
         name: &'src str,
         type_params: Vec<&'src str>,
         ty: TypeExpr<'src>,
@@ -32,6 +33,7 @@ pub enum Decl<'src> {
         nominal: bool,
     },
     FuncDef {
+        span: Span,
         name: &'src str,
         params: Vec<&'src str>,
         body: Expr<'src>,

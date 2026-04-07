@@ -254,7 +254,10 @@ impl<'src> InferCtx<'src> {
 
         // Infer free function bodies
         for decl in &stdlib.decls {
-            if let Decl::FuncDef { name, params, body } = decl {
+            if let Decl::FuncDef {
+                name, params, body, ..
+            } = decl
+            {
                 self.infer_func_body(name, params, body)?;
             }
         }
@@ -318,6 +321,7 @@ impl<'src> InferCtx<'src> {
                 name: method_name,
                 params,
                 body,
+                ..
             } = method
             {
                 let mangled = method_key(type_name, method_name);
@@ -1037,7 +1041,9 @@ pub fn check<'src>(
     // Pass 2: infer all function bodies
     for decl in &module.decls {
         match decl {
-            Decl::FuncDef { name, params, body } => {
+            Decl::FuncDef {
+                name, params, body, ..
+            } => {
                 ctx.infer_func_body(name, params, body)?;
                 // Dual-register qualified alias after inference
                 if let Some(mod_name) = scope.qualified_funcs.get(*name) {
@@ -1074,13 +1080,16 @@ pub fn check<'src>(
                     .collect();
                 for method in methods {
                     if let Decl::TypeAnno {
-                        name: method_name, ..
+                        span: method_span,
+                        name: method_name,
+                        ..
                     } = method
                         && !func_names.contains(method_name)
                     {
-                        return Err(CompileError::new(format!(
-                            "method '{name}.{method_name}' declared but not defined"
-                        )));
+                        return Err(CompileError::at(
+                            *method_span,
+                            format!("method '{name}.{method_name}' declared but not defined"),
+                        ));
                     }
                 }
 
@@ -1089,6 +1098,7 @@ pub fn check<'src>(
                         name: method_name,
                         params,
                         body,
+                        ..
                     } = method
                     {
                         let mangled = method_key(name, method_name);
