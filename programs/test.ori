@@ -1,14 +1,10 @@
-
-
 Foo := U64.(
-	new = |a| Foo(a)
+    new : U64 -> Foo
+    new = |a| a
 )
 
-
+main : I64 -> I64
 main = |arg| (
-	c = Foo.new(3)
-	0
+    c = Foo.new(3)
+    0
 )
-
-
-
