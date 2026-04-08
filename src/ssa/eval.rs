@@ -113,7 +113,14 @@ fn eval_inst(module: &Module, env: &Env, inst: &Inst) -> RtValue {
         Inst::BinOp(_, op, lhs, rhs) => eval_binop(*op, &env[lhs], &env[rhs]),
 
         Inst::Call(_, func_name, args) => {
-            let arg_vals: Vec<RtValue> = args.iter().map(|v| env[v].clone()).collect();
+            let arg_vals: Vec<RtValue> = args
+                .iter()
+                .map(|v| {
+                    env.get(v)
+                        .cloned()
+                        .unwrap_or_else(|| panic!("missing value {v} in call to {func_name}"))
+                })
+                .collect();
             eval_function(module, func_name, &arg_vals)
         }
 

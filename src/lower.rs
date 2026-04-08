@@ -422,6 +422,7 @@ impl<'src> LowerCtx<'src> {
                             let method_name = *method_name;
                             let mangled = method_key(name, method_name);
                             let func_id = self.builder.func();
+                            self.builder.debug_name_func(func_id, mangled.clone());
                             self.funcs.insert(mangled.clone(), func_id);
                             self.func_arities.insert(mangled, params.len());
                         }
@@ -441,6 +442,7 @@ impl<'src> LowerCtx<'src> {
                             let mangled = method_key(name, method_name);
                             if !self.funcs.contains_key(&mangled) {
                                 let func_id = self.builder.func();
+                                self.builder.debug_name_func(func_id, mangled.clone());
                                 self.funcs.insert(mangled.clone(), func_id);
                                 self.func_arities.insert(mangled, params.len());
                             }
@@ -450,6 +452,7 @@ impl<'src> LowerCtx<'src> {
                 Decl::FuncDef { name, params, .. } => {
                     let name = *name;
                     let func_id = self.builder.func();
+                    self.builder.debug_name_func(func_id, name.to_owned());
                     self.funcs.insert(name.to_owned(), func_id);
                     self.func_arities.insert(name.to_owned(), params.len());
                 }
@@ -892,6 +895,8 @@ impl<'src> LowerCtx<'src> {
             idx
         } else {
             let apply_func = self.builder.func();
+            let apply_name = format!("__apply_{callee_func}_{arg_index}");
+            self.builder.debug_name_func(apply_func, apply_name);
             let idx = self.lambda_sets.len();
             self.lambda_sets.push(LambdaSet {
                 apply_func,

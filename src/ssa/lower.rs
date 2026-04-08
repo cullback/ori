@@ -20,6 +20,76 @@ struct Ctx<'a> {
     fold_counter: usize,
 }
 
+/// Collect free VarIds in a Core expression (not in `bound`).
+fn collect_core_free_vars(
+    expr: &Core,
+    bound: &std::collections::HashSet<core::VarId>,
+    free: &mut Vec<core::VarId>,
+) {
+    match expr {
+        Core::Var(id) => {
+            if !bound.contains(id) && !free.contains(id) {
+                free.push(*id);
+            }
+        }
+        Core::Lit(_) => {}
+        Core::App { args, .. } => {
+            for a in args {
+                collect_core_free_vars(a, bound, free);
+            }
+        }
+        Core::Let { name, val, body } => {
+            collect_core_free_vars(val, bound, free);
+            let mut inner = bound.clone();
+            inner.insert(*name);
+            collect_core_free_vars(body, &inner, free);
+        }
+        Core::Match { expr, arms } => {
+            collect_core_free_vars(expr, bound, free);
+            for (pat, body) in arms {
+                let mut inner = bound.clone();
+                let Pattern::Constructor { fields, .. } = pat;
+                for f in fields {
+                    inner.insert(*f);
+                }
+                collect_core_free_vars(body, &inner, free);
+            }
+        }
+        Core::Fold { expr, arms } => {
+            collect_core_free_vars(expr, bound, free);
+            for arm in arms {
+                let mut inner = bound.clone();
+                let Pattern::Constructor { fields, .. } = &arm.pattern;
+                for f in fields {
+                    inner.insert(*f);
+                }
+                for r in &arm.rec_binds {
+                    inner.insert(*r);
+                }
+                collect_core_free_vars(&arm.body, &inner, free);
+            }
+        }
+        Core::Record { fields } => {
+            for (_, e) in fields {
+                collect_core_free_vars(e, bound, free);
+            }
+        }
+        Core::FieldAccess { record, .. } => collect_core_free_vars(record, bound, free),
+        Core::ListLit(elems) => {
+            for e in elems {
+                collect_core_free_vars(e, bound, free);
+            }
+        }
+        Core::ListWalk {
+            list, init, step, ..
+        } => {
+            collect_core_free_vars(list, bound, free);
+            collect_core_free_vars(init, bound, free);
+            collect_core_free_vars(step, bound, free);
+        }
+    }
+}
+
 /// Lower a Core Program to an SSA Module.
 /// `input_vars` are the free variables in `program.main` (main's parameters).
 pub fn lower(program: &Program, input_vars: &[core::VarId]) -> Module {
@@ -261,23 +331,54 @@ impl Ctx<'_> {
     }
 
     fn lower_fold(&mut self, scrutinee: Value, arms: &[core::FoldArm]) -> Value {
-        // Generate a recursive fold helper function.
-        // Capture all variables currently in scope as extra params.
         let fold_name = format!("__fold_{}", self.fold_counter);
         self.fold_counter += 1;
 
-        // The fold function takes: (scrutinee, ...captures)
-        // For simplicity, save/restore builder state and generate inline.
-        // Strategy: emit the fold as a call to a recursive function.
-        // For now, generate the function body.
+        // Collect free variables (VarIds referenced in arm bodies but not
+        // bound by patterns or rec_binds). These become extra params.
+        let mut bound: std::collections::HashSet<core::VarId> = std::collections::HashSet::new();
+        let mut free_vars: Vec<core::VarId> = Vec::new();
+        for arm in arms {
+            let Pattern::Constructor { fields, .. } = &arm.pattern;
+            for f in fields {
+                bound.insert(*f);
+            }
+            for r in &arm.rec_binds {
+                bound.insert(*r);
+            }
+        }
+        for arm in arms {
+            collect_core_free_vars(&arm.body, &bound, &mut free_vars);
+        }
+        free_vars.dedup();
 
+        // Map captures to their current SSA values
+        let capture_vals: Vec<Value> = free_vars
+            .iter()
+            .filter_map(|vid| self.vars.get(vid).copied())
+            .collect();
+        let captured_vids: Vec<core::VarId> = free_vars
+            .iter()
+            .filter(|vid| self.vars.contains_key(vid))
+            .copied()
+            .collect();
+
+        // Save builder state
         let saved_blocks = std::mem::take(&mut self.builder.blocks);
         let saved_current = self.builder.current_block.take();
         let saved_vars = self.vars.clone();
 
+        // Build the fold helper function: (scrutinee, ...captures)
         let entry = self.builder.create_block();
         self.builder.switch_to(entry);
         let scrutinee_param = self.builder.add_block_param(entry);
+
+        let mut all_params = vec![scrutinee_param];
+        for vid in &captured_vids {
+            let param = self.builder.add_block_param(entry);
+            self.vars.insert(*vid, param);
+            all_params.push(param);
+        }
 
         let merge = self.builder.create_block();
         let merge_result = self.builder.add_block_param(merge);
@@ -302,7 +403,6 @@ impl Ctx<'_> {
         for (i, arm) in arms.iter().enumerate() {
             self.builder.switch_to(arm_blocks[i].1);
 
-            // Recursive calls on recursive fields
             let Pattern::Constructor { tag, fields } = &arm.pattern;
             let con_def = self
                 .program
@@ -312,11 +412,16 @@ impl Ctx<'_> {
                 .find(|c| c.tag == *tag)
                 .unwrap();
 
+            // Recursive calls pass captures through
+            let capture_params: Vec<Value> =
+                captured_vids.iter().map(|vid| self.vars[vid]).collect();
             let mut rec_idx = 0;
             for (j, field_def) in con_def.fields.iter().enumerate() {
                 if field_def.recursive {
                     let field_val = self.vars[&fields[j]];
-                    let rec_result = self.builder.call(&fold_name, vec![field_val]);
+                    let mut call_args = vec![field_val];
+                    call_args.extend_from_slice(&capture_params);
+                    let rec_result = self.builder.call(&fold_name, call_args);
                     self.vars.insert(arm.rec_binds[rec_idx], rec_result);
                     rec_idx += 1;
                 }
@@ -328,16 +433,17 @@ impl Ctx<'_> {
 
         self.builder.switch_to(merge);
         self.builder.ret(merge_result);
-        self.builder
-            .finish_function(&fold_name, vec![scrutinee_param]);
+        self.builder.finish_function(&fold_name, all_params);
 
         // Restore state
         self.builder.blocks = saved_blocks;
         self.builder.current_block = saved_current;
         self.vars = saved_vars;
 
-        // Emit the call to the fold function
-        self.builder.call(&fold_name, vec![scrutinee])
+        // Emit the call with captures
+        let mut call_args = vec![scrutinee];
+        call_args.extend_from_slice(&capture_vals);
+        self.builder.call(&fold_name, call_args)
     }
 
     fn lower_list_walk(
