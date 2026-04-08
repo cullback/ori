@@ -66,7 +66,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             infer,
         }
     }
+}
 
+struct WalkKind {
+    backwards: bool,
+    until: bool,
+}
+
+impl<'a, 'src> LowerCtx<'a, 'src> {
     // ---- Type helpers ----
 
     fn expr_scalar_type(&self, span: ast::Span) -> ScalarType {
@@ -319,11 +326,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             } => {
                 let resolved = self.infer.method_resolutions.get(&expr.span).cloned();
                 if let Some(mangled) = resolved {
-                    // List.walk / walk_backwards: special lowering
-                    let is_walk = mangled == "List.walk" || mangled.ends_with(".List.walk");
-                    let is_walk_back = mangled == "List.walk_backwards"
-                        || mangled.ends_with(".List.walk_backwards");
-                    if is_walk || is_walk_back {
+                    // List.walk / walk_backwards / walk_until / walk_backwards_until
+                    if let Some(walk) = self.classify_walk(&mangled) {
                         let list_val = self.lower_expr(receiver);
                         let init_val = self.lower_expr(&args[0]);
                         let acc_ty = self.expr_scalar_type(args[0].span);
@@ -340,7 +344,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             init_val,
                             closure_val,
                             &apply_name,
-                            is_walk_back,
+                            walk.backwards,
+                            walk.until,
                             acc_ty,
                         );
                     }
@@ -424,11 +429,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     // ---- Call lowering ----
 
     fn lower_call(&mut self, func: &str, args: &[Expr<'src>], _span: ast::Span) -> Value {
-        // List.walk / List.walk_backwards
-        let is_walk = func == "List.walk" || func.ends_with(".List.walk");
-        let is_walk_back = func == "List.walk_backwards" || func.ends_with(".List.walk_backwards");
-        if is_walk || is_walk_back {
-            assert!(args.len() >= 3, "List.walk takes 3 arguments");
+        // List.walk / walk_backwards / walk_until / walk_backwards_until
+        if let Some(walk) = self.classify_walk(func) {
+            assert!(args.len() >= 3, "List.walk* takes 3 arguments");
             let list_val = self.lower_expr(&args[0]);
             let init_val = self.lower_expr(&args[1]);
             let acc_ty = self.expr_scalar_type(args[1].span);
@@ -445,7 +448,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 init_val,
                 closure_val,
                 &apply_name,
-                is_walk_back,
+                walk.backwards,
+                walk.until,
                 acc_ty,
             );
         }
@@ -952,6 +956,32 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     // ---- List walk lowering ----
 
+    /// Classify a function name as a List walk variant, if it is one.
+    fn classify_walk(&self, name: &str) -> Option<WalkKind> {
+        let base = name
+            .strip_prefix("List.")
+            .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest))?;
+        match base {
+            "walk" => Some(WalkKind {
+                backwards: false,
+                until: false,
+            }),
+            "walk_backwards" => Some(WalkKind {
+                backwards: true,
+                until: false,
+            }),
+            "walk_until" => Some(WalkKind {
+                backwards: false,
+                until: true,
+            }),
+            "walk_backwards_until" => Some(WalkKind {
+                backwards: true,
+                until: true,
+            }),
+            _ => None,
+        }
+    }
+
     fn lower_list_walk(
         &mut self,
         list_val: Value,
@@ -959,6 +989,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         step_val: Value,
         apply_name: &str,
         backwards: bool,
+        until: bool,
         acc_ty: ScalarType,
     ) -> Value {
         let len_val = self.builder.load(list_val, 0, ScalarType::U64);
@@ -994,14 +1025,29 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         } else {
             self.builder.load_dyn(data_ptr, i_param, ScalarType::Ptr)
         };
-        let new_acc =
+        let result =
             self.builder
                 .call(apply_name, vec![step_val, acc_param, elem], ScalarType::Ptr);
+
         let one = self.builder.const_u64(1);
         let next_i = self
             .builder
             .binop(BinaryOp::Add, i_param, one, ScalarType::U64);
-        self.builder.jump(header, vec![next_i, new_acc]);
+
+        if until {
+            // result is Step(b): slot 0 = tag, slot 1 = payload
+            let tag = self.builder.load(result, 0, ScalarType::U64);
+            let payload = self.builder.load(result, 1, acc_ty);
+            let break_tag = self.decls.constructors["Break"].tag_index;
+            let break_val = self.builder.const_u64(break_tag);
+            let is_break = self
+                .builder
+                .binop(BinaryOp::Eq, tag, break_val, ScalarType::Bool);
+            self.builder
+                .branch(is_break, done, vec![payload], header, vec![next_i, payload]);
+        } else {
+            self.builder.jump(header, vec![next_i, result]);
+        }
 
         self.builder.switch_to(done);
         done_param

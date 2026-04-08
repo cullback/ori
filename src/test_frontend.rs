@@ -993,6 +993,41 @@ main = |arg| List.sum([1, 2, 3, 4, 5])";
 }
 
 #[test]
+fn walk_until_break_early() {
+    // Sum elements until we hit a value > 3, then break
+    let source = "\
+main : I64 -> I64
+main = |arg| List.walk_until([1, 2, 3, 4, 5], 0, |acc, x|
+    if x == 4 then Break(acc)
+    else Continue(acc + x)
+)";
+    // 1 + 2 + 3 = 6 (stops before 4)
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn walk_until_no_break() {
+    // No break — processes all elements
+    let source = "\
+main : I64 -> I64
+main = |arg| List.walk_until([1, 2, 3], 0, |acc, x| Continue(acc + x))";
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn walk_backwards_until_break_early() {
+    // Walk backwards, break when we hit 2
+    let source = "\
+main : I64 -> I64
+main = |arg| List.walk_backwards_until([1, 2, 3, 4, 5], 0, |acc, x|
+    if x == 2 then Break(acc)
+    else Continue(acc + x)
+)";
+    // 5 + 4 + 3 = 12 (stops before 2)
+    assert_eq!(run_i64(source, 0), 12);
+}
+
+#[test]
 fn builtin_list_empty() {
     let source = "\
 main : I64 -> U64

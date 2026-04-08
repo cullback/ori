@@ -208,10 +208,7 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
         }
         ExprKind::QualifiedCall { segments, args } => {
             let mangled = segments.join(".");
-            let is_list_ho = mangled == "List.walk"
-                || mangled.ends_with(".List.walk")
-                || mangled == "List.walk_backwards"
-                || mangled.ends_with(".List.walk_backwards");
+            let is_list_ho = is_list_walk(&mangled);
             if is_list_ho || ctx.funcs.contains(&mangled) {
                 scan_call_args(ctx, &mangled, args);
             } else {
@@ -234,11 +231,7 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
         ExprKind::MethodCall { receiver, args, .. } => {
             scan_expr(ctx, receiver);
             if let Some(resolved) = ctx.method_resolutions.get(&expr.span).cloned() {
-                let is_ho = resolved == "List.walk"
-                    || resolved.ends_with(".List.walk")
-                    || resolved == "List.walk_backwards"
-                    || resolved.ends_with(".List.walk_backwards")
-                    || ctx.funcs.contains(&resolved);
+                let is_ho = is_list_walk(&resolved) || ctx.funcs.contains(&resolved);
                 if is_ho {
                     scan_call_args_offset(ctx, &resolved, args, 1);
                 } else {
@@ -503,6 +496,17 @@ fn collect_free<'src>(
             }
         }
     }
+}
+
+/// Check whether a function name is a List walk variant.
+fn is_list_walk(name: &str) -> bool {
+    let base = name
+        .strip_prefix("List.")
+        .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest));
+    matches!(
+        base,
+        Some("walk" | "walk_backwards" | "walk_until" | "walk_backwards_until")
+    )
 }
 
 pub fn pattern_names<'src>(pat: &ast::Pattern<'src>, bound: &mut HashSet<&'src str>) {
