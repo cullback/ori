@@ -438,6 +438,13 @@ impl TypeEngine {
 
     pub fn display_type(&self, ty: &Type) -> String {
         let resolved = self.resolve(ty);
+        // Show the nominal name if this type matches a transparent underlying type
+        #[expect(clippy::iter_over_hash_type, reason = "display order doesn't matter")]
+        for (name, underlying) in &self.transparent {
+            if self.types_match(&resolved, underlying) {
+                return name.clone();
+            }
+        }
         match &resolved {
             Type::Var(tv) => format!("t{}", tv.0),
             Type::Con(name) => name.clone(),

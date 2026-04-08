@@ -9,4 +9,4 @@ part1 = |input|
         else count)
 
 main : List(Str), Str -> Result(Str, Str)
-main = |args, input| Ok(part1(input).to_str())
+main = |args, input| Ok(part1(input))
