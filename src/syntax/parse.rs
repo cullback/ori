@@ -469,6 +469,15 @@ impl ParseCtx {
                             let ty = parse_type_expr(parts.next().unwrap());
                             stmts.push(Stmt::TypeHint { name, ty });
                         }
+                        Rule::guard_clause => {
+                            let mut parts = stmt_inner.into_inner();
+                            let condition = self.parse_expr(parts.next().unwrap());
+                            let return_val = self.parse_expr(parts.next().unwrap());
+                            stmts.push(Stmt::Guard {
+                                condition,
+                                return_val,
+                            });
+                        }
                         other => panic!("unexpected block statement: {other:?}"),
                     }
                 }
@@ -490,17 +499,17 @@ impl ParseCtx {
     fn parse_if_expr<'src>(&self, pair: Pair<'src, Rule>, span: Span) -> Expr<'src> {
         let mut inner: Vec<Pair<'src, Rule>> = pair.into_inner().collect();
 
-        // Check if it's boolean if-then-else or multi-arm match
         let has_match_arm = inner.iter().any(|p| p.as_rule() == Rule::match_arm);
-
         let scrutinee = self.parse_expr(inner.remove(0));
+
         if has_match_arm {
+            // Multi-arm match
             let mut arms = Vec::new();
             let mut else_body = None;
 
             for part in inner {
                 match part.as_rule() {
-                    Rule::match_arm => arms.push(self.parse_match_arm(part)),
+                    Rule::match_arm => arms.extend(self.parse_match_arms(part)),
                     Rule::expr | Rule::atom => else_body = Some(Box::new(self.parse_expr(part))),
                     _ => {}
                 }
@@ -515,6 +524,7 @@ impl ParseCtx {
                 span,
             )
         } else {
+            // Boolean if-then-else
             let then_body = self.parse_expr(inner.remove(0));
             let else_body = self.parse_expr(inner.remove(0));
 
@@ -527,14 +537,18 @@ impl ParseCtx {
                                 name: "True",
                                 fields: vec![],
                             },
+                            guards: vec![],
                             body: then_body,
+                            is_return: false,
                         },
                         MatchArm {
                             pattern: Pattern::Constructor {
                                 name: "False",
                                 fields: vec![],
                             },
+                            guards: vec![],
                             body: else_body,
+                            is_return: false,
                         },
                     ],
                     else_body: None,
@@ -547,7 +561,7 @@ impl ParseCtx {
     fn parse_fold_expr<'src>(&self, pair: Pair<'src, Rule>, span: Span) -> Expr<'src> {
         let mut inner = pair.into_inner();
         let scrutinee = self.parse_expr(inner.next().unwrap());
-        let arms: Vec<MatchArm<'_>> = inner.map(|p| self.parse_match_arm(p)).collect();
+        let arms: Vec<MatchArm<'_>> = inner.flat_map(|p| self.parse_match_arms(p)).collect();
         Expr::new(
             ExprKind::Fold {
                 expr: Box::new(scrutinee),
@@ -557,11 +571,36 @@ impl ParseCtx {
         )
     }
 
-    fn parse_match_arm<'src>(&self, pair: Pair<'src, Rule>) -> MatchArm<'src> {
-        let mut inner = pair.into_inner();
-        let pattern = parse_pattern(inner.next().unwrap());
-        let body = self.parse_expr(inner.next().unwrap());
-        MatchArm { pattern, body }
+    fn parse_match_arms<'src>(&self, pair: Pair<'src, Rule>) -> Vec<MatchArm<'src>> {
+        let mut inner: Vec<Pair<'src, Rule>> = pair.into_inner().collect();
+
+        // Last element is the body expression (expr)
+        let body = self.parse_expr(inner.pop().unwrap());
+
+        // Second to last is arm_end ("then" or "return")
+        let arm_end = inner.pop().unwrap();
+        let is_return = arm_end.as_str() == "return";
+
+        // Remaining elements are arm_branch pairs
+        let branches: Vec<Pair<'src, Rule>> = inner
+            .into_iter()
+            .filter(|p| p.as_rule() == Rule::arm_branch)
+            .collect();
+
+        branches
+            .into_iter()
+            .map(|branch| {
+                let mut branch_inner = branch.into_inner();
+                let pattern = parse_pattern(branch_inner.next().unwrap());
+                let guards: Vec<Expr<'src>> = branch_inner.map(|p| self.parse_expr(p)).collect();
+                MatchArm {
+                    pattern,
+                    guards: guards.clone(),
+                    body: body.clone(),
+                    is_return,
+                }
+            })
+            .collect()
     }
 
     fn parse_lambda<'src>(&self, pair: Pair<'src, Rule>, span: Span) -> Expr<'src> {

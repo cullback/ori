@@ -106,7 +106,9 @@ args = { expr ~ ("," ~ expr)* }
 block = { "(" ~ block_body ~ ")" }
 block_body = { block_stmt* ~ expr }
 
-block_stmt = { type_hint | assignment }
+block_stmt = { type_hint | guard_clause | assignment }
+
+guard_clause = { "if" ~ expr ~ "return" ~ expr }
 
 type_hint = { name ~ ":" ~ type_expr }
 
@@ -154,7 +156,9 @@ fold_expr = {
     "fold" ~ expr ~ match_arm+
 }
 
-match_arm = { ":" ~ pattern ~ "then" ~ expr }
+match_arm = { ":" ~ arm_branch ~ ("or" ~ arm_branch)* ~ arm_end ~ expr }
+arm_branch = { pattern ~ ("and" ~ expr)* }
+arm_end = { "then" | "return" }
 
 // ---- Patterns ----
 
@@ -182,4 +186,4 @@ mul_op =  { "*" | "/" | "%" }
 
 name = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" | "exports" | "where" }
+keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" | "exports" | "where" | "and" | "or" | "return" }

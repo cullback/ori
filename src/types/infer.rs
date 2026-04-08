@@ -380,6 +380,17 @@ impl<'src> InferCtx<'src> {
                                 self.env.insert(name, scheme);
                             }
                         }
+                        Stmt::Guard {
+                            condition,
+                            return_val,
+                        } => {
+                            let cond_ty = self.infer_expr(condition)?;
+                            let bool_ty = Type::Con("Bool".to_owned());
+                            self.unify_at(&cond_ty, &bool_ty, condition.span)?;
+                            // The return value must match the enclosing function's return type.
+                            // For now, just infer it; the caller's context will unify as needed.
+                            let _ret_ty = self.infer_expr(return_val)?;
+                        }
                     }
                 }
                 let result_ty = self.infer_expr(result)?;
@@ -394,12 +405,17 @@ impl<'src> InferCtx<'src> {
             } => {
                 let scrutinee_ty = self.infer_expr(scrutinee)?;
                 let result_ty = self.engine.fresh();
+                let bool_ty = Type::Con("Bool".to_owned());
                 for arm in arms {
                     let bindings =
                         self.infer_pattern(&arm.pattern, &scrutinee_ty, expr.span, None)?;
                     let saved_env = self.env.clone();
                     for (name, ty) in bindings {
                         self.env.insert(name, Scheme::mono(ty));
+                    }
+                    for guard_expr in &arm.guards {
+                        let guard_ty = self.infer_expr(guard_expr)?;
+                        self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
                     }
                     let body_ty = self.infer_expr(&arm.body)?;
                     self.unify_at(&result_ty, &body_ty, arm.body.span)?;
@@ -414,6 +430,7 @@ impl<'src> InferCtx<'src> {
             } => {
                 let scrutinee_ty = self.infer_expr(scrutinee)?;
                 let result_ty = self.engine.fresh();
+                let bool_ty = Type::Con("Bool".to_owned());
                 for arm in arms {
                     // In fold, recursive fields bind to the result type, not the scrutinee type
                     let bindings = self.infer_pattern(
@@ -425,6 +442,10 @@ impl<'src> InferCtx<'src> {
                     let saved_env = self.env.clone();
                     for (name, ty) in bindings {
                         self.env.insert(name, Scheme::mono(ty));
+                    }
+                    for guard_expr in &arm.guards {
+                        let guard_ty = self.infer_expr(guard_expr)?;
+                        self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
                     }
                     let body_ty = self.infer_expr(&arm.body)?;
                     self.unify_at(&result_ty, &body_ty, arm.body.span)?;

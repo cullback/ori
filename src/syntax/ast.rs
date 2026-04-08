@@ -145,7 +145,9 @@ pub enum ExprKind<'src> {
 #[derive(Debug, Clone)]
 pub struct MatchArm<'src> {
     pub pattern: Pattern<'src>,
+    pub guards: Vec<Expr<'src>>,
     pub body: Expr<'src>,
+    pub is_return: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +178,12 @@ pub enum Stmt<'src> {
     Destructure {
         pattern: Pattern<'src>,
         val: Expr<'src>,
+    },
+    /// Guard clause: `if condition return value`
+    /// If condition is true, return value from the enclosing function.
+    Guard {
+        condition: Expr<'src>,
+        return_val: Expr<'src>,
     },
 }
 

@@ -153,8 +153,8 @@ fn bool_and() {
     let source = "\
 Bool : [True, False]
 
-and : Bool, Bool -> Bool
-and = |a, b| if a
+both : Bool, Bool -> Bool
+both = |a, b| if a
     : True then b
     : False then False
 
@@ -164,7 +164,7 @@ bool_to_i64 = |b| if b
     : False then 0
 
 main : I64 -> I64
-main = |arg| bool_to_i64(and(True, True))";
+main = |arg| bool_to_i64(both(True, True))";
 
     assert_eq!(run_i64(source, 0), 1);
 }
@@ -1464,3 +1464,135 @@ main = |arg| double(arg)";
 // Monomorphization tests removed: Core IR no longer exists.
 // The above behavioral tests cover all the same scenarios.
 // ============================================================
+
+// ============================================================
+// Or-patterns
+// ============================================================
+
+#[test]
+fn or_pattern_basic() {
+    let source = "\
+Shape : [Circle(I64), Sphere(I64), Rect(I64, I64)]
+area : Shape -> I64
+area = |s| if s
+    : Circle(r) or Sphere(r) then r * r
+    : Rect(w, h) then w * h
+main : I64 -> I64
+main = |arg| area(Circle(5))";
+    assert_eq!(run_i64(source, 0), 25);
+}
+
+#[test]
+fn or_pattern_second_alternative() {
+    let source = "\
+Shape : [Circle(I64), Sphere(I64), Rect(I64, I64)]
+area : Shape -> I64
+area = |s| if s
+    : Circle(r) or Sphere(r) then r * r
+    : Rect(w, h) then w * h
+main : I64 -> I64
+main = |arg| area(Sphere(3))";
+    assert_eq!(run_i64(source, 0), 9);
+}
+
+// ============================================================
+// Guards (and condition)
+// ============================================================
+
+#[test]
+fn guard_basic() {
+    let source = "\
+Cmd : [Move(I64), Stop]
+handle : Cmd -> I64
+handle = |c| if c
+    : Move(dist) and dist == 0 then 99
+    : Move(dist) then dist
+    : Stop then 0
+main : I64 -> I64
+main = |arg| handle(Move(42))";
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+#[test]
+fn guard_fallthrough() {
+    let source = "\
+Cmd : [Move(I64), Stop]
+handle : Cmd -> I64
+handle = |c| if c
+    : Move(dist) and dist == 0 then 99
+    : Move(dist) then dist
+    : Stop then 0
+main : I64 -> I64
+main = |arg| handle(Move(0))";
+    assert_eq!(run_i64(source, 0), 99);
+}
+
+#[test]
+fn guard_chain() {
+    // Two guards chained with and
+    let source = "\
+Val : [Pair(I64, I64)]
+check : Val -> I64
+check = |v| if v
+    : Pair(a, b) and a == 1 and b == 2 then 100
+    : Pair(a, b) then a + b
+main : I64 -> I64
+main = |arg| check(Pair(1, 2))";
+    assert_eq!(run_i64(source, 0), 100);
+}
+
+// ============================================================
+// Return in match arms
+// ============================================================
+
+#[test]
+fn return_in_arm() {
+    let source = "\
+Val : [A(I64), B(I64)]
+extract : Val -> I64
+extract = |v| if v
+    : A(x) return x
+    : B(x) then x * 2
+main : I64 -> I64
+main = |arg| extract(A(7))";
+    assert_eq!(run_i64(source, 0), 7);
+}
+
+#[test]
+fn return_in_arm_b_branch() {
+    let source = "\
+Val : [A(I64), B(I64)]
+extract : Val -> I64
+extract = |v| if v
+    : A(x) return x
+    : B(x) then x * 2
+main : I64 -> I64
+main = |arg| extract(B(5))";
+    assert_eq!(run_i64(source, 0), 10);
+}
+
+// ============================================================
+// Guard clause: if condition return val
+// ============================================================
+
+#[test]
+fn guard_clause_if_return() {
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    if arg == 0 return 99
+    arg * 2
+)";
+    assert_eq!(run_i64(source, 0), 99);
+}
+
+#[test]
+fn guard_clause_fallthrough() {
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    if arg == 0 return 99
+    arg * 2
+)";
+    assert_eq!(run_i64(source, 5), 10);
+}

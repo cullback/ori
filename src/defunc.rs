@@ -158,6 +158,7 @@ fn collect_lambdas<'src>(
     }
 }
 
+#[expect(clippy::too_many_lines, reason = "traverses all expression forms")]
 fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
     match &expr.kind {
         ExprKind::Call { func, args } if ctx.funcs.contains(*func) => {
@@ -178,6 +179,13 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
                     Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
                         scan_expr(ctx, val);
                     }
+                    Stmt::Guard {
+                        condition,
+                        return_val,
+                    } => {
+                        scan_expr(ctx, condition);
+                        scan_expr(ctx, return_val);
+                    }
                     Stmt::TypeHint { .. } => {}
                 }
             }
@@ -191,6 +199,9 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
         } => {
             scan_expr(ctx, scrutinee);
             for arm in arms {
+                for guard_expr in &arm.guards {
+                    scan_expr(ctx, guard_expr);
+                }
                 scan_expr(ctx, &arm.body);
             }
             if let Some(eb) = else_body {
@@ -203,6 +214,9 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
         } => {
             scan_expr(ctx, scrutinee);
             for arm in arms {
+                for guard_expr in &arm.guards {
+                    scan_expr(ctx, guard_expr);
+                }
                 scan_expr(ctx, &arm.body);
             }
         }
@@ -464,6 +478,13 @@ fn collect_free<'src>(
                         collect_free(ctx, val, &inner, seen, free);
                         pattern_names(pattern, &mut inner);
                     }
+                    Stmt::Guard {
+                        condition,
+                        return_val,
+                    } => {
+                        collect_free(ctx, condition, &inner, seen, free);
+                        collect_free(ctx, return_val, &inner, seen, free);
+                    }
                     Stmt::TypeHint { .. } => {}
                 }
             }
@@ -478,6 +499,9 @@ fn collect_free<'src>(
             for arm in arms {
                 let mut arm_bound = bound.clone();
                 pattern_names(&arm.pattern, &mut arm_bound);
+                for guard_expr in &arm.guards {
+                    collect_free(ctx, guard_expr, &arm_bound, seen, free);
+                }
                 collect_free(ctx, &arm.body, &arm_bound, seen, free);
             }
             if let Some(eb) = else_body {
@@ -492,6 +516,9 @@ fn collect_free<'src>(
             for arm in arms {
                 let mut arm_bound = bound.clone();
                 pattern_names(&arm.pattern, &mut arm_bound);
+                for guard_expr in &arm.guards {
+                    collect_free(ctx, guard_expr, &arm_bound, seen, free);
+                }
                 collect_free(ctx, &arm.body, &arm_bound, seen, free);
             }
         }

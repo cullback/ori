@@ -94,6 +94,13 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>) {
                     Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
                         collect_refs(val, refs);
                     }
+                    Stmt::Guard {
+                        condition,
+                        return_val,
+                    } => {
+                        collect_refs(condition, refs);
+                        collect_refs(return_val, refs);
+                    }
                     Stmt::TypeHint { .. } => {}
                 }
             }
@@ -106,6 +113,9 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>) {
         } => {
             collect_refs(e, refs);
             for arm in arms {
+                for guard_expr in &arm.guards {
+                    collect_refs(guard_expr, refs);
+                }
                 collect_refs(&arm.body, refs);
             }
             if let Some(eb) = else_body {
@@ -115,6 +125,9 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>) {
         ExprKind::Fold { expr: e, arms } => {
             collect_refs(e, refs);
             for arm in arms {
+                for guard_expr in &arm.guards {
+                    collect_refs(guard_expr, refs);
+                }
                 collect_refs(&arm.body, refs);
             }
         }

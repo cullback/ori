@@ -227,6 +227,32 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             let v = self.lower_expr(val);
                             self.lower_destructure(pattern, v);
                         }
+                        Stmt::Guard {
+                            condition,
+                            return_val,
+                        } => {
+                            // Lower: if condition is true, return return_val from function
+                            let cond_val = self.lower_expr(condition);
+                            let cond_tag = self.builder.load(cond_val, 0, ScalarType::U64);
+                            let true_tag = self.decls.constructors["True"].tag_index;
+                            let true_val = self.builder.const_u64(true_tag);
+                            let is_true = self.builder.binop(
+                                BinaryOp::Eq,
+                                cond_tag,
+                                true_val,
+                                ScalarType::Bool,
+                            );
+                            let ret_block = self.builder.create_block();
+                            let cont_block = self.builder.create_block();
+                            self.builder
+                                .branch(is_true, ret_block, vec![], cont_block, vec![]);
+                            // Return block: evaluate return_val and ret
+                            self.builder.switch_to(ret_block);
+                            let ret_v = self.lower_expr(return_val);
+                            self.builder.ret(ret_v);
+                            // Continue block: proceed with next statements
+                            self.builder.switch_to(cont_block);
+                        }
                         Stmt::TypeHint { .. } => {}
                     }
                 }
@@ -236,10 +262,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ExprKind::If {
                 expr: scrutinee_expr,
                 arms,
-                ..
+                else_body,
             } => {
                 let result_ty = self.expr_scalar_type(expr.span);
-                self.lower_match(scrutinee_expr, arms, result_ty)
+                self.lower_match(scrutinee_expr, arms, else_body.as_deref(), result_ty)
             }
 
             ExprKind::Fold {
@@ -639,31 +665,47 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         &mut self,
         scrutinee_expr: &Expr<'src>,
         arms: &[ast::MatchArm<'src>],
+        else_body: Option<&Expr<'src>>,
         result_ty: ScalarType,
     ) -> Value {
         let scr_val = self.lower_expr(scrutinee_expr);
         let tag = self.builder.load(scr_val, 0, ScalarType::U64);
-
         let tag_block = self.builder.current_block.unwrap();
 
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, result_ty);
 
-        let mut switch_arms = Vec::new();
-        let mut arm_blocks = Vec::new();
-        for arm in arms {
+        // Create else block if needed
+        let else_block = else_body.map(|_| self.builder.create_block());
+
+        // Pre-create blocks for each arm
+        let arm_blocks: Vec<_> = arms.iter().map(|_| self.builder.create_block()).collect();
+
+        // Group arms by constructor tag, preserving order
+        let mut tag_groups: Vec<(u64, Vec<usize>)> = Vec::new();
+        for (i, arm) in arms.iter().enumerate() {
             let ast::Pattern::Constructor { name: con_name, .. } = &arm.pattern else {
                 panic!("match arms must use constructor patterns");
             };
-            let meta = &self.decls.constructors[*con_name];
-            let arm_block = self.builder.create_block();
-            switch_arms.push((meta.tag_index, arm_block, vec![]));
-            arm_blocks.push(arm_block);
+            let tag_idx = self.decls.constructors[*con_name].tag_index;
+            if let Some(group) = tag_groups.iter_mut().find(|(t, _)| *t == tag_idx) {
+                group.1.push(i);
+            } else {
+                tag_groups.push((tag_idx, vec![i]));
+            }
         }
 
-        self.builder.switch_to(tag_block);
-        self.builder.switch_int(tag, switch_arms, None);
+        // Build switch_int: each tag maps to first arm in group
+        let switch_arms: Vec<_> = tag_groups
+            .iter()
+            .map(|(tag_idx, arm_indices)| (*tag_idx, arm_blocks[arm_indices[0]], vec![]))
+            .collect();
 
+        self.builder.switch_to(tag_block);
+        self.builder
+            .switch_int(tag, switch_arms, else_block.map(|b| (b, vec![])));
+
+        // Lower each arm
         for (i, arm) in arms.iter().enumerate() {
             let ast::Pattern::Constructor {
                 name: con_name,
@@ -676,15 +718,58 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
             let meta = self.decls.constructors[*con_name].clone();
             let saved_vars = self.vars.clone();
+
+            // Load fields and bind
             for (fi, field_pat) in fields.iter().enumerate() {
                 let field_ty = meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
                 let field_val = self.builder.load(scr_val, fi + 1, field_ty);
                 self.bind_pattern_field(field_pat, field_val);
             }
 
+            // Evaluate guards
+            if !arm.guards.is_empty() {
+                // Find the next block to jump to on guard failure
+                let tag_idx = meta.tag_index;
+                let group = &tag_groups.iter().find(|(t, _)| *t == tag_idx).unwrap().1;
+                let pos_in_group = group.iter().position(|&idx| idx == i).unwrap();
+                let fail_target = if pos_in_group + 1 < group.len() {
+                    arm_blocks[group[pos_in_group + 1]]
+                } else {
+                    // Last arm in group: fall to else block or merge
+                    else_block.unwrap_or(merge)
+                };
+
+                for guard_expr in &arm.guards {
+                    let guard_val = self.lower_expr(guard_expr);
+                    let guard_tag = self.builder.load(guard_val, 0, ScalarType::U64);
+                    let true_tag = self.decls.constructors["True"].tag_index;
+                    let true_val = self.builder.const_u64(true_tag);
+                    let is_true =
+                        self.builder
+                            .binop(BinaryOp::Eq, guard_tag, true_val, ScalarType::Bool);
+                    let guard_ok = self.builder.create_block();
+                    self.builder
+                        .branch(is_true, guard_ok, vec![], fail_target, vec![]);
+                    self.builder.switch_to(guard_ok);
+                }
+            }
+
+            // Evaluate body and terminate
             let result = self.lower_expr(&arm.body);
-            self.builder.jump(merge, vec![result]);
+            if arm.is_return {
+                self.builder.ret(result);
+            } else {
+                self.builder.jump(merge, vec![result]);
+            }
+
             self.vars = saved_vars;
+        }
+
+        // Lower else block
+        if let (Some(else_block_id), Some(else_expr)) = (else_block, else_body) {
+            self.builder.switch_to(else_block_id);
+            let else_val = self.lower_expr(else_expr);
+            self.builder.jump(merge, vec![else_val]);
         }
 
         self.builder.switch_to(merge);
@@ -750,11 +835,33 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, result_ty);
-        let mut switch_arms = Vec::new();
 
         let tag_block = self.builder.current_block.unwrap();
 
-        for arm in arms {
+        // Pre-create blocks for each arm
+        let arm_blocks: Vec<_> = arms.iter().map(|_| self.builder.create_block()).collect();
+
+        // Group arms by constructor tag, preserving order
+        let mut tag_groups: Vec<(u64, Vec<usize>)> = Vec::new();
+        for (i, arm) in arms.iter().enumerate() {
+            let ast::Pattern::Constructor { name: con_name, .. } = &arm.pattern else {
+                panic!("fold arms must use constructor patterns");
+            };
+            let tag_idx = self.decls.constructors[*con_name].tag_index;
+            if let Some(group) = tag_groups.iter_mut().find(|(t, _)| *t == tag_idx) {
+                group.1.push(i);
+            } else {
+                tag_groups.push((tag_idx, vec![i]));
+            }
+        }
+
+        // Build switch_int: each tag maps to first arm in group
+        let switch_arms: Vec<_> = tag_groups
+            .iter()
+            .map(|(tag_idx, arm_indices)| (*tag_idx, arm_blocks[arm_indices[0]], vec![]))
+            .collect();
+
+        for (i, arm) in arms.iter().enumerate() {
             let ast::Pattern::Constructor {
                 name: con_name,
                 fields,
@@ -762,12 +869,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             else {
                 panic!("fold arms must use constructor patterns");
             };
+            assert!(!arm.is_return, "return in fold not yet supported");
             let con_name = *con_name;
             let meta = self.decls.constructors[con_name].clone();
-            let arm_block = self.builder.create_block();
-            switch_arms.push((meta.tag_index, arm_block, vec![]));
 
-            self.builder.switch_to(arm_block);
+            self.builder.switch_to(arm_blocks[i]);
 
             // Load fields and bind pattern names
             for (fi, field_pat) in fields.iter().enumerate() {
@@ -777,7 +883,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
 
             // For recursive fields, emit recursive call and shadow the binding
-            let mut rec_idx = 0;
             for (fi, field_pat) in fields.iter().enumerate() {
                 if fi < meta.recursive_flags.len() && meta.recursive_flags[fi] {
                     let field_ty = meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
@@ -791,10 +896,34 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     if let ast::Pattern::Binding(name) = field_pat {
                         self.vars.insert((*name).to_owned(), rec_result);
                     }
-                    rec_idx += 1;
                 }
             }
-            let _ = rec_idx; // suppress unused
+
+            // Evaluate guards
+            if !arm.guards.is_empty() {
+                let tag_idx = meta.tag_index;
+                let group = &tag_groups.iter().find(|(t, _)| *t == tag_idx).unwrap().1;
+                let pos_in_group = group.iter().position(|&idx| idx == i).unwrap();
+                let fail_target = if pos_in_group + 1 < group.len() {
+                    arm_blocks[group[pos_in_group + 1]]
+                } else {
+                    merge
+                };
+
+                for guard_expr in &arm.guards {
+                    let guard_val = self.lower_expr(guard_expr);
+                    let guard_tag = self.builder.load(guard_val, 0, ScalarType::U64);
+                    let true_tag = self.decls.constructors["True"].tag_index;
+                    let true_val = self.builder.const_u64(true_tag);
+                    let is_true =
+                        self.builder
+                            .binop(BinaryOp::Eq, guard_tag, true_val, ScalarType::Bool);
+                    let guard_ok = self.builder.create_block();
+                    self.builder
+                        .branch(is_true, guard_ok, vec![], fail_target, vec![]);
+                    self.builder.switch_to(guard_ok);
+                }
+            }
 
             let result = self.lower_expr(&arm.body);
             self.builder.jump(merge, vec![result]);
@@ -833,6 +962,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         for arm in arms {
             let mut excluded = HashSet::new();
             defunc::pattern_names(&arm.pattern, &mut excluded);
+            for guard_expr in &arm.guards {
+                self.collect_fold_captures_expr(guard_expr, &excluded, &mut seen, &mut captures);
+            }
             self.collect_fold_captures_expr(&arm.body, &excluded, &mut seen, &mut captures);
         }
         captures
@@ -897,6 +1029,23 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             self.collect_fold_captures_expr(val, &inner_excluded, seen, captures);
                             defunc::pattern_names(pattern, &mut inner_excluded);
                         }
+                        Stmt::Guard {
+                            condition,
+                            return_val,
+                        } => {
+                            self.collect_fold_captures_expr(
+                                condition,
+                                &inner_excluded,
+                                seen,
+                                captures,
+                            );
+                            self.collect_fold_captures_expr(
+                                return_val,
+                                &inner_excluded,
+                                seen,
+                                captures,
+                            );
+                        }
                         Stmt::TypeHint { .. } => {}
                     }
                 }
@@ -911,6 +1060,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 for arm in arms {
                     let mut arm_excl = excluded.clone();
                     defunc::pattern_names(&arm.pattern, &mut arm_excl);
+                    for guard_expr in &arm.guards {
+                        self.collect_fold_captures_expr(guard_expr, &arm_excl, seen, captures);
+                    }
                     self.collect_fold_captures_expr(&arm.body, &arm_excl, seen, captures);
                 }
                 if let Some(eb) = else_body {
@@ -922,6 +1074,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 for arm in arms {
                     let mut arm_excl = excluded.clone();
                     defunc::pattern_names(&arm.pattern, &mut arm_excl);
+                    for guard_expr in &arm.guards {
+                        self.collect_fold_captures_expr(guard_expr, &arm_excl, seen, captures);
+                    }
                     self.collect_fold_captures_expr(&arm.body, &arm_excl, seen, captures);
                 }
             }
