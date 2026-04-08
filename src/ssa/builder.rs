@@ -5,8 +5,8 @@ use std::collections::HashMap;
 /// Builds SSA functions and modules incrementally.
 pub struct Builder {
     next_value: usize,
-    blocks: Vec<Block>,
-    current_block: Option<BlockId>,
+    pub blocks: Vec<Block>,
+    pub current_block: Option<BlockId>,
     functions: HashMap<String, Function>,
     data: Vec<u8>,
 }
@@ -78,6 +78,12 @@ impl Builder {
         v
     }
 
+    pub fn const_i8(&mut self, n: i8) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::ConstI8(v, n));
+        v
+    }
+
     pub fn binop(&mut self, op: BinaryOp, lhs: Value, rhs: Value) -> Value {
         let v = self.fresh_value();
         self.push(Inst::BinOp(v, op, lhs, rhs));
@@ -93,6 +99,12 @@ impl Builder {
     pub fn construct(&mut self, tag: &str, fields: Vec<Value>) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Construct(v, tag.to_owned(), fields));
+        v
+    }
+
+    pub fn record_new(&mut self, fields: Vec<(String, Value)>) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::RecordNew(v, fields));
         v
     }
 
@@ -114,6 +126,12 @@ impl Builder {
         v
     }
 
+    pub fn list_set(&mut self, list: Value, index: Value, elem: Value) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::ListSet(v, list, index, elem));
+        v
+    }
+
     pub fn list_append(&mut self, list: Value, elem: Value) -> Value {
         let v = self.fresh_value();
         self.push(Inst::ListAppend(v, list, elem));
@@ -123,6 +141,12 @@ impl Builder {
     pub fn list_len(&mut self, list: Value) -> Value {
         let v = self.fresh_value();
         self.push(Inst::ListLen(v, list));
+        v
+    }
+
+    pub fn num_to_str(&mut self, num: Value) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::NumToStr(v, num));
         v
     }
 
@@ -151,6 +175,10 @@ impl Builder {
             else_block,
             else_args,
         });
+    }
+
+    pub fn switch(&mut self, scrutinee: Value, arms: Vec<(String, BlockId)>) {
+        self.set_terminator(Terminator::Switch { scrutinee, arms });
     }
 
     // ---- Function & module building ----

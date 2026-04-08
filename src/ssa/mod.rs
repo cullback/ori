@@ -1,12 +1,11 @@
 mod builder;
+pub mod eval;
 mod instruction;
+pub mod lower;
 
-#[allow(unused_imports)]
 pub use builder::Builder;
 #[allow(unused_imports)]
 pub use instruction::{BinaryOp, BlockId, Inst, Terminator, Value};
-
-use std::collections::HashMap;
 
 /// An SSA basic block with parameters, instructions, and a terminator.
 #[derive(Debug, Clone)]
@@ -27,7 +26,7 @@ pub struct Function {
 /// Top-level SSA module — all functions and static data.
 #[derive(Debug)]
 pub struct Module {
-    pub functions: HashMap<String, Function>,
+    pub functions: std::collections::HashMap<String, Function>,
     pub entry: String,
     pub data: Vec<u8>,
 }

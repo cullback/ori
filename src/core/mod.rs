@@ -1,4 +1,6 @@
+#[allow(dead_code)]
 pub mod builder;
+#[allow(dead_code)]
 pub mod eval;
 
 use std::collections::HashMap;
@@ -22,6 +24,7 @@ define_id!(TypeId);
 
 /// Optional debug names for all three ID types.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct DebugNames {
     pub vars: HashMap<VarId, String>,
     pub funcs: HashMap<FuncId, String>,
@@ -231,7 +234,7 @@ impl Core {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names, dead_code)]
 pub enum Value {
     VNum(NumVal),
     VConstruct { tag: FuncId, fields: Vec<Value> },

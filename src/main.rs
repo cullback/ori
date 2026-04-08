@@ -3,7 +3,13 @@ mod error;
 mod lower;
 mod resolve;
 mod source;
-#[allow(dead_code)]
+#[allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::restriction,
+    clippy::all,
+    dead_code
+)]
 mod ssa;
 mod stdlib;
 mod syntax;
@@ -13,7 +19,6 @@ mod test_frontend;
 mod test_programs;
 mod types;
 
-use std::collections::HashMap;
 use std::io::IsTerminal as _;
 use std::io::Read as _;
 use std::io::Write as _;
@@ -21,6 +26,7 @@ use std::process;
 
 use error::CompileError;
 use source::SourceArena;
+use ssa::eval::RtValue;
 
 fn compile(
     arena: &mut SourceArena,
@@ -34,20 +40,22 @@ fn compile(
 
     let parsed = syntax::parse::parse(arena.content(main_file), main_file)?;
     let resolved = resolve::resolve_imports(parsed, arena, source_dir)?;
-    // Arena is done growing — check and lower only read
     let infer_result = types::infer::check(arena, &resolved.module, &resolved.scope)?;
     lower::lower(arena, &resolved.module, &resolved.scope, &infer_result)
 }
 
-/// Convert a Str value (List(U8)) to a Rust byte vector.
-fn value_to_bytes(val: &core::Value) -> Vec<u8> {
-    let core::Value::VList(elems) = val else {
-        panic!("expected Str (List(U8)), got {val:?}");
+fn bytes_to_rt(bytes: &[u8]) -> RtValue {
+    RtValue::List(bytes.iter().map(|&b| RtValue::U8(b)).collect())
+}
+
+fn rt_to_bytes(val: &RtValue) -> Vec<u8> {
+    let RtValue::List(elems) = val else {
+        panic!("expected Str, got {val:?}");
     };
     elems
         .iter()
         .map(|e| {
-            let core::Value::VNum(core::NumVal::U8(b)) = e else {
+            let RtValue::U8(b) = e else {
                 panic!("expected U8 in Str, got {e:?}");
             };
             *b
@@ -55,42 +63,31 @@ fn value_to_bytes(val: &core::Value) -> Vec<u8> {
         .collect()
 }
 
-/// Convert a Rust byte slice to a Str value (List(U8)).
-fn bytes_to_value(bytes: &[u8]) -> core::Value {
-    core::Value::VList(
-        bytes
-            .iter()
-            .map(|&b| core::Value::VNum(core::NumVal::U8(b)))
-            .collect(),
-    )
-}
-
-fn print_value(val: &core::Value) {
+fn print_rt(val: &RtValue) {
     match val {
-        core::Value::VList(_) => {
-            let bytes = value_to_bytes(val);
+        RtValue::List(_) => {
+            let bytes = rt_to_bytes(val);
             std::io::stdout().write_all(&bytes).unwrap();
         }
-        core::Value::VNum(core::NumVal::I64(n)) => print!("{n}"),
-        core::Value::VNum(core::NumVal::U64(n)) => print!("{n}"),
-        core::Value::VNum(core::NumVal::F64(n)) => print!("{n}"),
-        core::Value::VNum(core::NumVal::U8(n)) => print!("{n}"),
-        core::Value::VNum(core::NumVal::I8(n)) => print!("{n}"),
+        RtValue::I64(n) => print!("{n}"),
+        RtValue::U64(n) => print!("{n}"),
+        RtValue::F64(n) => print!("{n}"),
+        RtValue::U8(n) => print!("{n}"),
+        RtValue::I8(n) => print!("{n}"),
         other => print!("{other:?}"),
     }
-    // Append newline unless the output already ends with one
-    if let core::Value::VList(elems) = val
-        && elems.last() == Some(&core::Value::VNum(core::NumVal::U8(b'\n')))
+    if let RtValue::List(elems) = val
+        && elems.last() == Some(&RtValue::U8(b'\n'))
     {
         return;
     }
     println!();
 }
 
-fn eprint_value(val: &core::Value) {
+fn eprint_rt(val: &RtValue) {
     match val {
-        core::Value::VList(_) => {
-            let bytes = value_to_bytes(val);
+        RtValue::List(_) => {
+            let bytes = rt_to_bytes(val);
             std::io::stderr().write_all(&bytes).unwrap();
         }
         other => eprint!("{other:?}"),
@@ -120,53 +117,47 @@ fn main() {
         }
     };
 
-    // Build List(Str) from command line args (skip binary name and source file)
-    let cli_args: Vec<core::Value> = args[2..]
-        .iter()
-        .map(|a| bytes_to_value(a.as_bytes()))
-        .collect();
-    let args_value = core::Value::VList(cli_args);
+    // Lower Core → SSA
+    let ssa_module = ssa::lower::lower(&program, &input_vars);
 
-    // Read stdin (empty if terminal, read all if piped)
+    // Build inputs
+    let cli_args: Vec<RtValue> = args[2..]
+        .iter()
+        .map(|a| bytes_to_rt(a.as_bytes()))
+        .collect();
+    let args_value = RtValue::List(cli_args);
+
     let stdin_value = if std::io::stdin().is_terminal() {
-        bytes_to_value(b"")
+        bytes_to_rt(b"")
     } else {
         let mut buf = Vec::new();
         std::io::stdin().read_to_end(&mut buf).unwrap();
-        bytes_to_value(&buf)
+        bytes_to_rt(&buf)
     };
 
-    // Evaluate: main : List(Str), Str -> Result(Str, Str)
-    let mut env = HashMap::new();
-    for (i, var) in input_vars.iter().enumerate() {
-        let val = match i {
-            0 => args_value.clone(),
-            1 => stdin_value.clone(),
-            _ => core::Value::VList(vec![]),
-        };
-        env.insert(*var, val);
+    // Build the argument list matching the input_vars
+    let mut main_args = Vec::new();
+    for i in 0..input_vars.len() {
+        match i {
+            0 => main_args.push(args_value.clone()),
+            1 => main_args.push(stdin_value.clone()),
+            _ => main_args.push(RtValue::List(vec![])),
+        }
     }
-    let result = core::eval::eval(&env, &program, &program.main);
 
-    // Handle Result(Str, Str) output
+    // Evaluate via SSA
+    let result = ssa::eval::eval(&ssa_module, &main_args);
+
+    // Handle Result output
     match &result {
-        core::Value::VConstruct { tag, fields } => {
-            let name = program.debug_names.func_name(*tag);
-            match name {
-                "Ok" => {
-                    print_value(&fields[0]);
-                }
-                "Err" => {
-                    eprint_value(&fields[0]);
-                    process::exit(1);
-                }
-                _ => {
-                    println!("{result:?}");
-                }
+        RtValue::Construct { tag, fields } => match tag.as_str() {
+            "Ok" => print_rt(&fields[0]),
+            "Err" => {
+                eprint_rt(&fields[0]);
+                process::exit(1);
             }
-        }
-        _ => {
-            println!("{result:?}");
-        }
+            _ => println!("{result:?}"),
+        },
+        _ => println!("{result:?}"),
     }
 }
