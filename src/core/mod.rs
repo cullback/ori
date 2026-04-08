@@ -239,10 +239,28 @@ pub enum Value {
     VList(Vec<Value>),
 }
 
-/// Marks whether a constructor field refers back to the enclosing type.
+/// Concrete representation type for a value, used for memory layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum MonoType {
+    I8,
+    U8,
+    I64,
+    U64,
+    F64,
+    Bool,
+    /// Heap-allocated compound type (tagged union, record, list).
+    Ptr,
+}
+
+/// Marks whether a constructor field refers back to the enclosing type,
+/// and (after monomorphization) what its concrete representation is.
 #[derive(Debug, Clone)]
 pub struct FieldDef {
     pub recursive: bool,
+    /// Concrete type of this field. None if the constructor is polymorphic
+    /// and has not been specialized yet.
+    pub mono_type: Option<MonoType>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +281,12 @@ pub struct FuncDef {
     pub name: FuncId,
     pub params: Vec<VarId>,
     pub body: Core,
+    /// Concrete types for each parameter (after monomorphization).
+    #[allow(dead_code)]
+    pub param_types: Vec<MonoType>,
+    /// Concrete return type (after monomorphization).
+    #[allow(dead_code)]
+    pub return_type: MonoType,
 }
 
 #[derive(Debug)]
@@ -272,4 +296,10 @@ pub struct Program {
     pub builtins: HashMap<FuncId, Builtin>,
     pub main: Core,
     pub debug_names: DebugNames,
+    /// Concrete type for each variable (populated during monomorphized lowering).
+    #[allow(dead_code)]
+    pub var_types: HashMap<VarId, MonoType>,
+    /// Constructor type schemes for SSA lowering to compute field types on-the-fly.
+    #[allow(dead_code)]
+    pub constructor_schemes: HashMap<FuncId, crate::types::engine::Scheme>,
 }

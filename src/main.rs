@@ -129,7 +129,7 @@ fn main() {
     };
 
     if dump_ssa {
-        eprintln!("--dump-ssa: low-level SSA lowering not yet implemented");
+        eprintln!("--dump-ssa: SSA lowering not yet implemented");
         process::exit(1);
     }
 

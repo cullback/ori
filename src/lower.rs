@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::core::builder::Builder;
 use crate::core::{
-    Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, Pattern, Program, VarId,
+    Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, MonoType, Pattern, Program,
+    VarId,
 };
 use crate::error::CompileError;
 use crate::source::SourceArena;
@@ -137,6 +138,20 @@ pub fn lower<'src>(
 
     ctx.register_lambda_types();
 
+    // Pass 1.75: populate constructor field types from concrete instantiations
+    ctx.populate_constructor_field_types();
+
+    // Store constructor schemes in builder for SSA lowering
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "constructor insertion order does not matter"
+    )]
+    for (con_name, con_id) in &ctx.constructors {
+        if let Some(scheme) = ctx.constructor_schemes.get(con_name.as_str()) {
+            ctx.builder.set_constructor_scheme(*con_id, scheme.clone());
+        }
+    }
+
     // Pass 2: lower all function bodies
     let mut main_params = None;
     let mut main_body = None;
@@ -161,10 +176,15 @@ pub fn lower<'src>(
         }
 
         let func_id = ctx.funcs[name];
+        let param_monos = ctx.func_param_monos(name);
         let param_vars: Vec<VarId> = params
             .iter()
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 let v = ctx.builder.var();
+                if let Some(mono) = param_monos.get(i) {
+                    ctx.builder.set_var_type(v, mono.clone());
+                }
                 ctx.vars.insert((*p).to_owned(), v);
                 v
             })
@@ -187,6 +207,8 @@ pub fn lower<'src>(
             name: func_id,
             params: param_vars,
             body: body_core,
+            param_types: param_monos,
+            return_type: ctx.func_return_mono(name),
         });
     }
 
@@ -242,6 +264,8 @@ pub fn lower<'src>(
                 name: func_id,
                 params: param_vars,
                 body: body_core,
+                param_types: ctx.func_param_monos(&mangled),
+                return_type: ctx.func_return_mono(&mangled),
             });
         }
     }
@@ -252,9 +276,13 @@ pub fn lower<'src>(
     // Lower main
     let params = main_params.ok_or_else(|| CompileError::new("no 'main' function defined"))?;
     let body = main_body.unwrap();
+    let main_param_monos = ctx.func_param_monos("main");
     let mut input_vars = Vec::new();
-    for p in &params {
+    for (i, p) in params.iter().enumerate() {
         let var = ctx.builder.var();
+        if let Some(mono) = main_param_monos.get(i) {
+            ctx.builder.set_var_type(var, mono.clone());
+        }
         ctx.vars.insert((*p).to_owned(), var);
         input_vars.push(var);
     }
@@ -271,6 +299,9 @@ pub fn lower<'src>(
 
     // Generate apply functions from collected lambda sets
     ctx.generate_apply_functions();
+
+    // Populate lambda capture field types from var_types
+    ctx.populate_lambda_capture_types();
 
     let program = ctx.builder.build(main_core);
     Ok((program, input_vars))
@@ -324,6 +355,12 @@ struct LowerCtx<'src> {
     /// Resolved literal types from type inference.
     lit_types: HashMap<ast::Span, crate::types::infer::NumType>,
     method_resolutions: HashMap<ast::Span, String>,
+    /// Fully-resolved concrete type for every expression (by span).
+    expr_types: HashMap<ast::Span, crate::types::engine::Type>,
+    /// Generalized type schemes for all functions/methods.
+    func_schemes: HashMap<String, crate::types::engine::Scheme>,
+    /// Constructor type schemes (e.g., Ok → forall ok err. ok -> Result(ok, err)).
+    constructor_schemes: HashMap<String, crate::types::engine::Scheme>,
 }
 
 impl<'src> LowerCtx<'src> {
@@ -363,6 +400,279 @@ impl<'src> LowerCtx<'src> {
             reachable: HashSet::new(),
             lit_types: infer_result.lit_types.clone(),
             method_resolutions: infer_result.method_resolutions.clone(),
+            expr_types: infer_result.expr_types.clone(),
+            func_schemes: infer_result.func_schemes.clone(),
+            constructor_schemes: infer_result.constructor_schemes.clone(),
+        }
+    }
+
+    /// Convert an inference `Type` to a concrete `MonoType` for layout computation.
+    fn type_to_mono(ty: &crate::types::engine::Type) -> MonoType {
+        use crate::types::engine::Type;
+        match ty {
+            Type::Con(name) => match name.as_str() {
+                "I8" => MonoType::I8,
+                "U8" => MonoType::U8,
+                "I64" => MonoType::I64,
+                "U64" => MonoType::U64,
+                "F64" => MonoType::F64,
+                "Bool" => MonoType::Bool,
+                // All other named types (user-defined tag unions, Str, etc.) are heap-allocated
+                _ => MonoType::Ptr,
+            },
+            // Everything else (App, Record, Tuple, Arrow, Var) is heap-allocated
+            _ => MonoType::Ptr,
+        }
+    }
+
+    /// Get the `MonoType` for an expression from its span.
+    fn expr_mono_type(&self, span: ast::Span) -> MonoType {
+        self.expr_types
+            .get(&span)
+            .map_or(MonoType::Ptr, Self::type_to_mono)
+    }
+
+    /// Get the return `MonoType` for a function from its scheme.
+    fn func_return_mono(&self, name: &str) -> MonoType {
+        self.func_schemes.get(name).map_or(MonoType::Ptr, |scheme| {
+            if let crate::types::engine::Type::Arrow(_, ret) = &scheme.ty {
+                Self::type_to_mono(ret)
+            } else {
+                Self::type_to_mono(&scheme.ty)
+            }
+        })
+    }
+
+    /// Get the parameter `MonoType`s for a function from its scheme.
+    fn func_param_monos(&self, name: &str) -> Vec<MonoType> {
+        self.func_schemes
+            .get(name)
+            .and_then(|scheme| {
+                if let crate::types::engine::Type::Arrow(params, _) = &scheme.ty {
+                    Some(params.iter().map(Self::type_to_mono).collect())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// Structurally match a type pattern (with Vars) against a concrete type,
+    /// extracting bindings for each type variable.
+    fn match_type_params(
+        pattern: &crate::types::engine::Type,
+        concrete: &crate::types::engine::Type,
+        bindings: &mut HashMap<crate::types::engine::TypeVar, crate::types::engine::Type>,
+    ) {
+        use crate::types::engine::Type;
+        match (pattern, concrete) {
+            (Type::Var(tv), _) => {
+                bindings.insert(*tv, concrete.clone());
+            }
+            (Type::App(n1, a1), Type::App(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
+                for (p, c) in a1.iter().zip(a2.iter()) {
+                    Self::match_type_params(p, c, bindings);
+                }
+            }
+            (Type::Arrow(p1, r1), Type::Arrow(p2, r2)) if p1.len() == p2.len() => {
+                for (p, c) in p1.iter().zip(p2.iter()) {
+                    Self::match_type_params(p, c, bindings);
+                }
+                Self::match_type_params(r1, r2, bindings);
+            }
+            _ => {}
+        }
+    }
+
+    /// Given a constructor name and the concrete type it produces (from `expr_types`),
+    /// compute the `MonoType` of each field.
+    fn constructor_field_monos(
+        &self,
+        con_name: &str,
+        concrete_result_type: &crate::types::engine::Type,
+    ) -> Vec<MonoType> {
+        use crate::types::engine::{Type, TypeEngine};
+
+        let Some(scheme) = self.constructor_schemes.get(con_name) else {
+            return vec![];
+        };
+
+        // Extract the return type and field types from the scheme
+        let (field_types, return_type) = match &scheme.ty {
+            Type::Arrow(params, ret) => (params.clone(), (**ret).clone()),
+            other => (vec![], other.clone()),
+        };
+
+        // Match the scheme's return type against the concrete type to get bindings
+        let mut bindings = HashMap::new();
+        Self::match_type_params(&return_type, concrete_result_type, &mut bindings);
+
+        // Apply bindings to each field type and convert to MonoType
+        field_types
+            .iter()
+            .map(|ft| {
+                let concrete = TypeEngine::apply_mapping(ft, &bindings);
+                Self::type_to_mono(&concrete)
+            })
+            .collect()
+    }
+
+    /// Scan `expr_types` for concrete type instantiations and populate `FieldDef.mono_type`
+    /// for constructors of single-instantiation parameterized types.
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "iteration order does not affect results"
+    )]
+    fn populate_constructor_field_types(&mut self) {
+        use crate::types::engine::Type;
+
+        // Collect all concrete App(name, args) types from expr_types
+        let mut type_instantiations: HashMap<String, Vec<Vec<crate::types::engine::Type>>> =
+            HashMap::new();
+        for ty in self.expr_types.values() {
+            Self::collect_app_types(ty, &mut type_instantiations);
+        }
+
+        // For each type with exactly one instantiation, populate constructor field types
+        for (type_name, instantiations) in &type_instantiations {
+            // Deduplicate and filter out instantiations with unresolved type variables
+            // (these come from polymorphic function bodies, not real usage sites)
+            let unique: Vec<&Vec<Type>> = {
+                let mut seen = Vec::new();
+                for inst in instantiations {
+                    let has_vars = inst.iter().any(Self::contains_type_var);
+                    if !has_vars && !seen.contains(&inst) {
+                        seen.push(inst);
+                    }
+                }
+                seen
+            };
+
+            if unique.len() != 1 {
+                continue; // Multiple instantiations — leave as None (Ptr fallback)
+            }
+
+            let concrete_args = unique[0];
+            let concrete_type = Type::App(type_name.clone(), concrete_args.clone());
+
+            // Find constructors that belong to this type and populate their field types
+            for (con_name, con_id) in &self.constructors {
+                let Some(scheme) = self.constructor_schemes.get(con_name.as_str()) else {
+                    continue;
+                };
+                // Check if this constructor's return type matches the current type
+                let ret_ty = match &scheme.ty {
+                    Type::Arrow(_, ret) => ret.as_ref(),
+                    other => other,
+                };
+                let ret_type_name = match ret_ty {
+                    Type::App(n, _) | Type::Con(n) => Some(n.as_str()),
+                    _ => None,
+                };
+                if ret_type_name != Some(type_name.as_str()) {
+                    continue; // This constructor doesn't belong to this type
+                }
+                let field_monos = self.constructor_field_monos(con_name, &concrete_type);
+                if !field_monos.is_empty() {
+                    self.builder
+                        .update_constructor_field_types(*con_id, &field_monos);
+                }
+            }
+        }
+
+        // Also handle non-parameterized constructors (like Bool := [True, False])
+        // These have no type params, so field types come directly from the scheme
+        for (con_name, con_id) in &self.constructors {
+            let Some(scheme) = self.constructor_schemes.get(con_name) else {
+                continue;
+            };
+            if !scheme.vars.is_empty() {
+                continue; // Parameterized — handled above
+            }
+            let field_types = match &scheme.ty {
+                Type::Arrow(params, _) => params.iter().map(Self::type_to_mono).collect(),
+                _ => vec![], // Nullary constructor
+            };
+            if !field_types.is_empty() {
+                self.builder
+                    .update_constructor_field_types(*con_id, &field_types);
+            }
+        }
+    }
+
+    /// Check if a type contains any unresolved type variables.
+    fn contains_type_var(ty: &crate::types::engine::Type) -> bool {
+        use crate::types::engine::Type;
+        match ty {
+            Type::Var(_) => true,
+            Type::Con(_) => false,
+            Type::App(_, args) => args.iter().any(Self::contains_type_var),
+            Type::Arrow(params, ret) => {
+                params.iter().any(Self::contains_type_var) || Self::contains_type_var(ret)
+            }
+            Type::Record { fields, rest } => {
+                fields.iter().any(|(_, t)| Self::contains_type_var(t))
+                    || rest.as_ref().is_some_and(|r| Self::contains_type_var(r))
+            }
+            Type::Tuple(elems) => elems.iter().any(Self::contains_type_var),
+        }
+    }
+
+    /// Recursively collect all App(name, args) types from a type expression.
+    fn collect_app_types(
+        ty: &crate::types::engine::Type,
+        map: &mut HashMap<String, Vec<Vec<crate::types::engine::Type>>>,
+    ) {
+        use crate::types::engine::Type;
+        match ty {
+            Type::App(name, args) => {
+                map.entry(name.clone()).or_default().push(args.clone());
+                for arg in args {
+                    Self::collect_app_types(arg, map);
+                }
+            }
+            Type::Arrow(params, ret) => {
+                for p in params {
+                    Self::collect_app_types(p, map);
+                }
+                Self::collect_app_types(ret, map);
+            }
+            Type::Record { fields, rest } => {
+                for (_, ft) in fields {
+                    Self::collect_app_types(ft, map);
+                }
+                if let Some(r) = rest {
+                    Self::collect_app_types(r, map);
+                }
+            }
+            Type::Tuple(elems) => {
+                for e in elems {
+                    Self::collect_app_types(e, map);
+                }
+            }
+            Type::Con(_) | Type::Var(_) => {}
+        }
+    }
+
+    /// Populate lambda closure constructor field types from captured variables' known types.
+    fn populate_lambda_capture_types(&mut self) {
+        for ls in &self.lambda_sets {
+            for entry in &ls.entries {
+                let capture_monos: Vec<MonoType> = entry
+                    .captures
+                    .iter()
+                    .map(|name| {
+                        self.vars
+                            .get(*name)
+                            .and_then(|var_id| self.builder.get_var_type(*var_id).cloned())
+                            .unwrap_or(MonoType::Ptr)
+                    })
+                    .collect();
+                if !capture_monos.is_empty() {
+                    self.builder
+                        .update_constructor_field_types(entry.tag, &capture_monos);
+                }
+            }
         }
     }
 
@@ -495,6 +805,8 @@ impl<'src> LowerCtx<'src> {
                     name: func_id,
                     params: param_vars,
                     body: body_core,
+                    param_types: self.func_param_monos(&mangled),
+                    return_type: self.func_return_mono(&mangled),
                 });
             }
         }
@@ -687,7 +999,10 @@ impl<'src> LowerCtx<'src> {
                 tag: con_id,
                 fields: recursive_flags
                     .iter()
-                    .map(|&recursive| FieldDef { recursive })
+                    .map(|&recursive| FieldDef {
+                        recursive,
+                        mono_type: None,
+                    })
                     .collect(),
             });
         }
@@ -1082,7 +1397,10 @@ impl<'src> LowerCtx<'src> {
                     fields: entry
                         .captures
                         .iter()
-                        .map(|_| FieldDef { recursive: false })
+                        .map(|_| FieldDef {
+                            recursive: false,
+                            mono_type: None,
+                        })
                         .collect(),
                 })
                 .collect();
@@ -1138,8 +1456,10 @@ impl<'src> LowerCtx<'src> {
                     match stmt {
                         Stmt::Let { name, val } => {
                             let name = *name;
+                            let mono = self.expr_mono_type(val.span);
                             let val_core = self.lower_expr(val);
                             let var_id = self.builder.var();
+                            self.builder.set_var_type(var_id, mono);
                             self.vars.insert(name.to_owned(), var_id);
                             bindings.push((var_id, val_core));
                         }
@@ -1166,10 +1486,17 @@ impl<'src> LowerCtx<'src> {
                 ..
             } => {
                 let scrutinee = self.lower_expr(scrutinee_expr);
+                let scrutinee_type = self.expr_types.get(&scrutinee_expr.span).cloned();
                 let core_arms: Vec<(Pattern, Core)> = arms
                     .iter()
                     .map(|arm| {
                         let (pat, var_bindings) = self.lower_pattern(&arm.pattern);
+                        // Annotate pattern-bound variables with concrete types
+                        self.annotate_pattern_vars(
+                            &arm.pattern,
+                            &var_bindings,
+                            scrutinee_type.as_ref(),
+                        );
                         for (name, var_id) in &var_bindings {
                             self.vars.insert(name.clone(), *var_id);
                         }
@@ -1188,7 +1515,11 @@ impl<'src> LowerCtx<'src> {
                 arms,
             } => {
                 let scrutinee = self.lower_expr(scrutinee_expr);
-                let core_arms = arms.iter().map(|arm| self.lower_fold_arm(arm)).collect();
+                let scrutinee_type = self.expr_types.get(&scrutinee_expr.span).cloned();
+                let core_arms = arms
+                    .iter()
+                    .map(|arm| self.lower_fold_arm(arm, scrutinee_type.as_ref()))
+                    .collect();
                 Core::fold(scrutinee, core_arms)
             }
 
@@ -1497,6 +1828,8 @@ impl<'src> LowerCtx<'src> {
                 name: ls.apply_func,
                 params: all_params,
                 body: apply_body,
+                param_types: vec![],
+                return_type: MonoType::Ptr,
             });
         }
 
@@ -1552,7 +1885,11 @@ impl<'src> LowerCtx<'src> {
 
     // ---- Fold lowering ----
 
-    fn lower_fold_arm(&mut self, arm: &ast::MatchArm<'src>) -> FoldArm {
+    fn lower_fold_arm(
+        &mut self,
+        arm: &ast::MatchArm<'src>,
+        scrutinee_type: Option<&crate::types::engine::Type>,
+    ) -> FoldArm {
         let ast::Pattern::Constructor { name: con_name, .. } = &arm.pattern else {
             panic!("fold arms must use constructor patterns");
         };
@@ -1564,6 +1901,7 @@ impl<'src> LowerCtx<'src> {
             .clone();
 
         let (pat, var_bindings) = self.lower_pattern(&arm.pattern);
+        self.annotate_pattern_vars(&arm.pattern, &var_bindings, scrutinee_type);
         let Pattern::Constructor {
             fields: field_vars, ..
         } = &pat;
@@ -1601,6 +1939,28 @@ impl<'src> LowerCtx<'src> {
     }
 
     // ---- Pattern lowering ----
+
+    /// Annotate pattern-bound variables with their concrete `MonoType`s
+    /// using the scrutinee type and the constructor's type scheme.
+    fn annotate_pattern_vars(
+        &mut self,
+        pat: &ast::Pattern<'src>,
+        var_bindings: &[(String, VarId)],
+        scrutinee_type: Option<&crate::types::engine::Type>,
+    ) {
+        let ast::Pattern::Constructor { name, .. } = pat else {
+            return;
+        };
+        let Some(scr_ty) = scrutinee_type else {
+            return;
+        };
+        let field_monos = self.constructor_field_monos(name, scr_ty);
+        for (i, (_name, var_id)) in var_bindings.iter().enumerate() {
+            if let Some(mono) = field_monos.get(i) {
+                self.builder.set_var_type(*var_id, mono.clone());
+            }
+        }
+    }
 
     fn lower_pattern(&mut self, pat: &ast::Pattern<'src>) -> (Pattern, Vec<(String, VarId)>) {
         match pat {

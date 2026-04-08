@@ -18,6 +18,15 @@ pub struct InferResult {
     pub lit_types: HashMap<Span, NumType>,
     /// Resolved method calls: span of qualified call → resolved mangled name.
     pub method_resolutions: HashMap<Span, String>,
+    /// Fully-resolved concrete type for every expression (by span).
+    /// Used by the lowerer for monomorphization and layout computation.
+    pub expr_types: HashMap<Span, Type>,
+    /// Resolved type schemes for all functions/methods.
+    /// Used by the lowerer to compute type parameter mappings for specialization.
+    pub func_schemes: HashMap<String, Scheme>,
+    /// Constructor type schemes (e.g., Ok: forall ok err. ok -> Result(ok, err)).
+    /// Used by the lowerer to compute concrete field types from instantiations.
+    pub constructor_schemes: HashMap<String, Scheme>,
 }
 
 /// Resolved numeric type for a literal, used to communicate from inference to lowering.
@@ -50,6 +59,9 @@ struct InferCtx<'src> {
     method_resolutions: HashMap<Span, String>,
     /// Span for each constraint (parallel to engine.constraints).
     constraint_spans: Vec<Span>,
+    /// Raw (possibly unresolved) types for each expression, keyed by span.
+    /// Resolved to concrete types at the end of inference.
+    expr_types: HashMap<Span, Type>,
 }
 
 impl<'src> InferCtx<'src> {
@@ -73,6 +85,7 @@ impl<'src> InferCtx<'src> {
             float_literal_vars: Vec::new(),
             method_resolutions: HashMap::new(),
             constraint_spans: Vec::new(),
+            expr_types: HashMap::new(),
         }
     }
 
@@ -369,11 +382,17 @@ impl<'src> InferCtx<'src> {
 
     // ---- Expression inference ----
 
+    fn infer_expr(&mut self, expr: &Expr<'src>) -> Result<Type, CompileError> {
+        let ty = self.infer_expr_inner(expr)?;
+        self.expr_types.insert(expr.span, ty.clone());
+        Ok(ty)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "expression inference handles all forms"
     )]
-    fn infer_expr(&mut self, expr: &Expr<'src>) -> Result<Type, CompileError> {
+    fn infer_expr_inner(&mut self, expr: &Expr<'src>) -> Result<Type, CompileError> {
         match &expr.kind {
             ExprKind::IntLit(_) => {
                 let ty = self.engine.fresh();
@@ -1271,8 +1290,52 @@ pub fn check<'src>(
     ctx.verify_constraints()?;
     let lit_types = ctx.resolve_literals()?;
 
+    // Resolve all expression types now that inference is complete.
+    let expr_types: HashMap<Span, Type> = ctx
+        .expr_types
+        .iter()
+        .map(|(span, ty)| (*span, ctx.engine.resolve(ty)))
+        .collect();
+
+    // Collect resolved function/method schemes for monomorphization.
+    let func_schemes: HashMap<String, Scheme> = ctx
+        .env
+        .iter()
+        .map(|(name, scheme)| {
+            let resolved_ty = ctx.engine.resolve(&scheme.ty);
+            (
+                name.clone(),
+                Scheme {
+                    vars: scheme.vars.clone(),
+                    constraints: scheme.constraints.clone(),
+                    ty: resolved_ty,
+                },
+            )
+        })
+        .collect();
+
+    // Collect resolved constructor schemes for monomorphization.
+    let constructor_schemes: HashMap<String, Scheme> = ctx
+        .constructors
+        .iter()
+        .map(|(name, scheme)| {
+            let resolved_ty = ctx.engine.resolve(&scheme.ty);
+            (
+                name.clone(),
+                Scheme {
+                    vars: scheme.vars.clone(),
+                    constraints: scheme.constraints.clone(),
+                    ty: resolved_ty,
+                },
+            )
+        })
+        .collect();
+
     Ok(InferResult {
         lit_types,
         method_resolutions: ctx.method_resolutions,
+        expr_types,
+        func_schemes,
+        constructor_schemes,
     })
 }

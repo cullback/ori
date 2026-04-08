@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    Builtin, ConstructorDef, Core, DebugNames, FuncDef, FuncId, Program, TypeDef, TypeId, VarId,
+    Builtin, ConstructorDef, Core, DebugNames, FuncDef, FuncId, MonoType, Program, TypeDef, TypeId,
+    VarId,
 };
 
 #[derive(Debug, Default)]
@@ -13,6 +14,8 @@ pub struct Builder {
     funcs: Vec<FuncDef>,
     builtins: HashMap<FuncId, Builtin>,
     debug_names: DebugNames,
+    var_types: HashMap<VarId, MonoType>,
+    constructor_schemes: HashMap<FuncId, crate::types::engine::Scheme>,
 }
 
 #[expect(
@@ -66,6 +69,32 @@ impl Builder {
         self.funcs.push(funcdef);
     }
 
+    /// Update the `mono_type` for each field of a constructor after instantiation scanning.
+    pub fn update_constructor_field_types(&mut self, tag: FuncId, mono_types: &[MonoType]) {
+        for type_def in &mut self.types {
+            for con in &mut type_def.constructors {
+                if con.tag == tag {
+                    for (field, mono) in con.fields.iter_mut().zip(mono_types.iter()) {
+                        field.mono_type = Some(mono.clone());
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn set_var_type(&mut self, id: VarId, mono: MonoType) {
+        self.var_types.insert(id, mono);
+    }
+
+    pub fn get_var_type(&self, id: VarId) -> Option<&MonoType> {
+        self.var_types.get(&id)
+    }
+
+    pub fn set_constructor_scheme(&mut self, tag: FuncId, scheme: crate::types::engine::Scheme) {
+        self.constructor_schemes.insert(tag, scheme);
+    }
+
     pub fn build(self, main: Core) -> Program {
         Program {
             types: self.types,
@@ -73,6 +102,8 @@ impl Builder {
             builtins: self.builtins,
             main,
             debug_names: self.debug_names,
+            var_types: self.var_types,
+            constructor_schemes: self.constructor_schemes,
         }
     }
 }

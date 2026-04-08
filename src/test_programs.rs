@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use crate::core::builder::Builder;
 use crate::core::eval::eval;
 use crate::core::{
-    Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, NumVal, Pattern, Program,
-    Value,
+    Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, MonoType, NumVal, Pattern,
+    Program, Value,
 };
 
 // -- Test-only helpers --
@@ -49,7 +49,10 @@ fn add_nat_type(b: &mut Builder) -> (FuncId, FuncId) {
         },
         ConstructorDef {
             tag: succ,
-            fields: vec![FieldDef { recursive: true }],
+            fields: vec![FieldDef {
+                recursive: true,
+                mono_type: None,
+            }],
         },
     ]);
     (zero, succ)
@@ -59,7 +62,16 @@ fn add_pair_type(b: &mut Builder) -> FuncId {
     let pair = b.func();
     b.add_type(vec![ConstructorDef {
         tag: pair,
-        fields: vec![FieldDef { recursive: false }, FieldDef { recursive: false }],
+        fields: vec![
+            FieldDef {
+                recursive: false,
+                mono_type: None,
+            },
+            FieldDef {
+                recursive: false,
+                mono_type: None,
+            },
+        ],
     }]);
     pair
 }
@@ -74,7 +86,16 @@ fn add_list_type(b: &mut Builder) -> (FuncId, FuncId) {
         },
         ConstructorDef {
             tag: cons,
-            fields: vec![FieldDef { recursive: false }, FieldDef { recursive: true }],
+            fields: vec![
+                FieldDef {
+                    recursive: false,
+                    mono_type: None,
+                },
+                FieldDef {
+                    recursive: true,
+                    mono_type: None,
+                },
+            ],
         },
     ]);
     (nil, cons)
@@ -102,11 +123,23 @@ fn add_tree_type(b: &mut Builder) -> (FuncId, FuncId) {
     b.add_type(vec![
         ConstructorDef {
             tag: leaf,
-            fields: vec![FieldDef { recursive: false }],
+            fields: vec![FieldDef {
+                recursive: false,
+                mono_type: None,
+            }],
         },
         ConstructorDef {
             tag: branch,
-            fields: vec![FieldDef { recursive: true }, FieldDef { recursive: true }],
+            fields: vec![
+                FieldDef {
+                    recursive: true,
+                    mono_type: None,
+                },
+                FieldDef {
+                    recursive: true,
+                    mono_type: None,
+                },
+            ],
         },
     ]);
     (leaf, branch)
@@ -398,6 +431,8 @@ fn list_reverse() {
                 ),
             ],
         ),
+        param_types: vec![],
+        return_type: MonoType::Ptr,
     });
 
     let xs = b.var();

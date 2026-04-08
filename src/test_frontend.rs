@@ -1268,3 +1268,109 @@ main = |arg| double(arg)";
         _ => panic!("expected TypeAnno"),
     }
 }
+
+// ============================================================
+// Monomorphization: verify constructor field types are populated
+// ============================================================
+
+/// Helper: compile to Core Program without evaluating.
+fn compile(source: &str) -> crate::core::Program {
+    let mut arena = SourceArena::new();
+    for (name, src) in crate::stdlib::all() {
+        arena.add(format!("<stdlib:{name}>"), src.to_owned());
+    }
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    let resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    let infer_result =
+        crate::types::infer::check(&arena, &resolved.module, &resolved.scope).unwrap();
+    let (program, _) =
+        crate::lower::lower(&arena, &resolved.module, &resolved.scope, &infer_result).unwrap();
+    program
+}
+
+#[test]
+fn mono_nonparam_constructor_field_types() {
+    use crate::core::MonoType;
+    let source = "\
+Maybe : [Just(I64), Nothing]
+
+main : I64 -> I64
+main = |x| if Just(x)
+    : Just(n) then n
+    : Nothing then 0";
+
+    let program = compile(source);
+    // Find the Just constructor (has 1 field)
+    let just_con = program
+        .types
+        .iter()
+        .flat_map(|t| &t.constructors)
+        .find(|c| c.fields.len() == 1 && program.debug_names.func_name(c.tag) == "Just")
+        .expect("Just constructor not found");
+    assert_eq!(
+        just_con.fields[0].mono_type,
+        Some(MonoType::I64),
+        "Just field should be I64"
+    );
+}
+
+#[test]
+fn mono_result_constructor_field_types() {
+    use crate::core::MonoType;
+    let source = "\
+main : I64 -> Result(I64, Str)
+main = |x| Ok(x)";
+
+    let program = compile(source);
+    // Find Ok constructor
+    let ok_con = program
+        .types
+        .iter()
+        .flat_map(|t| &t.constructors)
+        .find(|c| program.debug_names.func_name(c.tag) == "Ok")
+        .expect("Ok constructor not found");
+    assert_eq!(
+        ok_con.fields[0].mono_type,
+        Some(MonoType::I64),
+        "Ok field should be I64 for Result(I64, Str)"
+    );
+
+    // Find Err constructor
+    let err_con = program
+        .types
+        .iter()
+        .flat_map(|t| &t.constructors)
+        .find(|c| program.debug_names.func_name(c.tag) == "Err")
+        .expect("Err constructor not found");
+    assert_eq!(
+        err_con.fields[0].mono_type,
+        Some(MonoType::Ptr),
+        "Err field should be Ptr for Result(I64, Str)"
+    );
+}
+
+#[test]
+fn mono_pattern_bound_var_types() {
+    use crate::core::MonoType;
+    let source = "\
+Maybe : [Just(I64), Nothing]
+
+main : I64 -> I64
+main = |x| if Just(x)
+    : Just(n) then n
+    : Nothing then 0";
+
+    let program = compile(source);
+    // The variable 'n' bound by Just(n) should have type I64
+    let n_type = program
+        .var_types
+        .iter()
+        .find(|(_, mono)| **mono == MonoType::I64)
+        .map(|(_, m)| m.clone());
+    assert_eq!(
+        n_type,
+        Some(MonoType::I64),
+        "pattern-bound variable should have I64 type"
+    );
+}
