@@ -89,6 +89,22 @@ fn eval_builtin(func: FuncId, args: &[Value], program: &Program) -> Option<Value
                 fields: vec![],
             })
         }
+        Builtin::NumToStr => {
+            let s = match &args[0] {
+                Value::VNum(NumVal::U8(n)) => n.to_string(),
+                Value::VNum(NumVal::I8(n)) => n.to_string(),
+                Value::VNum(NumVal::U64(n)) => n.to_string(),
+                Value::VNum(NumVal::I64(n)) => n.to_string(),
+                Value::VNum(NumVal::F64(n)) => n.to_string(),
+                other => panic!("to_str: expected number, got {other:?}"),
+            };
+            Some(Value::VList(
+                s.into_bytes()
+                    .into_iter()
+                    .map(|b| Value::VNum(NumVal::U8(b)))
+                    .collect(),
+            ))
+        }
         Builtin::ListLen => {
             let [Value::VList(elems)] = args else {
                 panic!("List.len: expected list")

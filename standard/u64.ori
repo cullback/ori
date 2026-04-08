@@ -5,4 +5,5 @@ U64 := {}.(
     rem : U64, U64 -> U64
     eq : U64, U64 -> Bool
     neq : U64, U64 -> Bool
+    to_str : U64 -> Str
 )

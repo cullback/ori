@@ -6,4 +6,5 @@ U8 := {}.(
     rem : U8, U8 -> U8
     eq : U8, U8 -> Bool
     neq : U8, U8 -> Bool
+    to_str : U8 -> Str
 )

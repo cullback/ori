@@ -30,6 +30,7 @@ pub fn lower<'src>(
     // Register stdlib modules
     let bool_stdlib = ctx.register_stdlib_module(arena, "Bool");
     ctx.register_comparison_builtins();
+    ctx.register_num_to_str();
     let result_stdlib = ctx.register_stdlib_module(arena, "Result");
     let list_stdlib = ctx.register_stdlib_module(arena, "List");
     let str_stdlib = ctx.register_stdlib_module(arena, "Str");
@@ -493,6 +494,15 @@ impl<'src> LowerCtx<'src> {
                     body: body_core,
                 });
             }
+        }
+    }
+
+    fn register_num_to_str(&mut self) {
+        let to_str_id = self.builder.builtin(Builtin::NumToStr);
+        for ty in &["I64", "U64", "F64", "U8", "I8"] {
+            let key = format!("{ty}.to_str");
+            self.funcs.insert(key.clone(), to_str_id);
+            self.func_arities.insert(key, 1);
         }
     }
 

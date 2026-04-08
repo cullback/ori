@@ -49,6 +49,7 @@ pub enum Builtin {
     Rem,
     Max,
     Eq { true_con: FuncId, false_con: FuncId },
+    NumToStr,
     ListLen,
     ListGet,
     ListSet,

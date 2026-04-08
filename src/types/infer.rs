@@ -1037,6 +1037,20 @@ pub fn check<'src>(
     ctx.register_stdlib_module(arena, "List")?;
     ctx.register_stdlib_module(arena, "Str")?;
 
+    // Register to_str for all numeric types (not as full modules — their
+    // := {} declaration would incorrectly make them transparent to {}).
+    for ty in &["I64", "U64", "F64", "U8", "I8"] {
+        let mangled = format!("{ty}.to_str");
+        let param_ty = Type::Con((*ty).to_owned());
+        let ret_ty = Type::Con("Str".to_owned());
+        let scheme = Scheme {
+            vars: vec![],
+            constraints: vec![],
+            ty: Type::Arrow(vec![param_ty], Box::new(ret_ty)),
+        };
+        ctx.env.insert(mangled, scheme);
+    }
+
     // Pass 1: register all type declarations and function signatures
     for decl in &module.decls {
         match decl {

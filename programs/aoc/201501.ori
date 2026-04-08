@@ -8,5 +8,5 @@ part1 = |input|
         else if x == 41 then count - 1
         else count)
 
-main : List(Str), Str -> Result(I64, Str)
-main = |args, input| Ok(part1(input))
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| Ok(part1(input).to_str())

@@ -5,4 +5,5 @@ I64 := {}.(
     rem : I64, I64 -> I64
     eq : I64, I64 -> Bool
     neq : I64, I64 -> Bool
+    to_str : I64 -> Str
 )
