@@ -1,4 +1,7 @@
+mod decl_info;
+mod defunc;
 mod error;
+mod reachable;
 mod resolve;
 mod source;
 #[allow(
