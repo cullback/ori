@@ -1078,6 +1078,159 @@ main = |arg| Str.count_bytes(\"line1\\nline2\")";
 }
 
 // ============================================================
+// Character literals
+// ============================================================
+
+#[test]
+fn char_literal_ascii() {
+    let source = "\
+main : I64 -> I64
+main = |arg| 'A'";
+    assert_eq!(run_i64(source, 0), 65);
+}
+
+#[test]
+fn char_literal_paren() {
+    let source = "\
+main : I64 -> I64
+main = |arg| '('";
+    assert_eq!(run_i64(source, 0), 40);
+}
+
+#[test]
+fn char_literal_escape_newline() {
+    let source = "\
+main : I64 -> I64
+main = |arg| '\\n'";
+    assert_eq!(run_i64(source, 0), 10);
+}
+
+#[test]
+fn char_literal_emoji() {
+    let source = "\
+main : I64 -> I64
+main = |arg| '\u{1F469}'";
+    // U+1F469 = 128105
+    assert_eq!(run_i64(source, 0), 128105);
+}
+
+#[test]
+fn char_literal_in_arithmetic() {
+    let source = "\
+main : I64 -> I64
+main = |arg| 'A' + 1";
+    assert_eq!(run_i64(source, 0), 66);
+}
+
+// ============================================================
+// String interpolation
+// ============================================================
+
+#[test]
+fn string_interpolation_basic() {
+    let source = "\
+main : I64 -> U64
+main = |arg| (
+    name = \"world\"
+    \"hello ${name}\".count_bytes()
+)";
+    // "hello world" = 11 bytes
+    assert_eq!(run_u64(source, 0), 11);
+}
+
+#[test]
+fn string_interpolation_multiple() {
+    let source = "\
+main : I64 -> U64
+main = |arg| (
+    a = \"foo\"
+    b = \"bar\"
+    \"${a}${b}\".count_bytes()
+)";
+    // "foobar" = 6 bytes
+    assert_eq!(run_u64(source, 0), 6);
+}
+
+#[test]
+fn string_interpolation_only() {
+    let source = "\
+main : I64 -> U64
+main = |arg| (
+    x = \"abc\"
+    \"${x}\".count_bytes()
+)";
+    assert_eq!(run_u64(source, 0), 3);
+}
+
+#[test]
+fn string_dollar_without_brace() {
+    // $ without { is a literal dollar sign
+    let source = "\
+main : I64 -> U64
+main = |arg| \"price $5\".count_bytes()";
+    // "price $5" = 8 bytes
+    assert_eq!(run_u64(source, 0), 8);
+}
+
+#[test]
+fn string_escaped_interpolation() {
+    // \${ produces literal ${
+    let source = "\
+main : I64 -> U64
+main = |arg| \"use \\${x}\".count_bytes()";
+    // "use ${x}" = 8 bytes
+    assert_eq!(run_u64(source, 0), 8);
+}
+
+#[test]
+fn string_interpolation_auto_to_str() {
+    // Interpolated I64 is auto-converted via .to_str()
+    let source = "\
+main : I64 -> U64
+main = |arg| (
+    n : I64
+    n = 42
+    \"n=${n}\".count_bytes()
+)";
+    // "n=42" = 4 bytes
+    assert_eq!(run_u64(source, 0), 4);
+}
+
+// ============================================================
+// Triple-quoted strings
+// ============================================================
+
+#[test]
+fn triple_string_basic() {
+    let source = "\
+main : I64 -> U64
+main = |arg| \"\"\"\n    hello\n    world\n    \"\"\".count_bytes()";
+    // "hello\nworld" = 11 bytes
+    assert_eq!(run_u64(source, 0), 11);
+}
+
+#[test]
+fn triple_string_preserves_relative_indent() {
+    let source = "\
+main : I64 -> U64
+main = |arg| \"\"\"\n    line1\n        indented\n    \"\"\".count_bytes()";
+    // "line1\n    indented" = 18 bytes
+    assert_eq!(run_u64(source, 0), 18);
+}
+
+#[test]
+fn triple_string_with_interpolation() {
+    let source = "\
+main : I64 -> U64
+main = |arg| (
+    name = \"Alice\"
+    \"\"\"\n    hello ${name}\n    \"\"\".count_bytes()
+)";
+    // "hello Alice" = 11 bytes
+    assert_eq!(run_u64(source, 0), 11);
+}
+
+// ============================================================
 // Float literals and polymorphic numbers
 // ============================================================
 

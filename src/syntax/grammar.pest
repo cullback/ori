@@ -7,29 +7,26 @@ COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* }
 
 module = { SOI ~ exports_decl? ~ import_decl* ~ decl* ~ EOI }
 
-exports_decl = { "exports" ~ "[" ~ name ~ ("," ~ name)* ~ "]" }
+exports_decl = { "exports" ~ name_list }
 
 import_decl = { "import" ~ name ~ exposing_clause? }
-exposing_clause = { "exposing" ~ "[" ~ name ~ ("," ~ name)* ~ "]" }
+exposing_clause = { "exposing" ~ name_list }
+
+name_list = { "[" ~ name ~ ("," ~ name)* ~ "]" }
 
 decl = { type_anno | assignment }
 
 // Atomic: no space before "(" in type params (e.g. List(a), not List (a))
 type_head = @{ name ~ "(" }
 
-type_anno = {
-    type_head ~ type_params ~ ")" ~ ":=" ~ type_expr ~ method_block?
-  | type_head ~ type_params ~ ")" ~ "::" ~ type_expr ~ method_block?
-  | type_head ~ type_params ~ ")" ~ ":" ~ type_expr ~ where_clause? ~ method_block?
-  | name ~ ":=" ~ type_expr ~ method_block?
-  | name ~ "::" ~ type_expr ~ method_block?
-  | name ~ ":" ~ type_expr ~ where_clause? ~ method_block?
-}
+type_anno = { type_prefix ~ decl_kind ~ type_expr ~ where_clause? ~ method_block? }
+
+type_prefix = { type_head ~ name ~ ("," ~ name)* ~ ")" | name }
+
+decl_kind = { ":=" | "::" | ":" }
 
 where_clause = { "where" ~ "[" ~ constraint_decl ~ ("," ~ constraint_decl)* ~ "]" }
 constraint_decl = { name ~ "." ~ name ~ (":" ~ type_expr)? }
-
-type_params = { name ~ ("," ~ name)* }
 
 method_block = { ".(" ~ decl* ~ ")" }
 
@@ -69,7 +66,9 @@ base_atom = {
   | call_or_access
   | tuple
   | block
+  | triple_string_lit
   | string_lit
+  | char_lit
   | float_lit
   | int_lit
 }
@@ -130,8 +129,16 @@ lambda = { "|" ~ (lambda_param ~ ("," ~ lambda_param)*)? ~ "|" ~ expr }
 
 lambda_param = @{ "_" | name }
 
-string_lit = @{ "\"" ~ string_inner* ~ "\"" }
-string_inner = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
+string_lit = ${ "\"" ~ (interpolation | string_chars)* ~ "\"" }
+string_chars = @{ (!("\"" | "\\" | "${") ~ ANY | "\\" ~ ANY)+ }
+interpolation = { "${" ~ expr ~ "}" }
+
+triple_string_lit = ${ "\"\"\"" ~ (interpolation | triple_chars)* ~ "\"\"\"" }
+triple_chars = @{ (!("\"\"\"" | "\\" | "${") ~ ANY | "\\" ~ ANY)+ }
+
+char_lit = @{ "'" ~ (char_escape | char_raw) ~ "'" }
+char_raw = @{ !("'" | "\\") ~ ANY }
+char_escape = @{ "\\" ~ ANY }
 
 float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 int_lit   = @{ ASCII_DIGIT+ }

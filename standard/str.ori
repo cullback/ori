@@ -23,4 +23,8 @@ Str := List(U8).(
     # Returns the underlying byte list.
     to_utf8 : Str -> List(U8)
     to_utf8 = |s| s
+
+    # Returns the string unchanged (enables uniform to_str in interpolation).
+    to_str : Str -> Str
+    to_str = |s| s
 )

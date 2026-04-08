@@ -85,24 +85,14 @@ impl ParseCtx {
         for inner in pair.into_inner() {
             match inner.as_rule() {
                 Rule::exports_decl => {
-                    exports = inner
-                        .into_inner()
-                        .filter(|p| p.as_rule() == Rule::name)
-                        .map(|p| p.as_str())
-                        .collect();
+                    exports = parse_name_list(inner);
                 }
                 Rule::import_decl => {
                     let mut parts = inner.into_inner();
                     let module = parts.next().unwrap().as_str();
                     let exposing = parts
                         .find(|p| p.as_rule() == Rule::exposing_clause)
-                        .map(|clause| {
-                            clause
-                                .into_inner()
-                                .filter(|p| p.as_rule() == Rule::name)
-                                .map(|p| p.as_str())
-                                .collect()
-                        })
+                        .map(parse_name_list)
                         .unwrap_or_default();
                     imports.push(Import { module, exposing });
                 }
@@ -129,36 +119,39 @@ impl ParseCtx {
     fn parse_type_anno<'src>(&self, pair: Pair<'src, Rule>) -> Decl<'src> {
         let span = self.span_of(&pair);
         let doc = self.doc_at(&span);
-        let text = pair.as_str();
-        let kind = if text.contains(":=") {
-            TypeDeclKind::Transparent
-        } else if text.contains("::") {
-            TypeDeclKind::Opaque
-        } else {
-            TypeDeclKind::Alias
-        };
         let mut inner = pair.into_inner();
-        let first = inner.next().unwrap();
+
+        // type_prefix: either `Name(params)` or plain `Name`
+        let prefix = inner.next().unwrap();
+        let mut prefix_inner = prefix.into_inner();
+        let first = prefix_inner.next().unwrap();
         let name = match first.as_rule() {
             Rule::type_head => {
                 let text = first.as_str();
                 &text[..text.len() - 1] // strip trailing "("
             }
-            _ => first.as_str(), // plain name
+            _ => first.as_str(),
+        };
+        let type_params: Vec<&str> = prefix_inner
+            .filter(|p| p.as_rule() == Rule::name)
+            .map(|p| p.as_str())
+            .collect();
+
+        // decl_kind: `:=`, `::`, or `:`
+        let kind_pair = inner.next().unwrap();
+        let kind = match kind_pair.as_str() {
+            ":=" => TypeDeclKind::Transparent,
+            "::" => TypeDeclKind::Opaque,
+            ":" => TypeDeclKind::Alias,
+            other => panic!("unexpected decl_kind: {other}"),
         };
 
-        let mut type_params = Vec::new();
         let mut ty = None;
         let mut where_clause = Vec::new();
         let mut methods = Vec::new();
 
         for part in inner {
             match part.as_rule() {
-                Rule::type_params => {
-                    for p in part.into_inner() {
-                        type_params.push(p.as_str());
-                    }
-                }
                 Rule::type_expr | Rule::type_atom => {
                     ty = Some(parse_type_expr(part));
                 }
@@ -307,11 +300,73 @@ impl ParseCtx {
                 self.parse_expr(inner)
             }
             Rule::string_lit => {
+                let mut segments: Vec<Expr<'src>> = Vec::new();
+                for child in pair.into_inner() {
+                    match child.as_rule() {
+                        Rule::string_chars => {
+                            let bytes = unescape_string(child.as_str());
+                            if !bytes.is_empty() {
+                                segments.push(Expr::new(ExprKind::StrLit(bytes), span));
+                            }
+                        }
+                        Rule::interpolation => {
+                            let inner = self.parse_expr(child.into_inner().next().unwrap());
+                            segments.push(wrap_to_str(inner, span));
+                        }
+                        _ => {}
+                    }
+                }
+                concat_string_segments(segments, span)
+            }
+            Rule::triple_string_lit => {
                 let raw = pair.as_str();
-                // Strip surrounding quotes
+                let indent = triple_string_indent(raw);
+                let children: Vec<Pair<'src, Rule>> = pair.into_inner().collect();
+                let mut segments: Vec<Expr<'src>> = Vec::new();
+                let mut at_line_start = false;
+                let mut is_first = true;
+
+                for child in children {
+                    match child.as_rule() {
+                        Rule::triple_chars => {
+                            let processed = process_triple_literal(
+                                child.as_str(),
+                                indent,
+                                &mut is_first,
+                                &mut at_line_start,
+                            );
+                            let bytes = unescape_string(&processed);
+                            if !bytes.is_empty() {
+                                segments.push(Expr::new(ExprKind::StrLit(bytes), span));
+                            }
+                        }
+                        Rule::interpolation => {
+                            is_first = false;
+                            at_line_start = false;
+                            let inner = self.parse_expr(child.into_inner().next().unwrap());
+                            segments.push(wrap_to_str(inner, span));
+                        }
+                        _ => {}
+                    }
+                }
+                // Strip trailing newline from closing """ line
+                if let Some(last) = segments.last_mut()
+                    && let ExprKind::StrLit(ref mut bytes) = last.kind
+                    && bytes.last() == Some(&b'\n')
+                {
+                    bytes.pop();
+                }
+                if matches!(segments.last(), Some(e) if matches!(&e.kind, ExprKind::StrLit(b) if b.is_empty()))
+                {
+                    segments.pop();
+                }
+                concat_string_segments(segments, span)
+            }
+            Rule::char_lit => {
+                let raw = pair.as_str();
                 let inner = &raw[1..raw.len() - 1];
-                let bytes = unescape_string(inner);
-                Expr::new(ExprKind::StrLit(bytes), span)
+                let code_point = unescape_char(inner);
+                Expr::new(ExprKind::IntLit(code_point), span)
             }
             Rule::float_lit => {
                 let n: f64 = pair.as_str().parse().unwrap();
@@ -545,6 +600,16 @@ impl ParseCtx {
     }
 }
 
+// ---- Shared helpers ----
+
+fn parse_name_list(pair: Pair<'_, Rule>) -> Vec<&str> {
+    pair.into_inner()
+        .flat_map(Pair::into_inner)
+        .filter(|p| p.as_rule() == Rule::name)
+        .map(|p| p.as_str())
+        .collect()
+}
+
 // ---- Type expressions (no span needed, stateless) ----
 
 fn parse_constraint_decl(pair: Pair<'_, Rule>) -> ConstraintDecl<'_> {
@@ -757,6 +822,117 @@ fn parse_field_pattern(pair: Pair<'_, Rule>) -> (&str, Pattern<'_>) {
     }
 }
 
+/// Decode a character literal to its Unicode code point value.
+fn unescape_char(s: &str) -> i64 {
+    if let Some(rest) = s.strip_prefix('\\') {
+        match rest.chars().next().unwrap() {
+            'n' => 10,
+            't' => 9,
+            'r' => 13,
+            '0' => 0,
+            '\'' => 39,
+            '\\' => 92,
+            other => other as i64,
+        }
+    } else {
+        s.chars().next().unwrap() as i64
+    }
+}
+
+/// Wrap an interpolated expression in `.to_str()` for automatic string conversion.
+fn wrap_to_str(expr: Expr<'_>, span: Span) -> Expr<'_> {
+    Expr::new(
+        ExprKind::MethodCall {
+            receiver: Box::new(expr),
+            method: "to_str",
+            args: vec![],
+        },
+        span,
+    )
+}
+
+/// Build a concat chain from string segments, or a single expression / empty `StrLit`.
+fn concat_string_segments(segments: Vec<Expr<'_>>, span: Span) -> Expr<'_> {
+    if segments.is_empty() {
+        return Expr::new(ExprKind::StrLit(vec![]), span);
+    }
+    if segments.len() == 1 {
+        return segments.into_iter().next().unwrap();
+    }
+    let mut iter = segments.into_iter();
+    let first = iter.next().unwrap();
+    iter.fold(first, |acc, seg| {
+        // Use Call with pre-joined name to avoid span-keyed method resolution conflicts
+        Expr::new(
+            ExprKind::Call {
+                func: "Str.concat",
+                args: vec![acc, seg],
+            },
+            span,
+        )
+    })
+}
+
+/// Compute the indent level of a triple-quoted string from the closing `"""`.
+fn triple_string_indent(raw: &str) -> usize {
+    let without_close = &raw[..raw.len() - 3];
+    if let Some(last_nl) = without_close.rfind('\n') {
+        without_close.len() - last_nl - 1
+    } else {
+        0
+    }
+}
+
+/// Process a literal segment of a triple-quoted string, applying indent stripping.
+fn process_triple_literal(
+    raw: &str,
+    indent: usize,
+    is_first: &mut bool,
+    at_line_start: &mut bool,
+) -> String {
+    let mut result = String::new();
+    let mut remaining = raw;
+
+    if *is_first {
+        *is_first = false;
+        if let Some(rest) = remaining.strip_prefix('\n') {
+            remaining = rest;
+            *at_line_start = true;
+        } else if let Some(rest) = remaining.strip_prefix("\r\n") {
+            remaining = rest;
+            *at_line_start = true;
+        } else {
+            // No newline after opening """: content starts immediately
+        }
+    }
+
+    if remaining.is_empty() {
+        return result;
+    }
+
+    for (i, line) in remaining.split('\n').enumerate() {
+        if i > 0 {
+            result.push('\n');
+            *at_line_start = true;
+        }
+        if *at_line_start {
+            if line.len() >= indent {
+                result.push_str(&line[indent..]);
+            }
+            // Lines shorter than indent that are all whitespace are kept empty
+        } else {
+            result.push_str(line);
+        }
+        *at_line_start = false;
+    }
+
+    if remaining.ends_with('\n') {
+        *at_line_start = true;
+    }
+
+    result
+}
+
 /// Process escape sequences in a string literal and return UTF-8 bytes.
 fn unescape_string(s: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -769,6 +945,7 @@ fn unescape_string(s: &str) -> Vec<u8> {
                 Some('r') => bytes.push(b'\r'),
                 Some('0') => bytes.push(0),
                 Some('"') => bytes.push(b'"'),
+                Some('$') => bytes.push(b'$'),
                 Some('\\') | None => bytes.push(b'\\'),
                 Some(other) => {
                     bytes.push(b'\\');
