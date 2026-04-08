@@ -73,10 +73,12 @@ base_atom = {
   | int_lit
 }
 
-// Postfix: .method(args) or .field
+// Postfix: .method(args), .field, or is pattern
 method_head = @{ "." ~ name ~ "(" }
+is_keyword = @{ "is" ~ !(ASCII_ALPHANUMERIC | "_") }
 postfix = {
     method_head ~ args? ~ ")"
+  | is_keyword ~ pattern
   | "." ~ name
 }
 
@@ -177,13 +179,15 @@ field_pattern = {
 
 // ---- Operators ----
 
-binop  = _{ cmp_op | add_op | mul_op }
+binop  = _{ or_op | and_op | cmp_op | add_op | mul_op }
+or_op  =  { "or" }
+and_op =  { "and" }
 cmp_op =  { "==" | "!=" }
 add_op =  { "+" | "-" }
 mul_op =  { "*" | "/" | "%" }
 
 // ---- Terminals ----
 
-name = @{ !(keyword ~ !ASCII_ALPHANUMERIC) ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+name = @{ !(keyword ~ !(ASCII_ALPHANUMERIC | "_")) ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" | "exports" | "where" | "and" | "or" | "return" }
+keyword = { "if" | "then" | "else" | "fold" | "import" | "exposing" | "exports" | "where" | "and" | "or" | "return" | "is" }

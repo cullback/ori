@@ -140,6 +140,10 @@ pub enum ExprKind<'src> {
         method: &'src str,
         args: Vec<Expr<'src>>,
     },
+    Is {
+        expr: Box<Expr<'src>>,
+        pattern: Pattern<'src>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -196,4 +200,6 @@ pub enum BinOp {
     Rem,
     Eq,
     Neq,
+    And,
+    Or,
 }

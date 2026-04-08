@@ -241,6 +241,8 @@ impl ParseCtx {
                             "%" => BinOp::Rem,
                             "==" => BinOp::Eq,
                             "!=" => BinOp::Neq,
+                            "and" => BinOp::And,
+                            "or" => BinOp::Or,
                             other => panic!("unknown operator: {other}"),
                         };
                         Expr::new(
@@ -280,6 +282,17 @@ impl ParseCtx {
                                     receiver: Box::new(receiver),
                                     method,
                                     args,
+                                },
+                                postfix_span,
+                            )
+                        }
+                        Rule::is_keyword => {
+                            let pat_pair = parts.next().unwrap();
+                            let pattern = parse_pattern(pat_pair);
+                            Expr::new(
+                                ExprKind::Is {
+                                    expr: Box::new(receiver),
+                                    pattern,
                                 },
                                 postfix_span,
                             )
@@ -742,6 +755,8 @@ fn parse_field_type(pair: Pair<'_, Rule>) -> (&str, TypeExpr<'_>) {
 
 fn pratt_parser() -> PrattParser<Rule> {
     PrattParser::new()
+        .op(Op::infix(Rule::or_op, Assoc::Left))
+        .op(Op::infix(Rule::and_op, Assoc::Left))
         .op(Op::infix(Rule::cmp_op, Assoc::Left))
         .op(Op::infix(Rule::add_op, Assoc::Left))
         .op(Op::infix(Rule::mul_op, Assoc::Left))

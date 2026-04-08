@@ -149,6 +149,9 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>) {
                 collect_refs(e, refs);
             }
         }
+        ExprKind::Is { expr: inner, .. } => {
+            collect_refs(inner, refs);
+        }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
     }
 }

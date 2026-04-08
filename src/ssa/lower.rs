@@ -6,7 +6,7 @@ use crate::error::CompileError;
 use crate::source::SourceArena;
 use crate::ssa::Module;
 use crate::ssa::builder::Builder;
-use crate::ssa::instruction::{BinaryOp, ScalarType, Value};
+use crate::ssa::instruction::{BinaryOp, BlockId, ScalarType, Value};
 use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};
 use crate::types::engine::Type;
 use crate::types::infer::InferResult;
@@ -199,6 +199,23 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 panic!("undefined name: {name}");
             }
 
+            ExprKind::BinOp {
+                op: BinOp::And,
+                lhs,
+                rhs,
+            } => self.lower_and_expr(lhs, rhs),
+
+            ExprKind::BinOp {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+            } => self.lower_or_expr(lhs, rhs),
+
+            ExprKind::Is {
+                expr: inner,
+                pattern,
+            } => self.lower_is_expr(inner, pattern),
+
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
@@ -211,6 +228,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     BinOp::Rem => self.builder.binop(BinaryOp::Rem, l, r, ty),
                     BinOp::Eq => self.lower_eq(l, r, false),
                     BinOp::Neq => self.lower_eq(l, r, true),
+                    BinOp::And | BinOp::Or => unreachable!(),
                 }
             }
 
@@ -231,27 +249,39 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             condition,
                             return_val,
                         } => {
-                            // Lower: if condition is true, return return_val from function
-                            let cond_val = self.lower_expr(condition);
-                            let cond_tag = self.builder.load(cond_val, 0, ScalarType::U64);
-                            let true_tag = self.decls.constructors["True"].tag_index;
-                            let true_val = self.builder.const_u64(true_tag);
-                            let is_true = self.builder.binop(
-                                BinaryOp::Eq,
-                                cond_tag,
-                                true_val,
-                                ScalarType::Bool,
-                            );
-                            let ret_block = self.builder.create_block();
-                            let cont_block = self.builder.create_block();
-                            self.builder
-                                .branch(is_true, ret_block, vec![], cont_block, vec![]);
-                            // Return block: evaluate return_val and ret
-                            self.builder.switch_to(ret_block);
-                            let ret_v = self.lower_expr(return_val);
-                            self.builder.ret(ret_v);
-                            // Continue block: proceed with next statements
-                            self.builder.switch_to(cont_block);
+                            if Self::expr_contains_is(condition) {
+                                // Use and-chain lowering for Is binding flow
+                                let cont_block = self.builder.create_block();
+                                let saved_vars = self.vars.clone();
+                                self.lower_and_chain(condition, cont_block);
+                                // We're in the success path — return
+                                let ret_v = self.lower_expr(return_val);
+                                self.builder.ret(ret_v);
+                                self.vars = saved_vars;
+                                self.builder.switch_to(cont_block);
+                            } else {
+                                // Lower: if condition is true, return return_val from function
+                                let cond_val = self.lower_expr(condition);
+                                let cond_tag = self.builder.load(cond_val, 0, ScalarType::U64);
+                                let true_tag = self.decls.constructors["True"].tag_index;
+                                let true_val = self.builder.const_u64(true_tag);
+                                let is_true = self.builder.binop(
+                                    BinaryOp::Eq,
+                                    cond_tag,
+                                    true_val,
+                                    ScalarType::Bool,
+                                );
+                                let ret_block = self.builder.create_block();
+                                let cont_block = self.builder.create_block();
+                                self.builder
+                                    .branch(is_true, ret_block, vec![], cont_block, vec![]);
+                                // Return block: evaluate return_val and ret
+                                self.builder.switch_to(ret_block);
+                                let ret_v = self.lower_expr(return_val);
+                                self.builder.ret(ret_v);
+                                // Continue block: proceed with next statements
+                                self.builder.switch_to(cont_block);
+                            }
                         }
                         Stmt::TypeHint { .. } => {}
                     }
@@ -265,7 +295,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 else_body,
             } => {
                 let result_ty = self.expr_scalar_type(expr.span);
-                self.lower_match(scrutinee_expr, arms, else_body.as_deref(), result_ty)
+                // Detect boolean if-then-else with Is bindings in scrutinee
+                if Self::is_bool_if_with_is(scrutinee_expr, arms) {
+                    self.lower_bool_if_with_is(scrutinee_expr, arms, result_ty)
+                } else {
+                    self.lower_match(scrutinee_expr, arms, else_body.as_deref(), result_ty)
+                }
             }
 
             ExprKind::Fold {
@@ -654,6 +689,246 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let else_tag = self.builder.const_u64(else_tag_idx);
         self.builder.store(else_ptr, 0, else_tag);
         self.builder.jump(merge, vec![else_ptr]);
+
+        self.builder.switch_to(merge);
+        merge_param
+    }
+
+    // ---- Is / And / Or lowering ----
+
+    /// Convert a raw bool SSA comparison result to a Bool tagged union (True/False pointer).
+    fn lower_bool_from_cmp(&mut self, cmp: Value) -> Value {
+        let true_meta = &self.decls.constructors["True"];
+        let false_meta = &self.decls.constructors["False"];
+        let alloc_size = 1 + true_meta.max_fields;
+
+        let then_block = self.builder.create_block();
+        let else_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
+
+        self.builder
+            .branch(cmp, then_block, vec![], else_block, vec![]);
+
+        self.builder.switch_to(then_block);
+        let true_ptr = self.builder.alloc(alloc_size);
+        let true_tag = self.builder.const_u64(true_meta.tag_index);
+        self.builder.store(true_ptr, 0, true_tag);
+        self.builder.jump(merge, vec![true_ptr]);
+
+        self.builder.switch_to(else_block);
+        let false_ptr = self.builder.alloc(alloc_size);
+        let false_tag = self.builder.const_u64(false_meta.tag_index);
+        self.builder.store(false_ptr, 0, false_tag);
+        self.builder.jump(merge, vec![false_ptr]);
+
+        self.builder.switch_to(merge);
+        merge_param
+    }
+
+    /// Lower a standalone `x is Pattern` expression (produces Bool, no binding flow).
+    fn lower_is_expr(&mut self, inner: &Expr<'src>, pattern: &ast::Pattern<'src>) -> Value {
+        let scr = self.lower_expr(inner);
+        match pattern {
+            ast::Pattern::Constructor { name, .. } => {
+                let tag = self.builder.load(scr, 0, ScalarType::U64);
+                let meta = &self.decls.constructors[*name];
+                let expected_tag = self.builder.const_u64(meta.tag_index);
+                let matches = self
+                    .builder
+                    .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
+                self.lower_bool_from_cmp(matches)
+            }
+            ast::Pattern::Wildcard | ast::Pattern::Binding(_) => {
+                // Always matches
+                self.lower_constructor_call("True", &[])
+            }
+            _ => panic!("unsupported pattern in `is` expression"),
+        }
+    }
+
+    /// Lower `lhs and rhs` with fused Is-chain support (bindings flow from lhs into rhs).
+    fn lower_and_expr(&mut self, lhs: &Expr<'src>, rhs: &Expr<'src>) -> Value {
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
+        let false_block = self.builder.create_block();
+
+        let saved_vars = self.vars.clone();
+
+        // Lower LHS chain — may emit branches to false_block, accumulating bindings
+        self.lower_and_chain(lhs, false_block);
+
+        // We're in the success path — all Is bindings from lhs are in scope
+        let rhs_val = self.lower_expr(rhs);
+        self.builder.jump(merge, vec![rhs_val]);
+
+        // False block: produce False and jump to merge
+        self.builder.switch_to(false_block);
+        let false_val = self.lower_constructor_call("False", &[]);
+        self.builder.jump(merge, vec![false_val]);
+
+        self.vars = saved_vars;
+        self.builder.switch_to(merge);
+        merge_param
+    }
+
+    /// Recursively process an And chain, branching to `false_block` on failure
+    /// and accumulating Is bindings in `self.vars` on success.
+    fn lower_and_chain(&mut self, expr: &Expr<'src>, false_block: BlockId) {
+        match &expr.kind {
+            ExprKind::Is {
+                expr: inner,
+                pattern,
+            } => {
+                let scr = self.lower_expr(inner);
+                match pattern {
+                    ast::Pattern::Constructor { name, fields } => {
+                        let tag = self.builder.load(scr, 0, ScalarType::U64);
+                        let meta = self.decls.constructors[*name].clone();
+                        let expected_tag = self.builder.const_u64(meta.tag_index);
+                        let matches =
+                            self.builder
+                                .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
+                        let match_block = self.builder.create_block();
+                        self.builder
+                            .branch(matches, match_block, vec![], false_block, vec![]);
+                        self.builder.switch_to(match_block);
+                        // Bind pattern fields
+                        for (fi, field_pat) in fields.iter().enumerate() {
+                            let field_ty =
+                                meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
+                            let field_val = self.builder.load(scr, fi + 1, field_ty);
+                            self.bind_pattern_field(field_pat, field_val);
+                        }
+                    }
+                    ast::Pattern::Binding(name) => {
+                        // Always matches, bind value
+                        self.vars.insert((*name).to_owned(), scr);
+                    }
+                    ast::Pattern::Wildcard => {
+                        // Always matches, no binding
+                    }
+                    _ => panic!("unsupported pattern in `is` chain"),
+                }
+            }
+            ExprKind::BinOp {
+                op: BinOp::And,
+                lhs,
+                rhs,
+            } => {
+                // Process LHS first (may branch, accumulating bindings)
+                self.lower_and_chain(lhs, false_block);
+                // Then process RHS (we're in the LHS success path)
+                self.lower_and_chain(rhs, false_block);
+            }
+            _ => {
+                // Regular boolean expression — evaluate, check True tag, branch
+                let val = self.lower_expr(expr);
+                let tag = self.builder.load(val, 0, ScalarType::U64);
+                let true_tag = self.decls.constructors["True"].tag_index;
+                let true_val = self.builder.const_u64(true_tag);
+                let is_true = self
+                    .builder
+                    .binop(BinaryOp::Eq, tag, true_val, ScalarType::Bool);
+                let continue_block = self.builder.create_block();
+                self.builder
+                    .branch(is_true, continue_block, vec![], false_block, vec![]);
+                self.builder.switch_to(continue_block);
+            }
+        }
+    }
+
+    /// Lower `lhs or rhs` with short-circuit evaluation.
+    fn lower_or_expr(&mut self, lhs: &Expr<'src>, rhs: &Expr<'src>) -> Value {
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
+
+        let lhs_val = self.lower_expr(lhs);
+        let tag = self.builder.load(lhs_val, 0, ScalarType::U64);
+        let true_tag = self.decls.constructors["True"].tag_index;
+        let true_val = self.builder.const_u64(true_tag);
+        let is_true = self
+            .builder
+            .binop(BinaryOp::Eq, tag, true_val, ScalarType::Bool);
+        let rhs_block = self.builder.create_block();
+        // If LHS is True, short-circuit to merge with LHS value
+        self.builder
+            .branch(is_true, merge, vec![lhs_val], rhs_block, vec![]);
+
+        self.builder.switch_to(rhs_block);
+        let rhs_val = self.lower_expr(rhs);
+        self.builder.jump(merge, vec![rhs_val]);
+
+        self.builder.switch_to(merge);
+        merge_param
+    }
+
+    // ---- Boolean if-then-else with Is binding flow ----
+
+    /// Check if this is a boolean if-then-else (True/False arms) where the
+    /// scrutinee contains Is expressions that need binding flow.
+    fn is_bool_if_with_is(scrutinee: &Expr<'src>, arms: &[ast::MatchArm<'src>]) -> bool {
+        if arms.len() != 2 {
+            return false;
+        }
+        let is_true_false = matches!(
+            (&arms[0].pattern, &arms[1].pattern),
+            (
+                ast::Pattern::Constructor { name: "True", .. },
+                ast::Pattern::Constructor { name: "False", .. }
+            )
+        );
+        if !is_true_false {
+            return false;
+        }
+        Self::expr_contains_is(scrutinee)
+    }
+
+    /// Check if an expression tree contains any Is expression.
+    fn expr_contains_is(expr: &Expr<'src>) -> bool {
+        match &expr.kind {
+            ExprKind::Is { .. } => true,
+            ExprKind::BinOp { lhs, rhs, .. } => {
+                Self::expr_contains_is(lhs) || Self::expr_contains_is(rhs)
+            }
+            _ => false,
+        }
+    }
+
+    /// Lower a boolean if-then-else where the scrutinee contains Is expressions,
+    /// flowing bindings from the scrutinee into the True arm body.
+    fn lower_bool_if_with_is(
+        &mut self,
+        scrutinee: &Expr<'src>,
+        arms: &[ast::MatchArm<'src>],
+        result_ty: ScalarType,
+    ) -> Value {
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, result_ty);
+        let false_block = self.builder.create_block();
+
+        let saved_vars = self.vars.clone();
+
+        // Use and-chain lowering for the scrutinee — bindings flow into self.vars
+        self.lower_and_chain(scrutinee, false_block);
+
+        // True arm: bindings from Is are in scope
+        let true_result = self.lower_expr(&arms[0].body);
+        if arms[0].is_return {
+            self.builder.ret(true_result);
+        } else {
+            self.builder.jump(merge, vec![true_result]);
+        }
+
+        // False arm
+        self.builder.switch_to(false_block);
+        self.vars = saved_vars;
+        let false_result = self.lower_expr(&arms[1].body);
+        if arms[1].is_return {
+            self.builder.ret(false_result);
+        } else {
+            self.builder.jump(merge, vec![false_result]);
+        }
 
         self.builder.switch_to(merge);
         merge_param
@@ -1105,6 +1380,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 for e in elems {
                     self.collect_fold_captures_expr(e, excluded, seen, captures);
                 }
+            }
+            ExprKind::Is { expr, .. } => {
+                self.collect_fold_captures_expr(expr, excluded, seen, captures);
             }
         }
     }

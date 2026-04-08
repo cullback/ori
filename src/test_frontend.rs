@@ -1596,3 +1596,95 @@ main = |arg| (
 )";
     assert_eq!(run_i64(source, 5), 10);
 }
+
+// ============================================================
+// Is pattern-test operator
+// ============================================================
+
+#[test]
+fn is_basic() {
+    let source = "\
+Val : [A(I64), B(I64)]
+main : I64 -> I64
+main = |arg| (
+    v = A(42)
+    if v is A(_) then 1 else 0
+)";
+    assert_eq!(run_i64(source, 0), 1);
+}
+
+#[test]
+fn is_no_match() {
+    let source = "\
+Val : [A(I64), B(I64)]
+main : I64 -> I64
+main = |arg| (
+    v = B(42)
+    if v is A(_) then 1 else 0
+)";
+    assert_eq!(run_i64(source, 0), 0);
+}
+
+#[test]
+fn is_binding_flow() {
+    // Bindings from is flow through and into then
+    let source = "\
+Val : [A(I64), B(I64)]
+main : I64 -> I64
+main = |arg| (
+    v = A(42)
+    if v is A(x) and x == 42 then x else 0
+)";
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+#[test]
+fn is_chain() {
+    // Multiple is in and chain
+    let source = "\
+Inner : [Val(I64)]
+Outer : [Wrap(Inner)]
+main : I64 -> I64
+main = |arg| (
+    o = Wrap(Val(99))
+    if o is Wrap(inner) and inner is Val(n) then n else 0
+)";
+    assert_eq!(run_i64(source, 0), 99);
+}
+
+#[test]
+fn is_guard_clause() {
+    // is with return for guard clause
+    let source = "\
+Val : [A(I64), B(I64)]
+unwrap_a : Val -> I64
+unwrap_a = |v| (
+    if v is A(x) return x
+    0
+)
+main : I64 -> I64
+main = |arg| unwrap_a(A(7))";
+    assert_eq!(run_i64(source, 0), 7);
+}
+
+#[test]
+fn is_or_expression() {
+    let source = "\
+Val : [A(I64), B(I64), C]
+main : I64 -> I64
+main = |arg| (
+    v = B(1)
+    if v is A(_) or v is B(_) then 1 else 0
+)";
+    assert_eq!(run_i64(source, 0), 1);
+}
+
+#[test]
+fn and_or_precedence() {
+    // and binds tighter than or
+    // True or (False and False) -> True
+    let source = "\
+main : I64 -> I64
+main = |arg| if True or False and False then 1 else 0";
+    assert_eq!(run_i64(source, 0), 1);
+}

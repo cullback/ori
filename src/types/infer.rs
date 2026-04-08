@@ -55,6 +55,8 @@ struct InferCtx<'src> {
     int_literal_vars: Vec<(TypeVar, Span)>,
     /// Track float literal type vars for defaulting and side table.
     float_literal_vars: Vec<(TypeVar, Span)>,
+    /// Bindings from `is` expressions, indexed by the Is expression's span.
+    is_bindings: HashMap<Span, Vec<(String, Type)>>,
     /// Resolved method calls: span → mangled method name.
     method_resolutions: HashMap<Span, String>,
     /// Span for each constraint (parallel to engine.constraints).
@@ -81,6 +83,7 @@ impl<'src> InferCtx<'src> {
             ]),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
+            is_bindings: HashMap::new(),
             method_resolutions: HashMap::new(),
             constraint_spans: Vec::new(),
             expr_types: HashMap::new(),
@@ -282,6 +285,38 @@ impl<'src> InferCtx<'src> {
                 ))
             }
 
+            ExprKind::BinOp {
+                op: BinOp::And,
+                lhs,
+                rhs,
+            } => {
+                let lhs_ty = self.infer_expr(lhs)?;
+                let bool_ty = Type::Con("Bool".to_owned());
+                self.unify_at(&lhs_ty, &bool_ty, lhs.span)?;
+
+                // Collect Is bindings from LHS and add to env for RHS
+                let saved_env = self.env.clone();
+                self.collect_is_bindings(lhs);
+
+                let rhs_ty = self.infer_expr(rhs)?;
+                self.unify_at(&rhs_ty, &bool_ty, rhs.span)?;
+                self.env = saved_env;
+                Ok(bool_ty)
+            }
+
+            ExprKind::BinOp {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+            } => {
+                let lhs_ty = self.infer_expr(lhs)?;
+                let bool_ty = Type::Con("Bool".to_owned());
+                self.unify_at(&lhs_ty, &bool_ty, lhs.span)?;
+                let rhs_ty = self.infer_expr(rhs)?;
+                self.unify_at(&rhs_ty, &bool_ty, rhs.span)?;
+                Ok(bool_ty)
+            }
+
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lt = self.infer_expr(lhs)?;
                 let rt = self.infer_expr(rhs)?;
@@ -297,7 +332,7 @@ impl<'src> InferCtx<'src> {
                                 BinOp::Mul => "mul",
                                 BinOp::Div => "div",
                                 BinOp::Rem => "rem",
-                                BinOp::Eq | BinOp::Neq => unreachable!(),
+                                _ => unreachable!(),
                             };
                             let method_type = Type::Arrow(
                                 vec![Type::Var(tv), Type::Var(tv)],
@@ -339,6 +374,7 @@ impl<'src> InferCtx<'src> {
                         }
                         Ok(Type::Con("Bool".to_owned()))
                     }
+                    BinOp::And | BinOp::Or => unreachable!(),
                 }
             }
 
@@ -387,9 +423,13 @@ impl<'src> InferCtx<'src> {
                             let cond_ty = self.infer_expr(condition)?;
                             let bool_ty = Type::Con("Bool".to_owned());
                             self.unify_at(&cond_ty, &bool_ty, condition.span)?;
+                            // Flow Is bindings from condition into return_val scope
+                            let guard_saved_env = self.env.clone();
+                            self.collect_is_bindings(condition);
                             // The return value must match the enclosing function's return type.
                             // For now, just infer it; the caller's context will unify as needed.
                             let _ret_ty = self.infer_expr(return_val)?;
+                            self.env = guard_saved_env;
                         }
                     }
                 }
@@ -413,9 +453,15 @@ impl<'src> InferCtx<'src> {
                     for (name, ty) in bindings {
                         self.env.insert(name, Scheme::mono(ty));
                     }
+                    // For True arms of boolean if-then-else, flow Is bindings from scrutinee
+                    if let ast::Pattern::Constructor { name: "True", .. } = &arm.pattern {
+                        self.collect_is_bindings(scrutinee);
+                    }
                     for guard_expr in &arm.guards {
                         let guard_ty = self.infer_expr(guard_expr)?;
                         self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
+                        // Flow Is bindings from guard into subsequent guards and arm body
+                        self.collect_is_bindings(guard_expr);
                     }
                     let body_ty = self.infer_expr(&arm.body)?;
                     self.unify_at(&result_ty, &body_ty, arm.body.span)?;
@@ -446,6 +492,8 @@ impl<'src> InferCtx<'src> {
                     for guard_expr in &arm.guards {
                         let guard_ty = self.infer_expr(guard_expr)?;
                         self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
+                        // Flow Is bindings from guard into subsequent guards and arm body
+                        self.collect_is_bindings(guard_expr);
                     }
                     let body_ty = self.infer_expr(&arm.body)?;
                     self.unify_at(&result_ty, &body_ty, arm.body.span)?;
@@ -577,6 +625,16 @@ impl<'src> InferCtx<'src> {
                         self.engine.display_type(&resolved)
                     ),
                 ))
+            }
+
+            ExprKind::Is {
+                expr: inner,
+                pattern,
+            } => {
+                let inner_ty = self.infer_expr(inner)?;
+                let bindings = self.infer_pattern(pattern, &inner_ty, expr.span, None)?;
+                self.is_bindings.insert(expr.span, bindings);
+                Ok(Type::Con("Bool".to_owned()))
             }
         }
     }
@@ -767,6 +825,29 @@ impl<'src> InferCtx<'src> {
             }
             ast::Pattern::Binding(name) => Ok(vec![((*name).to_owned(), expected.clone())]),
             ast::Pattern::Wildcard => Ok(vec![]),
+        }
+    }
+
+    /// Collect Is bindings from an expression tree and add them to the environment.
+    /// Used by `And` to flow bindings from LHS `is` expressions into RHS scope.
+    fn collect_is_bindings(&mut self, expr: &Expr<'src>) {
+        match &expr.kind {
+            ExprKind::Is { .. } => {
+                if let Some(bindings) = self.is_bindings.get(&expr.span).cloned() {
+                    for (name, ty) in bindings {
+                        self.env.insert(name, Scheme::mono(ty));
+                    }
+                }
+            }
+            ExprKind::BinOp {
+                op: BinOp::And,
+                lhs,
+                rhs,
+            } => {
+                self.collect_is_bindings(lhs);
+                self.collect_is_bindings(rhs);
+            }
+            _ => {}
         }
     }
 

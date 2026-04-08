@@ -264,6 +264,9 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
                 scan_expr(ctx, e);
             }
         }
+        ExprKind::Is { expr: inner, .. } => {
+            scan_expr(ctx, inner);
+        }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) | ExprKind::Name(_) => {}
     }
 }
@@ -521,6 +524,10 @@ fn collect_free<'src>(
                 }
                 collect_free(ctx, &arm.body, &arm_bound, seen, free);
             }
+        }
+        ExprKind::Is { expr: inner, .. } => {
+            collect_free(ctx, inner, bound, seen, free);
+            // Bindings from pattern are NOT free variables
         }
     }
 }
