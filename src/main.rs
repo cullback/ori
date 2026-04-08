@@ -3,6 +3,8 @@ mod error;
 mod lower;
 mod resolve;
 mod source;
+#[allow(dead_code)]
+mod ssa;
 mod stdlib;
 mod syntax;
 #[cfg(test)]
