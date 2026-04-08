@@ -21,7 +21,7 @@ impl fmt::Display for BlockId {
 }
 
 /// Scalar types that fit in a register.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     I8,
     U8,

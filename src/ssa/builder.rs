@@ -8,6 +8,7 @@ pub struct Builder {
     pub blocks: Vec<Block>,
     pub current_block: Option<BlockId>,
     functions: HashMap<String, Function>,
+    pub value_types: HashMap<Value, ScalarType>,
 }
 
 impl Builder {
@@ -17,6 +18,7 @@ impl Builder {
             blocks: Vec::new(),
             current_block: None,
             functions: HashMap::new(),
+            value_types: HashMap::new(),
         }
     }
 
@@ -24,6 +26,10 @@ impl Builder {
         let v = Value(self.next_value);
         self.next_value += 1;
         v
+    }
+
+    pub fn set_type(&mut self, v: Value, ty: ScalarType) {
+        self.value_types.insert(v, ty);
     }
 
     pub fn create_block(&mut self) -> BlockId {
@@ -40,9 +46,10 @@ impl Builder {
         self.current_block = Some(block);
     }
 
-    pub fn add_block_param(&mut self, block: BlockId) -> Value {
+    pub fn add_block_param(&mut self, block: BlockId, ty: ScalarType) -> Value {
         let v = self.fresh_value();
         self.blocks[block.0].params.push(v);
+        self.set_type(v, ty);
         v
     }
 
@@ -51,58 +58,67 @@ impl Builder {
     pub fn const_i64(&mut self, n: i64) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::I64, n as u64));
+        self.set_type(v, ScalarType::I64);
         v
     }
 
     pub fn const_u64(&mut self, n: u64) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::U64, n));
+        self.set_type(v, ScalarType::U64);
         v
     }
 
     pub fn const_f64(&mut self, n: f64) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::F64, n.to_bits()));
+        self.set_type(v, ScalarType::F64);
         v
     }
 
     pub fn const_u8(&mut self, n: u8) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::U8, u64::from(n)));
+        self.set_type(v, ScalarType::U8);
         v
     }
 
     pub fn const_i8(&mut self, n: i8) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::I8, n as u64));
+        self.set_type(v, ScalarType::I8);
         v
     }
 
     pub fn const_bool(&mut self, b: bool) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::Bool, u64::from(b)));
+        self.set_type(v, ScalarType::Bool);
         v
     }
 
     pub fn const_ptr_null(&mut self) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::Ptr, 0));
+        self.set_type(v, ScalarType::Ptr);
         v
     }
 
     // ---- Arithmetic ----
 
-    pub fn binop(&mut self, op: BinaryOp, lhs: Value, rhs: Value) -> Value {
+    pub fn binop(&mut self, op: BinaryOp, lhs: Value, rhs: Value, ty: ScalarType) -> Value {
         let v = self.fresh_value();
         self.push(Inst::BinOp(v, op, lhs, rhs));
+        self.set_type(v, ty);
         v
     }
 
     // ---- Calls ----
 
-    pub fn call(&mut self, func: &str, args: Vec<Value>) -> Value {
+    pub fn call(&mut self, func: &str, args: Vec<Value>, ret_ty: ScalarType) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Call(v, func.to_owned(), args));
+        self.set_type(v, ret_ty);
         v
     }
 
@@ -111,12 +127,14 @@ impl Builder {
     pub fn alloc(&mut self, size: usize) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Alloc(v, size));
+        self.set_type(v, ScalarType::Ptr);
         v
     }
 
-    pub fn load(&mut self, ptr: Value, offset: usize) -> Value {
+    pub fn load(&mut self, ptr: Value, offset: usize, ty: ScalarType) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Load(v, ptr, offset));
+        self.set_type(v, ty);
         v
     }
 
@@ -124,9 +142,10 @@ impl Builder {
         self.push(Inst::Store(ptr, offset, val));
     }
 
-    pub fn load_dyn(&mut self, ptr: Value, idx: Value) -> Value {
+    pub fn load_dyn(&mut self, ptr: Value, idx: Value, ty: ScalarType) -> Value {
         let v = self.fresh_value();
         self.push(Inst::LoadDyn(v, ptr, idx));
+        self.set_type(v, ty);
         v
     }
 
@@ -184,14 +203,24 @@ impl Builder {
 
     // ---- Function building ----
 
-    pub fn finish_function(&mut self, name: &str, params: Vec<Value>) {
+    pub fn finish_function(
+        &mut self,
+        name: &str,
+        params: Vec<Value>,
+        param_types: Vec<ScalarType>,
+        return_type: ScalarType,
+    ) {
         let blocks = std::mem::take(&mut self.blocks);
+        let value_types = std::mem::take(&mut self.value_types);
         self.functions.insert(
             name.to_owned(),
             Function {
                 name: name.to_owned(),
                 params,
                 blocks,
+                param_types,
+                return_type,
+                value_types,
             },
         );
         self.current_block = None;

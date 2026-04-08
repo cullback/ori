@@ -1,6 +1,4 @@
-mod core;
 mod error;
-mod lower;
 mod resolve;
 mod source;
 #[allow(
@@ -15,8 +13,6 @@ mod stdlib;
 mod syntax;
 #[cfg(test)]
 mod test_frontend;
-#[cfg(test)]
-mod test_programs;
 mod types;
 
 use std::io::IsTerminal as _;
@@ -31,7 +27,7 @@ fn compile(
     arena: &mut SourceArena,
     main_file: source::FileId,
     source_dir: Option<&std::path::Path>,
-) -> Result<(crate::core::Program, Vec<crate::core::VarId>), CompileError> {
+) -> Result<(crate::ssa::Module, Vec<crate::ssa::Value>), CompileError> {
     for (name, src) in stdlib::all() {
         arena.add(format!("<stdlib:{name}>"), src.to_owned());
     }
@@ -39,7 +35,7 @@ fn compile(
     let parsed = syntax::parse::parse(arena.content(main_file), main_file)?;
     let resolved = resolve::resolve_imports(parsed, arena, source_dir)?;
     let infer_result = types::infer::check(arena, &resolved.module, &resolved.scope)?;
-    lower::lower(arena, &resolved.module, &resolved.scope, &infer_result)
+    ssa::lower::lower(arena, &resolved.module, &resolved.scope, &infer_result)
 }
 
 fn bytes_to_scalar(bytes: &[u8], heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {
@@ -106,16 +102,13 @@ fn main() {
     let main_file = arena.add(source_path.clone(), content);
 
     let source_dir = std::path::Path::new(source_path).parent();
-    let (program, input_vars) = match compile(&mut arena, main_file, source_dir) {
+    let (ssa_module, input_vals) = match compile(&mut arena, main_file, source_dir) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("{}", e.format(&arena));
             process::exit(1);
         }
     };
-
-    // Lower Core → SSA
-    let ssa_module = ssa::lower::lower(&program, &input_vars);
 
     if dump_ssa {
         eprint!("{ssa_module}");
@@ -141,7 +134,7 @@ fn main() {
     };
 
     let mut ssa_args = Vec::new();
-    for i in 0..input_vars.len() {
+    for i in 0..input_vals.len() {
         ssa_args.push(match i {
             0 => args_list,
             1 => stdin_val,

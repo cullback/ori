@@ -23,6 +23,9 @@ pub struct Function {
     pub name: String,
     pub params: Vec<Value>,
     pub blocks: Vec<Block>,
+    pub param_types: Vec<ScalarType>,
+    pub return_type: ScalarType,
+    pub value_types: std::collections::HashMap<Value, ScalarType>,
 }
 
 /// Top-level SSA module — all functions.
