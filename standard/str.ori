@@ -1,3 +1,5 @@
+exports [Str]
+
 # UTF-8 encoded string, backed by a byte list.
 Str := List(U8).(
     # Returns the number of bytes in the string.

@@ -1,3 +1,6 @@
+import Bool
+import List
+
 # Records, row polymorphism, type aliases, and built-in lists
 
 # Type alias for a record type

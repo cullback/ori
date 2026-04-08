@@ -1,3 +1,5 @@
+exports [List]
+
 # Built-in vector-backed ordered collection.
 # Methods without bodies are compiler builtins.
 List := {}.(

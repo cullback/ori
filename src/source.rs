@@ -31,6 +31,7 @@ impl SourceArena {
         self.files[id.0].0
     }
 
+    #[allow(dead_code)]
     pub fn find_by_path(&self, path: &str) -> Option<FileId> {
         self.files.iter().position(|(p, _)| *p == path).map(FileId)
     }

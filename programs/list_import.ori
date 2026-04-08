@@ -1,3 +1,6 @@
+import Bool
+import List
+
 main : I64 -> I64
 main = |arg| (
     xs = [1, 2, 3, 4, 5]

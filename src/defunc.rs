@@ -35,7 +35,6 @@ pub struct DefuncTable<'src> {
 /// building the defunctionalization table.
 pub fn collect<'src>(
     module: &ast::Module<'src>,
-    stdlib_methods: &[(&'src str, &Decl<'src>)],
     decls: &DeclInfo,
     reachable: &HashSet<String>,
     infer_result: &InferResult,
@@ -54,28 +53,6 @@ pub fn collect<'src>(
 
     // Scan user declarations
     collect_lambdas(&mut ctx, &module.decls, reachable);
-
-    // Scan stdlib method bodies
-    for &(type_name, method) in stdlib_methods {
-        if let Decl::FuncDef {
-            name, params, body, ..
-        } = method
-        {
-            let mangled = method_key(type_name, name);
-            if reachable.contains(&mangled) {
-                for (i, p) in params.iter().enumerate() {
-                    let key = (mangled.clone(), i);
-                    if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
-                        ctx.ho_vars.insert((*p).to_owned(), ls_idx);
-                    }
-                }
-                scan_expr(&mut ctx, body);
-                for p in params {
-                    ctx.ho_vars.remove(*p);
-                }
-            }
-        }
-    }
 
     // Duplicate ho_param_sets entries for function aliases
     let alias_entries: Vec<((String, usize), usize)> = ctx
@@ -126,28 +103,53 @@ fn collect_lambdas<'src>(
     decls: &[Decl<'src>],
     reachable: &HashSet<String>,
 ) {
+    // Pass 1: scan free function bodies (establishes lambda sets from callers)
     for decl in decls {
-        match decl {
-            Decl::FuncDef { name, body, .. } => {
-                if reachable.contains(*name) {
-                    scan_expr(ctx, body);
+        if let Decl::FuncDef {
+            name, params, body, ..
+        } = decl
+            && reachable.contains(*name)
+        {
+            for (i, p) in params.iter().enumerate() {
+                let key = ((*name).to_owned(), i);
+                if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
+                    ctx.ho_vars.insert((*p).to_owned(), ls_idx);
                 }
             }
-            Decl::TypeAnno {
-                name: type_name,
-                methods,
-                ..
-            } => {
-                for method_decl in methods {
-                    if let Decl::FuncDef {
-                        name: method_name,
-                        body,
-                        ..
-                    } = method_decl
-                    {
-                        let mangled = method_key(type_name, method_name);
-                        if reachable.contains(&mangled) {
-                            scan_expr(ctx, body);
+            scan_expr(ctx, body);
+            for p in params {
+                ctx.ho_vars.remove(*p);
+            }
+        }
+    }
+
+    // Pass 2: scan method bodies (uses lambda sets established by callers)
+    for decl in decls {
+        if let Decl::TypeAnno {
+            name: type_name,
+            methods,
+            ..
+        } = decl
+        {
+            for method_decl in methods {
+                if let Decl::FuncDef {
+                    name: method_name,
+                    params,
+                    body,
+                    ..
+                } = method_decl
+                {
+                    let mangled = method_key(type_name, method_name);
+                    if reachable.contains(&mangled) {
+                        for (i, p) in params.iter().enumerate() {
+                            let key = (mangled.clone(), i);
+                            if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
+                                ctx.ho_vars.insert((*p).to_owned(), ls_idx);
+                            }
+                        }
+                        scan_expr(ctx, body);
+                        for p in params {
+                            ctx.ho_vars.remove(*p);
                         }
                     }
                 }

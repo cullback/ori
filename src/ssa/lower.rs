@@ -21,28 +21,14 @@ pub fn lower<'src>(
     scope: &crate::resolve::ModuleScope,
     infer_result: &InferResult,
 ) -> Result<(Module, Vec<Value>), CompileError> {
-    // Parse stdlib modules
-    let bool_stdlib = decl_info::parse_stdlib_module(arena, "Bool");
-    let result_stdlib = decl_info::parse_stdlib_module(arena, "Result");
-    let list_stdlib = decl_info::parse_stdlib_module(arena, "List");
-    let str_stdlib = decl_info::parse_stdlib_module(arena, "Str");
-    let stdlib_modules = [bool_stdlib, result_stdlib, list_stdlib, str_stdlib];
-
     // Pass 1: Registration
-    let (mut decls, all_stdlib_methods) =
-        decl_info::build(arena, module, scope, infer_result, &stdlib_modules);
+    let mut decls = decl_info::build(arena, module, scope, infer_result);
 
     // Pass 2: Reachability
-    let reachable = crate::reachable::compute(&decls, module, &all_stdlib_methods, infer_result);
+    let reachable = crate::reachable::compute(&decls, module, infer_result);
 
     // Pass 3: Defunctionalization
-    let defunc_table = defunc::collect(
-        module,
-        &all_stdlib_methods,
-        &decls,
-        &reachable,
-        infer_result,
-    );
+    let defunc_table = defunc::collect(module, &decls, &reachable, infer_result);
 
     // Merge closure constructors into DeclInfo
     decls
@@ -50,14 +36,7 @@ pub fn lower<'src>(
         .extend(defunc_table.closure_constructors.clone());
 
     // Pass 4: SSA emission
-    lower_to_ssa(
-        module,
-        infer_result,
-        &decls,
-        &reachable,
-        &defunc_table,
-        &all_stdlib_methods,
-    )
+    lower_to_ssa(module, infer_result, &decls, &reachable, &defunc_table)
 }
 
 // ---- SSA lowering context ----
@@ -1169,7 +1148,6 @@ fn lower_to_ssa<'src>(
     decls: &DeclInfo,
     reachable: &HashSet<String>,
     defunc_table: &DefuncTable<'src>,
-    all_stdlib_methods: &[(&'src str, &Decl<'src>)],
 ) -> Result<(Module, Vec<Value>), CompileError> {
     let mut ctx = LowerCtx::new(decls, defunc_table, infer_result);
 
@@ -1238,32 +1216,6 @@ fn lower_to_ssa<'src>(
                 continue;
             }
 
-            for (i, p) in params.iter().enumerate() {
-                let key = (mangled.clone(), i);
-                if let Some(&ls_idx) = defunc_table.ho_param_sets.get(&key) {
-                    ctx.ho_vars.insert((*p).to_owned(), ls_idx);
-                }
-            }
-
-            ctx.lower_function(&mangled, params, body);
-
-            for p in params {
-                ctx.vars.remove(*p);
-                ctx.ho_vars.remove(*p);
-            }
-        }
-    }
-
-    // Lower stdlib method bodies
-    for &(type_name, method) in all_stdlib_methods {
-        if let Decl::FuncDef {
-            name, params, body, ..
-        } = method
-        {
-            let mangled = method_key(type_name, name);
-            if !reachable.contains(&mangled) {
-                continue;
-            }
             for (i, p) in params.iter().enumerate() {
                 let key = (mangled.clone(), i);
                 if let Some(&ls_idx) = defunc_table.ho_param_sets.get(&key) {

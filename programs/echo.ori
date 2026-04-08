@@ -1,3 +1,8 @@
+import Bool
+import List
+import Str
+import Result
+
 # Echoes the first command line argument.
 main : List(Str) -> Result(Str, Str)
 main = |args|

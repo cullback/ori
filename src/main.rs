@@ -31,10 +31,6 @@ fn compile(
     main_file: source::FileId,
     source_dir: Option<&std::path::Path>,
 ) -> Result<(crate::ssa::Module, Vec<crate::ssa::Value>), CompileError> {
-    for (name, src) in stdlib::all() {
-        arena.add(format!("<stdlib:{name}>"), src.to_owned());
-    }
-
     let parsed = syntax::parse::parse(arena.content(main_file), main_file)?;
     let resolved = resolve::resolve_imports(parsed, arena, source_dir)?;
     let infer_result = types::infer::check(arena, &resolved.module, &resolved.scope)?;

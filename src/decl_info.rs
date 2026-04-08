@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use crate::source::SourceArena;
 use crate::ssa::ScalarType;
 use crate::syntax::ast::{self, Decl, TypeExpr};
-use crate::syntax::parse;
 use crate::types::engine::{Scheme, Type};
 use crate::types::infer::InferResult;
 
@@ -60,17 +59,13 @@ pub struct DeclInfo {
     pub constructor_schemes: HashMap<String, Scheme>,
 }
 
-/// Build `DeclInfo` and collect stdlib method references.
-///
-/// Returns the registration data and a flat list of `(type_name, &Decl)` for
-/// every method in every stdlib module. These are needed by later passes.
-pub fn build<'a, 'src>(
+/// Build `DeclInfo` from the resolved module declarations.
+pub fn build<'src>(
     _arena: &'src SourceArena,
     module: &ast::Module<'src>,
     scope: &crate::resolve::ModuleScope,
     infer_result: &InferResult,
-    stdlib_modules: &'a [ast::Module<'src>],
-) -> (DeclInfo, Vec<(&'src str, &'a Decl<'src>)>) {
+) -> DeclInfo {
     let mut info = DeclInfo {
         funcs: HashSet::new(),
         func_arities: HashMap::new(),
@@ -83,19 +78,8 @@ pub fn build<'a, 'src>(
         constructor_schemes: infer_result.constructor_schemes.clone(),
     };
 
-    // Register stdlib modules
-    for stdlib in stdlib_modules {
-        register_decls(&mut info, &stdlib.decls);
-    }
-
     register_comparison_info();
     register_num_to_str(&mut info);
-
-    // Collect stdlib methods
-    let mut all_stdlib_methods: Vec<(&'src str, &'a Decl<'src>)> = Vec::new();
-    for stdlib in stdlib_modules {
-        all_stdlib_methods.extend(extract_methods(stdlib));
-    }
 
     // Register user declarations
     register_decls(&mut info, &module.decls);
@@ -157,16 +141,7 @@ pub fn build<'a, 'src>(
         }
     }
 
-    (info, all_stdlib_methods)
-}
-
-/// Parse a stdlib module from the arena by name.
-pub fn parse_stdlib_module<'src>(arena: &'src SourceArena, module_name: &str) -> ast::Module<'src> {
-    let file_id = arena
-        .find_by_path(&format!("<stdlib:{module_name}>"))
-        .unwrap_or_else(|| panic!("stdlib module '{module_name}' not loaded in arena"));
-    parse::parse(arena.content(file_id), file_id)
-        .expect("stdlib module should always parse successfully")
+    info
 }
 
 /// Register all declarations (types, constructors, functions) into `DeclInfo`.
@@ -277,24 +252,4 @@ fn register_num_to_str(info: &mut DeclInfo) {
         info.num_to_str_methods.insert(key.clone());
         info.func_arities.insert(key, 1);
     }
-}
-
-/// Extract `(type_name, &Decl)` pairs for all methods in a stdlib module.
-pub fn extract_methods<'a, 'src>(
-    stdlib: &'a ast::Module<'src>,
-) -> Vec<(&'src str, &'a Decl<'src>)> {
-    let mut methods = Vec::new();
-    for decl in &stdlib.decls {
-        if let Decl::TypeAnno {
-            name,
-            methods: type_methods,
-            ..
-        } = decl
-        {
-            for m in type_methods {
-                methods.push((*name, m));
-            }
-        }
-    }
-    methods
 }

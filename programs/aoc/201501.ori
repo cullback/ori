@@ -1,3 +1,8 @@
+import Bool
+import List
+import Str
+import Result
+
 # Advent of Code 2015, Day 1: Not Quite Lisp
 
 part1 : Str -> I64

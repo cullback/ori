@@ -1,3 +1,5 @@
+exports [Bool]
+
 Bool := [True, False].(
     not : Bool -> Bool
     not = |b| if b

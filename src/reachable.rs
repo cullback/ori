@@ -8,19 +8,13 @@ use crate::types::infer::InferResult;
 ///
 /// Walks the call graph through user declarations, stdlib methods, and method
 /// resolutions, expanding through function aliases.
-pub fn compute<'src>(
+pub fn compute(
     decls: &DeclInfo,
-    module: &ast::Module<'src>,
-    stdlib_methods: &[(&'src str, &Decl<'src>)],
+    module: &ast::Module<'_>,
     infer_result: &InferResult,
 ) -> HashSet<String> {
     let mut bodies: HashMap<String, &Expr<'_>> = HashMap::new();
 
-    for &(type_name, method) in stdlib_methods {
-        if let Decl::FuncDef { name, body, .. } = method {
-            bodies.insert(method_key(type_name, name), body);
-        }
-    }
     for decl in &module.decls {
         match decl {
             Decl::FuncDef { name, body, .. } => {

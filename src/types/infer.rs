@@ -78,8 +78,6 @@ impl<'src> InferCtx<'src> {
                 "I64".to_owned(),
                 "U64".to_owned(),
                 "F64".to_owned(),
-                "List".to_owned(),
-                "Str".to_owned(),
             ]),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
@@ -236,146 +234,6 @@ impl<'src> InferCtx<'src> {
                     ty: con_type,
                 },
             );
-        }
-        Ok(())
-    }
-
-    // ---- Stdlib module registration ----
-
-    /// Parse and register a stdlib module: types, constructors, method signatures, and bodies.
-    fn register_stdlib_module(
-        &mut self,
-        arena: &'src SourceArena,
-        module_name: &str,
-    ) -> Result<(), CompileError> {
-        let file_id = arena
-            .find_by_path(&format!("<stdlib:{module_name}>"))
-            .ok_or_else(|| {
-                CompileError::new(format!("stdlib module '{module_name}' not loaded in arena"))
-            })?;
-        let stdlib = crate::syntax::parse::parse(arena.content(file_id), file_id)?;
-
-        for decl in &stdlib.decls {
-            match decl {
-                Decl::TypeAnno {
-                    name,
-                    type_params,
-                    ty: TypeExpr::TagUnion(tags),
-                    methods,
-                    ..
-                } => {
-                    let name = *name;
-                    self.register_type_decl(name, type_params, tags)?;
-                    self.register_methods(name, methods)?;
-                    self.infer_method_bodies(name, methods)?;
-                }
-                Decl::TypeAnno {
-                    name,
-                    ty,
-                    kind,
-                    methods,
-                    ..
-                } => {
-                    let name = *name;
-                    // For nominal types, add transparency so method bodies
-                    // can convert between the nominal and underlying type.
-                    if *kind != TypeDeclKind::Alias {
-                        let underlying = self.resolve_type_expr(ty)?;
-                        self.engine.transparent.insert(name.to_owned(), underlying);
-                    }
-                    self.register_methods(name, methods)?;
-                    self.infer_method_bodies(name, methods)?;
-                    // Opaque: remove transparency after method block
-                    if *kind == TypeDeclKind::Opaque {
-                        self.engine.transparent.remove(name);
-                    }
-                }
-                Decl::FuncDef { name, params, .. } => {
-                    let name = *name;
-                    let param_types: Vec<Type> =
-                        params.iter().map(|_| self.engine.fresh()).collect();
-                    let ret = self.engine.fresh();
-                    let func_ty = Type::Arrow(param_types, Box::new(ret));
-                    self.env.insert(name.to_owned(), Scheme::mono(func_ty));
-                }
-            }
-        }
-
-        // Infer free function bodies
-        for decl in &stdlib.decls {
-            if let Decl::FuncDef {
-                name, params, body, ..
-            } = decl
-            {
-                self.infer_func_body(name, params, body)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Register method signatures and type annotations for methods on a type.
-    fn register_methods(
-        &mut self,
-        type_name: &str,
-        methods: &[Decl<'src>],
-    ) -> Result<(), CompileError> {
-        for method in methods {
-            match method {
-                Decl::FuncDef {
-                    name: method_name,
-                    params,
-                    ..
-                } => {
-                    let method_name = *method_name;
-                    let mangled = method_key(type_name, method_name);
-                    let param_types: Vec<Type> =
-                        params.iter().map(|_| self.engine.fresh()).collect();
-                    let ret = self.engine.fresh();
-                    let func_ty = Type::Arrow(param_types, Box::new(ret));
-                    self.env.insert(mangled, Scheme::mono(func_ty));
-                }
-                Decl::TypeAnno {
-                    name: method_name,
-                    ty,
-                    ..
-                } => {
-                    let method_name = *method_name;
-                    let mangled = method_key(type_name, method_name);
-                    // Body-less annotation: convert to a proper scheme for builtins
-                    let mut tvar_env = HashMap::new();
-                    let anno_ty = self.type_expr_to_type(ty, &mut tvar_env)?;
-                    let tvars: Vec<crate::types::engine::TypeVar> =
-                        tvar_env.into_values().collect();
-                    let scheme = Scheme {
-                        vars: tvars,
-                        constraints: vec![],
-                        ty: anno_ty,
-                    };
-                    self.env.insert(mangled.clone(), scheme);
-                    self.type_annos.insert(mangled, ty.clone());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Infer bodies of Ori-implemented methods on a type.
-    fn infer_method_bodies(
-        &mut self,
-        type_name: &str,
-        methods: &[Decl<'src>],
-    ) -> Result<(), CompileError> {
-        for method in methods {
-            if let Decl::FuncDef {
-                name: method_name,
-                params,
-                body,
-                ..
-            } = method
-            {
-                let mangled = method_key(type_name, method_name);
-                self.infer_func_body(&mangled, params, body)?;
-            }
         }
         Ok(())
     }
@@ -1050,12 +908,6 @@ pub fn check<'src>(
 ) -> Result<InferResult, CompileError> {
     let mut ctx = InferCtx::new();
 
-    // Register stdlib modules
-    ctx.register_stdlib_module(arena, "Bool")?;
-    ctx.register_stdlib_module(arena, "Result")?;
-    ctx.register_stdlib_module(arena, "List")?;
-    ctx.register_stdlib_module(arena, "Str")?;
-
     // Register to_str for all numeric types (not as full modules — their
     // := {} declaration would incorrectly make them transparent to {}).
     for ty in &["I64", "U64", "F64", "U8", "I8"] {
@@ -1105,6 +957,7 @@ pub fn check<'src>(
                         }
                         Decl::TypeAnno {
                             name: method_name,
+                            span: method_span,
                             ty,
                             ..
                         } => {
@@ -1114,7 +967,18 @@ pub fn check<'src>(
                                 let qual = format!("{mod_name}.{mangled}");
                                 ctx.type_annos.insert(qual, ty.clone());
                             }
-                            ctx.type_annos.insert(mangled, ty.clone());
+                            ctx.type_annos.insert(mangled.clone(), ty.clone());
+                            if arena.path(method_span.file).starts_with("<stdlib:") {
+                                let mut tvar_env = HashMap::new();
+                                let anno_ty = ctx.type_expr_to_type(ty, &mut tvar_env)?;
+                                let tvars: Vec<_> = tvar_env.into_values().collect();
+                                let scheme = Scheme {
+                                    vars: tvars,
+                                    constraints: vec![],
+                                    ty: anno_ty,
+                                };
+                                ctx.env.insert(mangled, scheme);
+                            }
                         }
                     }
                 }
@@ -1151,12 +1015,25 @@ pub fn check<'src>(
                             }
                             Decl::TypeAnno {
                                 name: method_name,
+                                span: method_span,
                                 ty: method_ty,
                                 ..
                             } => {
                                 let method_name = *method_name;
                                 let mangled = method_key(name, method_name);
-                                ctx.type_annos.insert(mangled, method_ty.clone());
+                                ctx.type_annos.insert(mangled.clone(), method_ty.clone());
+                                if arena.path(method_span.file).starts_with("<stdlib:") {
+                                    let mut tvar_env = HashMap::new();
+                                    let anno_ty =
+                                        ctx.type_expr_to_type(method_ty, &mut tvar_env)?;
+                                    let tvars: Vec<_> = tvar_env.into_values().collect();
+                                    let scheme = Scheme {
+                                        vars: tvars,
+                                        constraints: vec![],
+                                        ty: anno_ty,
+                                    };
+                                    ctx.env.insert(mangled, scheme);
+                                }
                             }
                         }
                     }
@@ -1229,7 +1106,8 @@ pub fn check<'src>(
                 // For nominal types (:= and ::), make the type transparent
                 // so method bodies can convert between the nominal and underlying type.
                 // For transparent (:=), this persists. For opaque (::), removed after.
-                if *kind != TypeDeclKind::Alias {
+                // Tag unions are not transparent — they define distinct sum types.
+                if *kind != TypeDeclKind::Alias && !matches!(ty, TypeExpr::TagUnion(_)) {
                     let underlying = ctx.resolve_type_expr(ty)?;
                     ctx.engine.transparent.insert(name.to_owned(), underlying);
                 }
@@ -1252,10 +1130,13 @@ pub fn check<'src>(
                     } = method
                         && !func_names.contains(method_name)
                     {
-                        return Err(CompileError::at(
-                            *method_span,
-                            format!("method '{name}.{method_name}' declared but not defined"),
-                        ));
+                        let is_stdlib = arena.path(method_span.file).starts_with("<stdlib:");
+                        if !is_stdlib {
+                            return Err(CompileError::at(
+                                *method_span,
+                                format!("method '{name}.{method_name}' declared but not defined"),
+                            ));
+                        }
                     }
                 }
 

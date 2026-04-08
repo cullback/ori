@@ -1,3 +1,8 @@
+import Bool
+import List
+import Str
+import Result
+
 # Passes stdin through to stdout.
 main : List(Str), Str -> Result(Str, Str)
 main = |args, stdin| Ok(stdin)
