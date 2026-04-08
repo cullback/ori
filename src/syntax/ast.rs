@@ -135,6 +135,11 @@ pub enum ExprKind<'src> {
     },
     Tuple(Vec<Expr<'src>>),
     ListLit(Vec<Expr<'src>>),
+    MethodCall {
+        receiver: Box<Expr<'src>>,
+        method: &'src str,
+        args: Vec<Expr<'src>>,
+    },
 }
 
 #[derive(Debug, Clone)]

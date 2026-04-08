@@ -598,6 +598,71 @@ impl<'src> InferCtx<'src> {
                 }
                 Ok(Type::App("List".to_owned(), vec![elem_ty]))
             }
+
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                let recv_ty = self.infer_expr(receiver)?;
+                let mut arg_types = Vec::new();
+                for a in args {
+                    arg_types.push(self.infer_expr(a)?);
+                }
+                let ret = self.engine.fresh();
+                let resolved = self.engine.resolve(&recv_ty);
+
+                // Concrete type: look up Type.method
+                if let Type::Con(name) | Type::App(name, _) = &resolved {
+                    let mangled = format!("{name}.{method}");
+                    if let Some(scheme) = self.env.get(&mangled).cloned() {
+                        let func_ty = self.engine.instantiate(&scheme);
+                        let mut full_args = vec![recv_ty];
+                        full_args.extend(arg_types);
+                        let expected = Type::Arrow(full_args, Box::new(ret.clone()));
+                        self.unify_at(&func_ty, &expected, expr.span)?;
+                        self.method_resolutions.insert(expr.span, mangled);
+                        return Ok(ret);
+                    }
+                    // Numeric builtins
+                    if Self::NUMERIC_TYPES.contains(&name.as_str())
+                        && Self::ARITHMETIC_METHODS.contains(method)
+                    {
+                        let concrete_ty = resolved.clone();
+                        self.unify_at(&recv_ty, &concrete_ty, expr.span)?;
+                        for arg_ty in &arg_types {
+                            self.unify_at(arg_ty, &concrete_ty, expr.span)?;
+                        }
+                        self.method_resolutions
+                            .insert(expr.span, format!("__builtin.{method}"));
+                        if *method == "eq" || *method == "neq" {
+                            return Ok(Type::Con("Bool".to_owned()));
+                        }
+                        return Ok(concrete_ty);
+                    }
+                }
+
+                // Type variable: generate constraint
+                if let Type::Var(tv) = resolved {
+                    let mut param_types = vec![Type::Var(tv)];
+                    param_types.extend(arg_types);
+                    let method_type = Type::Arrow(param_types, Box::new(ret.clone()));
+                    self.engine.constraints.push(Constraint {
+                        type_var: tv,
+                        method_name: (*method).to_owned(),
+                        method_type,
+                    });
+                    return Ok(ret);
+                }
+
+                Err(CompileError::at(
+                    expr.span,
+                    format!(
+                        "no method '{method}' on type {}",
+                        self.engine.display_type(&resolved)
+                    ),
+                ))
+            }
         }
     }
 

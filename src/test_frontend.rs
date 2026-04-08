@@ -996,6 +996,33 @@ main = |arg| List.len([])";
 // ============================================================
 
 #[test]
+fn dot_method_call() {
+    let source = "\
+main : I64 -> U64
+main = |arg| \"hello\".count_bytes()";
+
+    assert_eq!(run_u64(source, 0), 5);
+}
+
+#[test]
+fn dot_method_chain() {
+    let source = "\
+main : I64 -> U64
+main = |arg| \"hi\".concat(\"!\").count_bytes()";
+
+    assert_eq!(run_u64(source, 0), 3);
+}
+
+#[test]
+fn dot_method_on_list() {
+    let source = "\
+main : I64 -> I64
+main = |arg| [10, 20, 30].get(1)";
+
+    assert_eq!(run_i64(source, 0), 20);
+}
+
+#[test]
 fn str_count_bytes() {
     let source = "\
 main : I64 -> U64

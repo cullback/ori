@@ -226,6 +226,7 @@ impl ParseCtx {
 
     // ---- Expressions (Pratt parser for operators) ----
 
+    #[expect(clippy::too_many_lines, reason = "handles all expression forms")]
     fn parse_expr<'src>(&self, pair: Pair<'src, Rule>) -> Expr<'src> {
         let span = self.span_of(&pair);
         match pair.as_rule() {
@@ -261,6 +262,47 @@ impl ParseCtx {
                     .parse(pair.into_inner())
             }
             Rule::atom => {
+                let mut inner = pair.into_inner();
+                let base = self.parse_expr(inner.next().unwrap());
+                // Fold postfix chains: .method(args) or .field
+                inner.fold(base, |receiver, postfix| {
+                    let postfix_span = Span {
+                        file: self.file,
+                        start: receiver.span.start,
+                        end: self.span_of(&postfix).end,
+                    };
+                    let mut parts = postfix.into_inner();
+                    let first = parts.next().unwrap();
+                    match first.as_rule() {
+                        Rule::method_head => {
+                            let text = first.as_str();
+                            // Strip leading "." and trailing "("
+                            let method = &text[1..text.len() - 1];
+                            let args: Vec<Expr<'_>> = parts
+                                .find(|p| p.as_rule() == Rule::args)
+                                .map(|p| p.into_inner().map(|a| self.parse_expr(a)).collect())
+                                .unwrap_or_default();
+                            Expr::new(
+                                ExprKind::MethodCall {
+                                    receiver: Box::new(receiver),
+                                    method,
+                                    args,
+                                },
+                                postfix_span,
+                            )
+                        }
+                        Rule::name => Expr::new(
+                            ExprKind::FieldAccess {
+                                record: Box::new(receiver),
+                                field: first.as_str(),
+                            },
+                            postfix_span,
+                        ),
+                        _ => panic!("unexpected postfix rule: {:?}", first.as_rule()),
+                    }
+                })
+            }
+            Rule::base_atom => {
                 let inner = pair.into_inner().next().unwrap();
                 self.parse_expr(inner)
             }
@@ -332,26 +374,7 @@ impl ParseCtx {
                     .unwrap_or_default();
                 Expr::new(ExprKind::Call { func, args }, span)
             }
-            Rule::name => {
-                let first_name = first.as_str();
-                if inner.is_empty() {
-                    return Expr::new(ExprKind::Name(first_name), span);
-                }
-                // Field access chain
-                let mut result = Expr::new(ExprKind::Name(first_name), span);
-                for field in inner {
-                    if field.as_rule() == Rule::name {
-                        result = Expr::new(
-                            ExprKind::FieldAccess {
-                                record: Box::new(result),
-                                field: field.as_str(),
-                            },
-                            span,
-                        );
-                    }
-                }
-                result
-            }
+            Rule::name => Expr::new(ExprKind::Name(first.as_str()), span),
             other => panic!("unexpected call_or_access child: {other:?}"),
         }
     }

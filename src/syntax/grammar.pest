@@ -57,7 +57,9 @@ field_type = { name ~ ":" ~ type_atom }
 
 expr = { atom ~ (binop ~ atom)* }
 
-atom = {
+atom = { base_atom ~ postfix* }
+
+base_atom = {
     if_expr
   | fold_expr
   | lambda
@@ -72,6 +74,13 @@ atom = {
   | int_lit
 }
 
+// Postfix: .method(args) or .field
+method_head = @{ "." ~ name ~ "(" }
+postfix = {
+    method_head ~ args? ~ ")"
+  | "." ~ name
+}
+
 list_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
 
 tuple = { "(" ~ expr ~ ("," ~ expr)+ ~ ")" }
@@ -83,7 +92,6 @@ neg_expr = { "-" ~ atom }
 call_or_access = {
     qualified_head ~ args? ~ ")"
   | call_head ~ args? ~ ")"
-  | name ~ ("." ~ name)+
   | name
 }
 

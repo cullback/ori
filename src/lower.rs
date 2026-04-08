@@ -643,6 +643,12 @@ impl<'src> LowerCtx<'src> {
                 }
             }
             ExprKind::FieldAccess { record, .. } => Self::collect_refs(record, refs),
+            ExprKind::MethodCall { receiver, args, .. } => {
+                Self::collect_refs(receiver, refs);
+                for a in args {
+                    Self::collect_refs(a, refs);
+                }
+            }
             ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
                 for e in elems {
                     Self::collect_refs(e, refs);
@@ -784,6 +790,12 @@ impl<'src> LowerCtx<'src> {
             ExprKind::FieldAccess { record, .. } => {
                 self.scan_expr(record);
             }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.scan_expr(receiver);
+                for a in args {
+                    self.scan_expr(a);
+                }
+            }
             ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
                 for e in elems {
                     self.scan_expr(e);
@@ -881,6 +893,7 @@ impl<'src> LowerCtx<'src> {
         free
     }
 
+    #[expect(clippy::too_many_lines, reason = "traverses all expression forms")]
     fn collect_free(
         &self,
         expr: &Expr<'src>,
@@ -932,6 +945,12 @@ impl<'src> LowerCtx<'src> {
             }
             ExprKind::FieldAccess { record, .. } => {
                 self.collect_free(record, bound, seen, free);
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.collect_free(receiver, bound, seen, free);
+                for a in args {
+                    self.collect_free(a, bound, seen, free);
+                }
             }
             ExprKind::Lambda { params, body } => {
                 let mut inner = bound.clone();
@@ -1186,6 +1205,47 @@ impl<'src> LowerCtx<'src> {
 
             ExprKind::FieldAccess { record, field } => {
                 Core::field_access(self.lower_expr(record), (*field).to_owned())
+            }
+
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                // Look up resolved method from type inference
+                let resolved = self.method_resolutions.get(&expr.span).cloned();
+                if let Some(mangled) = resolved {
+                    // Build full args: receiver + method args
+                    let recv_core = self.lower_expr(receiver);
+                    let mut full_args = vec![recv_core];
+                    for a in args {
+                        full_args.push(self.lower_expr(a));
+                    }
+                    // Check for builtin
+                    if let Some(op_name) = mangled.strip_prefix("__builtin.") {
+                        let binop_id = self.binops[&match op_name {
+                            "add" => BinOp::Add,
+                            "sub" => BinOp::Sub,
+                            "mul" => BinOp::Mul,
+                            "div" => BinOp::Div,
+                            "rem" => BinOp::Rem,
+                            "eq" => BinOp::Eq,
+                            "neq" => BinOp::Neq,
+                            _ => panic!("unknown builtin: {op_name}"),
+                        }];
+                        return Core::app(binop_id, full_args);
+                    }
+                    // Check list builtins
+                    if let Some(&builtin_id) = self.list_builtins.get(&mangled) {
+                        return Core::app(builtin_id, full_args);
+                    }
+                    // Regular method
+                    if let Some(&func_id) = self.funcs.get(&mangled) {
+                        return Core::app(func_id, full_args);
+                    }
+                    panic!("unresolved method: {mangled}");
+                }
+                panic!("no method resolution for .{method}() at {:?}", expr.span);
             }
 
             ExprKind::Tuple(elems) => {
