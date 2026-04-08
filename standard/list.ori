@@ -34,6 +34,6 @@ List := {}.(
     map = |xs, f| List.walk(xs, [], |acc, x| List.append(acc, f(x)))
 
     # Returns the sum of all elements.
-    sum : List(I64) -> I64
+    sum : List(a) -> a where [a.add]
     sum = |xs| List.walk(xs, 0, |acc, x| acc + x)
 )
