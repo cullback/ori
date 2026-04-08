@@ -45,12 +45,25 @@ pub fn resolve_imports<'src>(
     source_dir: Option<&Path>,
 ) -> Result<Resolved<'src>, CompileError> {
     let mut scope = ModuleScope::new();
-
-    if module.imports.is_empty() {
-        return Ok(Resolved { module, scope });
-    }
-
     let mut all_decls: Vec<Decl<'src>> = Vec::new();
+
+    // Auto-import all stdlib modules so they're always available.
+    for name in stdlib::MODULES {
+        let src = stdlib::get(name).unwrap();
+        let file_id = arena.add(format!("<stdlib:{name}>"), src.to_owned());
+        let imported = parse::parse(arena.content(file_id), file_id)?;
+        let exported: Vec<Decl<'_>> = imported
+            .decls
+            .into_iter()
+            .filter(|d| {
+                let n = match d {
+                    Decl::TypeAnno { name, .. } | Decl::FuncDef { name, .. } => *name,
+                };
+                imported.exports.contains(&n)
+            })
+            .collect();
+        all_decls.extend(exported);
+    }
 
     for import in &module.imports {
         // Try stdlib first, then file system

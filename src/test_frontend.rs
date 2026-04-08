@@ -207,20 +207,19 @@ main = |arg| unwrap_or(Nothing, 99)";
 
 #[test]
 fn if_then_else_true_branch() {
-    let source = "import Bool\nmain : I64 -> I64\nmain = |x| if x == 0 then 99 else x * 2";
+    let source = "main : I64 -> I64\nmain = |x| if x == 0 then 99 else x * 2";
     assert_eq!(run_i64(source, 0), 99);
 }
 
 #[test]
 fn if_then_else_false_branch() {
-    let source = "import Bool\nmain : I64 -> I64\nmain = |x| if x == 0 then 99 else x * 2";
+    let source = "main : I64 -> I64\nmain = |x| if x == 0 then 99 else x * 2";
     assert_eq!(run_i64(source, 5), 10);
 }
 
 #[test]
 fn if_then_else_nested() {
     let source = "\
-import Bool
 main : I64 -> I64
 main = |x| (
     a = if x == 0 then 1 else 0
@@ -233,7 +232,7 @@ main = |x| (
 
 #[test]
 fn not_equal() {
-    let source = "import Bool\nmain : I64 -> I64\nmain = |x| if x != 0 then 1 else 0";
+    let source = "main : I64 -> I64\nmain = |x| if x != 0 then 1 else 0";
     assert_eq!(run_i64(source, 0), 0);
     assert_eq!(run_i64(source, 7), 1);
 }
@@ -243,10 +242,8 @@ fn not_equal() {
 // ============================================================
 
 #[test]
-fn imported_bool_available() {
-    // Use True/False by importing Bool
+fn prelude_bool_available() {
     let source = "\
-import Bool
 to_i64 : Bool -> I64
 to_i64 = |b| if b
     : True then 1
@@ -387,7 +384,6 @@ main = |arg| tree_sum(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3)))";
 #[test]
 fn fold_tree_depth() {
     let source = "\
-import Bool
 Tree : [Leaf(I64), Branch(Tree, Tree)]
 
 max : I64, I64 -> I64
@@ -861,14 +857,14 @@ main = |arg| get_x({ x: 42, y: 0 })";
 #[test]
 #[should_panic(expected = "type error")]
 fn type_error_add_bool() {
-    run_i64("import Bool\nmain : I64 -> I64\nmain = |x| x + True", 0);
+    run_i64("main : I64 -> I64\nmain = |x| x + True", 0);
 }
 
 #[test]
 #[should_panic(expected = "type error")]
 fn type_error_if_branch_mismatch() {
     run_i64(
-        "import Bool\nmain : I64 -> I64\nmain = |x| if x == 0 then 1 else True",
+        "main : I64 -> I64\nmain = |x| if x == 0 then 1 else True",
         0,
     );
 }
@@ -916,8 +912,6 @@ main = |arg| Lnk.sum(Cons(1, Cons(2, Cons(3, Nil))))";
 #[test]
 fn builtin_list_literal() {
     let source = "\
-import Bool
-import List
 main : I64 -> U64
 main = |arg| List.len([1, 2, 3])";
 
@@ -927,8 +921,6 @@ main = |arg| List.len([1, 2, 3])";
 #[test]
 fn builtin_list_get() {
     let source = "\
-import Bool
-import List
 main : I64 -> I64
 main = |arg| List.get([10, 20, 30], 1)";
 
@@ -938,8 +930,6 @@ main = |arg| List.get([10, 20, 30], 1)";
 #[test]
 fn builtin_list_append() {
     let source = "\
-import Bool
-import List
 main : I64 -> U64
 main = |arg| List.len(List.append([1, 2], 3))";
 
@@ -949,8 +939,6 @@ main = |arg| List.len(List.append([1, 2], 3))";
 #[test]
 fn builtin_list_walk_sum() {
     let source = "\
-import Bool
-import List
 main : I64 -> I64
 main = |arg| List.walk([1, 2, 3, 4, 5], 0, |acc, x| acc + x)";
 
@@ -960,8 +948,6 @@ main = |arg| List.walk([1, 2, 3, 4, 5], 0, |acc, x| acc + x)";
 #[test]
 fn builtin_list_reverse() {
     let source = "\
-import Bool
-import List
 main : I64 -> I64
 main = |arg| List.get(List.reverse([10, 20, 30]), 0)";
 
@@ -972,8 +958,6 @@ main = |arg| List.get(List.reverse([10, 20, 30]), 0)";
 #[test]
 fn builtin_list_set() {
     let source = "\
-import Bool
-import List
 main : I64 -> I64
 main = |arg| List.get(List.set([10, 20, 30], 1, 99), 1)";
 
@@ -984,8 +968,6 @@ main = |arg| List.get(List.set([10, 20, 30], 1, 99), 1)";
 fn builtin_list_walk_backwards() {
     // walk_backwards accumulates right-to-left: 0 + 3*100 + 2*10 + 1*1 = 321
     let source = "\
-import Bool
-import List
 main : I64 -> I64
 main = |arg| List.walk_backwards([1, 2, 3], 0, |acc, x| acc * 10 + x)";
 
@@ -995,8 +977,6 @@ main = |arg| List.walk_backwards([1, 2, 3], 0, |acc, x| acc * 10 + x)";
 #[test]
 fn builtin_list_map() {
     let source = "\
-import Bool
-import List
 main : I64 -> I64
 main = |arg| List.sum(List.map([1, 2, 3], |x| x * 2))";
 
@@ -1006,8 +986,6 @@ main = |arg| List.sum(List.map([1, 2, 3], |x| x * 2))";
 #[test]
 fn builtin_list_sum() {
     let source = "\
-import Bool
-import List
 main : I64 -> I64
 main = |arg| List.sum([1, 2, 3, 4, 5])";
 
@@ -1017,8 +995,6 @@ main = |arg| List.sum([1, 2, 3, 4, 5])";
 #[test]
 fn builtin_list_empty() {
     let source = "\
-import Bool
-import List
 main : I64 -> U64
 main = |arg| List.len([])";
 
@@ -1032,9 +1008,6 @@ main = |arg| List.len([])";
 #[test]
 fn dot_method_call() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| \"hello\".count_bytes()";
 
@@ -1044,9 +1017,6 @@ main = |arg| \"hello\".count_bytes()";
 #[test]
 fn dot_method_chain() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| \"hi\".concat(\"!\").count_bytes()";
 
@@ -1056,8 +1026,6 @@ main = |arg| \"hi\".concat(\"!\").count_bytes()";
 #[test]
 fn dot_method_on_list() {
     let source = "\
-import Bool
-import List
 main : I64 -> I64
 main = |arg| [10, 20, 30].get(1)";
 
@@ -1067,9 +1035,6 @@ main = |arg| [10, 20, 30].get(1)";
 #[test]
 fn str_count_bytes() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| Str.count_bytes(\"hello\")";
 
@@ -1079,9 +1044,6 @@ main = |arg| Str.count_bytes(\"hello\")";
 #[test]
 fn str_append() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| Str.count_bytes(Str.concat(\"hi\", \"!\"))";
 
@@ -1092,9 +1054,6 @@ main = |arg| Str.count_bytes(Str.concat(\"hi\", \"!\"))";
 fn str_get_byte() {
     // 'H' = 72 in ASCII/UTF-8
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U8
 main = |arg| Str.get(\"Hello\", 0)";
 
@@ -1107,9 +1066,6 @@ main = |arg| Str.get(\"Hello\", 0)";
 #[test]
 fn str_literal_escape() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| Str.count_bytes(\"line1\\nline2\")";
 
@@ -1169,9 +1125,6 @@ main = |arg| 'A' + 1";
 #[test]
 fn string_interpolation_basic() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| (
     name = \"world\"
@@ -1184,9 +1137,6 @@ main = |arg| (
 #[test]
 fn string_interpolation_multiple() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| (
     a = \"foo\"
@@ -1200,9 +1150,6 @@ main = |arg| (
 #[test]
 fn string_interpolation_only() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| (
     x = \"abc\"
@@ -1215,9 +1162,6 @@ main = |arg| (
 fn string_dollar_without_brace() {
     // $ without { is a literal dollar sign
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| \"price $5\".count_bytes()";
     // "price $5" = 8 bytes
@@ -1228,9 +1172,6 @@ main = |arg| \"price $5\".count_bytes()";
 fn string_escaped_interpolation() {
     // \${ produces literal ${
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| \"use \\${x}\".count_bytes()";
     // "use ${x}" = 8 bytes
@@ -1241,9 +1182,6 @@ main = |arg| \"use \\${x}\".count_bytes()";
 fn string_interpolation_auto_to_str() {
     // Interpolated I64 is auto-converted via .to_str()
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| (
     n : I64
@@ -1261,7 +1199,7 @@ main = |arg| (
 #[test]
 fn triple_string_basic() {
     let source = "\
-import Bool\nimport List\nimport Str\nmain : I64 -> U64
+main : I64 -> U64
 main = |arg| \"\"\"\n    hello\n    world\n    \"\"\".count_bytes()";
     // "hello\nworld" = 11 bytes
     assert_eq!(run_u64(source, 0), 11);
@@ -1270,7 +1208,7 @@ main = |arg| \"\"\"\n    hello\n    world\n    \"\"\".count_bytes()";
 #[test]
 fn triple_string_preserves_relative_indent() {
     let source = "\
-import Bool\nimport List\nimport Str\nmain : I64 -> U64
+main : I64 -> U64
 main = |arg| \"\"\"\n    line1\n        indented\n    \"\"\".count_bytes()";
     // "line1\n    indented" = 18 bytes
     assert_eq!(run_u64(source, 0), 18);
@@ -1279,9 +1217,6 @@ main = |arg| \"\"\"\n    line1\n        indented\n    \"\"\".count_bytes()";
 #[test]
 fn triple_string_with_interpolation() {
     let source = "\
-import Bool
-import List
-import Str
 main : I64 -> U64
 main = |arg| (
     name = \"Alice\"
@@ -1361,7 +1296,6 @@ main = |arg| add_twice(10, 3)";
 fn constraint_method_on_concrete_type() {
     // x.not() where x is Bool -- resolves to Bool.not
     let source = "\
-import Bool
 main : I64 -> I64
 main = |arg| (
     b = True

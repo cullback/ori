@@ -1,7 +1,3 @@
-import Bool
-import List
-import Str
-import Result
 
 # Outputs "hello world" followed by the first argument.
 main : List(Str) -> Result(Str, Str)

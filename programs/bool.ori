@@ -1,4 +1,3 @@
-import Bool
 
 not : Bool -> Bool
 not = |b| if b

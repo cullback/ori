@@ -1,5 +1,3 @@
-import Bool
-import List
 
 # Records, row polymorphism, type aliases, and built-in lists
 
