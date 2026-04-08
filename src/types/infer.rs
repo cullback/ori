@@ -48,6 +48,8 @@ struct InferCtx<'src> {
     float_literal_vars: Vec<(TypeVar, Span)>,
     /// Resolved method calls: span → mangled method name.
     method_resolutions: HashMap<Span, String>,
+    /// Span for each constraint (parallel to engine.constraints).
+    constraint_spans: Vec<Span>,
 }
 
 impl<'src> InferCtx<'src> {
@@ -70,7 +72,13 @@ impl<'src> InferCtx<'src> {
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
             method_resolutions: HashMap::new(),
+            constraint_spans: Vec::new(),
         }
+    }
+
+    fn push_constraint(&mut self, constraint: Constraint, span: Span) {
+        self.engine.constraints.push(constraint);
+        self.constraint_spans.push(span);
     }
 
     fn type_error(span: Span, msg: &str) -> CompileError {
@@ -418,11 +426,14 @@ impl<'src> InferCtx<'src> {
                                 vec![Type::Var(tv), Type::Var(tv)],
                                 Box::new(Type::Var(tv)),
                             );
-                            self.engine.constraints.push(Constraint {
-                                type_var: tv,
-                                method_name: method_name.to_owned(),
-                                method_type,
-                            });
+                            self.push_constraint(
+                                Constraint {
+                                    type_var: tv,
+                                    method_name: method_name.to_owned(),
+                                    method_type,
+                                },
+                                expr.span,
+                            );
                         }
                         Ok(lt)
                     }
@@ -440,11 +451,14 @@ impl<'src> InferCtx<'src> {
                                 vec![Type::Var(tv), Type::Var(tv)],
                                 Box::new(Type::Con("Bool".to_owned())),
                             );
-                            self.engine.constraints.push(Constraint {
-                                type_var: tv,
-                                method_name: method_name.to_owned(),
-                                method_type,
-                            });
+                            self.push_constraint(
+                                Constraint {
+                                    type_var: tv,
+                                    method_name: method_name.to_owned(),
+                                    method_type,
+                                },
+                                expr.span,
+                            );
                         }
                         Ok(Type::Con("Bool".to_owned()))
                     }
@@ -647,11 +661,14 @@ impl<'src> InferCtx<'src> {
                     let mut param_types = vec![Type::Var(tv)];
                     param_types.extend(arg_types);
                     let method_type = Type::Arrow(param_types, Box::new(ret.clone()));
-                    self.engine.constraints.push(Constraint {
-                        type_var: tv,
-                        method_name: (*method).to_owned(),
-                        method_type,
-                    });
+                    self.push_constraint(
+                        Constraint {
+                            type_var: tv,
+                            method_name: (*method).to_owned(),
+                            method_type,
+                        },
+                        expr.span,
+                    );
                     return Ok(ret);
                 }
 
@@ -708,11 +725,14 @@ impl<'src> InferCtx<'src> {
                     let mut param_types = vec![Type::Var(tv)];
                     param_types.extend(arg_types);
                     let method_type = Type::Arrow(param_types, Box::new(ret.clone()));
-                    self.engine.constraints.push(Constraint {
-                        type_var: tv,
-                        method_name: method_name.to_owned(),
-                        method_type,
-                    });
+                    self.push_constraint(
+                        Constraint {
+                            type_var: tv,
+                            method_name: method_name.to_owned(),
+                            method_type,
+                        },
+                        span,
+                    );
                     return Ok(ret);
                 }
                 // Resolved to a concrete type: look up Type.method
@@ -897,21 +917,35 @@ impl<'src> InferCtx<'src> {
     const ARITHMETIC_METHODS: &'static [&'static str] =
         &["add", "sub", "mul", "div", "rem", "eq", "neq"];
 
-    /// Verify constraints whose type vars resolved to concrete types.
-    fn verify_constraints(&self) -> Result<(), CompileError> {
-        for c in &self.engine.constraints {
+    /// Verify constraints whose type vars resolved to concrete types,
+    /// and store method resolutions for the lowerer.
+    fn verify_constraints(&mut self) -> Result<(), CompileError> {
+        for (i, c) in self.engine.constraints.clone().iter().enumerate() {
             let resolved = self.engine.resolve(&Type::Var(c.type_var));
             let (Type::Con(type_name) | Type::App(type_name, _)) = &resolved else {
                 continue; // still polymorphic or structural, stays as constraint
             };
+            let maybe_span = self.constraint_spans.get(i).copied();
             // Numeric types implicitly have arithmetic methods
             if Self::NUMERIC_TYPES.contains(&type_name.as_str())
                 && Self::ARITHMETIC_METHODS.contains(&c.method_name.as_str())
             {
+                if let Some(s) = maybe_span {
+                    self.method_resolutions
+                        .insert(s, format!("__builtin.{}", c.method_name));
+                }
                 continue;
             }
             let mangled = format!("{type_name}.{}", c.method_name);
-            if !self.env.contains_key(&mangled) {
+            if let Some(scheme) = self.env.get(&mangled).cloned() {
+                // Unify the constraint's method type with the actual method signature
+                // so that arg types (e.g. index literals) resolve correctly.
+                let actual_ty = self.engine.instantiate(&scheme);
+                drop(self.engine.unify(&c.method_type, &actual_ty));
+                if let Some(s) = maybe_span {
+                    self.method_resolutions.insert(s, mangled);
+                }
+            } else {
                 return Err(CompileError::new(format!(
                     "type error: {type_name} has no method '{}'",
                     c.method_name
@@ -1220,8 +1254,8 @@ pub fn check<'src>(
         }
     }
 
-    let lit_types = ctx.resolve_literals()?;
     ctx.verify_constraints()?;
+    let lit_types = ctx.resolve_literals()?;
 
     Ok(InferResult {
         lit_types,

@@ -96,8 +96,11 @@ call_or_access = {
 }
 
 // Atomic heads: no whitespace allowed before "("
-qualified_head = @{ name ~ ("." ~ name)+ ~ "(" }
+// qualified_head only matches Type.method( — first segment must be uppercase
+qualified_head = @{ upper_name ~ ("." ~ name)+ ~ "(" }
 call_head      = @{ name ~ "(" }
+
+upper_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
 
 args = { expr ~ ("," ~ expr)* }
 

@@ -1,1 +1,7 @@
-Result(ok, err) : [Ok(ok), Err(err)]
+# A value that is either a success or a failure.
+Result(ok, err) := [Ok(ok), Err(err)].(
+    # Extracts the Ok value, panicking on Err.
+    unwrap : Result(ok, err) -> ok
+    unwrap = |r| if r
+        : Ok(val) then val
+)
