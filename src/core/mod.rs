@@ -1,6 +1,4 @@
 pub mod builder;
-#[allow(dead_code)]
-pub mod eval;
 
 use std::collections::HashMap;
 
@@ -138,6 +136,8 @@ pub enum Core {
     FieldAccess {
         record: Box<Core>,
         field: String,
+        /// Slot index: alphabetical position among the record's fields.
+        slot: usize,
     },
     ListLit(Vec<Core>),
     ListWalk {
@@ -205,10 +205,11 @@ impl Core {
         Self::Record { fields }
     }
 
-    pub fn field_access(record: Self, field: String) -> Self {
+    pub fn field_access(record: Self, field: String, slot: usize) -> Self {
         Self::FieldAccess {
             record: Box::new(record),
             field,
+            slot,
         }
     }
 
@@ -231,22 +232,6 @@ impl Core {
             backwards,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::enum_variant_names)]
-pub enum Value {
-    VNum(NumVal),
-    #[allow(dead_code)]
-    VConstruct {
-        tag: FuncId,
-        fields: Vec<Value>,
-    },
-    #[allow(dead_code)]
-    VRecord {
-        fields: Vec<(String, Value)>,
-    },
-    VList(Vec<Value>),
 }
 
 /// Concrete representation type for a value, used for memory layout.

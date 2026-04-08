@@ -176,13 +176,9 @@ impl<'a> LowerCtx<'a> {
                 ptr
             }
 
-            Core::FieldAccess { record, field } => {
+            Core::FieldAccess { record, slot, .. } => {
                 let ptr = self.lower_expr(record);
-                // We need to know the slot index for this field.
-                // Since we sort fields alphabetically, compute the index.
-                // For now, use a heuristic: look up the record's known fields.
-                // TODO: proper record layout from type info
-                self.builder.load(ptr, field_slot_index(field))
+                self.builder.load(ptr, *slot)
             }
 
             Core::ListLit(elements) => {
@@ -381,9 +377,11 @@ impl<'a> LowerCtx<'a> {
             );
         }
 
-        // Build the fold helper function
-        // Params: val_ptr, capture_0, capture_1, ...
+        // Build the fold helper function in isolation — save/restore parent state
         let saved_vars = self.var_map.clone();
+        let saved_blocks = std::mem::take(&mut self.builder.blocks);
+        let saved_current = self.builder.current_block.take();
+
         let val_param = self.builder.fresh_value();
         let mut fold_params = vec![val_param];
         let mut capture_param_map: HashMap<VarId, Value> = HashMap::new();
@@ -467,7 +465,9 @@ impl<'a> LowerCtx<'a> {
         self.builder.ret(merge_param);
         self.builder.finish_function(&fold_name, fold_params);
 
-        // Restore var_map and call the fold helper from the original context
+        // Restore parent function's builder state
+        self.builder.blocks = saved_blocks;
+        self.builder.current_block = saved_current;
         self.var_map = saved_vars;
         let scr_val = self.lower_expr(scrutinee);
         let mut call_args = vec![scr_val];
@@ -608,14 +608,4 @@ impl<'a> LowerCtx<'a> {
         self.builder.switch_to(done);
         done_param
     }
-}
-
-/// Compute the slot index for a record field (alphabetical order).
-/// TODO: replace with proper layout from type info.
-fn field_slot_index(field: &str) -> usize {
-    // For now, we can't compute this without knowing all fields.
-    // Return 0 as a placeholder — this only matters for records,
-    // which are rare in current programs.
-    let _ = field;
-    0
 }

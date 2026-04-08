@@ -425,6 +425,33 @@ impl<'src> LowerCtx<'src> {
         }
     }
 
+    /// Compute the slot index for a field access on a record/tuple type.
+    /// Fields are stored in alphabetical order, so the slot is the alphabetical position.
+    fn field_slot(ty: &crate::types::engine::Type, field: &str) -> usize {
+        use crate::types::engine::Type;
+        match ty {
+            Type::Record { fields, .. } => {
+                let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                names.sort_unstable();
+                names
+                    .iter()
+                    .position(|n| *n == field)
+                    .unwrap_or_else(|| panic!("field '{field}' not found in record type"))
+            }
+            Type::Tuple(elems) => {
+                // Tuple fields are named "0", "1", "2", ...
+                // When stored alphabetically, single-digit names sort correctly.
+                let mut names: Vec<String> = (0..elems.len()).map(|i| i.to_string()).collect();
+                names.sort_unstable();
+                names
+                    .iter()
+                    .position(|n| n == field)
+                    .unwrap_or_else(|| panic!("field '{field}' not found in tuple type"))
+            }
+            _ => panic!("field access on non-record type: {ty:?}"),
+        }
+    }
+
     /// Get the `MonoType` for an expression from its span.
     fn expr_mono_type(&self, span: ast::Span) -> MonoType {
         self.expr_types
@@ -1572,7 +1599,11 @@ impl<'src> LowerCtx<'src> {
             }
 
             ExprKind::FieldAccess { record, field } => {
-                Core::field_access(self.lower_expr(record), (*field).to_owned())
+                let slot = self
+                    .expr_types
+                    .get(&record.span)
+                    .map_or(0, |ty| Self::field_slot(ty, field));
+                Core::field_access(self.lower_expr(record), (*field).to_owned(), slot)
             }
 
             ExprKind::MethodCall {
@@ -1848,15 +1879,20 @@ impl<'src> LowerCtx<'src> {
             ast::Pattern::Tuple(elems) => {
                 for (i, elem) in elems.iter().enumerate() {
                     let field_var = self.builder.var();
-                    let access = Core::field_access(Core::var(source_var), i.to_string());
+                    let access = Core::field_access(Core::var(source_var), i.to_string(), i);
                     bindings.push((field_var, access));
                     self.lower_destructure_elem(elem, field_var, bindings);
                 }
             }
             ast::Pattern::Record { fields } => {
+                // Compute slot indices: fields are stored in alphabetical order.
+                let mut all_names: Vec<&str> = fields.iter().map(|(n, _)| *n).collect();
+                all_names.sort_unstable();
                 for (name, elem) in fields {
+                    let slot = all_names.iter().position(|n| n == name).unwrap();
                     let field_var = self.builder.var();
-                    let access = Core::field_access(Core::var(source_var), (*name).to_owned());
+                    let access =
+                        Core::field_access(Core::var(source_var), (*name).to_owned(), slot);
                     bindings.push((field_var, access));
                     self.lower_destructure_elem(elem, field_var, bindings);
                 }

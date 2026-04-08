@@ -4,7 +4,7 @@ use crate::ssa::Module;
 use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 
 /// A scalar runtime value that fits in a register.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scalar {
     I64(i64),
     U64(u64),

@@ -42,31 +42,9 @@ fn compile(
     lower::lower(arena, &resolved.module, &resolved.scope, &infer_result)
 }
 
-fn bytes_to_value(bytes: &[u8]) -> core::Value {
-    core::Value::VList(
-        bytes
-            .iter()
-            .map(|&b| core::Value::VNum(core::NumVal::U8(b)))
-            .collect(),
-    )
-}
-
-fn value_to_scalar(val: &core::Value, heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {
-    match val {
-        core::Value::VNum(core::NumVal::I64(n)) => ssa::eval::Scalar::I64(*n),
-        core::Value::VNum(core::NumVal::U64(n)) => ssa::eval::Scalar::U64(*n),
-        core::Value::VNum(core::NumVal::F64(n)) => ssa::eval::Scalar::F64(*n),
-        core::Value::VNum(core::NumVal::U8(n)) => ssa::eval::Scalar::U8(*n),
-        core::Value::VNum(core::NumVal::I8(n)) => ssa::eval::Scalar::I8(*n),
-        core::Value::VList(elems) => {
-            let scalars: Vec<ssa::eval::Scalar> =
-                elems.iter().map(|e| value_to_scalar(e, heap)).collect();
-            heap_alloc_list(heap, &scalars)
-        }
-        core::Value::VConstruct { .. } | core::Value::VRecord { .. } => {
-            panic!("complex values not supported in SSA conversion yet")
-        }
-    }
+fn bytes_to_scalar(bytes: &[u8], heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {
+    let scalars: Vec<ssa::eval::Scalar> = bytes.iter().map(|&b| ssa::eval::Scalar::U8(b)).collect();
+    heap_alloc_list(heap, &scalars)
 }
 
 fn heap_alloc_list(heap: &mut ssa::eval::Heap, elems: &[ssa::eval::Scalar]) -> ssa::eval::Scalar {
@@ -150,16 +128,16 @@ fn main() {
 
     let cli_args: Vec<ssa::eval::Scalar> = program_args
         .iter()
-        .map(|a| value_to_scalar(&bytes_to_value(a.as_bytes()), &mut heap))
+        .map(|a| bytes_to_scalar(a.as_bytes(), &mut heap))
         .collect();
     let args_list = heap_alloc_list(&mut heap, &cli_args);
 
     let stdin_val = if std::io::stdin().is_terminal() {
-        value_to_scalar(&bytes_to_value(b""), &mut heap)
+        bytes_to_scalar(b"", &mut heap)
     } else {
         let mut buf = Vec::new();
         std::io::stdin().read_to_end(&mut buf).unwrap();
-        value_to_scalar(&bytes_to_value(&buf), &mut heap)
+        bytes_to_scalar(&buf, &mut heap)
     };
 
     let mut ssa_args = Vec::new();
@@ -167,7 +145,7 @@ fn main() {
         ssa_args.push(match i {
             0 => args_list,
             1 => stdin_val,
-            _ => value_to_scalar(&bytes_to_value(b""), &mut heap),
+            _ => bytes_to_scalar(b"", &mut heap),
         });
     }
 

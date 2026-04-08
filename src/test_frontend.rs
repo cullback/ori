@@ -1,12 +1,9 @@
-use std::collections::HashMap;
-
-use crate::core::{NumVal, Value};
 use crate::source::SourceArena;
+use crate::ssa::eval::Scalar;
 
-/// Compile and run an Ori program with the given I64 input.
-fn run(source: &str, input: i64) -> Value {
+/// Compile and run an Ori program via SSA with the given I64 input.
+fn run(source: &str, input: i64) -> Scalar {
     let mut arena = SourceArena::new();
-    // Pre-load stdlib
     for (name, src) in crate::stdlib::all() {
         arena.add(format!("<stdlib:{name}>"), src.to_owned());
     }
@@ -17,28 +14,39 @@ fn run(source: &str, input: i64) -> Value {
         crate::types::infer::check(&arena, &resolved.module, &resolved.scope).unwrap();
     let (program, input_vars) =
         crate::lower::lower(&arena, &resolved.module, &resolved.scope, &infer_result).unwrap();
-    let mut env = HashMap::new();
-    for (i, var) in input_vars.iter().enumerate() {
-        let val = if i == 0 {
-            Value::VNum(NumVal::I64(input))
-        } else {
-            Value::VList(vec![])
-        };
-        env.insert(*var, val);
-    }
-    crate::core::eval::eval(&env, &program, &program.main)
+
+    let ssa_module = crate::ssa::lower::lower(&program, &input_vars);
+    let mut heap = crate::ssa::eval::new_heap();
+    let ssa_args: Vec<Scalar> = input_vars
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            if i == 0 {
+                Scalar::I64(input)
+            } else {
+                // Empty list: 3-slot header (len=0, cap=0, data_ptr)
+                let data = heap.alloc(0);
+                let header = heap.alloc(3);
+                heap.store(header, 0, Scalar::U64(0));
+                heap.store(header, 1, Scalar::U64(0));
+                heap.store(header, 2, Scalar::Ptr(data));
+                Scalar::Ptr(header)
+            }
+        })
+        .collect();
+    crate::ssa::eval::eval(&ssa_module, &mut heap, &ssa_args)
 }
 
 fn run_i64(source: &str, input: i64) -> i64 {
     match run(source, input) {
-        Value::VNum(NumVal::I64(n)) => n,
+        Scalar::I64(n) => n,
         other => panic!("expected I64 result, got {other:?}"),
     }
 }
 
 fn run_u64(source: &str, input: i64) -> u64 {
     match run(source, input) {
-        Value::VNum(NumVal::U64(n)) => n,
+        Scalar::U64(n) => n,
         other => panic!("expected U64 result, got {other:?}"),
     }
 }
@@ -1055,7 +1063,7 @@ main : I64 -> U8
 main = |arg| Str.get(\"Hello\", 0)";
 
     match run(source, 0) {
-        Value::VNum(NumVal::U8(n)) => assert_eq!(n, 72),
+        Scalar::U8(n) => assert_eq!(n, 72),
         other => panic!("expected U8, got {other:?}"),
     }
 }
@@ -1081,7 +1089,7 @@ main : I64 -> F64
 main = |arg| 3.14 * 2.0";
 
     match run(source, 0) {
-        crate::core::Value::VNum(crate::core::NumVal::F64(n)) => {
+        Scalar::F64(n) => {
             assert!((n - 6.28).abs() < 0.001);
         }
         other => panic!("expected F64, got {other:?}"),

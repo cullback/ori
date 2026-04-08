@@ -1,11 +1,8 @@
-use std::collections::HashMap;
-
 use crate::core::builder::Builder;
-use crate::core::eval::eval;
 use crate::core::{
-    Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, MonoType, NumVal, Pattern,
-    Program, Value,
+    Builtin, ConstructorDef, Core, FieldDef, FoldArm, FuncDef, FuncId, MonoType, Pattern, Program,
 };
+use crate::ssa::eval::{Heap, Scalar};
 
 // -- Test-only helpers --
 
@@ -25,16 +22,46 @@ fn list(nil: FuncId, cons: FuncId, items: Vec<Core>) -> Core {
     result
 }
 
-fn vnum(n: u64) -> Value {
-    Value::VNum(NumVal::U64(n))
+fn run(program: &Program) -> (Scalar, Heap) {
+    let ssa_module = crate::ssa::lower::lower(program, &[]);
+    let mut heap = crate::ssa::eval::new_heap();
+    let result = crate::ssa::eval::eval(&ssa_module, &mut heap, &[]);
+    (result, heap)
 }
 
-fn vcon(tag: FuncId, fields: Vec<Value>) -> Value {
-    Value::VConstruct { tag, fields }
+/// Read a linked list (Cons/Nil tagged union) from the heap as a Vec of scalars.
+/// Assumes Nil = tag 0, Cons = tag 1 with head at slot 1 and tail at slot 2.
+fn read_linked_list(heap: &Heap, ptr: Scalar) -> Vec<Scalar> {
+    let mut result = Vec::new();
+    let mut current = ptr;
+    loop {
+        let Scalar::Ptr(idx) = current else {
+            panic!("expected Ptr in linked list, got {current:?}");
+        };
+        let Scalar::U64(tag) = heap.load(idx, 0) else {
+            panic!("expected U64 tag");
+        };
+        match tag {
+            0 => break,
+            1 => {
+                result.push(heap.load(idx, 1));
+                current = heap.load(idx, 2);
+            }
+            _ => panic!("unexpected tag {tag} in linked list"),
+        }
+    }
+    result
 }
 
-fn run(program: &Program) -> Value {
-    eval(&HashMap::new(), program, &program.main)
+/// Read the tag index from a tagged union pointer.
+fn read_tag(heap: &Heap, ptr: Scalar) -> u64 {
+    let Scalar::Ptr(idx) = ptr else {
+        panic!("expected Ptr, got {ptr:?}");
+    };
+    let Scalar::U64(tag) = heap.load(idx, 0) else {
+        panic!("expected U64 tag");
+    };
+    tag
 }
 
 // -- Shared type registration helpers --
@@ -211,7 +238,8 @@ fn factorial() {
             ),
         ),
     );
-    assert_eq!(run(&b.build(main)), vnum(120));
+    let (result, _) = run(&b.build(main));
+    assert_eq!(result, Scalar::U64(120));
 }
 
 /// fib(10) = 55
@@ -270,7 +298,8 @@ fn fibonacci() {
             ),
         ),
     );
-    assert_eq!(run(&b.build(main)), vnum(55));
+    let (result, _) = run(&b.build(main));
+    assert_eq!(result, Scalar::U64(55));
 }
 
 /// sum [1,2,3,4,5] = 15
@@ -310,7 +339,8 @@ fn list_sum() {
             ],
         ),
     );
-    assert_eq!(run(&b.build(main)), vnum(15));
+    let (result, _) = run(&b.build(main));
+    assert_eq!(result, Scalar::U64(15));
 }
 
 /// length [1,2,3,4,5] = 5
@@ -350,7 +380,8 @@ fn list_length() {
             ],
         ),
     );
-    assert_eq!(run(&b.build(main)), vnum(5));
+    let (result, _) = run(&b.build(main));
+    assert_eq!(result, Scalar::U64(5));
 }
 
 /// map (+1) [1,2,3] = [2,3,4]
@@ -386,17 +417,9 @@ fn list_map_inc() {
             ],
         ),
     );
-    let expected = vcon(
-        cons,
-        vec![
-            vnum(2),
-            vcon(
-                cons,
-                vec![vnum(3), vcon(cons, vec![vnum(4), vcon(nil, vec![])])],
-            ),
-        ],
-    );
-    assert_eq!(run(&b.build(main)), expected);
+    let (result, heap) = run(&b.build(main));
+    let elems = read_linked_list(&heap, result);
+    assert_eq!(elems, vec![Scalar::U64(2), Scalar::U64(3), Scalar::U64(4)]);
 }
 
 /// reverse [1,2,3] = [3,2,1]
@@ -405,6 +428,7 @@ fn list_reverse() {
     let mut b = Builder::new();
     let (nil, cons) = add_list_type(&mut b);
     let append = b.func();
+    b.debug_name_func(append, "append".to_owned());
 
     let xs_p = b.var();
     let x_p = b.var();
@@ -456,17 +480,9 @@ fn list_reverse() {
             ],
         ),
     );
-    let expected = vcon(
-        cons,
-        vec![
-            vnum(3),
-            vcon(
-                cons,
-                vec![vnum(2), vcon(cons, vec![vnum(1), vcon(nil, vec![])])],
-            ),
-        ],
-    );
-    assert_eq!(run(&b.build(main)), expected);
+    let (result, heap) = run(&b.build(main));
+    let elems = read_linked_list(&heap, result);
+    assert_eq!(elems, vec![Scalar::U64(3), Scalar::U64(2), Scalar::U64(1)]);
 }
 
 /// sum(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3))) = 6
@@ -511,7 +527,8 @@ fn tree_sum() {
             ],
         ),
     );
-    assert_eq!(run(&b.build(main)), vnum(6));
+    let (result, _) = run(&b.build(main));
+    assert_eq!(result, Scalar::U64(6));
 }
 
 /// depth(Branch(Branch(Leaf(1), Leaf(2)), Leaf(3))) = 3
@@ -563,7 +580,8 @@ fn tree_depth() {
             ],
         ),
     );
-    assert_eq!(run(&b.build(main)), vnum(3));
+    let (result, _) = run(&b.build(main));
+    assert_eq!(result, Scalar::U64(3));
 }
 
 /// is_prime via trial division.
@@ -701,17 +719,13 @@ fn is_prime_program(n: u64) -> (Program, FuncId, FuncId) {
 
 #[test]
 fn is_prime() {
+    // In SSA, Bool True = tag 0 (first constructor), False = tag 1
     let check = |n: u64, expected: bool| {
-        let (program, true_con, false_con) = is_prime_program(n);
-        let expected_tag = if expected { true_con } else { false_con };
-        assert_eq!(
-            run(&program),
-            Value::VConstruct {
-                tag: expected_tag,
-                fields: vec![]
-            },
-            "is_prime({n}) should be {expected}"
-        );
+        let (program, _, _) = is_prime_program(n);
+        let (result, heap) = run(&program);
+        let tag = read_tag(&heap, result);
+        let expected_tag = if expected { 0 } else { 1 };
+        assert_eq!(tag, expected_tag, "is_prime({n}) should be {expected}");
     };
     check(2, true);
     check(3, true);
