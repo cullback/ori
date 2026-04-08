@@ -76,6 +76,13 @@ fn print_value(val: &core::Value) {
         core::Value::VNum(core::NumVal::I8(n)) => print!("{n}"),
         other => print!("{other:?}"),
     }
+    // Append newline unless the output already ends with one
+    if let core::Value::VList(elems) = val
+        && elems.last() == Some(&core::Value::VNum(core::NumVal::U8(b'\n')))
+    {
+        return;
+    }
+    println!();
 }
 
 fn eprint_value(val: &core::Value) {
