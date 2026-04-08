@@ -1,3 +1,3 @@
 # Outputs "hello world" followed by the first argument.
 main : List(Str) -> Result(Str, Str)
-main = |args| Ok("hello world ".concat(args.get(0)))
+main = |args| Ok("hello, world!\n")

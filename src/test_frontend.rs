@@ -15,10 +15,18 @@ fn run(source: &str, input: i64) -> Value {
     let resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     let infer_result =
         crate::types::infer::check(&arena, &resolved.module, &resolved.scope).unwrap();
-    let (program, input_var) =
+    let (program, input_vars) =
         crate::lower::lower(&arena, &resolved.module, &resolved.scope, &infer_result).unwrap();
     let mut env = HashMap::new();
-    env.insert(input_var, Value::VNum(NumVal::I64(input)));
+    // Bind first param to the I64 input; any extra params get a default
+    for (i, var) in input_vars.iter().enumerate() {
+        let val = if i == 0 {
+            Value::VNum(NumVal::I64(input))
+        } else {
+            Value::VList(vec![])
+        };
+        env.insert(*var, val);
+    }
     crate::core::eval::eval(&env, &program, &program.main)
 }
 

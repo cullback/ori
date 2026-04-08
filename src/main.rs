@@ -12,6 +12,8 @@ mod test_programs;
 mod types;
 
 use std::collections::HashMap;
+use std::io::IsTerminal as _;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::process;
 
@@ -22,7 +24,7 @@ fn compile(
     arena: &mut SourceArena,
     main_file: source::FileId,
     source_dir: Option<&std::path::Path>,
-) -> Result<(crate::core::Program, crate::core::VarId), CompileError> {
+) -> Result<(crate::core::Program, Vec<crate::core::VarId>), CompileError> {
     // Pre-load stdlib into arena
     for (name, src) in stdlib::all() {
         arena.add(format!("<stdlib:{name}>"), src.to_owned());
@@ -76,7 +78,7 @@ fn main() {
     let main_file = arena.add(args[1].clone(), content);
 
     let source_dir = std::path::Path::new(&args[1]).parent();
-    let (program, input_var) = match compile(&mut arena, main_file, source_dir) {
+    let (program, input_vars) = match compile(&mut arena, main_file, source_dir) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("{}", e.format(&arena));
@@ -91,9 +93,25 @@ fn main() {
         .collect();
     let args_value = core::Value::VList(cli_args);
 
-    // Evaluate: main : List(Str) -> Result(Str, Str)
+    // Read stdin (empty if terminal, read all if piped)
+    let stdin_value = if std::io::stdin().is_terminal() {
+        bytes_to_value(b"")
+    } else {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf).unwrap();
+        bytes_to_value(&buf)
+    };
+
+    // Evaluate: main : List(Str), Str -> Result(Str, Str)
     let mut env = HashMap::new();
-    env.insert(input_var, args_value);
+    for (i, var) in input_vars.iter().enumerate() {
+        let val = match i {
+            0 => args_value.clone(),
+            1 => stdin_value.clone(),
+            _ => core::Value::VList(vec![]),
+        };
+        env.insert(*var, val);
+    }
     let result = core::eval::eval(&env, &program, &program.main);
 
     // Handle Result(Str, Str) output

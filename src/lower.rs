@@ -16,15 +16,15 @@ fn method_key(type_name: &str, method: &str) -> String {
 
 /// Lower a parsed AST module into a Core IR program.
 ///
-/// Returns the program and the `VarId` of `main`'s input parameter
-/// (a free variable that the runtime must bind before evaluation).
+/// Returns the program and `VarId`s for `main`'s parameters
+/// (free variables that the runtime must bind before evaluation).
 #[expect(clippy::too_many_lines, reason = "multi-pass lowering orchestration")]
 pub fn lower<'src>(
     arena: &'src SourceArena,
     module: &Module<'src>,
     scope: &crate::resolve::ModuleScope,
     infer_result: &crate::types::infer::InferResult,
-) -> Result<(Program, VarId), CompileError> {
+) -> Result<(Program, Vec<VarId>), CompileError> {
     let mut ctx = LowerCtx::new(infer_result);
 
     // Register stdlib modules
@@ -251,15 +251,12 @@ pub fn lower<'src>(
     // Lower main
     let params = main_params.ok_or_else(|| CompileError::new("no 'main' function defined"))?;
     let body = main_body.unwrap();
-    if params.len() != 1 {
-        return Err(CompileError::new(format!(
-            "main must take exactly one parameter, got {}",
-            params.len()
-        )));
+    let mut input_vars = Vec::new();
+    for p in &params {
+        let var = ctx.builder.var();
+        ctx.vars.insert((*p).to_owned(), var);
+        input_vars.push(var);
     }
-
-    let input_var = ctx.builder.var();
-    ctx.vars.insert(params[0].to_owned(), input_var);
 
     // Mark main's higher-order params (unlikely but consistent)
     for (i, p) in params.iter().enumerate() {
@@ -275,7 +272,7 @@ pub fn lower<'src>(
     ctx.generate_apply_functions();
 
     let program = ctx.builder.build(main_core);
-    Ok((program, input_var))
+    Ok((program, input_vars))
 }
 
 // ---- Defunctionalization data structures ----
