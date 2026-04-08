@@ -249,10 +249,6 @@ impl<'src> InferCtx<'src> {
         Ok(ty)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "expression inference handles all forms"
-    )]
     fn infer_expr_inner(&mut self, expr: &Expr<'src>) -> Result<Type, CompileError> {
         match &expr.kind {
             ExprKind::IntLit(_) => {
@@ -317,66 +313,7 @@ impl<'src> InferCtx<'src> {
                 Ok(bool_ty)
             }
 
-            ExprKind::BinOp { op, lhs, rhs } => {
-                let lt = self.infer_expr(lhs)?;
-                let rt = self.infer_expr(rhs)?;
-                match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                        self.unify_at(&lt, &rt, expr.span)?;
-                        // If operand is a type var, generate an arithmetic constraint
-                        let resolved = self.engine.resolve(&lt);
-                        if let Type::Var(tv) = resolved {
-                            let method_name = match op {
-                                BinOp::Add => "add",
-                                BinOp::Sub => "sub",
-                                BinOp::Mul => "mul",
-                                BinOp::Div => "div",
-                                BinOp::Rem => "rem",
-                                _ => unreachable!(),
-                            };
-                            let method_type = Type::Arrow(
-                                vec![Type::Var(tv), Type::Var(tv)],
-                                Box::new(Type::Var(tv)),
-                            );
-                            self.push_constraint(
-                                Constraint {
-                                    type_var: tv,
-                                    method_name: method_name.to_owned(),
-                                    method_type,
-                                },
-                                expr.span,
-                            );
-                        }
-                        Ok(lt)
-                    }
-                    BinOp::Eq | BinOp::Neq => {
-                        self.unify_at(&lt, &rt, expr.span)?;
-                        // If operand is a type var, generate eq/neq constraint
-                        let resolved = self.engine.resolve(&lt);
-                        if let Type::Var(tv) = resolved {
-                            let method_name = match op {
-                                BinOp::Eq => "eq",
-                                BinOp::Neq => "neq",
-                                _ => unreachable!(),
-                            };
-                            let method_type = Type::Arrow(
-                                vec![Type::Var(tv), Type::Var(tv)],
-                                Box::new(Type::Con("Bool".to_owned())),
-                            );
-                            self.push_constraint(
-                                Constraint {
-                                    type_var: tv,
-                                    method_name: method_name.to_owned(),
-                                    method_type,
-                                },
-                                expr.span,
-                            );
-                        }
-                        Ok(Type::Con("Bool".to_owned()))
-                    }
-                    BinOp::And | BinOp::Or => unreachable!(),
-                }
-            }
+            ExprKind::BinOp { op, lhs, rhs } => self.infer_binop(op, lhs, rhs, expr.span),
 
             ExprKind::Call { func, args } => {
                 let func = *func;
@@ -563,69 +500,7 @@ impl<'src> InferCtx<'src> {
                 receiver,
                 method,
                 args,
-            } => {
-                let recv_ty = self.infer_expr(receiver)?;
-                let mut arg_types = Vec::new();
-                for a in args {
-                    arg_types.push(self.infer_expr(a)?);
-                }
-                let ret = self.engine.fresh();
-                let resolved = self.engine.resolve(&recv_ty);
-
-                // Concrete type: look up Type.method
-                if let Type::Con(name) | Type::App(name, _) = &resolved {
-                    let mangled = format!("{name}.{method}");
-                    if let Some(scheme) = self.env.get(&mangled).cloned() {
-                        let func_ty = self.engine.instantiate(&scheme);
-                        let mut full_args = vec![recv_ty];
-                        full_args.extend(arg_types);
-                        let expected = Type::Arrow(full_args, Box::new(ret.clone()));
-                        self.unify_at(&func_ty, &expected, expr.span)?;
-                        self.method_resolutions.insert(expr.span, mangled);
-                        return Ok(ret);
-                    }
-                    // Numeric builtins
-                    if Self::NUMERIC_TYPES.contains(&name.as_str())
-                        && Self::ARITHMETIC_METHODS.contains(method)
-                    {
-                        let concrete_ty = resolved.clone();
-                        self.unify_at(&recv_ty, &concrete_ty, expr.span)?;
-                        for arg_ty in &arg_types {
-                            self.unify_at(arg_ty, &concrete_ty, expr.span)?;
-                        }
-                        self.method_resolutions
-                            .insert(expr.span, format!("__builtin.{method}"));
-                        if *method == "eq" || *method == "neq" {
-                            return Ok(Type::Con("Bool".to_owned()));
-                        }
-                        return Ok(concrete_ty);
-                    }
-                }
-
-                // Type variable: generate constraint
-                if let Type::Var(tv) = resolved {
-                    let mut param_types = vec![Type::Var(tv)];
-                    param_types.extend(arg_types);
-                    let method_type = Type::Arrow(param_types, Box::new(ret.clone()));
-                    self.push_constraint(
-                        Constraint {
-                            type_var: tv,
-                            method_name: (*method).to_owned(),
-                            method_type,
-                        },
-                        expr.span,
-                    );
-                    return Ok(ret);
-                }
-
-                Err(CompileError::at(
-                    expr.span,
-                    format!(
-                        "no method '{method}' on type {}",
-                        self.engine.display_type(&resolved)
-                    ),
-                ))
-            }
+            } => self.infer_method_call(receiver, method, args, expr.span),
 
             ExprKind::Is {
                 expr: inner,
@@ -704,23 +579,10 @@ impl<'src> InferCtx<'src> {
                         self.method_resolutions.insert(span, mangled);
                         return Ok(ret);
                     }
-                    // Numeric builtins: arithmetic methods on numeric types
-                    if Self::NUMERIC_TYPES.contains(&concrete_name.as_str())
-                        && Self::ARITHMETIC_METHODS.contains(&method_name)
-                    {
-                        // Builtin arithmetic: both args same type, result same type
-                        let concrete_ty = resolved.clone();
-                        self.unify_at(&var_ty, &concrete_ty, span)?;
-                        for arg_ty in &arg_types {
-                            self.unify_at(arg_ty, &concrete_ty, span)?;
-                        }
-                        // Record as a builtin method resolution for the lowerer
-                        self.method_resolutions
-                            .insert(span, format!("__builtin.{method_name}"));
-                        if method_name == "eq" || method_name == "neq" {
-                            return Ok(Type::Con("Bool".to_owned()));
-                        }
-                        return Ok(concrete_ty);
+                    if let Some(result) = self.resolve_numeric_builtin(
+                        concrete_name, method_name, &var_ty, &arg_types, &resolved, span,
+                    ) {
+                        return result;
                     }
                 }
             }
@@ -730,6 +592,153 @@ impl<'src> InferCtx<'src> {
             span,
             &format!("undefined function '{func}'"),
         ))
+    }
+
+    // ---- Binary operator inference ----
+
+    fn infer_binop(
+        &mut self,
+        op: &BinOp,
+        lhs: &Expr<'src>,
+        rhs: &Expr<'src>,
+        span: Span,
+    ) -> Result<Type, CompileError> {
+        let lt = self.infer_expr(lhs)?;
+        let rt = self.infer_expr(rhs)?;
+        self.unify_at(&lt, &rt, span)?;
+
+        let is_eq = matches!(op, BinOp::Eq | BinOp::Neq);
+        let method_name = match op {
+            BinOp::Add => "add",
+            BinOp::Sub => "sub",
+            BinOp::Mul => "mul",
+            BinOp::Div => "div",
+            BinOp::Rem => "rem",
+            BinOp::Eq => "eq",
+            BinOp::Neq => "neq",
+            BinOp::And | BinOp::Or => unreachable!(),
+        };
+
+        let resolved = self.engine.resolve(&lt);
+        if let Type::Var(tv) = resolved {
+            let ret_ty = if is_eq {
+                Type::Con("Bool".to_owned())
+            } else {
+                Type::Var(tv)
+            };
+            let method_type =
+                Type::Arrow(vec![Type::Var(tv), Type::Var(tv)], Box::new(ret_ty));
+            self.push_constraint(
+                Constraint {
+                    type_var: tv,
+                    method_name: method_name.to_owned(),
+                    method_type,
+                },
+                span,
+            );
+        }
+
+        if is_eq {
+            Ok(Type::Con("Bool".to_owned()))
+        } else {
+            Ok(lt)
+        }
+    }
+
+    // ---- Method call inference ----
+
+    fn infer_method_call(
+        &mut self,
+        receiver: &Expr<'src>,
+        method: &'src str,
+        args: &[Expr<'src>],
+        span: Span,
+    ) -> Result<Type, CompileError> {
+        let recv_ty = self.infer_expr(receiver)?;
+        let mut arg_types = Vec::new();
+        for a in args {
+            arg_types.push(self.infer_expr(a)?);
+        }
+        let ret = self.engine.fresh();
+        let resolved = self.engine.resolve(&recv_ty);
+
+        // Concrete type: look up Type.method
+        if let Type::Con(name) | Type::App(name, _) = &resolved {
+            let mangled = format!("{name}.{method}");
+            if let Some(scheme) = self.env.get(&mangled).cloned() {
+                let func_ty = self.engine.instantiate(&scheme);
+                let mut full_args = vec![recv_ty];
+                full_args.extend(arg_types);
+                let expected = Type::Arrow(full_args, Box::new(ret.clone()));
+                self.unify_at(&func_ty, &expected, span)?;
+                self.method_resolutions.insert(span, mangled);
+                return Ok(ret);
+            }
+            if let Some(result) =
+                self.resolve_numeric_builtin(name, method, &recv_ty, &arg_types, &resolved, span)
+            {
+                return result;
+            }
+        }
+
+        // Type variable: generate constraint
+        if let Type::Var(tv) = resolved {
+            let mut param_types = vec![Type::Var(tv)];
+            param_types.extend(arg_types);
+            let method_type = Type::Arrow(param_types, Box::new(ret.clone()));
+            self.push_constraint(
+                Constraint {
+                    type_var: tv,
+                    method_name: (*method).to_owned(),
+                    method_type,
+                },
+                span,
+            );
+            return Ok(ret);
+        }
+
+        Err(CompileError::at(
+            span,
+            format!(
+                "no method '{method}' on type {}",
+                self.engine.display_type(&resolved)
+            ),
+        ))
+    }
+
+    // ---- Numeric builtin resolution ----
+
+    /// Try to resolve a method call as a numeric builtin (add, sub, eq, etc.).
+    /// Returns `Some(Ok(ty))` if it matched, `None` if not a numeric builtin.
+    fn resolve_numeric_builtin(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        recv_ty: &Type,
+        arg_types: &[Type],
+        resolved: &Type,
+        span: Span,
+    ) -> Option<Result<Type, CompileError>> {
+        if !Self::NUMERIC_TYPES.contains(&type_name) || !Self::ARITHMETIC_METHODS.contains(&method)
+        {
+            return None;
+        }
+        let concrete_ty = resolved.clone();
+        if let Err(e) = self.unify_at(recv_ty, &concrete_ty, span) {
+            return Some(Err(e));
+        }
+        for arg_ty in arg_types {
+            if let Err(e) = self.unify_at(arg_ty, &concrete_ty, span) {
+                return Some(Err(e));
+            }
+        }
+        self.method_resolutions
+            .insert(span, format!("__builtin.{method}"));
+        if method == "eq" || method == "neq" {
+            Some(Ok(Type::Con("Bool".to_owned())))
+        } else {
+            Some(Ok(concrete_ty))
+        }
     }
 
     // ---- Pattern inference ----

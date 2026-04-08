@@ -155,7 +155,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     // ---- Expression lowering ----
 
-    #[expect(clippy::too_many_lines, reason = "handles all expression forms")]
     fn lower_expr(&mut self, expr: &Expr<'src>) -> Value {
         match &expr.kind {
             #[expect(
@@ -234,60 +233,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
             ExprKind::Call { func, args } => self.lower_call(func, args, expr.span),
 
-            ExprKind::Block(stmts, result) => {
-                for stmt in stmts {
-                    match stmt {
-                        Stmt::Let { name, val } => {
-                            let v = self.lower_expr(val);
-                            self.vars.insert((*name).to_owned(), v);
-                        }
-                        Stmt::Destructure { pattern, val } => {
-                            let v = self.lower_expr(val);
-                            self.lower_destructure(pattern, v);
-                        }
-                        Stmt::Guard {
-                            condition,
-                            return_val,
-                        } => {
-                            if Self::expr_contains_is(condition) {
-                                // Use and-chain lowering for Is binding flow
-                                let cont_block = self.builder.create_block();
-                                let saved_vars = self.vars.clone();
-                                self.lower_and_chain(condition, cont_block);
-                                // We're in the success path — return
-                                let ret_v = self.lower_expr(return_val);
-                                self.builder.ret(ret_v);
-                                self.vars = saved_vars;
-                                self.builder.switch_to(cont_block);
-                            } else {
-                                // Lower: if condition is true, return return_val from function
-                                let cond_val = self.lower_expr(condition);
-                                let cond_tag = self.builder.load(cond_val, 0, ScalarType::U64);
-                                let true_tag = self.decls.constructors["True"].tag_index;
-                                let true_val = self.builder.const_u64(true_tag);
-                                let is_true = self.builder.binop(
-                                    BinaryOp::Eq,
-                                    cond_tag,
-                                    true_val,
-                                    ScalarType::Bool,
-                                );
-                                let ret_block = self.builder.create_block();
-                                let cont_block = self.builder.create_block();
-                                self.builder
-                                    .branch(is_true, ret_block, vec![], cont_block, vec![]);
-                                // Return block: evaluate return_val and ret
-                                self.builder.switch_to(ret_block);
-                                let ret_v = self.lower_expr(return_val);
-                                self.builder.ret(ret_v);
-                                // Continue block: proceed with next statements
-                                self.builder.switch_to(cont_block);
-                            }
-                        }
-                        Stmt::TypeHint { .. } => {}
-                    }
-                }
-                self.lower_expr(result)
-            }
+            ExprKind::Block(stmts, result) => self.lower_block(stmts, result),
 
             ExprKind::If {
                 expr: scrutinee_expr,
@@ -312,46 +258,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
 
             ExprKind::QualifiedCall { segments, args } => {
-                // Check if inference resolved this to a method call
-                if let Some(resolved) = self.infer.method_resolutions.get(&expr.span).cloned() {
-                    let receiver_name = segments[0];
-                    let receiver_val = if let Some(&val) = self.vars.get(receiver_name) {
-                        val
-                    } else if self.decls.constructors.contains_key(receiver_name) {
-                        self.lower_constructor_call(receiver_name, &[])
-                    } else {
-                        panic!("undefined receiver: {receiver_name}");
-                    };
-                    if let Some(builtin_name) = resolved.strip_prefix("__builtin.") {
-                        let l = receiver_val;
-                        let r = self.lower_expr(&args[0]);
-                        let ty = self.expr_scalar_type(expr.span);
-                        return match builtin_name {
-                            "add" => self.builder.binop(BinaryOp::Add, l, r, ty),
-                            "sub" => self.builder.binop(BinaryOp::Sub, l, r, ty),
-                            "mul" => self.builder.binop(BinaryOp::Mul, l, r, ty),
-                            "div" => self.builder.binop(BinaryOp::Div, l, r, ty),
-                            "rem" => self.builder.binop(BinaryOp::Rem, l, r, ty),
-                            "eq" => self.lower_eq(l, r, false),
-                            "neq" => self.lower_eq(l, r, true),
-                            _ => panic!("unknown builtin: {builtin_name}"),
-                        };
-                    }
-                    // Method call: receiver.method(args) -> Type.method(receiver, args)
-                    let mut arg_vals = vec![receiver_val];
-                    for (i, a) in args.iter().enumerate() {
-                        let idx = i + 1;
-                        let key = (resolved.clone(), idx);
-                        if self.defunc.ho_param_sets.contains_key(&key) {
-                            arg_vals.push(self.lower_lambda_arg(a, &resolved, idx));
-                        } else {
-                            arg_vals.push(self.lower_expr(a));
-                        }
-                    }
-                    return self.emit_function_call(&resolved, arg_vals, expr.span);
-                }
-                let mangled = segments.join(".");
-                self.lower_call(&mangled, args, expr.span)
+                self.lower_qualified_call(segments, args, expr.span)
             }
 
             ExprKind::Record { fields } => {
@@ -384,78 +291,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 receiver,
                 method,
                 args,
-            } => {
-                let resolved = self.infer.method_resolutions.get(&expr.span).cloned();
-                if let Some(mangled) = resolved {
-                    // List.walk / walk_backwards / walk_until / walk_backwards_until
-                    if let Some(walk) = self.classify_walk(&mangled) {
-                        let list_val = self.lower_expr(receiver);
-                        let init_val = self.lower_expr(&args[0]);
-                        let acc_ty = self.expr_scalar_type(args[0].span);
-                        let key = (mangled.clone(), 2);
-                        let closure_val = if self.defunc.ho_param_sets.contains_key(&key) {
-                            self.lower_lambda_arg(&args[1], &mangled, 2)
-                        } else {
-                            self.lower_expr(&args[1])
-                        };
-                        let ls_idx = self.defunc.ho_param_sets[&key];
-                        let apply_name = self.defunc.lambda_sets[ls_idx].apply_name.clone();
-                        return self.lower_list_walk(
-                            list_val,
-                            init_val,
-                            closure_val,
-                            &apply_name,
-                            walk.backwards,
-                            walk.until,
-                            acc_ty,
-                        );
-                    }
-
-                    // Build full args: receiver + method args (with lambda handling)
-                    let recv_val = self.lower_expr(receiver);
-                    let mut full_args = vec![recv_val];
-                    for (i, a) in args.iter().enumerate() {
-                        let idx = i + 1;
-                        let key = (mangled.clone(), idx);
-                        if self.defunc.ho_param_sets.contains_key(&key) {
-                            full_args.push(self.lower_lambda_arg(a, &mangled, idx));
-                        } else {
-                            full_args.push(self.lower_expr(a));
-                        }
-                    }
-                    // Check for builtin arithmetic
-                    if let Some(op_name) = mangled.strip_prefix("__builtin.") {
-                        let ty = self.expr_scalar_type(expr.span);
-                        return match op_name {
-                            "add" => {
-                                self.builder
-                                    .binop(BinaryOp::Add, full_args[0], full_args[1], ty)
-                            }
-                            "sub" => {
-                                self.builder
-                                    .binop(BinaryOp::Sub, full_args[0], full_args[1], ty)
-                            }
-                            "mul" => {
-                                self.builder
-                                    .binop(BinaryOp::Mul, full_args[0], full_args[1], ty)
-                            }
-                            "div" => {
-                                self.builder
-                                    .binop(BinaryOp::Div, full_args[0], full_args[1], ty)
-                            }
-                            "rem" => {
-                                self.builder
-                                    .binop(BinaryOp::Rem, full_args[0], full_args[1], ty)
-                            }
-                            "eq" => self.lower_eq(full_args[0], full_args[1], false),
-                            "neq" => self.lower_eq(full_args[0], full_args[1], true),
-                            _ => panic!("unknown builtin: {op_name}"),
-                        };
-                    }
-                    return self.emit_function_call(&mangled, full_args, expr.span);
-                }
-                panic!("no method resolution for .{method}() at {:?}", expr.span);
-            }
+            } => self.lower_method_call(receiver, method, args, expr.span),
 
             ExprKind::Tuple(elems) => {
                 let ptr = self.builder.alloc(elems.len());
@@ -485,6 +321,140 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 header
             }
         }
+    }
+
+    // ---- Block lowering ----
+
+    fn lower_block(&mut self, stmts: &[Stmt<'src>], result: &Expr<'src>) -> Value {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, val } => {
+                    let v = self.lower_expr(val);
+                    self.vars.insert((*name).to_owned(), v);
+                }
+                Stmt::Destructure { pattern, val } => {
+                    let v = self.lower_expr(val);
+                    self.lower_destructure(pattern, v);
+                }
+                Stmt::Guard {
+                    condition,
+                    return_val,
+                } => {
+                    if Self::expr_contains_is(condition) {
+                        // Use and-chain lowering for Is binding flow
+                        let cont_block = self.builder.create_block();
+                        let saved_vars = self.vars.clone();
+                        self.lower_and_chain(condition, cont_block);
+                        // We're in the success path — return
+                        let ret_v = self.lower_expr(return_val);
+                        self.builder.ret(ret_v);
+                        self.vars = saved_vars;
+                        self.builder.switch_to(cont_block);
+                    } else {
+                        // Lower: if condition is true, return return_val from function
+                        let cond_val = self.lower_expr(condition);
+                        let cond_tag = self.builder.load(cond_val, 0, ScalarType::U64);
+                        let true_tag = self.decls.constructors["True"].tag_index;
+                        let true_val = self.builder.const_u64(true_tag);
+                        let is_true = self.builder.binop(
+                            BinaryOp::Eq,
+                            cond_tag,
+                            true_val,
+                            ScalarType::Bool,
+                        );
+                        let ret_block = self.builder.create_block();
+                        let cont_block = self.builder.create_block();
+                        self.builder
+                            .branch(is_true, ret_block, vec![], cont_block, vec![]);
+                        // Return block: evaluate return_val and ret
+                        self.builder.switch_to(ret_block);
+                        let ret_v = self.lower_expr(return_val);
+                        self.builder.ret(ret_v);
+                        // Continue block: proceed with next statements
+                        self.builder.switch_to(cont_block);
+                    }
+                }
+                Stmt::TypeHint { .. } => {}
+            }
+        }
+        self.lower_expr(result)
+    }
+
+    // ---- Qualified / method call lowering ----
+
+    fn lower_qualified_call(
+        &mut self,
+        segments: &[&'src str],
+        args: &[Expr<'src>],
+        span: ast::Span,
+    ) -> Value {
+        // Check if inference resolved this to a method call
+        if let Some(resolved) = self.infer.method_resolutions.get(&span).cloned() {
+            let receiver_name = segments[0];
+            let receiver_val = if let Some(&val) = self.vars.get(receiver_name) {
+                val
+            } else if self.decls.constructors.contains_key(receiver_name) {
+                self.lower_constructor_call(receiver_name, &[])
+            } else {
+                panic!("undefined receiver: {receiver_name}");
+            };
+            if let Some(builtin_name) = resolved.strip_prefix("__builtin.") {
+                let r = self.lower_expr(&args[0]);
+                return self.lower_builtin_op(builtin_name, receiver_val, r, span);
+            }
+            let arg_vals = self.lower_method_args(receiver_val, args, &resolved);
+            return self.emit_function_call(&resolved, arg_vals, span);
+        }
+        let mangled = segments.join(".");
+        self.lower_call(&mangled, args, span)
+    }
+
+    fn lower_method_call(
+        &mut self,
+        receiver: &Expr<'src>,
+        method: &'src str,
+        args: &[Expr<'src>],
+        span: ast::Span,
+    ) -> Value {
+        let resolved = self.infer.method_resolutions.get(&span).cloned();
+        let Some(mangled) = resolved else {
+            panic!("no method resolution for .{method}() at {span:?}");
+        };
+
+        // List.walk / walk_backwards / walk_until / walk_backwards_until
+        if let Some(walk) = self.classify_walk(&mangled) {
+            let list_val = self.lower_expr(receiver);
+            let init_val = self.lower_expr(&args[0]);
+            let acc_ty = self.expr_scalar_type(args[0].span);
+            let key = (mangled.clone(), 2);
+            let closure_val = if self.defunc.ho_param_sets.contains_key(&key) {
+                self.lower_lambda_arg(&args[1], &mangled, 2)
+            } else {
+                self.lower_expr(&args[1])
+            };
+            let ls_idx = self.defunc.ho_param_sets[&key];
+            let apply_name = self.defunc.lambda_sets[ls_idx].apply_name.clone();
+            return self.lower_list_walk(
+                list_val,
+                init_val,
+                closure_val,
+                &apply_name,
+                walk.backwards,
+                walk.until,
+                acc_ty,
+            );
+        }
+
+        // Build full args: receiver + method args (with lambda handling)
+        let recv_val = self.lower_expr(receiver);
+        let full_args = self.lower_method_args(recv_val, args, &mangled);
+
+        // Check for builtin arithmetic
+        if let Some(op_name) = mangled.strip_prefix("__builtin.") {
+            return self.lower_builtin_op(op_name, full_args[0], full_args[1], span);
+        }
+
+        self.emit_function_call(&mangled, full_args, span)
     }
 
     // ---- Call lowering ----
@@ -601,6 +571,43 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             panic!("unknown list builtin: {name}");
         };
         self.builder.call(intrinsic, args, ret_ty)
+    }
+
+    // ---- Builtin arithmetic dispatch ----
+
+    fn lower_builtin_op(&mut self, name: &str, lhs: Value, rhs: Value, span: ast::Span) -> Value {
+        let ty = self.expr_scalar_type(span);
+        match name {
+            "add" => self.builder.binop(BinaryOp::Add, lhs, rhs, ty),
+            "sub" => self.builder.binop(BinaryOp::Sub, lhs, rhs, ty),
+            "mul" => self.builder.binop(BinaryOp::Mul, lhs, rhs, ty),
+            "div" => self.builder.binop(BinaryOp::Div, lhs, rhs, ty),
+            "rem" => self.builder.binop(BinaryOp::Rem, lhs, rhs, ty),
+            "eq" => self.lower_eq(lhs, rhs, false),
+            "neq" => self.lower_eq(lhs, rhs, true),
+            _ => panic!("unknown builtin: {name}"),
+        }
+    }
+
+    // ---- Method argument building ----
+
+    fn lower_method_args(
+        &mut self,
+        receiver: Value,
+        args: &[Expr<'src>],
+        callee: &str,
+    ) -> Vec<Value> {
+        let mut vals = vec![receiver];
+        for (i, a) in args.iter().enumerate() {
+            let idx = i + 1;
+            let key = (callee.to_owned(), idx);
+            if self.defunc.ho_param_sets.contains_key(&key) {
+                vals.push(self.lower_lambda_arg(a, callee, idx));
+            } else {
+                vals.push(self.lower_expr(a));
+            }
+        }
+        vals
     }
 
     // ---- Lambda argument lowering ----
@@ -934,6 +941,56 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         merge_param
     }
 
+    // ---- Match/fold shared helpers ----
+
+    fn group_arms_by_tag(&self, arms: &[ast::MatchArm<'src>]) -> Vec<(u64, Vec<usize>)> {
+        let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
+        for (i, arm) in arms.iter().enumerate() {
+            let ast::Pattern::Constructor { name: con_name, .. } = &arm.pattern else {
+                panic!("arms must use constructor patterns");
+            };
+            let tag_idx = self.decls.constructors[*con_name].tag_index;
+            if let Some(group) = groups.iter_mut().find(|(t, _)| *t == tag_idx) {
+                group.1.push(i);
+            } else {
+                groups.push((tag_idx, vec![i]));
+            }
+        }
+        groups
+    }
+
+    fn lower_guards(
+        &mut self,
+        guards: &[Expr<'src>],
+        arm_idx: usize,
+        tag_idx: u64,
+        tag_groups: &[(u64, Vec<usize>)],
+        arm_blocks: &[BlockId],
+        default_fail: BlockId,
+    ) {
+        let group = &tag_groups.iter().find(|(t, _)| *t == tag_idx).unwrap().1;
+        let pos_in_group = group.iter().position(|&idx| idx == arm_idx).unwrap();
+        let fail_target = if pos_in_group + 1 < group.len() {
+            arm_blocks[group[pos_in_group + 1]]
+        } else {
+            default_fail
+        };
+
+        for guard_expr in guards {
+            let guard_val = self.lower_expr(guard_expr);
+            let guard_tag = self.builder.load(guard_val, 0, ScalarType::U64);
+            let true_tag = self.decls.constructors["True"].tag_index;
+            let true_val = self.builder.const_u64(true_tag);
+            let is_true =
+                self.builder
+                    .binop(BinaryOp::Eq, guard_tag, true_val, ScalarType::Bool);
+            let guard_ok = self.builder.create_block();
+            self.builder
+                .branch(is_true, guard_ok, vec![], fail_target, vec![]);
+            self.builder.switch_to(guard_ok);
+        }
+    }
+
     // ---- Match lowering ----
 
     fn lower_match(
@@ -949,38 +1006,18 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, result_ty);
-
-        // Create else block if needed
         let else_block = else_body.map(|_| self.builder.create_block());
-
-        // Pre-create blocks for each arm
         let arm_blocks: Vec<_> = arms.iter().map(|_| self.builder.create_block()).collect();
+        let tag_groups = self.group_arms_by_tag(arms);
 
-        // Group arms by constructor tag, preserving order
-        let mut tag_groups: Vec<(u64, Vec<usize>)> = Vec::new();
-        for (i, arm) in arms.iter().enumerate() {
-            let ast::Pattern::Constructor { name: con_name, .. } = &arm.pattern else {
-                panic!("match arms must use constructor patterns");
-            };
-            let tag_idx = self.decls.constructors[*con_name].tag_index;
-            if let Some(group) = tag_groups.iter_mut().find(|(t, _)| *t == tag_idx) {
-                group.1.push(i);
-            } else {
-                tag_groups.push((tag_idx, vec![i]));
-            }
-        }
-
-        // Build switch_int: each tag maps to first arm in group
         let switch_arms: Vec<_> = tag_groups
             .iter()
             .map(|(tag_idx, arm_indices)| (*tag_idx, arm_blocks[arm_indices[0]], vec![]))
             .collect();
-
         self.builder.switch_to(tag_block);
         self.builder
             .switch_int(tag, switch_arms, else_block.map(|b| (b, vec![])));
 
-        // Lower each arm
         for (i, arm) in arms.iter().enumerate() {
             let ast::Pattern::Constructor {
                 name: con_name,
@@ -994,42 +1031,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let meta = self.decls.constructors[*con_name].clone();
             let saved_vars = self.vars.clone();
 
-            // Load fields and bind
             for (fi, field_pat) in fields.iter().enumerate() {
                 let field_ty = meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
                 let field_val = self.builder.load(scr_val, fi + 1, field_ty);
                 self.bind_pattern_field(field_pat, field_val);
             }
 
-            // Evaluate guards
             if !arm.guards.is_empty() {
-                // Find the next block to jump to on guard failure
-                let tag_idx = meta.tag_index;
-                let group = &tag_groups.iter().find(|(t, _)| *t == tag_idx).unwrap().1;
-                let pos_in_group = group.iter().position(|&idx| idx == i).unwrap();
-                let fail_target = if pos_in_group + 1 < group.len() {
-                    arm_blocks[group[pos_in_group + 1]]
-                } else {
-                    // Last arm in group: fall to else block or merge
-                    else_block.unwrap_or(merge)
-                };
-
-                for guard_expr in &arm.guards {
-                    let guard_val = self.lower_expr(guard_expr);
-                    let guard_tag = self.builder.load(guard_val, 0, ScalarType::U64);
-                    let true_tag = self.decls.constructors["True"].tag_index;
-                    let true_val = self.builder.const_u64(true_tag);
-                    let is_true =
-                        self.builder
-                            .binop(BinaryOp::Eq, guard_tag, true_val, ScalarType::Bool);
-                    let guard_ok = self.builder.create_block();
-                    self.builder
-                        .branch(is_true, guard_ok, vec![], fail_target, vec![]);
-                    self.builder.switch_to(guard_ok);
-                }
+                let default_fail = else_block.unwrap_or(merge);
+                self.lower_guards(
+                    &arm.guards, i, meta.tag_index, &tag_groups, &arm_blocks, default_fail,
+                );
             }
 
-            // Evaluate body and terminate
             let result = self.lower_expr(&arm.body);
             if arm.is_return {
                 self.builder.ret(result);
@@ -1040,7 +1054,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             self.vars = saved_vars;
         }
 
-        // Lower else block
         if let (Some(else_block_id), Some(else_expr)) = (else_block, else_body) {
             self.builder.switch_to(else_block_id);
             let else_val = self.lower_expr(else_expr);
@@ -1113,24 +1126,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         let tag_block = self.builder.current_block.unwrap();
 
-        // Pre-create blocks for each arm
         let arm_blocks: Vec<_> = arms.iter().map(|_| self.builder.create_block()).collect();
+        let tag_groups = self.group_arms_by_tag(arms);
 
-        // Group arms by constructor tag, preserving order
-        let mut tag_groups: Vec<(u64, Vec<usize>)> = Vec::new();
-        for (i, arm) in arms.iter().enumerate() {
-            let ast::Pattern::Constructor { name: con_name, .. } = &arm.pattern else {
-                panic!("fold arms must use constructor patterns");
-            };
-            let tag_idx = self.decls.constructors[*con_name].tag_index;
-            if let Some(group) = tag_groups.iter_mut().find(|(t, _)| *t == tag_idx) {
-                group.1.push(i);
-            } else {
-                tag_groups.push((tag_idx, vec![i]));
-            }
-        }
-
-        // Build switch_int: each tag maps to first arm in group
         let switch_arms: Vec<_> = tag_groups
             .iter()
             .map(|(tag_idx, arm_indices)| (*tag_idx, arm_blocks[arm_indices[0]], vec![]))
@@ -1145,12 +1143,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 panic!("fold arms must use constructor patterns");
             };
             assert!(!arm.is_return, "return in fold not yet supported");
-            let con_name = *con_name;
-            let meta = self.decls.constructors[con_name].clone();
+            let meta = self.decls.constructors[*con_name].clone();
 
             self.builder.switch_to(arm_blocks[i]);
 
-            // Load fields and bind pattern names
             for (fi, field_pat) in fields.iter().enumerate() {
                 let field_ty = meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
                 let field_val = self.builder.load(val_param, fi + 1, field_ty);
@@ -1167,37 +1163,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         call_args.push(self.vars[*cap_name]);
                     }
                     let rec_result = self.builder.call(&fold_name, call_args, result_ty);
-                    // Shadow: the user's binding name now refers to the fold result
                     if let ast::Pattern::Binding(name) = field_pat {
                         self.vars.insert((*name).to_owned(), rec_result);
                     }
                 }
             }
 
-            // Evaluate guards
             if !arm.guards.is_empty() {
-                let tag_idx = meta.tag_index;
-                let group = &tag_groups.iter().find(|(t, _)| *t == tag_idx).unwrap().1;
-                let pos_in_group = group.iter().position(|&idx| idx == i).unwrap();
-                let fail_target = if pos_in_group + 1 < group.len() {
-                    arm_blocks[group[pos_in_group + 1]]
-                } else {
-                    merge
-                };
-
-                for guard_expr in &arm.guards {
-                    let guard_val = self.lower_expr(guard_expr);
-                    let guard_tag = self.builder.load(guard_val, 0, ScalarType::U64);
-                    let true_tag = self.decls.constructors["True"].tag_index;
-                    let true_val = self.builder.const_u64(true_tag);
-                    let is_true =
-                        self.builder
-                            .binop(BinaryOp::Eq, guard_tag, true_val, ScalarType::Bool);
-                    let guard_ok = self.builder.create_block();
-                    self.builder
-                        .branch(is_true, guard_ok, vec![], fail_target, vec![]);
-                    self.builder.switch_to(guard_ok);
-                }
+                self.lower_guards(
+                    &arm.guards, i, meta.tag_index, &tag_groups, &arm_blocks, merge,
+                );
             }
 
             let result = self.lower_expr(&arm.body);
