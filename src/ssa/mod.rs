@@ -1,4 +1,5 @@
 mod builder;
+mod display;
 pub mod eval;
 mod instruction;
 pub mod lower;

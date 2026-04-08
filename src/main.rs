@@ -96,19 +96,26 @@ fn eprint_rt(val: &RtValue) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: ori <file.ori>");
+    let dump_ssa = args.iter().any(|a| a == "--dump-ssa");
+    let file_args: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
+    if file_args.is_empty() {
+        eprintln!("usage: ori [--dump-ssa] <file.ori> [args...]");
         process::exit(1);
     }
-    let content = std::fs::read_to_string(&args[1]).unwrap_or_else(|e| {
-        eprintln!("error reading {}: {e}", args[1]);
+    let source_path = file_args[0];
+    let content = std::fs::read_to_string(source_path).unwrap_or_else(|e| {
+        eprintln!("error reading {source_path}: {e}");
         process::exit(1);
     });
 
     let mut arena = SourceArena::new();
-    let main_file = arena.add(args[1].clone(), content);
+    let main_file = arena.add(source_path.clone(), content);
 
-    let source_dir = std::path::Path::new(&args[1]).parent();
+    let source_dir = std::path::Path::new(source_path).parent();
     let (program, input_vars) = match compile(&mut arena, main_file, source_dir) {
         Ok(result) => result,
         Err(e) => {
@@ -120,8 +127,14 @@ fn main() {
     // Lower Core → SSA
     let ssa_module = ssa::lower::lower(&program, &input_vars);
 
-    // Build inputs
-    let cli_args: Vec<RtValue> = args[2..]
+    if dump_ssa {
+        eprint!("{ssa_module}");
+        return;
+    }
+
+    // Build inputs — program args are non-flag args after the source file
+    let program_args: Vec<&String> = file_args[1..].to_vec();
+    let cli_args: Vec<RtValue> = program_args
         .iter()
         .map(|a| bytes_to_rt(a.as_bytes()))
         .collect();
