@@ -1,66 +1,139 @@
 use std::collections::HashMap;
 
 use crate::ssa::Module;
-use crate::ssa::instruction::{BinaryOp, BlockId, Inst, Terminator, Value};
+use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 
-/// Runtime values for the SSA interpreter.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RtValue {
+/// A scalar runtime value that fits in a register.
+#[derive(Debug, Clone, Copy)]
+pub enum Scalar {
     I64(i64),
     U64(u64),
     F64(f64),
     U8(u8),
     I8(i8),
     Bool(bool),
-    Construct { tag: String, fields: Vec<RtValue> },
-    Record { fields: Vec<(String, RtValue)> },
-    List(Vec<RtValue>),
+    Ptr(usize), // index into heap
 }
 
-type Env = HashMap<Value, RtValue>;
+/// Simulated heap for the interpreter.
+/// Each allocation is a Vec<u8> at a heap index.
+pub struct Heap {
+    /// Each entry: (refcount, bytes).
+    objects: Vec<(usize, Vec<u8>)>,
+}
+
+impl Heap {
+    fn new() -> Self {
+        // Index 0 is null
+        Self {
+            objects: vec![(0, vec![])],
+        }
+    }
+
+    fn alloc(&mut self, size: usize) -> usize {
+        let idx = self.objects.len();
+        self.objects.push((1, vec![0u8; size]));
+        idx
+    }
+
+    fn load(&self, idx: usize, offset: usize, ty: ScalarType) -> Scalar {
+        let bytes = &self.objects[idx].1;
+        match ty {
+            ScalarType::I8 => Scalar::I8(bytes[offset] as i8),
+            ScalarType::U8 => Scalar::U8(bytes[offset]),
+            ScalarType::I64 => {
+                let b: [u8; 8] = bytes[offset..offset + 8].try_into().unwrap();
+                Scalar::I64(i64::from_le_bytes(b))
+            }
+            ScalarType::U64 => {
+                let b: [u8; 8] = bytes[offset..offset + 8].try_into().unwrap();
+                Scalar::U64(u64::from_le_bytes(b))
+            }
+            ScalarType::F64 => {
+                let b: [u8; 8] = bytes[offset..offset + 8].try_into().unwrap();
+                Scalar::F64(f64::from_le_bytes(b))
+            }
+            ScalarType::Bool => Scalar::Bool(bytes[offset] != 0),
+            ScalarType::Ptr => {
+                let b: [u8; 8] = bytes[offset..offset + 8].try_into().unwrap();
+                Scalar::Ptr(usize::from_le_bytes(b))
+            }
+        }
+    }
+
+    fn store(&mut self, idx: usize, offset: usize, val: Scalar) {
+        let bytes = &mut self.objects[idx].1;
+        match val {
+            Scalar::I8(n) => bytes[offset] = n as u8,
+            Scalar::U8(n) => bytes[offset] = n,
+            Scalar::I64(n) => bytes[offset..offset + 8].copy_from_slice(&n.to_le_bytes()),
+            Scalar::U64(n) => bytes[offset..offset + 8].copy_from_slice(&n.to_le_bytes()),
+            Scalar::F64(n) => bytes[offset..offset + 8].copy_from_slice(&n.to_le_bytes()),
+            Scalar::Bool(b) => bytes[offset] = u8::from(b),
+            Scalar::Ptr(p) => bytes[offset..offset + 8].copy_from_slice(&p.to_le_bytes()),
+        }
+    }
+
+    fn rc_inc(&mut self, idx: usize) {
+        if idx != 0 {
+            self.objects[idx].0 += 1;
+        }
+    }
+
+    fn rc_dec(&mut self, idx: usize) {
+        if idx != 0 {
+            self.objects[idx].0 -= 1;
+            if self.objects[idx].0 == 0 {
+                self.objects[idx].1.clear();
+            }
+        }
+    }
+}
+
+type Env = HashMap<Value, Scalar>;
 
 /// Evaluate the entry function of an SSA module.
-pub fn eval(module: &Module, args: &[RtValue]) -> RtValue {
-    eval_with_name(module, &module.entry, args)
+pub fn eval(module: &Module, heap: &mut Heap, args: &[Scalar]) -> Scalar {
+    eval_function(module, heap, &module.entry, args)
 }
 
-/// Evaluate a named function in the SSA module.
-pub fn eval_with_name(module: &Module, name: &str, args: &[RtValue]) -> RtValue {
-    eval_function(module, name, args)
+/// Create a new heap for interpretation.
+pub fn new_heap() -> Heap {
+    Heap::new()
 }
 
-fn eval_function(module: &Module, func_name: &str, args: &[RtValue]) -> RtValue {
-    let func = &module.functions[func_name];
+fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) -> Scalar {
+    let func = &module.functions[name];
     let mut env = Env::new();
 
-    // Bind function params
     for (param, arg) in func.params.iter().zip(args) {
-        env.insert(*param, arg.clone());
+        env.insert(*param, *arg);
     }
 
     let mut current = BlockId(0);
-    let mut block_args: Vec<RtValue> = vec![];
+    let mut block_args: Vec<Scalar> = vec![];
 
     loop {
         let block = &func.blocks[current.0];
 
-        // Bind block parameters
         for (param, arg) in block.params.iter().zip(&block_args) {
-            env.insert(*param, arg.clone());
+            env.insert(*param, *arg);
         }
 
-        // Execute instructions
         for inst in &block.insts {
-            let val = eval_inst(module, &env, inst);
-            env.insert(inst.dest(), val);
+            let val = eval_inst(module, heap, &env, inst);
+            if let Some(dest) = inst.dest() {
+                if let Some(v) = val {
+                    env.insert(dest, v);
+                }
+            }
         }
 
-        // Execute terminator
         match &block.terminator {
-            Terminator::Return(v) => return env[v].clone(),
+            Terminator::Return(v) => return env[v],
 
             Terminator::Jump(target, args) => {
-                block_args = args.iter().map(|v| env[v].clone()).collect();
+                block_args = args.iter().map(|v| env[v]).collect();
                 current = *target;
             }
 
@@ -71,30 +144,33 @@ fn eval_function(module: &Module, func_name: &str, args: &[RtValue]) -> RtValue 
                 else_block,
                 else_args,
             } => {
-                let is_true = match &env[cond] {
-                    RtValue::Bool(b) => *b,
-                    other => panic!("branch on non-boolean: {other:?}"),
+                let Scalar::Bool(b) = env[cond] else {
+                    panic!("branch on non-bool: {:?}", env[cond]);
                 };
-                if is_true {
-                    block_args = then_args.iter().map(|v| env[v].clone()).collect();
+                if b {
+                    block_args = then_args.iter().map(|v| env[v]).collect();
                     current = *then_block;
                 } else {
-                    block_args = else_args.iter().map(|v| env[v].clone()).collect();
+                    block_args = else_args.iter().map(|v| env[v]).collect();
                     current = *else_block;
                 }
             }
 
-            Terminator::Switch { scrutinee, arms } => {
-                let val = &env[scrutinee];
-                let RtValue::Construct { tag, fields } = val else {
-                    panic!("switch on non-construct: {val:?}");
-                };
-                let (_, target) = arms
-                    .iter()
-                    .find(|(t, _)| t == tag)
-                    .unwrap_or_else(|| panic!("no matching arm for tag '{tag}'"));
-                block_args = fields.clone();
-                current = *target;
+            Terminator::SwitchInt {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                let tag = scalar_to_u64(env[scrutinee]);
+                if let Some((_, block, args)) = arms.iter().find(|(v, _, _)| *v == tag) {
+                    block_args = args.iter().map(|v| env[v]).collect();
+                    current = *block;
+                } else if let Some((block, args)) = default {
+                    block_args = args.iter().map(|v| env[v]).collect();
+                    current = *block;
+                } else {
+                    panic!("no matching arm for tag {tag}");
+                }
             }
 
             Terminator::None => panic!("reached incomplete block"),
@@ -102,153 +178,122 @@ fn eval_function(module: &Module, func_name: &str, args: &[RtValue]) -> RtValue 
     }
 }
 
-fn eval_inst(module: &Module, env: &Env, inst: &Inst) -> RtValue {
+fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option<Scalar> {
     match inst {
-        Inst::Const(_, n) => RtValue::I64(*n),
-        Inst::ConstU64(_, n) => RtValue::U64(*n),
-        Inst::ConstF64(_, n) => RtValue::F64(*n),
-        Inst::ConstU8(_, n) => RtValue::U8(*n),
-        Inst::ConstI8(_, n) => RtValue::I8(*n),
+        Inst::Const(_, ty, bits) => Some(bits_to_scalar(*ty, *bits)),
 
-        Inst::BinOp(_, op, lhs, rhs) => eval_binop(*op, &env[lhs], &env[rhs]),
+        Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs], env[rhs])),
 
-        Inst::Call(_, func_name, args) => {
-            let arg_vals: Vec<RtValue> = args
-                .iter()
-                .map(|v| {
-                    env.get(v)
-                        .cloned()
-                        .unwrap_or_else(|| panic!("missing value {v} in call to {func_name}"))
-                })
-                .collect();
-            eval_function(module, func_name, &arg_vals)
+        Inst::Call(_, name, args) => {
+            let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v]).collect();
+            Some(eval_function(module, heap, name, &arg_vals))
         }
 
-        Inst::Construct(_, tag, fields) => RtValue::Construct {
-            tag: tag.clone(),
-            fields: fields.iter().map(|v| env[v].clone()).collect(),
-        },
-
-        Inst::RecordNew(_, fields) => RtValue::Record {
-            fields: fields
-                .iter()
-                .map(|(name, v)| (name.clone(), env[v].clone()))
-                .collect(),
-        },
-
-        Inst::FieldGet(_, record, field) => {
-            let RtValue::Record { fields } = &env[record] else {
-                panic!("field access on non-record");
-            };
-            fields
-                .iter()
-                .find(|(n, _)| n == field)
-                .unwrap_or_else(|| panic!("no field '{field}'"))
-                .1
-                .clone()
+        Inst::Alloc(_, size) => {
+            let idx = heap.alloc(*size);
+            Some(Scalar::Ptr(idx))
         }
 
-        Inst::ListNew(_, elems) => RtValue::List(elems.iter().map(|v| env[v].clone()).collect()),
-
-        Inst::ListGet(_, list, index) => {
-            let RtValue::List(elems) = &env[list] else {
-                panic!("list_get on non-list");
+        Inst::Load(_, ty, ptr, offset) => {
+            let Scalar::Ptr(idx) = env[ptr] else {
+                panic!("load from non-ptr: {:?}", env[ptr]);
             };
-            let i = as_usize(&env[index]);
-            elems[i].clone()
+            Some(heap.load(idx, *offset, *ty))
         }
 
-        Inst::ListSet(_, list, index, elem) => {
-            let RtValue::List(elems) = &env[list] else {
-                panic!("list_set on non-list");
+        Inst::Store(ptr, offset, val) => {
+            let Scalar::Ptr(idx) = env[ptr] else {
+                panic!("store to non-ptr: {:?}", env[ptr]);
             };
-            let i = as_usize(&env[index]);
-            let mut new_list = elems.clone();
-            new_list[i] = env[elem].clone();
-            RtValue::List(new_list)
+            heap.store(idx, *offset, env[val]);
+            None
         }
 
-        Inst::ListAppend(_, list, elem) => {
-            let RtValue::List(elems) = &env[list] else {
-                panic!("list_append on non-list");
+        Inst::RcInc(ptr) => {
+            let Scalar::Ptr(idx) = env[ptr] else {
+                panic!("rc_inc on non-ptr");
             };
-            let mut new_list = elems.clone();
-            new_list.push(env[elem].clone());
-            RtValue::List(new_list)
+            heap.rc_inc(idx);
+            None
         }
 
-        Inst::ListLen(_, list) => {
-            let RtValue::List(elems) = &env[list] else {
-                panic!("list_len on non-list");
+        Inst::RcDec(ptr) => {
+            let Scalar::Ptr(idx) = env[ptr] else {
+                panic!("rc_dec on non-ptr");
             };
-            RtValue::U64(elems.len() as u64)
-        }
-
-        Inst::NumToStr(_, num) => {
-            let s = match &env[num] {
-                RtValue::I64(n) => n.to_string(),
-                RtValue::U64(n) => n.to_string(),
-                RtValue::F64(n) => n.to_string(),
-                RtValue::U8(n) => n.to_string(),
-                RtValue::I8(n) => n.to_string(),
-                other => panic!("num_to_str on {other:?}"),
-            };
-            RtValue::List(s.into_bytes().into_iter().map(RtValue::U8).collect())
+            heap.rc_dec(idx);
+            None
         }
     }
 }
 
-fn eval_binop(op: BinaryOp, lhs: &RtValue, rhs: &RtValue) -> RtValue {
+fn bits_to_scalar(ty: ScalarType, bits: u64) -> Scalar {
+    match ty {
+        ScalarType::I8 => Scalar::I8(bits as i8),
+        ScalarType::U8 => Scalar::U8(bits as u8),
+        ScalarType::I64 => Scalar::I64(bits as i64),
+        ScalarType::U64 => Scalar::U64(bits),
+        ScalarType::F64 => Scalar::F64(f64::from_bits(bits)),
+        ScalarType::Bool => Scalar::Bool(bits != 0),
+        ScalarType::Ptr => Scalar::Ptr(bits as usize),
+    }
+}
+
+fn scalar_to_u64(s: Scalar) -> u64 {
+    match s {
+        Scalar::I64(n) => n as u64,
+        Scalar::U64(n) => n,
+        Scalar::U8(n) => u64::from(n),
+        Scalar::I8(n) => n as u64,
+        Scalar::Bool(b) => u64::from(b),
+        Scalar::Ptr(p) => p as u64,
+        Scalar::F64(_) => panic!("switch on float"),
+    }
+}
+
+fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
     match (op, lhs, rhs) {
-        // I64
-        (BinaryOp::Add, RtValue::I64(a), RtValue::I64(b)) => RtValue::I64(a + b),
-        (BinaryOp::Sub, RtValue::I64(a), RtValue::I64(b)) => RtValue::I64(a - b),
-        (BinaryOp::Mul, RtValue::I64(a), RtValue::I64(b)) => RtValue::I64(a * b),
-        (BinaryOp::Div, RtValue::I64(a), RtValue::I64(b)) => RtValue::I64(a / b),
-        (BinaryOp::Rem, RtValue::I64(a), RtValue::I64(b)) => RtValue::I64(a % b),
-        (BinaryOp::Max, RtValue::I64(a), RtValue::I64(b)) => RtValue::I64(*a.max(b)),
-        (BinaryOp::Eq, RtValue::I64(a), RtValue::I64(b)) => RtValue::Bool(a == b),
-        (BinaryOp::Neq, RtValue::I64(a), RtValue::I64(b)) => RtValue::Bool(a != b),
-        // U64
-        (BinaryOp::Add, RtValue::U64(a), RtValue::U64(b)) => RtValue::U64(a + b),
-        (BinaryOp::Sub, RtValue::U64(a), RtValue::U64(b)) => RtValue::U64(a - b),
-        (BinaryOp::Mul, RtValue::U64(a), RtValue::U64(b)) => RtValue::U64(a * b),
-        (BinaryOp::Div, RtValue::U64(a), RtValue::U64(b)) => RtValue::U64(a / b),
-        (BinaryOp::Rem, RtValue::U64(a), RtValue::U64(b)) => RtValue::U64(a % b),
-        (BinaryOp::Max, RtValue::U64(a), RtValue::U64(b)) => RtValue::U64(*a.max(b)),
-        (BinaryOp::Eq, RtValue::U64(a), RtValue::U64(b)) => RtValue::Bool(a == b),
-        (BinaryOp::Neq, RtValue::U64(a), RtValue::U64(b)) => RtValue::Bool(a != b),
-        // U8
-        (BinaryOp::Add, RtValue::U8(a), RtValue::U8(b)) => RtValue::U8(a + b),
-        (BinaryOp::Sub, RtValue::U8(a), RtValue::U8(b)) => RtValue::U8(a - b),
-        (BinaryOp::Mul, RtValue::U8(a), RtValue::U8(b)) => RtValue::U8(a * b),
-        (BinaryOp::Div, RtValue::U8(a), RtValue::U8(b)) => RtValue::U8(a / b),
-        (BinaryOp::Rem, RtValue::U8(a), RtValue::U8(b)) => RtValue::U8(a % b),
-        (BinaryOp::Eq, RtValue::U8(a), RtValue::U8(b)) => RtValue::Bool(a == b),
-        (BinaryOp::Neq, RtValue::U8(a), RtValue::U8(b)) => RtValue::Bool(a != b),
-        // I8
-        (BinaryOp::Add, RtValue::I8(a), RtValue::I8(b)) => RtValue::I8(a + b),
-        (BinaryOp::Sub, RtValue::I8(a), RtValue::I8(b)) => RtValue::I8(a - b),
-        (BinaryOp::Mul, RtValue::I8(a), RtValue::I8(b)) => RtValue::I8(a * b),
-        (BinaryOp::Div, RtValue::I8(a), RtValue::I8(b)) => RtValue::I8(a / b),
-        (BinaryOp::Rem, RtValue::I8(a), RtValue::I8(b)) => RtValue::I8(a % b),
-        (BinaryOp::Eq, RtValue::I8(a), RtValue::I8(b)) => RtValue::Bool(a == b),
-        (BinaryOp::Neq, RtValue::I8(a), RtValue::I8(b)) => RtValue::Bool(a != b),
-        // F64
-        (BinaryOp::Add, RtValue::F64(a), RtValue::F64(b)) => RtValue::F64(a + b),
-        (BinaryOp::Sub, RtValue::F64(a), RtValue::F64(b)) => RtValue::F64(a - b),
-        (BinaryOp::Mul, RtValue::F64(a), RtValue::F64(b)) => RtValue::F64(a * b),
-        (BinaryOp::Div, RtValue::F64(a), RtValue::F64(b)) => RtValue::F64(a / b),
-        (BinaryOp::Eq, RtValue::F64(a), RtValue::F64(b)) => RtValue::Bool(a == b),
-        (BinaryOp::Neq, RtValue::F64(a), RtValue::F64(b)) => RtValue::Bool(a != b),
-        _ => panic!("unsupported binop {op:?} on {lhs:?}, {rhs:?}"),
-    }
-}
+        (BinaryOp::Add, Scalar::I64(a), Scalar::I64(b)) => Scalar::I64(a.wrapping_add(b)),
+        (BinaryOp::Sub, Scalar::I64(a), Scalar::I64(b)) => Scalar::I64(a.wrapping_sub(b)),
+        (BinaryOp::Mul, Scalar::I64(a), Scalar::I64(b)) => Scalar::I64(a.wrapping_mul(b)),
+        (BinaryOp::Div, Scalar::I64(a), Scalar::I64(b)) => Scalar::I64(a / b),
+        (BinaryOp::Rem, Scalar::I64(a), Scalar::I64(b)) => Scalar::I64(a % b),
+        (BinaryOp::Max, Scalar::I64(a), Scalar::I64(b)) => Scalar::I64(a.max(b)),
+        (BinaryOp::Eq, Scalar::I64(a), Scalar::I64(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::I64(a), Scalar::I64(b)) => Scalar::Bool(a != b),
 
-fn as_usize(val: &RtValue) -> usize {
-    match val {
-        RtValue::U64(n) => *n as usize,
-        RtValue::I64(n) => *n as usize,
-        other => panic!("expected index, got {other:?}"),
+        (BinaryOp::Add, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.wrapping_add(b)),
+        (BinaryOp::Sub, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.wrapping_sub(b)),
+        (BinaryOp::Mul, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.wrapping_mul(b)),
+        (BinaryOp::Div, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a / b),
+        (BinaryOp::Rem, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a % b),
+        (BinaryOp::Max, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.max(b)),
+        (BinaryOp::Eq, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a != b),
+
+        (BinaryOp::Add, Scalar::U8(a), Scalar::U8(b)) => Scalar::U8(a.wrapping_add(b)),
+        (BinaryOp::Sub, Scalar::U8(a), Scalar::U8(b)) => Scalar::U8(a.wrapping_sub(b)),
+        (BinaryOp::Mul, Scalar::U8(a), Scalar::U8(b)) => Scalar::U8(a.wrapping_mul(b)),
+        (BinaryOp::Div, Scalar::U8(a), Scalar::U8(b)) => Scalar::U8(a / b),
+        (BinaryOp::Rem, Scalar::U8(a), Scalar::U8(b)) => Scalar::U8(a % b),
+        (BinaryOp::Eq, Scalar::U8(a), Scalar::U8(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::U8(a), Scalar::U8(b)) => Scalar::Bool(a != b),
+
+        (BinaryOp::Add, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a.wrapping_add(b)),
+        (BinaryOp::Sub, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a.wrapping_sub(b)),
+        (BinaryOp::Mul, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a.wrapping_mul(b)),
+        (BinaryOp::Div, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a / b),
+        (BinaryOp::Rem, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a % b),
+        (BinaryOp::Eq, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a != b),
+
+        (BinaryOp::Add, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a + b),
+        (BinaryOp::Sub, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a - b),
+        (BinaryOp::Mul, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a * b),
+        (BinaryOp::Div, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a / b),
+        (BinaryOp::Eq, Scalar::F64(a), Scalar::F64(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::F64(a), Scalar::F64(b)) => Scalar::Bool(a != b),
+
+        _ => panic!("unsupported binop {op:?} on {lhs:?}, {rhs:?}"),
     }
 }

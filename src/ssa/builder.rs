@@ -1,5 +1,5 @@
 use super::{Block, Function, Module};
-use crate::ssa::instruction::{BinaryOp, BlockId, Inst, Terminator, Value};
+use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 use std::collections::HashMap;
 
 /// Builds SSA functions and modules incrementally.
@@ -8,7 +8,6 @@ pub struct Builder {
     pub blocks: Vec<Block>,
     pub current_block: Option<BlockId>,
     functions: HashMap<String, Function>,
-    data: Vec<u8>,
 }
 
 impl Builder {
@@ -18,18 +17,15 @@ impl Builder {
             blocks: Vec::new(),
             current_block: None,
             functions: HashMap::new(),
-            data: Vec::new(),
         }
     }
 
-    /// Allocate a fresh SSA value.
     pub const fn fresh_value(&mut self) -> Value {
         let v = Value(self.next_value);
         self.next_value += 1;
         v
     }
 
-    /// Create a new basic block, returning its id.
     pub fn create_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len());
         self.blocks.push(Block {
@@ -40,49 +36,61 @@ impl Builder {
         id
     }
 
-    /// Set the current block for instruction emission.
     pub const fn switch_to(&mut self, block: BlockId) {
         self.current_block = Some(block);
     }
 
-    /// Add a parameter to a block, returning the value it binds.
     pub fn add_block_param(&mut self, block: BlockId) -> Value {
         let v = self.fresh_value();
         self.blocks[block.0].params.push(v);
         v
     }
 
-    // ---- Instruction builders ----
+    // ---- Constants ----
 
     pub fn const_i64(&mut self, n: i64) -> Value {
         let v = self.fresh_value();
-        self.push(Inst::Const(v, n));
+        self.push(Inst::Const(v, ScalarType::I64, n as u64));
         v
     }
 
     pub fn const_u64(&mut self, n: u64) -> Value {
         let v = self.fresh_value();
-        self.push(Inst::ConstU64(v, n));
+        self.push(Inst::Const(v, ScalarType::U64, n));
         v
     }
 
     pub fn const_f64(&mut self, n: f64) -> Value {
         let v = self.fresh_value();
-        self.push(Inst::ConstF64(v, n));
+        self.push(Inst::Const(v, ScalarType::F64, n.to_bits()));
         v
     }
 
     pub fn const_u8(&mut self, n: u8) -> Value {
         let v = self.fresh_value();
-        self.push(Inst::ConstU8(v, n));
+        self.push(Inst::Const(v, ScalarType::U8, u64::from(n)));
         v
     }
 
     pub fn const_i8(&mut self, n: i8) -> Value {
         let v = self.fresh_value();
-        self.push(Inst::ConstI8(v, n));
+        self.push(Inst::Const(v, ScalarType::I8, n as u64));
         v
     }
+
+    pub fn const_bool(&mut self, b: bool) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::Const(v, ScalarType::Bool, u64::from(b)));
+        v
+    }
+
+    pub fn const_ptr_null(&mut self) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::Const(v, ScalarType::Ptr, 0));
+        v
+    }
+
+    // ---- Arithmetic ----
 
     pub fn binop(&mut self, op: BinaryOp, lhs: Value, rhs: Value) -> Value {
         let v = self.fresh_value();
@@ -90,64 +98,38 @@ impl Builder {
         v
     }
 
+    // ---- Calls ----
+
     pub fn call(&mut self, func: &str, args: Vec<Value>) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Call(v, func.to_owned(), args));
         v
     }
 
-    pub fn construct(&mut self, tag: &str, fields: Vec<Value>) -> Value {
+    // ---- Memory ----
+
+    pub fn alloc(&mut self, size: usize) -> Value {
         let v = self.fresh_value();
-        self.push(Inst::Construct(v, tag.to_owned(), fields));
+        self.push(Inst::Alloc(v, size));
         v
     }
 
-    pub fn record_new(&mut self, fields: Vec<(String, Value)>) -> Value {
+    pub fn load(&mut self, ty: ScalarType, ptr: Value, offset: usize) -> Value {
         let v = self.fresh_value();
-        self.push(Inst::RecordNew(v, fields));
+        self.push(Inst::Load(v, ty, ptr, offset));
         v
     }
 
-    pub fn field_get(&mut self, record: Value, field: &str) -> Value {
-        let v = self.fresh_value();
-        self.push(Inst::FieldGet(v, record, field.to_owned()));
-        v
+    pub fn store(&mut self, ptr: Value, offset: usize, val: Value) {
+        self.push(Inst::Store(ptr, offset, val));
     }
 
-    pub fn list_new(&mut self, elements: Vec<Value>) -> Value {
-        let v = self.fresh_value();
-        self.push(Inst::ListNew(v, elements));
-        v
+    pub fn rc_inc(&mut self, ptr: Value) {
+        self.push(Inst::RcInc(ptr));
     }
 
-    pub fn list_get(&mut self, list: Value, index: Value) -> Value {
-        let v = self.fresh_value();
-        self.push(Inst::ListGet(v, list, index));
-        v
-    }
-
-    pub fn list_set(&mut self, list: Value, index: Value, elem: Value) -> Value {
-        let v = self.fresh_value();
-        self.push(Inst::ListSet(v, list, index, elem));
-        v
-    }
-
-    pub fn list_append(&mut self, list: Value, elem: Value) -> Value {
-        let v = self.fresh_value();
-        self.push(Inst::ListAppend(v, list, elem));
-        v
-    }
-
-    pub fn list_len(&mut self, list: Value) -> Value {
-        let v = self.fresh_value();
-        self.push(Inst::ListLen(v, list));
-        v
-    }
-
-    pub fn num_to_str(&mut self, num: Value) -> Value {
-        let v = self.fresh_value();
-        self.push(Inst::NumToStr(v, num));
-        v
+    pub fn rc_dec(&mut self, ptr: Value) {
+        self.push(Inst::RcDec(ptr));
     }
 
     // ---- Terminators ----
@@ -177,13 +159,21 @@ impl Builder {
         });
     }
 
-    pub fn switch(&mut self, scrutinee: Value, arms: Vec<(String, BlockId)>) {
-        self.set_terminator(Terminator::Switch { scrutinee, arms });
+    pub fn switch_int(
+        &mut self,
+        scrutinee: Value,
+        arms: Vec<(u64, BlockId, Vec<Value>)>,
+        default: Option<(BlockId, Vec<Value>)>,
+    ) {
+        self.set_terminator(Terminator::SwitchInt {
+            scrutinee,
+            arms,
+            default,
+        });
     }
 
-    // ---- Function & module building ----
+    // ---- Function building ----
 
-    /// Finish the current function, collecting its blocks.
     pub fn finish_function(&mut self, name: &str, params: Vec<Value>) {
         let blocks = std::mem::take(&mut self.blocks);
         self.functions.insert(
@@ -197,19 +187,10 @@ impl Builder {
         self.current_block = None;
     }
 
-    /// Add data to the static data section, returning the offset.
-    pub fn add_data(&mut self, bytes: &[u8]) -> usize {
-        let offset = self.data.len();
-        self.data.extend_from_slice(bytes);
-        offset
-    }
-
-    /// Build the final module.
     pub fn build(self, entry: &str) -> Module {
         Module {
             functions: self.functions,
             entry: entry.to_owned(),
-            data: self.data,
         }
     }
 

@@ -1,7 +1,7 @@
 use std::fmt;
 
-use super::{Block, Function, Module};
-use crate::ssa::instruction::{BinaryOp, Inst, Terminator};
+use super::{Function, Module};
+use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator};
 
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -48,14 +48,29 @@ impl fmt::Display for Function {
     }
 }
 
+impl fmt::Display for ScalarType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::I8 => write!(f, "i8"),
+            Self::U8 => write!(f, "u8"),
+            Self::I64 => write!(f, "i64"),
+            Self::U64 => write!(f, "u64"),
+            Self::F64 => write!(f, "f64"),
+            Self::Bool => write!(f, "bool"),
+            Self::Ptr => write!(f, "ptr"),
+        }
+    }
+}
+
 impl fmt::Display for Inst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Const(d, n) => write!(f, "{d} = const {n}_i64"),
-            Self::ConstU64(d, n) => write!(f, "{d} = const {n}_u64"),
-            Self::ConstF64(d, n) => write!(f, "{d} = const {n}_f64"),
-            Self::ConstU8(d, n) => write!(f, "{d} = const {n}_u8"),
-            Self::ConstI8(d, n) => write!(f, "{d} = const {n}_i8"),
+            Self::Const(d, ty, bits) => match ty {
+                ScalarType::F64 => write!(f, "{d} = const {}_f64", f64::from_bits(*bits)),
+                ScalarType::Bool => write!(f, "{d} = const {}", *bits != 0),
+                ScalarType::Ptr => write!(f, "{d} = const 0x{bits:x}_ptr"),
+                _ => write!(f, "{d} = const {bits}_{ty}"),
+            },
             Self::BinOp(d, op, l, r) => write!(f, "{d} = {op} {l}, {r}"),
             Self::Call(d, name, args) => {
                 write!(f, "{d} = call {name}(")?;
@@ -67,46 +82,11 @@ impl fmt::Display for Inst {
                 }
                 write!(f, ")")
             }
-            Self::Construct(d, tag, fields) => {
-                write!(f, "{d} = construct {tag}")?;
-                if !fields.is_empty() {
-                    write!(f, "(")?;
-                    for (i, v) in fields.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{v}")?;
-                    }
-                    write!(f, ")")?;
-                }
-                Ok(())
-            }
-            Self::RecordNew(d, fields) => {
-                write!(f, "{d} = record {{")?;
-                for (i, (name, v)) in fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ",")?;
-                    }
-                    write!(f, " {name}: {v}")?;
-                }
-                write!(f, " }}")
-            }
-            Self::FieldGet(d, rec, name) => write!(f, "{d} = {rec}.{name}"),
-            Self::ListNew(d, elems) => {
-                write!(f, "{d} = list[")?;
-                for (i, v) in elems.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{v}")?;
-                }
-                write!(f, "]")
-            }
-            Self::ListGet(d, list, idx) => write!(f, "{d} = {list}[{idx}]"),
-            Self::ListSet(d, list, idx, val) => write!(f, "{d} = {list}[{idx}] = {val}"),
-            Self::ListAppend(d, list, val) => write!(f, "{d} = {list}.append({val})"),
-            Self::ListLen(d, list) => write!(f, "{d} = {list}.len()"),
-            Self::NumToStr(d, num) => write!(f, "{d} = {num}.to_str()"),
+            Self::Alloc(d, size) => write!(f, "{d} = alloc {size}"),
+            Self::Load(d, ty, ptr, off) => write!(f, "{d} = load {ty} {ptr}[{off}]"),
+            Self::Store(ptr, off, val) => write!(f, "store {val} -> {ptr}[{off}]"),
+            Self::RcInc(ptr) => write!(f, "rc_inc {ptr}"),
+            Self::RcDec(ptr) => write!(f, "rc_dec {ptr}"),
         }
     }
 }
@@ -123,13 +103,6 @@ impl fmt::Display for BinaryOp {
             Self::Neq => write!(f, "neq"),
             Self::Max => write!(f, "max"),
         }
-    }
-}
-
-impl fmt::Display for Block {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Used via Function::Display
-        write!(f, "{}", self.terminator)
     }
 }
 
@@ -183,10 +156,37 @@ impl fmt::Display for Terminator {
                 }
                 Ok(())
             }
-            Self::Switch { scrutinee, arms } => {
-                writeln!(f, "switch {scrutinee}")?;
-                for (tag, block) in arms {
-                    write!(f, "      : {tag} -> {block}")?;
+            Self::SwitchInt {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                write!(f, "switch {scrutinee}")?;
+                for (val, block, args) in arms {
+                    write!(f, "\n      {val} -> {block}")?;
+                    if !args.is_empty() {
+                        write!(f, "(")?;
+                        for (i, a) in args.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{a}")?;
+                        }
+                        write!(f, ")")?;
+                    }
+                }
+                if let Some((block, args)) = default {
+                    write!(f, "\n      _ -> {block}")?;
+                    if !args.is_empty() {
+                        write!(f, "(")?;
+                        for (i, a) in args.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{a}")?;
+                        }
+                        write!(f, ")")?;
+                    }
                 }
                 Ok(())
             }

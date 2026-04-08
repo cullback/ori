@@ -1,28 +1,7 @@
+use std::collections::HashMap;
+
 use crate::core::{NumVal, Value};
 use crate::source::SourceArena;
-
-fn rt_to_core_value(rt: crate::ssa::eval::RtValue) -> Value {
-    use crate::ssa::eval::RtValue;
-    match rt {
-        RtValue::I64(n) => Value::VNum(NumVal::I64(n)),
-        RtValue::U64(n) => Value::VNum(NumVal::U64(n)),
-        RtValue::F64(n) => Value::VNum(NumVal::F64(n)),
-        RtValue::U8(n) => Value::VNum(NumVal::U8(n)),
-        RtValue::I8(n) => Value::VNum(NumVal::I8(n)),
-        RtValue::Bool(_) => panic!("unexpected Bool in output"),
-        RtValue::Construct { tag, fields } => Value::VConstruct {
-            tag: crate::core::FuncId::new(0), // placeholder — tests don't check tag id
-            fields: fields.into_iter().map(rt_to_core_value).collect(),
-        },
-        RtValue::Record { fields } => Value::VRecord {
-            fields: fields
-                .into_iter()
-                .map(|(k, v)| (k, rt_to_core_value(v)))
-                .collect(),
-        },
-        RtValue::List(elems) => Value::VList(elems.into_iter().map(rt_to_core_value).collect()),
-    }
-}
 
 /// Compile and run an Ori program with the given I64 input.
 fn run(source: &str, input: i64) -> Value {
@@ -38,19 +17,16 @@ fn run(source: &str, input: i64) -> Value {
         crate::types::infer::check(&arena, &resolved.module, &resolved.scope).unwrap();
     let (program, input_vars) =
         crate::lower::lower(&arena, &resolved.module, &resolved.scope, &infer_result).unwrap();
-    let ssa_module = crate::ssa::lower::lower(&program, &input_vars);
-    let mut args = Vec::new();
-    // Bind first param to the I64 input; any extra params get a default
-    for i in 0..input_vars.len() {
+    let mut env = HashMap::new();
+    for (i, var) in input_vars.iter().enumerate() {
         let val = if i == 0 {
-            crate::ssa::eval::RtValue::I64(input)
+            Value::VNum(NumVal::I64(input))
         } else {
-            crate::ssa::eval::RtValue::List(vec![])
+            Value::VList(vec![])
         };
-        args.push(val);
+        env.insert(*var, val);
     }
-    let rt_result = crate::ssa::eval::eval(&ssa_module, &args);
-    rt_to_core_value(rt_result)
+    crate::core::eval::eval(&env, &program, &program.main)
 }
 
 fn run_i64(source: &str, input: i64) -> i64 {
