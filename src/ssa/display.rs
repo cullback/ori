@@ -83,8 +83,10 @@ impl fmt::Display for Inst {
                 write!(f, ")")
             }
             Self::Alloc(d, size) => write!(f, "{d} = alloc {size}"),
-            Self::Load(d, ty, ptr, off) => write!(f, "{d} = load {ty} {ptr}[{off}]"),
+            Self::Load(d, ptr, off) => write!(f, "{d} = load {ptr}[{off}]"),
             Self::Store(ptr, off, val) => write!(f, "store {val} -> {ptr}[{off}]"),
+            Self::LoadDyn(d, ptr, idx) => write!(f, "{d} = load_dyn {ptr}[{idx}]"),
+            Self::StoreDyn(ptr, idx, val) => write!(f, "store_dyn {val} -> {ptr}[{idx}]"),
             Self::RcInc(ptr) => write!(f, "rc_inc {ptr}"),
             Self::RcDec(ptr) => write!(f, "rc_dec {ptr}"),
         }

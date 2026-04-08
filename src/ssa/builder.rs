@@ -114,14 +114,24 @@ impl Builder {
         v
     }
 
-    pub fn load(&mut self, ty: ScalarType, ptr: Value, offset: usize) -> Value {
+    pub fn load(&mut self, ptr: Value, offset: usize) -> Value {
         let v = self.fresh_value();
-        self.push(Inst::Load(v, ty, ptr, offset));
+        self.push(Inst::Load(v, ptr, offset));
         v
     }
 
     pub fn store(&mut self, ptr: Value, offset: usize, val: Value) {
         self.push(Inst::Store(ptr, offset, val));
+    }
+
+    pub fn load_dyn(&mut self, ptr: Value, idx: Value) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::LoadDyn(v, ptr, idx));
+        v
+    }
+
+    pub fn store_dyn(&mut self, ptr: Value, idx: Value, val: Value) {
+        self.push(Inst::StoreDyn(ptr, idx, val));
     }
 
     pub fn rc_inc(&mut self, ptr: Value) {

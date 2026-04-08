@@ -19,7 +19,6 @@ mod test_frontend;
 mod test_programs;
 mod types;
 
-use std::collections::HashMap;
 use std::io::IsTerminal as _;
 use std::io::Read as _;
 use std::io::Write as _;
@@ -43,21 +42,6 @@ fn compile(
     lower::lower(arena, &resolved.module, &resolved.scope, &infer_result)
 }
 
-fn value_to_bytes(val: &core::Value) -> Vec<u8> {
-    let core::Value::VList(elems) = val else {
-        panic!("expected Str, got {val:?}");
-    };
-    elems
-        .iter()
-        .map(|e| {
-            let core::Value::VNum(core::NumVal::U8(b)) = e else {
-                panic!("expected U8 in Str, got {e:?}");
-            };
-            *b
-        })
-        .collect()
-}
-
 fn bytes_to_value(bytes: &[u8]) -> core::Value {
     core::Value::VList(
         bytes
@@ -67,35 +51,59 @@ fn bytes_to_value(bytes: &[u8]) -> core::Value {
     )
 }
 
-fn print_value(val: &core::Value) {
+fn value_to_scalar(val: &core::Value, heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {
     match val {
-        core::Value::VList(_) => {
-            let bytes = value_to_bytes(val);
-            std::io::stdout().write_all(&bytes).unwrap();
+        core::Value::VNum(core::NumVal::I64(n)) => ssa::eval::Scalar::I64(*n),
+        core::Value::VNum(core::NumVal::U64(n)) => ssa::eval::Scalar::U64(*n),
+        core::Value::VNum(core::NumVal::F64(n)) => ssa::eval::Scalar::F64(*n),
+        core::Value::VNum(core::NumVal::U8(n)) => ssa::eval::Scalar::U8(*n),
+        core::Value::VNum(core::NumVal::I8(n)) => ssa::eval::Scalar::I8(*n),
+        core::Value::VList(elems) => {
+            let scalars: Vec<ssa::eval::Scalar> =
+                elems.iter().map(|e| value_to_scalar(e, heap)).collect();
+            heap_alloc_list(heap, &scalars)
         }
-        core::Value::VNum(core::NumVal::I64(n)) => print!("{n}"),
-        core::Value::VNum(core::NumVal::U64(n)) => print!("{n}"),
-        core::Value::VNum(core::NumVal::F64(n)) => print!("{n}"),
-        core::Value::VNum(core::NumVal::U8(n)) => print!("{n}"),
-        core::Value::VNum(core::NumVal::I8(n)) => print!("{n}"),
-        other => print!("{other:?}"),
+        core::Value::VConstruct { .. } | core::Value::VRecord { .. } => {
+            panic!("complex values not supported in SSA conversion yet")
+        }
     }
-    if let core::Value::VList(elems) = val
-        && elems.last() == Some(&core::Value::VNum(core::NumVal::U8(b'\n')))
-    {
-        return;
-    }
-    println!();
 }
 
-fn eprint_value(val: &core::Value) {
-    match val {
-        core::Value::VList(_) => {
-            let bytes = value_to_bytes(val);
-            std::io::stderr().write_all(&bytes).unwrap();
-        }
-        other => eprint!("{other:?}"),
+fn heap_alloc_list(heap: &mut ssa::eval::Heap, elems: &[ssa::eval::Scalar]) -> ssa::eval::Scalar {
+    use ssa::eval::Scalar;
+    let len = elems.len();
+    let data_idx = heap.alloc(len);
+    for (i, elem) in elems.iter().enumerate() {
+        heap.store(data_idx, i, *elem);
     }
+    let header_idx = heap.alloc(3);
+    heap.store(header_idx, 0, Scalar::U64(len as u64));
+    heap.store(header_idx, 1, Scalar::U64(len as u64));
+    heap.store(header_idx, 2, Scalar::Ptr(data_idx));
+    Scalar::Ptr(header_idx)
+}
+
+fn scalar_str_to_bytes(heap: &ssa::eval::Heap, str_ptr: ssa::eval::Scalar) -> Vec<u8> {
+    use ssa::eval::Scalar;
+    let Scalar::Ptr(list_idx) = str_ptr else {
+        panic!("expected Ptr for string, got {str_ptr:?}");
+    };
+    let Scalar::U64(len) = heap.load(list_idx, 0) else {
+        panic!("expected U64 for list len");
+    };
+    let Scalar::Ptr(data_idx) = heap.load(list_idx, 2) else {
+        panic!("expected Ptr for list data");
+    };
+    #[expect(clippy::cast_possible_truncation)]
+    let len_usize = len as usize;
+    let mut bytes = Vec::with_capacity(len_usize);
+    for i in 0..len_usize {
+        let Scalar::U8(b) = heap.load(data_idx, i) else {
+            panic!("expected U8 in string data");
+        };
+        bytes.push(b);
+    }
+    bytes
 }
 
 fn main() {
@@ -128,52 +136,63 @@ fn main() {
         }
     };
 
+    // Lower Core → SSA
+    let ssa_module = ssa::lower::lower(&program, &input_vars);
+
     if dump_ssa {
-        eprintln!("--dump-ssa: SSA lowering not yet implemented");
-        process::exit(1);
+        eprint!("{ssa_module}");
+        process::exit(0);
     }
 
-    // Build inputs
+    // Build SSA inputs
+    let mut heap = ssa::eval::new_heap();
     let program_args: Vec<&String> = file_args[1..].to_vec();
-    let cli_args: Vec<core::Value> = program_args
-        .iter()
-        .map(|a| bytes_to_value(a.as_bytes()))
-        .collect();
-    let args_value = core::Value::VList(cli_args);
 
-    let stdin_value = if std::io::stdin().is_terminal() {
-        bytes_to_value(b"")
+    let cli_args: Vec<ssa::eval::Scalar> = program_args
+        .iter()
+        .map(|a| value_to_scalar(&bytes_to_value(a.as_bytes()), &mut heap))
+        .collect();
+    let args_list = heap_alloc_list(&mut heap, &cli_args);
+
+    let stdin_val = if std::io::stdin().is_terminal() {
+        value_to_scalar(&bytes_to_value(b""), &mut heap)
     } else {
         let mut buf = Vec::new();
         std::io::stdin().read_to_end(&mut buf).unwrap();
-        bytes_to_value(&buf)
+        value_to_scalar(&bytes_to_value(&buf), &mut heap)
     };
 
-    // Evaluate via Core interpreter
-    let mut env = HashMap::new();
-    for (i, var) in input_vars.iter().enumerate() {
-        let val = match i {
-            0 => args_value.clone(),
-            1 => stdin_value.clone(),
-            _ => core::Value::VList(vec![]),
-        };
-        env.insert(*var, val);
+    let mut ssa_args = Vec::new();
+    for i in 0..input_vars.len() {
+        ssa_args.push(match i {
+            0 => args_list,
+            1 => stdin_val,
+            _ => value_to_scalar(&bytes_to_value(b""), &mut heap),
+        });
     }
-    let result = core::eval::eval(&env, &program, &program.main);
 
-    // Handle Result output
-    match &result {
-        core::Value::VConstruct { tag, fields } => {
-            let name = program.debug_names.func_name(*tag);
-            match name {
-                "Ok" => print_value(&fields[0]),
-                "Err" => {
-                    eprint_value(&fields[0]);
-                    process::exit(1);
-                }
-                _ => println!("{result:?}"),
-            }
+    let result = ssa::eval::eval(&ssa_module, &mut heap, &ssa_args);
+
+    // Handle Result output — result is a Ptr to a tagged union
+    let ssa::eval::Scalar::Ptr(result_idx) = result else {
+        eprintln!("unexpected non-Ptr result: {result:?}");
+        process::exit(1);
+    };
+    let ssa::eval::Scalar::U64(tag) = heap.load(result_idx, 0) else {
+        eprintln!("unexpected tag type");
+        process::exit(1);
+    };
+    let payload = heap.load(result_idx, 1);
+
+    // Tag 0 = first constructor (Ok), Tag 1 = second (Err)
+    let bytes = scalar_str_to_bytes(&heap, payload);
+    if tag == 0 {
+        std::io::stdout().write_all(&bytes).unwrap();
+        if !bytes.ends_with(b"\n") {
+            println!();
         }
-        _ => println!("{result:?}"),
+    } else {
+        std::io::stderr().write_all(&bytes).unwrap();
+        process::exit(1);
     }
 }

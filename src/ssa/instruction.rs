@@ -57,12 +57,16 @@ pub enum Inst {
     BinOp(Value, BinaryOp, Value, Value),
     /// dest = func(args...).
     Call(Value, String, Vec<Value>),
-    /// dest = heap allocate `size` bytes (refcount starts at 1).
+    /// dest = heap allocate `num_slots` scalar slots (refcount starts at 1).
     Alloc(Value, usize),
-    /// dest = read `ty` from `ptr + offset`.
-    Load(Value, ScalarType, Value, usize),
-    /// Write `val` to `ptr + offset`. No result.
+    /// dest = read from `ptr` at static slot `offset`.
+    Load(Value, Value, usize),
+    /// Write `val` to `ptr` at static slot `offset`. No result.
     Store(Value, usize, Value),
+    /// dest = read from `ptr` at dynamic slot index `idx_val`.
+    LoadDyn(Value, Value, Value),
+    /// Write `val` to `ptr` at dynamic slot index `idx_val`. No result.
+    StoreDyn(Value, Value, Value),
     /// Increment reference count of `ptr`.
     RcInc(Value),
     /// Decrement reference count of `ptr`, free if zero.
@@ -77,8 +81,9 @@ impl Inst {
             | Self::BinOp(v, _, _, _)
             | Self::Call(v, _, _)
             | Self::Alloc(v, _)
-            | Self::Load(v, _, _, _) => Some(*v),
-            Self::Store(..) | Self::RcInc(_) | Self::RcDec(_) => None,
+            | Self::Load(v, _, _)
+            | Self::LoadDyn(v, _, _) => Some(*v),
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
         }
     }
 }
