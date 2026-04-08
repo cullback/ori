@@ -63,6 +63,31 @@ fn bytes_to_value(bytes: &[u8]) -> core::Value {
     )
 }
 
+fn print_value(val: &core::Value) {
+    match val {
+        core::Value::VList(_) => {
+            let bytes = value_to_bytes(val);
+            std::io::stdout().write_all(&bytes).unwrap();
+        }
+        core::Value::VNum(core::NumVal::I64(n)) => print!("{n}"),
+        core::Value::VNum(core::NumVal::U64(n)) => print!("{n}"),
+        core::Value::VNum(core::NumVal::F64(n)) => print!("{n}"),
+        core::Value::VNum(core::NumVal::U8(n)) => print!("{n}"),
+        core::Value::VNum(core::NumVal::I8(n)) => print!("{n}"),
+        other => print!("{other:?}"),
+    }
+}
+
+fn eprint_value(val: &core::Value) {
+    match val {
+        core::Value::VList(_) => {
+            let bytes = value_to_bytes(val);
+            std::io::stderr().write_all(&bytes).unwrap();
+        }
+        other => eprint!("{other:?}"),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -120,12 +145,10 @@ fn main() {
             let name = program.debug_names.func_name(*tag);
             match name {
                 "Ok" => {
-                    let bytes = value_to_bytes(&fields[0]);
-                    std::io::stdout().write_all(&bytes).unwrap();
+                    print_value(&fields[0]);
                 }
                 "Err" => {
-                    let bytes = value_to_bytes(&fields[0]);
-                    std::io::stderr().write_all(&bytes).unwrap();
+                    eprint_value(&fields[0]);
                     process::exit(1);
                 }
                 _ => {

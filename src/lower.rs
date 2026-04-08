@@ -714,6 +714,7 @@ impl<'src> LowerCtx<'src> {
         }
     }
 
+    #[expect(clippy::too_many_lines, reason = "traverses all expression forms")]
     fn scan_expr(&mut self, expr: &Expr<'src>) {
         match &expr.kind {
             ExprKind::Call { func, args } if self.funcs.contains_key(*func) => {
@@ -789,8 +790,25 @@ impl<'src> LowerCtx<'src> {
             }
             ExprKind::MethodCall { receiver, args, .. } => {
                 self.scan_expr(receiver);
-                for a in args {
-                    self.scan_expr(a);
+                // Check if resolved method is higher-order (e.g. List.walk)
+                if let Some(resolved) = self.method_resolutions.get(&expr.span).cloned() {
+                    let is_ho = resolved == "List.walk"
+                        || resolved.ends_with(".List.walk")
+                        || resolved == "List.walk_backwards"
+                        || resolved.ends_with(".List.walk_backwards")
+                        || self.funcs.contains_key(&resolved);
+                    if is_ho {
+                        // Offset arg indices by 1 (receiver is arg 0)
+                        self.scan_call_args_offset(&resolved, args, 1);
+                    } else {
+                        for a in args {
+                            self.scan_expr(a);
+                        }
+                    }
+                } else {
+                    for a in args {
+                        self.scan_expr(a);
+                    }
                 }
             }
             ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
@@ -806,11 +824,18 @@ impl<'src> LowerCtx<'src> {
     }
 
     fn scan_call_args(&mut self, func_name: &str, args: &[Expr<'src>]) {
+        self.scan_call_args_offset(func_name, args, 0);
+    }
+
+    /// Scan function call args for lambdas, with an index offset
+    /// (e.g. offset=1 for method calls where receiver is arg 0).
+    fn scan_call_args_offset(&mut self, func_name: &str, args: &[Expr<'src>], offset: usize) {
         for (i, arg) in args.iter().enumerate() {
+            let idx = i + offset;
             match &arg.kind {
                 ExprKind::Lambda { params, body } => {
                     let free = self.compute_free_vars(body, params);
-                    self.register_lambda(func_name, i, params.clone(), Some(body), free, None);
+                    self.register_lambda(func_name, idx, params.clone(), Some(body), free, None);
                 }
                 ExprKind::Name(name) => {
                     let name = *name;
@@ -819,7 +844,7 @@ impl<'src> LowerCtx<'src> {
                         let arity = self.func_arities[name];
                         self.register_lambda(
                             func_name,
-                            i,
+                            idx,
                             Vec::new(),
                             None,
                             Vec::new(),
@@ -1212,11 +1237,41 @@ impl<'src> LowerCtx<'src> {
                 // Look up resolved method from type inference
                 let resolved = self.method_resolutions.get(&expr.span).cloned();
                 if let Some(mangled) = resolved {
-                    // Build full args: receiver + method args
+                    // List.walk / walk_backwards: special Core node
+                    let is_walk = mangled == "List.walk" || mangled.ends_with(".List.walk");
+                    let is_walk_back = mangled == "List.walk_backwards"
+                        || mangled.ends_with(".List.walk_backwards");
+                    if is_walk || is_walk_back {
+                        let list_core = self.lower_expr(receiver);
+                        let init_core = self.lower_expr(&args[0]);
+                        let key = (mangled.clone(), 2); // step is arg 2 (after receiver + init)
+                        let closure_core = if self.ho_param_sets.contains_key(&key) {
+                            self.lower_lambda_arg(&args[1], &mangled, 2)
+                        } else {
+                            self.lower_expr(&args[1])
+                        };
+                        let ls_idx = self.ho_param_sets[&key];
+                        let apply_func = self.lambda_sets[ls_idx].apply_func;
+                        return Core::list_walk(
+                            list_core,
+                            init_core,
+                            closure_core,
+                            apply_func,
+                            is_walk_back,
+                        );
+                    }
+
+                    // Build full args: receiver + method args (with lambda handling)
                     let recv_core = self.lower_expr(receiver);
                     let mut full_args = vec![recv_core];
-                    for a in args {
-                        full_args.push(self.lower_expr(a));
+                    for (i, a) in args.iter().enumerate() {
+                        let idx = i + 1; // offset for receiver
+                        let key = (mangled.clone(), idx);
+                        if self.ho_param_sets.contains_key(&key) {
+                            full_args.push(self.lower_lambda_arg(a, &mangled, idx));
+                        } else {
+                            full_args.push(self.lower_expr(a));
+                        }
                     }
                     // Check for builtin
                     if let Some(op_name) = mangled.strip_prefix("__builtin.") {

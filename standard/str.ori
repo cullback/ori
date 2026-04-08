@@ -21,6 +21,6 @@ Str := List(U8).(
     from_bytes = |bytes| bytes
 
     # Returns the underlying byte list.
-    to_bytes : Str -> List(U8)
-    to_bytes = |s| s
+    to_utf8 : Str -> List(U8)
+    to_utf8 = |s| s
 )

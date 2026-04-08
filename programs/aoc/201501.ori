@@ -1,0 +1,12 @@
+# Advent of Code 2015, Day 1: Not Quite Lisp
+# ( = 40, ) = 41 in ASCII
+
+part1 : Str -> I64
+part1 = |input|
+    input.to_utf8().walk(0, |count, x|
+        if x == 40 then count + 1
+        else if x == 41 then count - 1
+        else count)
+
+main : List(Str), Str -> Result(I64, Str)
+main = |args, input| Ok(part1(input))
