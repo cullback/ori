@@ -392,145 +392,14 @@ fn compute_free_vars<'src>(
     body: &Expr<'src>,
     params: &[&'src str],
 ) -> Vec<&'src str> {
-    let mut free = Vec::new();
-    let mut seen = HashSet::new();
     let bound: HashSet<&str> = params.iter().copied().collect();
-    collect_free(ctx, body, &bound, &mut seen, &mut free);
-    free
+    ast::free_names(body, &bound, &mut HashSet::new(), &|name| {
+        ctx.constructors.contains_key(name)
+            || ctx.funcs.contains(name)
+            || ctx.list_builtins.contains(name)
+    })
 }
 
-#[expect(clippy::too_many_lines, reason = "traverses all expression forms")]
-fn collect_free<'src>(
-    ctx: &ScanCtx<'_, 'src>,
-    expr: &Expr<'src>,
-    bound: &HashSet<&'src str>,
-    seen: &mut HashSet<&'src str>,
-    free: &mut Vec<&'src str>,
-) {
-    match &expr.kind {
-        ExprKind::Name(name) => {
-            let name = *name;
-            if !bound.contains(name)
-                && !ctx.constructors.contains_key(name)
-                && !ctx.funcs.contains(name)
-                && !seen.contains(name)
-            {
-                seen.insert(name);
-                free.push(name);
-            }
-        }
-        ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
-        ExprKind::BinOp { lhs, rhs, .. } => {
-            collect_free(ctx, lhs, bound, seen, free);
-            collect_free(ctx, rhs, bound, seen, free);
-        }
-        ExprKind::Call { func, args } => {
-            if !bound.contains(func)
-                && !ctx.constructors.contains_key(*func)
-                && !ctx.funcs.contains(*func)
-                && !ctx.list_builtins.contains(*func)
-                && !seen.contains(func)
-            {
-                seen.insert(func);
-                free.push(func);
-            }
-            for arg in args {
-                collect_free(ctx, arg, bound, seen, free);
-            }
-        }
-        ExprKind::QualifiedCall { args, .. } => {
-            for arg in args {
-                collect_free(ctx, arg, bound, seen, free);
-            }
-        }
-        ExprKind::Record { fields } => {
-            for (_, field_expr) in fields {
-                collect_free(ctx, field_expr, bound, seen, free);
-            }
-        }
-        ExprKind::FieldAccess { record, .. } => {
-            collect_free(ctx, record, bound, seen, free);
-        }
-        ExprKind::MethodCall { receiver, args, .. } => {
-            collect_free(ctx, receiver, bound, seen, free);
-            for a in args {
-                collect_free(ctx, a, bound, seen, free);
-            }
-        }
-        ExprKind::Lambda { params, body } => {
-            let mut inner = bound.clone();
-            for p in params {
-                inner.insert(p);
-            }
-            collect_free(ctx, body, &inner, seen, free);
-        }
-        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
-            for e in elems {
-                collect_free(ctx, e, bound, seen, free);
-            }
-        }
-        ExprKind::Block(stmts, result) => {
-            let mut inner = bound.clone();
-            for stmt in stmts {
-                match stmt {
-                    Stmt::Let { name, val } => {
-                        collect_free(ctx, val, &inner, seen, free);
-                        inner.insert(name);
-                    }
-                    Stmt::Destructure { pattern, val } => {
-                        collect_free(ctx, val, &inner, seen, free);
-                        pattern_names(pattern, &mut inner);
-                    }
-                    Stmt::Guard {
-                        condition,
-                        return_val,
-                    } => {
-                        collect_free(ctx, condition, &inner, seen, free);
-                        collect_free(ctx, return_val, &inner, seen, free);
-                    }
-                    Stmt::TypeHint { .. } => {}
-                }
-            }
-            collect_free(ctx, result, &inner, seen, free);
-        }
-        ExprKind::If {
-            expr: scrutinee,
-            arms,
-            else_body,
-        } => {
-            collect_free(ctx, scrutinee, bound, seen, free);
-            for arm in arms {
-                let mut arm_bound = bound.clone();
-                pattern_names(&arm.pattern, &mut arm_bound);
-                for guard_expr in &arm.guards {
-                    collect_free(ctx, guard_expr, &arm_bound, seen, free);
-                }
-                collect_free(ctx, &arm.body, &arm_bound, seen, free);
-            }
-            if let Some(eb) = else_body {
-                collect_free(ctx, eb, bound, seen, free);
-            }
-        }
-        ExprKind::Fold {
-            expr: scrutinee,
-            arms,
-        } => {
-            collect_free(ctx, scrutinee, bound, seen, free);
-            for arm in arms {
-                let mut arm_bound = bound.clone();
-                pattern_names(&arm.pattern, &mut arm_bound);
-                for guard_expr in &arm.guards {
-                    collect_free(ctx, guard_expr, &arm_bound, seen, free);
-                }
-                collect_free(ctx, &arm.body, &arm_bound, seen, free);
-            }
-        }
-        ExprKind::Is { expr: inner, .. } => {
-            collect_free(ctx, inner, bound, seen, free);
-            // Bindings from pattern are NOT free variables
-        }
-    }
-}
 
 /// Check whether a function name is a List walk variant.
 fn is_list_walk(name: &str) -> bool {
@@ -543,26 +412,3 @@ fn is_list_walk(name: &str) -> bool {
     )
 }
 
-pub fn pattern_names<'src>(pat: &ast::Pattern<'src>, bound: &mut HashSet<&'src str>) {
-    match pat {
-        ast::Pattern::Constructor { fields, .. } => {
-            for f in fields {
-                pattern_names(f, bound);
-            }
-        }
-        ast::Pattern::Record { fields } => {
-            for (_, field_pat) in fields {
-                pattern_names(field_pat, bound);
-            }
-        }
-        ast::Pattern::Tuple(elems) => {
-            for e in elems {
-                pattern_names(e, bound);
-            }
-        }
-        ast::Pattern::Binding(name) => {
-            bound.insert(name);
-        }
-        ast::Pattern::Wildcard => {}
-    }
-}

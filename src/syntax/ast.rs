@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::source::FileId;
 
 #[derive(Debug, Clone)]
@@ -202,4 +204,170 @@ pub enum BinOp {
     Neq,
     And,
     Or,
+}
+
+// ---- Pattern utilities ----
+
+impl<'src> Pattern<'src> {
+    /// Add all binding names introduced by this pattern to `bound`.
+    pub fn bind_names(&self, bound: &mut HashSet<&'src str>) {
+        match self {
+            Pattern::Constructor { fields, .. } => {
+                for f in fields {
+                    f.bind_names(bound);
+                }
+            }
+            Pattern::Record { fields } => {
+                for (_, pat) in fields {
+                    pat.bind_names(bound);
+                }
+            }
+            Pattern::Tuple(elems) => {
+                for e in elems {
+                    e.bind_names(bound);
+                }
+            }
+            Pattern::Binding(name) => {
+                bound.insert(name);
+            }
+            Pattern::Wildcard => {}
+        }
+    }
+}
+
+// ---- Free variable collection ----
+
+/// Collect free variable names in `expr`, respecting lexical scope.
+///
+/// A name is "free" if it's not in `bound`, `is_known` returns false,
+/// and it hasn't already been added to `seen`. New names are added to
+/// `seen` for dedup across calls.
+pub fn free_names<'src>(
+    expr: &Expr<'src>,
+    bound: &HashSet<&'src str>,
+    seen: &mut HashSet<&'src str>,
+    is_known: &impl Fn(&str) -> bool,
+) -> Vec<&'src str> {
+    let mut out = Vec::new();
+    free_names_inner(expr, bound, seen, is_known, &mut out);
+    out
+}
+
+fn free_names_inner<'src>(
+    expr: &Expr<'src>,
+    bound: &HashSet<&'src str>,
+    seen: &mut HashSet<&'src str>,
+    is_known: &impl Fn(&str) -> bool,
+    out: &mut Vec<&'src str>,
+) {
+    let check = |name: &'src str, seen: &mut HashSet<&'src str>, out: &mut Vec<&'src str>| {
+        if !bound.contains(name) && !is_known(name) && seen.insert(name) {
+            out.push(name);
+        }
+    };
+
+    match &expr.kind {
+        ExprKind::Name(name) => check(name, seen, out),
+        ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            free_names_inner(lhs, bound, seen, is_known, out);
+            free_names_inner(rhs, bound, seen, is_known, out);
+        }
+        ExprKind::Call { func, args } => {
+            check(func, seen, out);
+            for a in args {
+                free_names_inner(a, bound, seen, is_known, out);
+            }
+        }
+        ExprKind::QualifiedCall { args, .. } => {
+            for a in args {
+                free_names_inner(a, bound, seen, is_known, out);
+            }
+        }
+        ExprKind::Block(stmts, result) => {
+            let mut inner = bound.clone();
+            for stmt in stmts {
+                match stmt {
+                    Stmt::Let { name, val } => {
+                        free_names_inner(val, &inner, seen, is_known, out);
+                        inner.insert(name);
+                    }
+                    Stmt::Destructure { pattern, val } => {
+                        free_names_inner(val, &inner, seen, is_known, out);
+                        pattern.bind_names(&mut inner);
+                    }
+                    Stmt::Guard {
+                        condition,
+                        return_val,
+                    } => {
+                        free_names_inner(condition, &inner, seen, is_known, out);
+                        free_names_inner(return_val, &inner, seen, is_known, out);
+                    }
+                    Stmt::TypeHint { .. } => {}
+                }
+            }
+            free_names_inner(result, &inner, seen, is_known, out);
+        }
+        ExprKind::If {
+            expr: scrutinee,
+            arms,
+            else_body,
+        } => {
+            free_names_inner(scrutinee, bound, seen, is_known, out);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                arm.pattern.bind_names(&mut arm_bound);
+                for guard_expr in &arm.guards {
+                    free_names_inner(guard_expr, &arm_bound, seen, is_known, out);
+                }
+                free_names_inner(&arm.body, &arm_bound, seen, is_known, out);
+            }
+            if let Some(eb) = else_body {
+                free_names_inner(eb, bound, seen, is_known, out);
+            }
+        }
+        ExprKind::Fold {
+            expr: scrutinee,
+            arms,
+        } => {
+            free_names_inner(scrutinee, bound, seen, is_known, out);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                arm.pattern.bind_names(&mut arm_bound);
+                for guard_expr in &arm.guards {
+                    free_names_inner(guard_expr, &arm_bound, seen, is_known, out);
+                }
+                free_names_inner(&arm.body, &arm_bound, seen, is_known, out);
+            }
+        }
+        ExprKind::Record { fields } => {
+            for (_, e) in fields {
+                free_names_inner(e, bound, seen, is_known, out);
+            }
+        }
+        ExprKind::FieldAccess { record, .. } => {
+            free_names_inner(record, bound, seen, is_known, out);
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            free_names_inner(receiver, bound, seen, is_known, out);
+            for a in args {
+                free_names_inner(a, bound, seen, is_known, out);
+            }
+        }
+        ExprKind::Lambda { params, body } => {
+            let mut inner = bound.clone();
+            for p in params {
+                inner.insert(p);
+            }
+            free_names_inner(body, &inner, seen, is_known, out);
+        }
+        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
+            for e in elems {
+                free_names_inner(e, bound, seen, is_known, out);
+            }
+        }
+        ExprKind::Is { expr: inner, .. } => {
+            free_names_inner(inner, bound, seen, is_known, out);
+        }
+    }
 }

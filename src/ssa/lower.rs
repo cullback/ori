@@ -1206,160 +1206,23 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     // ---- Free variable collection for fold arms (over AST Expr) ----
 
     fn collect_fold_captures(&self, arms: &[ast::MatchArm<'src>]) -> Vec<(&'src str, Value)> {
-        let mut captures: Vec<(&'src str, Value)> = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-
+        let is_known = |name: &str| {
+            self.decls.constructors.contains_key(name) || self.decls.funcs.contains(name)
+        };
+        let mut captures = Vec::new();
+        let mut seen = HashSet::new();
         for arm in arms {
-            let mut excluded = HashSet::new();
-            defunc::pattern_names(&arm.pattern, &mut excluded);
-            for guard_expr in &arm.guards {
-                self.collect_fold_captures_expr(guard_expr, &excluded, &mut seen, &mut captures);
+            let mut bound = HashSet::new();
+            arm.pattern.bind_names(&mut bound);
+            for expr in arm.guards.iter().chain(std::iter::once(&arm.body)) {
+                for name in ast::free_names(expr, &bound, &mut seen, &is_known) {
+                    if let Some(&val) = self.vars.get(name) {
+                        captures.push((name, val));
+                    }
+                }
             }
-            self.collect_fold_captures_expr(&arm.body, &excluded, &mut seen, &mut captures);
         }
         captures
-    }
-
-    fn collect_fold_captures_expr(
-        &self,
-        expr: &Expr<'src>,
-        excluded: &HashSet<&'src str>,
-        seen: &mut HashSet<&'src str>,
-        captures: &mut Vec<(&'src str, Value)>,
-    ) {
-        match &expr.kind {
-            ExprKind::Name(name) => {
-                let name = *name;
-                if excluded.contains(name)
-                    || self.decls.constructors.contains_key(name)
-                    || self.decls.funcs.contains(name)
-                    || seen.contains(name)
-                {
-                    return;
-                }
-                if let Some(&val) = self.vars.get(name) {
-                    seen.insert(name);
-                    captures.push((name, val));
-                }
-            }
-            ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
-            ExprKind::BinOp { lhs, rhs, .. } => {
-                self.collect_fold_captures_expr(lhs, excluded, seen, captures);
-                self.collect_fold_captures_expr(rhs, excluded, seen, captures);
-            }
-            ExprKind::Call { func, args } => {
-                if !excluded.contains(func)
-                    && !self.decls.constructors.contains_key(*func)
-                    && !self.decls.funcs.contains(*func)
-                    && !seen.contains(func)
-                {
-                    if let Some(&val) = self.vars.get(*func) {
-                        seen.insert(func);
-                        captures.push((func, val));
-                    }
-                }
-                for a in args {
-                    self.collect_fold_captures_expr(a, excluded, seen, captures);
-                }
-            }
-            ExprKind::QualifiedCall { args, .. } => {
-                for a in args {
-                    self.collect_fold_captures_expr(a, excluded, seen, captures);
-                }
-            }
-            ExprKind::Block(stmts, result) => {
-                let mut inner_excluded = excluded.clone();
-                for stmt in stmts {
-                    match stmt {
-                        Stmt::Let { name, val } => {
-                            self.collect_fold_captures_expr(val, &inner_excluded, seen, captures);
-                            inner_excluded.insert(name);
-                        }
-                        Stmt::Destructure { pattern, val } => {
-                            self.collect_fold_captures_expr(val, &inner_excluded, seen, captures);
-                            defunc::pattern_names(pattern, &mut inner_excluded);
-                        }
-                        Stmt::Guard {
-                            condition,
-                            return_val,
-                        } => {
-                            self.collect_fold_captures_expr(
-                                condition,
-                                &inner_excluded,
-                                seen,
-                                captures,
-                            );
-                            self.collect_fold_captures_expr(
-                                return_val,
-                                &inner_excluded,
-                                seen,
-                                captures,
-                            );
-                        }
-                        Stmt::TypeHint { .. } => {}
-                    }
-                }
-                self.collect_fold_captures_expr(result, &inner_excluded, seen, captures);
-            }
-            ExprKind::If {
-                expr: scr,
-                arms,
-                else_body,
-            } => {
-                self.collect_fold_captures_expr(scr, excluded, seen, captures);
-                for arm in arms {
-                    let mut arm_excl = excluded.clone();
-                    defunc::pattern_names(&arm.pattern, &mut arm_excl);
-                    for guard_expr in &arm.guards {
-                        self.collect_fold_captures_expr(guard_expr, &arm_excl, seen, captures);
-                    }
-                    self.collect_fold_captures_expr(&arm.body, &arm_excl, seen, captures);
-                }
-                if let Some(eb) = else_body {
-                    self.collect_fold_captures_expr(eb, excluded, seen, captures);
-                }
-            }
-            ExprKind::Fold { expr: scr, arms } => {
-                self.collect_fold_captures_expr(scr, excluded, seen, captures);
-                for arm in arms {
-                    let mut arm_excl = excluded.clone();
-                    defunc::pattern_names(&arm.pattern, &mut arm_excl);
-                    for guard_expr in &arm.guards {
-                        self.collect_fold_captures_expr(guard_expr, &arm_excl, seen, captures);
-                    }
-                    self.collect_fold_captures_expr(&arm.body, &arm_excl, seen, captures);
-                }
-            }
-            ExprKind::Record { fields } => {
-                for (_, e) in fields {
-                    self.collect_fold_captures_expr(e, excluded, seen, captures);
-                }
-            }
-            ExprKind::FieldAccess { record, .. } => {
-                self.collect_fold_captures_expr(record, excluded, seen, captures);
-            }
-            ExprKind::MethodCall { receiver, args, .. } => {
-                self.collect_fold_captures_expr(receiver, excluded, seen, captures);
-                for a in args {
-                    self.collect_fold_captures_expr(a, excluded, seen, captures);
-                }
-            }
-            ExprKind::Lambda { params, body } => {
-                let mut inner_excluded = excluded.clone();
-                for p in params {
-                    inner_excluded.insert(p);
-                }
-                self.collect_fold_captures_expr(body, &inner_excluded, seen, captures);
-            }
-            ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
-                for e in elems {
-                    self.collect_fold_captures_expr(e, excluded, seen, captures);
-                }
-            }
-            ExprKind::Is { expr, .. } => {
-                self.collect_fold_captures_expr(expr, excluded, seen, captures);
-            }
-        }
     }
 
     // ---- List walk lowering ----
