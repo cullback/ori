@@ -193,7 +193,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 }
                 let name = self.symbols.display(*sym);
                 if self.decls.constructors.contains_key(name) {
-                    return self.lower_constructor_call(name, &[]);
+                    return self.lower_constructor_call(name, &[], Some(&expr.ty));
+                }
+                // Structural constructor: bare uppercase reference
+                // not registered in decl_info. Layout comes from the
+                // expression's inferred TagUnion type.
+                if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    return self.lower_constructor_call(name, &[], Some(&expr.ty));
                 }
                 panic!("undefined name: {name}");
             }
@@ -231,7 +237,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 }
             }
 
-            ExprKind::Call { target, args, .. } => self.lower_call_by_sym(*target, args),
+            ExprKind::Call { target, args, .. } => {
+                self.lower_call_by_sym(*target, args, &expr.ty)
+            }
 
             ExprKind::Block(stmts, result) => self.lower_block(stmts, result),
 
@@ -390,9 +398,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     // - `MethodCall { receiver, resolved, args }` — always a
     //   method call with explicit receiver as first arg.
 
-    fn lower_call_by_sym(&mut self, target: SymbolId, args: &[Expr<'src>]) -> Value {
+    fn lower_call_by_sym(
+        &mut self,
+        target: SymbolId,
+        args: &[Expr<'src>],
+        result_ty: &Type,
+    ) -> Value {
         let name = self.symbols.display(target).to_owned();
-        self.lower_call(&name, args)
+        self.lower_call(&name, args, result_ty)
     }
 
     fn lower_qualified_call(
@@ -417,7 +430,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .iter()
                 .find(|(sym, _)| self.symbols.display(**sym) == receiver_name)
                 .map(|(_, v)| *v)
-                .unwrap_or_else(|| self.lower_constructor_call(receiver_name, &[]));
+                .unwrap_or_else(|| {
+                    // Receiver is a declared nullary constructor
+                    // being used as a method target (e.g. `True.not()`).
+                    // Structural constructors don't flow through this
+                    // path — they go through `ExprKind::Call` instead.
+                    self.lower_constructor_call(receiver_name, &[], None)
+                });
             if let Some(op_name) = resolved_name.strip_prefix("__builtin.") {
                 let rhs = self.lower_expr(&args[0]);
                 let ty = self.expr_scalar_type(outer);
@@ -431,9 +450,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             return self.builder.call(resolved_name, arg_vals, ret_ty);
         }
         // Plain static qualified call: treat segments.join(".") as
-        // the callable name and route through `lower_call`.
+        // the callable name and route through `lower_call`. Pass the
+        // outer expression's type so any structural constructor at
+        // the tail of the call gets the right layout.
         let mangled = segments.join(".");
-        self.lower_call(&mangled, args)
+        self.lower_call(&mangled, args, &outer.ty)
     }
 
     fn lower_method_call(
@@ -493,7 +514,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// Central dispatch for direct and static qualified calls: list
     /// walks (which need the walk loop emitted inline), list
     /// builtins, num-to-str, constructors, and plain function calls.
-    fn lower_call(&mut self, func: &str, args: &[Expr<'src>]) -> Value {
+    ///
+    /// `result_ty` is the type of the enclosing expression, used to
+    /// compute layout for structural constructor calls.
+    fn lower_call(
+        &mut self,
+        func: &str,
+        args: &[Expr<'src>],
+        result_ty: &Type,
+    ) -> Value {
         if let Some(walk) = classify_walk(func) {
             assert!(args.len() >= 3, "List.walk* takes 3 arguments");
             let list_val = self.lower_expr(&args[0]);
@@ -523,12 +552,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
         if self.decls.constructors.contains_key(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-            return self.lower_constructor_call(func, &arg_vals);
+            return self.lower_constructor_call(func, &arg_vals, Some(result_ty));
         }
         if self.decls.funcs.contains(func) {
             let ret_ty = self.func_ret_type(func);
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
             return self.builder.call(func, arg_vals, ret_ty);
+        }
+        // Structural constructor (not in decl_info). Layout is
+        // derived from `result_ty` which inference closed to a
+        // concrete `Type::TagUnion`.
+        if func.starts_with(|c: char| c.is_ascii_uppercase()) {
+            let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+            return self.lower_constructor_call(func, &arg_vals, Some(result_ty));
         }
         panic!("undefined function or constructor: {func}")
     }
@@ -552,13 +588,47 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
+    // ---- Constructor layout ----
+
+    /// Return the layout info for a constructor: `(tag_index,
+    /// max_fields, field_scalar_types)`. Declared constructors
+    /// (from `TypeAnno` declarations) use their stored
+    /// `ConstructorMeta`. Structural constructors (created by
+    /// `ast::from_raw`'s pre-pass for uppercase names not in any
+    /// declaration) compute layout from the provided `ctx_ty`, which
+    /// must be a closed `Type::TagUnion`. Tag index is the
+    /// constructor's position in the sorted tag list.
+    fn con_layout(
+        &self,
+        name: &str,
+        ctx_ty: Option<&Type>,
+    ) -> (u64, usize, Vec<ScalarType>) {
+        if let Some(meta) = self.decls.constructors.get(name) {
+            return (meta.tag_index, meta.max_fields, meta.field_types.clone());
+        }
+        let ty = ctx_ty.unwrap_or_else(|| {
+            panic!("structural constructor '{name}' without context type")
+        });
+        structural_con_layout(ty, name)
+    }
+
     // ---- Constructor call emission ----
 
-    fn lower_constructor_call(&mut self, name: &str, args: &[Value]) -> Value {
-        let meta = self.decls.constructors[name].clone();
-        let alloc_size = 1 + meta.max_fields;
+    /// Emit a constructor call. `ctx_ty` is the type of the
+    /// enclosing expression — used to compute layout for
+    /// structural constructors (which don't have entries in
+    /// `decl_info.constructors`). For declared constructors the
+    /// `ctx_ty` is ignored and `ConstructorMeta` is used directly.
+    fn lower_constructor_call(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        ctx_ty: Option<&Type>,
+    ) -> Value {
+        let (tag_index, max_fields, _field_types) = self.con_layout(name, ctx_ty);
+        let alloc_size = 1 + max_fields;
         let ptr = self.builder.alloc(alloc_size);
-        let tag_val = self.builder.const_u64(meta.tag_index);
+        let tag_val = self.builder.const_u64(tag_index);
         self.builder.store(ptr, 0, tag_val);
         for (i, &arg) in args.iter().enumerate() {
             self.builder.store(ptr, i + 1, arg);
@@ -617,20 +687,21 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     /// Lower a standalone `x is Pattern` expression (produces Bool, no binding flow).
     fn lower_is_expr(&mut self, inner: &Expr<'src>, pattern: &ast::Pattern<'src>) -> Value {
+        let inner_ty = inner.ty.clone();
         let scr = self.lower_expr(inner);
         match pattern {
             ast::Pattern::Constructor { name, .. } => {
+                let (tag_index, _, _) = self.con_layout(name, Some(&inner_ty));
                 let tag = self.builder.load(scr, 0, ScalarType::U64);
-                let meta = &self.decls.constructors[*name];
-                let expected_tag = self.builder.const_u64(meta.tag_index);
+                let expected_tag = self.builder.const_u64(tag_index);
                 let matches = self
                     .builder
                     .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
                 self.lower_bool_from_cmp(matches)
             }
             ast::Pattern::Wildcard | ast::Pattern::Binding(_) => {
-                // Always matches
-                self.lower_constructor_call("True", &[])
+                // Always matches — emit a declared Bool::True.
+                self.lower_constructor_call("True", &[], None)
             }
             _ => panic!("unsupported pattern in `is` expression"),
         }
@@ -653,7 +724,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         // False block: produce False and jump to merge
         self.builder.switch_to(false_block);
-        let false_val = self.lower_constructor_call("False", &[]);
+        let false_val = self.lower_constructor_call("False", &[], None);
         self.builder.jump(merge, vec![false_val]);
 
         self.vars = saved_vars;
@@ -669,12 +740,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 expr: inner,
                 pattern,
             } => {
+                let inner_ty = inner.ty.clone();
                 let scr = self.lower_expr(inner);
                 match pattern {
                     ast::Pattern::Constructor { name, fields } => {
+                        let (tag_index, _, field_types) =
+                            self.con_layout(name, Some(&inner_ty));
                         let tag = self.builder.load(scr, 0, ScalarType::U64);
-                        let meta = self.decls.constructors[*name].clone();
-                        let expected_tag = self.builder.const_u64(meta.tag_index);
+                        let expected_tag = self.builder.const_u64(tag_index);
                         let matches =
                             self.builder
                                 .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
@@ -685,7 +758,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         // Bind pattern fields
                         for (fi, field_pat) in fields.iter().enumerate() {
                             let field_ty =
-                                meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
+                                field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
                             let field_val = self.builder.load(scr, fi + 1, field_ty);
                             self.bind_pattern_field(field_pat, field_val);
                         }
@@ -825,13 +898,21 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     // ---- Match/fold shared helpers ----
 
-    fn group_arms_by_tag(&self, arms: &[ast::MatchArm<'src>]) -> Vec<(u64, Vec<usize>)> {
+    /// Group match arms by the tag index of their top-level
+    /// constructor pattern. `scrutinee_ty` provides the context
+    /// needed to compute tag indices for structural constructors
+    /// (which aren't in `decl_info.constructors`).
+    fn group_arms_by_tag(
+        &self,
+        arms: &[ast::MatchArm<'src>],
+        scrutinee_ty: &Type,
+    ) -> Vec<(u64, Vec<usize>)> {
         let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
         for (i, arm) in arms.iter().enumerate() {
             let ast::Pattern::Constructor { name: con_name, .. } = &arm.pattern else {
                 panic!("arms must use constructor patterns");
             };
-            let tag_idx = self.decls.constructors[*con_name].tag_index;
+            let (tag_idx, _, _) = self.con_layout(con_name, Some(scrutinee_ty));
             if let Some(group) = groups.iter_mut().find(|(t, _)| *t == tag_idx) {
                 group.1.push(i);
             } else {
@@ -879,6 +960,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         else_body: Option<&Expr<'src>>,
         result_ty: ScalarType,
     ) -> Value {
+        let scrutinee_ty = scrutinee_expr.ty.clone();
         let scr_val = self.lower_expr(scrutinee_expr);
         let tag = self.builder.load(scr_val, 0, ScalarType::U64);
         let tag_block = self.builder.current_block.unwrap();
@@ -887,7 +969,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let merge_param = self.builder.add_block_param(merge, result_ty);
         let else_block = else_body.map(|_| self.builder.create_block());
         let arm_blocks: Vec<_> = arms.iter().map(|_| self.builder.create_block()).collect();
-        let tag_groups = self.group_arms_by_tag(arms);
+        let tag_groups = self.group_arms_by_tag(arms, &scrutinee_ty);
 
         let switch_arms: Vec<_> = tag_groups
             .iter()
@@ -907,11 +989,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             };
             self.builder.switch_to(arm_blocks[i]);
 
-            let meta = self.decls.constructors[*con_name].clone();
+            let (arm_tag_idx, _, field_types) =
+                self.con_layout(con_name, Some(&scrutinee_ty));
             let saved_vars = self.vars.clone();
 
             for (fi, field_pat) in fields.iter().enumerate() {
-                let field_ty = meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
+                let field_ty = field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
                 let field_val = self.builder.load(scr_val, fi + 1, field_ty);
                 self.bind_pattern_field(field_pat, field_val);
             }
@@ -921,7 +1004,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 self.lower_guards(
                     &arm.guards,
                     i,
-                    meta.tag_index,
+                    arm_tag_idx,
                     &tag_groups,
                     &arm_blocks,
                     default_fail,
@@ -1178,6 +1261,42 @@ fn lower_to_ssa<'src>(
 /// Classify a mangled callable name as a `List.walk*` variant.
 /// Returns `None` for every non-walk name. Lives at module level
 /// (not as a method on `LowerCtx`) because it's pure string analysis.
+/// Compute layout info for a structural constructor from a closed
+/// `Type::TagUnion` context. Returns `(tag_index, max_fields,
+/// field_scalar_types)`. Tag index is the constructor's position in
+/// the tag list sorted by name (dense, 0..N). Max fields is the
+/// maximum payload arity across all tags in the union. Payload scalar
+/// types are computed from the constructor's payload types in the
+/// sorted union.
+///
+/// Panics if `ty` isn't a closed `Type::TagUnion` or if `con_name`
+/// isn't present among its tags — both are bugs in earlier passes
+/// that should have been caught by inference/mono.
+fn structural_con_layout(ty: &Type, con_name: &str) -> (u64, usize, Vec<ScalarType>) {
+    let Type::TagUnion { tags, rest } = ty else {
+        panic!(
+            "structural constructor '{con_name}' expected TagUnion context, got {ty:?}"
+        );
+    };
+    assert!(
+        rest.is_none(),
+        "structural constructor '{con_name}' context has open row — mono should have closed it"
+    );
+    let mut sorted: Vec<(String, Vec<Type>)> = tags.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let max_fields = sorted.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+    let idx = sorted
+        .iter()
+        .position(|(n, _)| n == con_name)
+        .unwrap_or_else(|| {
+            panic!("structural constructor '{con_name}' not in union {tags:?}")
+        });
+    #[allow(clippy::cast_possible_truncation, reason = "tag count fits in u64")]
+    let tag_index = idx as u64;
+    let field_types: Vec<ScalarType> = sorted[idx].1.iter().map(type_to_scalar).collect();
+    (tag_index, max_fields, field_types)
+}
+
 fn classify_walk(name: &str) -> Option<WalkKind> {
     let base = name
         .strip_prefix("List.")

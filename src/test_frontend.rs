@@ -1614,6 +1614,69 @@ main = |arg| area(Sphere(3))";
 // ============================================================
 
 #[test]
+fn structural_tag_runtime_nullary() {
+    // End-to-end: compile and run a program that uses structural
+    // constructors and a match to dispatch on them. Exercises the
+    // SSA lowering path (steps 7-9).
+    let source = "\
+pick : I64 -> [Blue, Green, Red]
+pick = |n| if n == 0 then Red
+    else if n == 1 then Green
+    else Blue
+
+main : I64 -> I64
+main = |arg| (
+    r = pick(arg)
+    if r
+        : Red then 100
+        : Green then 200
+        : Blue then 300
+)";
+    assert_eq!(run_i64(source, 0), 100);
+    assert_eq!(run_i64(source, 1), 200);
+    assert_eq!(run_i64(source, 2), 300);
+}
+
+#[test]
+fn structural_tag_runtime_with_payload() {
+    // Structural constructors carrying I64 payloads, matched with
+    // field bindings.
+    let source = "\
+wrap : I64 -> [Neg(I64), Pos(I64), Zero]
+wrap = |n| if n == 0 then Zero
+    else if n == 1 then Pos(n)
+    else Neg(n)
+
+main : I64 -> I64
+main = |arg| (
+    r = wrap(arg)
+    if r
+        : Pos(x) then x * 10
+        : Neg(x) then x * -1
+        : Zero then 999
+)";
+    assert_eq!(run_i64(source, 0), 999);
+    assert_eq!(run_i64(source, 1), 10);
+    assert_eq!(run_i64(source, 5), -5);
+}
+
+#[test]
+fn structural_tag_runtime_is_expression() {
+    // Standalone `is` expression on a structural tag value.
+    let source = "\
+check : I64 -> [No, Yes]
+check = |n| if n == 0 then Yes else No
+
+main : I64 -> I64
+main = |arg| (
+    r = check(arg)
+    if r is Yes then 1 else 0
+)";
+    assert_eq!(run_i64(source, 0), 1);
+    assert_eq!(run_i64(source, 7), 0);
+}
+
+#[test]
 fn structural_tag_widening_to_annotated_type() {
     // An annotation closes the row. Here the body produces a union
     // containing just Red and Green, which widens to match the
