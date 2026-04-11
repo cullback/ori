@@ -73,6 +73,83 @@ fn run_i64(source: &str, input: i64) -> i64 {
     }
 }
 
+/// Run parse → resolve → fold_lift → flatten_patterns → topo → infer
+/// and return the inferred function scheme for the given function
+/// name as a rendered string. Used by tests that want to assert on
+/// inferred types without needing the full SSA pipeline — e.g. tests
+/// for structural tag unions where lowering support isn't landed yet.
+#[allow(dead_code, reason = "used by structural-tag inference tests")]
+fn infer_func_type(source: &str, func: &str) -> String {
+    let mut arena = SourceArena::new();
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    let infer_result = crate::types::infer::check(
+        &arena,
+        &mut resolved.module,
+        &resolved.scope,
+        &resolved.symbols,
+        &resolved.fields,
+    )
+    .unwrap_or_else(|e| panic!("infer failed: {}", e.format(&arena)));
+    let scheme = infer_result
+        .func_schemes
+        .get(func)
+        .unwrap_or_else(|| panic!("no scheme for function '{func}'"));
+    render_scheme(&scheme.ty)
+}
+
+#[allow(dead_code, reason = "used by structural-tag inference tests")]
+fn render_scheme(ty: &crate::types::engine::Type) -> String {
+    use crate::types::engine::Type;
+    match ty {
+        Type::Var(_) => "'_".to_owned(),
+        Type::Con(name) => name.clone(),
+        Type::App(name, args) => {
+            let arg_strs: Vec<String> = args.iter().map(render_scheme).collect();
+            format!("{name}({})", arg_strs.join(", "))
+        }
+        Type::Arrow(params, ret) => {
+            let param_strs: Vec<String> = params.iter().map(render_scheme).collect();
+            format!("{} -> {}", param_strs.join(", "), render_scheme(ret))
+        }
+        Type::Record { fields, rest } => {
+            let mut field_strs: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", render_scheme(t)))
+                .collect();
+            if rest.is_some() {
+                field_strs.push("..".to_owned());
+            }
+            format!("{{ {} }}", field_strs.join(", "))
+        }
+        Type::TagUnion { tags, rest } => {
+            let mut tag_strs: Vec<String> = tags
+                .iter()
+                .map(|(n, payloads)| {
+                    if payloads.is_empty() {
+                        n.clone()
+                    } else {
+                        let ps: Vec<String> = payloads.iter().map(render_scheme).collect();
+                        format!("{n}({})", ps.join(", "))
+                    }
+                })
+                .collect();
+            if rest.is_some() {
+                tag_strs.push("..".to_owned());
+            }
+            format!("[{}]", tag_strs.join(", "))
+        }
+        Type::Tuple(elems) => {
+            let elem_strs: Vec<String> = elems.iter().map(render_scheme).collect();
+            format!("({})", elem_strs.join(", "))
+        }
+    }
+}
+
 fn run_u64(source: &str, input: i64) -> u64 {
     match run(source, input) {
         Scalar::U64(n) => n,
@@ -1531,6 +1608,127 @@ main = |arg| area(Sphere(3))";
 // ============================================================
 // Nested patterns (flatten_patterns pass)
 // ============================================================
+
+// ============================================================
+// Structural tag unions
+// ============================================================
+
+#[test]
+fn structural_tag_widening_to_annotated_type() {
+    // An annotation closes the row. Here the body produces a union
+    // containing just Red and Green, which widens to match the
+    // annotated closed union of three tags. Open-row syntax `..`
+    // in annotations isn't supported by the grammar yet, so we use
+    // a closed annotation for now.
+    let source = "\
+parse : I64 -> [Red, Green, Blue]
+parse = |n| if n == 0 then Red else Green";
+    let ty = infer_func_type(source, "parse");
+    // After widening, the inferred type should be the annotated
+    // closed union — exactly three tags, no open row.
+    assert!(
+        ty.contains("Red") && ty.contains("Green") && ty.contains("Blue"),
+        "expected closed union of three tags, got: {ty}"
+    );
+    assert!(
+        !ty.contains(".."),
+        "annotation should close the row, got: {ty}"
+    );
+}
+
+#[test]
+fn structural_tag_with_payload_annotation() {
+    // Structural constructor with a payload: `Wrapped(n)` produces
+    // a tag union where Wrapped carries an I64, closed to the
+    // annotated return type.
+    let source = "\
+wrap : I64 -> [Wrapped(I64)]
+wrap = |n| Wrapped(n)";
+    let ty = infer_func_type(source, "wrap");
+    assert!(
+        ty.contains("Wrapped(I64)"),
+        "expected Wrapped carrying I64, got: {ty}"
+    );
+}
+
+#[test]
+fn structural_tag_multiple_with_payloads() {
+    // Three constructors with different payload shapes. The
+    // annotation closes the row; inference unifies the payloads to
+    // the annotated types.
+    let source = "\
+classify : I64 -> [Pos(I64), Neg(I64), Zero]
+classify = |n| if n == 0 then Zero
+    else if n == 1 then Pos(n)
+    else Neg(n)";
+    let ty = infer_func_type(source, "classify");
+    assert!(
+        ty.contains("Pos(I64)") && ty.contains("Neg(I64)") && ty.contains("Zero"),
+        "expected closed union, got: {ty}"
+    );
+}
+
+#[test]
+fn structural_tag_match_closes_row() {
+    // An exhaustive match on a parameter with no annotation should
+    // close the scrutinee's row to exactly the tags covered. Here
+    // `c`'s inferred type starts open (from the match arms) and
+    // closes to `[Red, Green, Blue]` because all three branches
+    // are covered and there's no else.
+    let source = "\
+describe = |c| if c
+    : Red then 1
+    : Green then 2
+    : Blue then 3";
+    let ty = infer_func_type(source, "describe");
+    assert!(
+        ty.contains("Red") && ty.contains("Green") && ty.contains("Blue"),
+        "expected all three tags in closed union, got: {ty}"
+    );
+    assert!(
+        !ty.contains(".."),
+        "exhaustive match should close the row, got: {ty}"
+    );
+}
+
+#[test]
+fn structural_tag_match_with_else_stays_open() {
+    // A match with an `else` branch leaves the row open — the else
+    // handles anything else that could flow in. The scrutinee's
+    // type should still contain `..`.
+    let source = "\
+describe = |c| if c
+    : Red then 1
+    : Green then 2
+    else 0";
+    let ty = infer_func_type(source, "describe");
+    assert!(
+        ty.contains("Red") && ty.contains("Green"),
+        "expected Red and Green in union, got: {ty}"
+    );
+    assert!(
+        ty.contains(".."),
+        "else branch should leave row open, got: {ty}"
+    );
+}
+
+#[test]
+fn structural_tag_open_row_without_annotation() {
+    // Without a closing annotation, the inferred body type keeps
+    // its open row. The two branches contribute `Red` and `Green`,
+    // and the inferred type contains both plus an open rest (`..`).
+    let source = "\
+parse = |n| if n == 0 then Red else Green";
+    let ty = infer_func_type(source, "parse");
+    assert!(
+        ty.contains("Red") && ty.contains("Green"),
+        "expected union containing both tags, got: {ty}"
+    );
+    assert!(
+        ty.contains(".."),
+        "expected open row without annotation, got: {ty}"
+    );
+}
 
 #[test]
 fn nested_pattern_ok_branch() {

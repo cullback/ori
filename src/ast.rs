@@ -488,13 +488,22 @@ pub fn from_raw<'src>(
                 // namespace so `Call { func: "Ok" }` resolves correctly.
                 if let raw::TypeExpr::TagUnion(tags) = ty {
                     for tag in tags {
-                        let cid = symbols.fresh(tag.name, *span, SymbolKind::Func);
+                        let cid = symbols.fresh(tag.name, *span, SymbolKind::Constructor);
                         top_level.insert(tag.name, cid);
                     }
                 }
             }
         }
     }
+
+    // Pass 1.5: structural constructor collection. Walk every
+    // expression and pattern in the module, and for every
+    // uppercase-named reference that isn't already in `top_level`,
+    // allocate a fresh `SymbolKind::Constructor`. This makes bare
+    // references like `Red` resolvable even when no `TypeAnno`
+    // declares them — the inference pass then produces an open
+    // `Type::TagUnion` for them. See `notes/tags-impl.md`.
+    collect_structural_constructors(&module, symbols, &mut top_level);
 
     // Pass 2: walk each decl with the resolver to fill in SymbolIds on
     // every binding site and reference. Each decl gets a fresh,
@@ -522,6 +531,204 @@ pub fn from_raw<'src>(
             })
             .collect(),
         decls,
+    }
+}
+
+// ---- Structural constructor pre-pass ----
+
+/// Check if a name looks like a constructor (starts with ASCII
+/// uppercase). Mirrors `syntax::parse::is_constructor_name`.
+fn is_con_name(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// Walk every expression and pattern in the module. For every
+/// uppercase-named reference that isn't already bound in `top_level`,
+/// allocate a fresh `SymbolKind::Constructor` and insert it. Called
+/// after Pass 1 (which seeds `top_level` with declared names) and
+/// before Pass 2 (which resolves references against it).
+fn collect_structural_constructors<'src>(
+    module: &raw::Module<'src>,
+    symbols: &mut SymbolTable,
+    top_level: &mut HashMap<&'src str, SymbolId>,
+) {
+    for decl in &module.decls {
+        match decl {
+            raw::Decl::FuncDef { body, span, .. } => {
+                collect_in_expr(body, *span, symbols, top_level);
+            }
+            raw::Decl::TypeAnno {
+                methods, span, ..
+            } => {
+                for method in methods {
+                    if let raw::Decl::FuncDef { body, .. } = method {
+                        collect_in_expr(body, *span, symbols, top_level);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn maybe_register<'src>(
+    name: &'src str,
+    span: raw::Span,
+    symbols: &mut SymbolTable,
+    top_level: &mut HashMap<&'src str, SymbolId>,
+) {
+    if !is_con_name(name) {
+        return;
+    }
+    if top_level.contains_key(name) {
+        return;
+    }
+    let id = symbols.fresh(name, span, SymbolKind::Constructor);
+    top_level.insert(name, id);
+}
+
+fn collect_in_expr<'src>(
+    expr: &raw::Expr<'src>,
+    span: raw::Span,
+    symbols: &mut SymbolTable,
+    top_level: &mut HashMap<&'src str, SymbolId>,
+) {
+    match &expr.kind {
+        raw::ExprKind::IntLit(_)
+        | raw::ExprKind::FloatLit(_)
+        | raw::ExprKind::StrLit(_) => {}
+        raw::ExprKind::Name(name) => {
+            maybe_register(name, span, symbols, top_level);
+        }
+        raw::ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_in_expr(lhs, span, symbols, top_level);
+            collect_in_expr(rhs, span, symbols, top_level);
+        }
+        raw::ExprKind::Call { func, args } => {
+            maybe_register(func, span, symbols, top_level);
+            for a in args {
+                collect_in_expr(a, span, symbols, top_level);
+            }
+        }
+        raw::ExprKind::QualifiedCall { args, .. } => {
+            // Qualified calls like `Module.func(...)` never introduce
+            // a bare structural constructor — the segments are a
+            // module path, not a tag name.
+            for a in args {
+                collect_in_expr(a, span, symbols, top_level);
+            }
+        }
+        raw::ExprKind::Block(stmts, result) => {
+            for stmt in stmts {
+                collect_in_stmt(stmt, span, symbols, top_level);
+            }
+            collect_in_expr(result, span, symbols, top_level);
+        }
+        raw::ExprKind::If {
+            expr: scrutinee,
+            arms,
+            else_body,
+        } => {
+            collect_in_expr(scrutinee, span, symbols, top_level);
+            for arm in arms {
+                collect_in_pattern(&arm.pattern, span, symbols, top_level);
+                for g in &arm.guards {
+                    collect_in_expr(g, span, symbols, top_level);
+                }
+                collect_in_expr(&arm.body, span, symbols, top_level);
+            }
+            if let Some(eb) = else_body {
+                collect_in_expr(eb, span, symbols, top_level);
+            }
+        }
+        raw::ExprKind::Fold {
+            expr: scrutinee,
+            arms,
+        } => {
+            collect_in_expr(scrutinee, span, symbols, top_level);
+            for arm in arms {
+                collect_in_pattern(&arm.pattern, span, symbols, top_level);
+                for g in &arm.guards {
+                    collect_in_expr(g, span, symbols, top_level);
+                }
+                collect_in_expr(&arm.body, span, symbols, top_level);
+            }
+        }
+        raw::ExprKind::Lambda { body, .. } => {
+            collect_in_expr(body, span, symbols, top_level);
+        }
+        raw::ExprKind::Record { fields } => {
+            for (_, e) in fields {
+                collect_in_expr(e, span, symbols, top_level);
+            }
+        }
+        raw::ExprKind::FieldAccess { record, .. } => {
+            collect_in_expr(record, span, symbols, top_level);
+        }
+        raw::ExprKind::Tuple(elems) | raw::ExprKind::ListLit(elems) => {
+            for e in elems {
+                collect_in_expr(e, span, symbols, top_level);
+            }
+        }
+        raw::ExprKind::MethodCall { receiver, args, .. } => {
+            collect_in_expr(receiver, span, symbols, top_level);
+            for a in args {
+                collect_in_expr(a, span, symbols, top_level);
+            }
+        }
+        raw::ExprKind::Is { expr: inner, pattern } => {
+            collect_in_expr(inner, span, symbols, top_level);
+            collect_in_pattern(pattern, span, symbols, top_level);
+        }
+    }
+}
+
+fn collect_in_stmt<'src>(
+    stmt: &raw::Stmt<'src>,
+    span: raw::Span,
+    symbols: &mut SymbolTable,
+    top_level: &mut HashMap<&'src str, SymbolId>,
+) {
+    match stmt {
+        raw::Stmt::Let { val, .. } => collect_in_expr(val, span, symbols, top_level),
+        raw::Stmt::Destructure { pattern, val } => {
+            collect_in_pattern(pattern, span, symbols, top_level);
+            collect_in_expr(val, span, symbols, top_level);
+        }
+        raw::Stmt::Guard {
+            condition,
+            return_val,
+        } => {
+            collect_in_expr(condition, span, symbols, top_level);
+            collect_in_expr(return_val, span, symbols, top_level);
+        }
+        raw::Stmt::TypeHint { .. } => {}
+    }
+}
+
+fn collect_in_pattern<'src>(
+    pat: &raw::Pattern<'src>,
+    span: raw::Span,
+    symbols: &mut SymbolTable,
+    top_level: &mut HashMap<&'src str, SymbolId>,
+) {
+    match pat {
+        raw::Pattern::Constructor { name, fields } => {
+            maybe_register(name, span, symbols, top_level);
+            for f in fields {
+                collect_in_pattern(f, span, symbols, top_level);
+            }
+        }
+        raw::Pattern::Record { fields } => {
+            for (_, f) in fields {
+                collect_in_pattern(f, span, symbols, top_level);
+            }
+        }
+        raw::Pattern::Tuple(elems) => {
+            for e in elems {
+                collect_in_pattern(e, span, symbols, top_level);
+            }
+        }
+        raw::Pattern::Wildcard | raw::Pattern::Binding(_) => {}
     }
 }
 

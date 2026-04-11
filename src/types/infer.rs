@@ -164,9 +164,24 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     Box::new(self.type_expr_to_type(ret, tvar_env)?),
                 ))
             }
-            TypeExpr::TagUnion(_) => {
-                // Inline tag unions in type expressions are not supported in inference yet
-                Ok(self.engine.fresh())
+            TypeExpr::TagUnion(tags) => {
+                // Inline tag union in a type annotation becomes a
+                // closed `Type::TagUnion`. Nominal declarations that
+                // use tag unions still go through `register_type_decl`
+                // and produce a `Type::Con` — this path only fires for
+                // inline annotations like `f : I64 -> [Red, Green]`.
+                let mut tag_entries: Vec<(String, Vec<Type>)> = Vec::new();
+                for tag in tags {
+                    let mut payload_types = Vec::new();
+                    for payload in &tag.fields {
+                        payload_types.push(self.type_expr_to_type(payload, tvar_env)?);
+                    }
+                    tag_entries.push((tag.name.to_owned(), payload_types));
+                }
+                Ok(Type::TagUnion {
+                    tags: tag_entries,
+                    rest: None,
+                })
             }
             TypeExpr::Record(fields) => {
                 let mut type_fields = Vec::new();
@@ -276,6 +291,20 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 if let Some(scheme) = self.constructors.get(name).cloned() {
                     return Ok(self.engine.instantiate(&scheme));
                 }
+                // Structural constructor: the pre-resolver in
+                // `ast::from_raw::collect_structural_constructors`
+                // allocates a `SymbolKind::Constructor` for every
+                // uppercase name that wasn't declared. Inference
+                // produces an open tag union `[Name, ..ρ]` for it;
+                // later unifications narrow or widen the row as
+                // needed. See `notes/tags-impl.md` step 4.
+                if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    let rest = self.engine.fresh();
+                    return Ok(Type::TagUnion {
+                        tags: vec![(name.to_owned(), vec![])],
+                        rest: Some(Box::new(rest)),
+                    });
+                }
                 Err(Self::type_error(
                     expr.span,
                     &format!("undefined name '{name}'"),
@@ -379,7 +408,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             ExprKind::If {
                 expr: scrutinee,
                 arms,
-                ..
+                else_body,
             } => {
                 let scrutinee_ty = self.infer_expr(scrutinee)?;
                 let result_ty = self.engine.fresh();
@@ -405,6 +434,15 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     let body_ty = self.infer_expr(&arm.body)?;
                     self.unify_at(&result_ty, &body_ty, arm.body.span)?;
                     self.env = saved_env;
+                }
+                if let Some(eb) = else_body {
+                    let eb_ty = self.infer_expr(eb)?;
+                    self.unify_at(&result_ty, &eb_ty, eb.span)?;
+                } else {
+                    // Exhaustive match with no else branch: if the
+                    // scrutinee's type is still an open tag union
+                    // row, close it. See `notes/tags-impl.md` step 6.
+                    self.close_open_tag_row(&scrutinee_ty);
                 }
                 Ok(result_ty)
             }
@@ -439,6 +477,10 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     self.unify_at(&result_ty, &body_ty, arm.body.span)?;
                     self.env = saved_env;
                 }
+                // Fold always consumes the entire collection, so its
+                // arm coverage must be exhaustive — close any open row
+                // on the scrutinee the same way `If` does.
+                self.close_open_tag_row(&scrutinee_ty);
                 Ok(result_ty)
             }
 
@@ -555,6 +597,18 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             let expected = Type::Arrow(arg_types, Box::new(ret.clone()));
             self.unify_at(&func_ty, &expected, span)?;
             return Ok(ret);
+        }
+
+        // Structural constructor call: `Ok(42)` where `Ok` isn't in
+        // any declared `TypeAnno`. Produces an open tag union with
+        // one tag whose payload types are the inferred arg types.
+        // See `notes/tags-impl.md` step 4.
+        if func.starts_with(|c: char| c.is_ascii_uppercase()) {
+            let rest = self.engine.fresh();
+            return Ok(Type::TagUnion {
+                tags: vec![(func.to_owned(), arg_types)],
+                rest: Some(Box::new(rest)),
+            });
         }
 
         // Method call on a type variable: x.method(args) → generate constraint
@@ -758,7 +812,139 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
     }
 
+    // ---- Match exhaustiveness closure ----
+
+    /// Close an open tag union row on a scrutinee type. Called after
+    /// all arms of an exhaustive match have been typed. If the
+    /// scrutinee's type is a `Type::TagUnion` with an open `rest`
+    /// variable, unify that variable with an empty closed union so
+    /// the row becomes exactly the set of tags matched by the arms.
+    ///
+    /// Safe to call on any type — if the resolved scrutinee isn't an
+    /// open tag union, this is a no-op. If unification fails (e.g.
+    /// the row was already constrained), the error is silently
+    /// discarded because closure is best-effort: a genuine
+    /// type error would already have been surfaced during the
+    /// per-arm unification.
+    fn close_open_tag_row(&mut self, scrutinee_ty: &Type) {
+        let resolved = self.engine.resolve(scrutinee_ty);
+        let Type::TagUnion {
+            rest: Some(rest_var),
+            ..
+        } = resolved
+        else {
+            return;
+        };
+        let empty_closed = Type::TagUnion {
+            tags: vec![],
+            rest: None,
+        };
+        if let Err(_err) = self.engine.unify(&rest_var, &empty_closed) {
+            // Best-effort closure — a genuine type error would have
+            // already been caught by per-arm unification.
+        }
+    }
+
     // ---- Pattern inference ----
+
+    /// Infer bindings for a Constructor pattern that references a
+    /// declared `TagUnion` constructor (scheme already in
+    /// `self.constructors`). Extracted from `infer_pattern` so the
+    /// structural path is a peer rather than an inner branch.
+    fn infer_declared_con_pattern(
+        &mut self,
+        scheme: &Scheme,
+        fields: &[ast::Pattern<'src>],
+        expected: &Type,
+        span: Span,
+        rec_subst: Option<&Type>,
+    ) -> Result<Vec<(SymbolId, Type)>, CompileError> {
+        let con_ty = self.engine.instantiate(scheme);
+
+        if fields.is_empty() {
+            // Nullary constructor
+            self.unify_at(&con_ty, expected, span)?;
+            return Ok(vec![]);
+        }
+
+        let field_types: Vec<Type> =
+            fields.iter().map(|_| self.engine.fresh()).collect();
+        let con_ret = self.engine.fresh();
+        let arrow = Type::Arrow(field_types.clone(), Box::new(con_ret.clone()));
+        self.unify_at(&con_ty, &arrow, span)?;
+        self.unify_at(&con_ret, expected, span)?;
+
+        let mut bindings = Vec::new();
+        for (field_pat, field_ty) in fields.iter().zip(field_types.iter()) {
+            // For fold patterns: if field type matches scrutinee and
+            // rec_subst is Some, use the substitution type instead.
+            let bind_ty = if let Some(result_ty) = rec_subst {
+                let resolved = self.engine.resolve(field_ty);
+                let scrutinee_resolved = self.engine.resolve(expected);
+                if self.engine.types_match(&resolved, &scrutinee_resolved) {
+                    result_ty.clone()
+                } else {
+                    field_ty.clone()
+                }
+            } else {
+                field_ty.clone()
+            };
+            match field_pat {
+                ast::Pattern::Binding(sym) => {
+                    bindings.push((*sym, bind_ty));
+                }
+                ast::Pattern::Wildcard => {}
+                ast::Pattern::Constructor { .. }
+                | ast::Pattern::Record { .. }
+                | ast::Pattern::Tuple(_) => {
+                    bindings.extend(self.infer_pattern(field_pat, &bind_ty, span, None)?);
+                }
+            }
+        }
+        Ok(bindings)
+    }
+
+    /// Infer bindings for a Constructor pattern that references a
+    /// structural (undeclared) tag. Unifies the scrutinee against an
+    /// open tag union `[Name(payload..), ..ρ]`, letting the
+    /// unification engine widen the scrutinee's row to include the
+    /// new tag if it was also open.
+    ///
+    /// The scrutinee's row stays open here. Match-arm closure (the
+    /// "exhaustive match closes the row" rule) is applied later by
+    /// `close_open_match_rows` after all arms have been typed.
+    fn infer_structural_con_pattern(
+        &mut self,
+        name: &str,
+        fields: &[ast::Pattern<'src>],
+        expected: &Type,
+        span: Span,
+    ) -> Result<Vec<(SymbolId, Type)>, CompileError> {
+        let payload_types: Vec<Type> =
+            fields.iter().map(|_| self.engine.fresh()).collect();
+        let rest = self.engine.fresh();
+        let pattern_ty = Type::TagUnion {
+            tags: vec![(name.to_owned(), payload_types.clone())],
+            rest: Some(Box::new(rest)),
+        };
+        self.unify_at(&pattern_ty, expected, span)?;
+
+        let mut bindings = Vec::new();
+        for (field_pat, field_ty) in fields.iter().zip(payload_types.iter()) {
+            match field_pat {
+                ast::Pattern::Binding(sym) => {
+                    bindings.push((*sym, field_ty.clone()));
+                }
+                ast::Pattern::Wildcard => {}
+                ast::Pattern::Constructor { .. }
+                | ast::Pattern::Record { .. }
+                | ast::Pattern::Tuple(_) => {
+                    bindings.extend(self.infer_pattern(field_pat, field_ty, span, None)?);
+                }
+            }
+        }
+        Ok(bindings)
+    }
 
     fn infer_pattern(
         &mut self,
@@ -770,58 +956,16 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         match pat {
             ast::Pattern::Constructor { name, fields } => {
                 let name = *name;
-                let scheme = self
-                    .constructors
-                    .get(name)
-                    .ok_or_else(|| {
-                        Self::type_error(span, &format!("unknown constructor '{name}'"))
-                    })?
-                    .clone();
-                let con_ty = self.engine.instantiate(&scheme);
-
-                if fields.is_empty() {
-                    // Nullary constructor
-                    self.unify_at(&con_ty, expected, span)?;
-                    Ok(vec![])
-                } else {
-                    // Constructor with fields
-                    let field_types: Vec<Type> =
-                        fields.iter().map(|_| self.engine.fresh()).collect();
-                    let con_ret = self.engine.fresh();
-                    let arrow = Type::Arrow(field_types.clone(), Box::new(con_ret.clone()));
-                    self.unify_at(&con_ty, &arrow, span)?;
-                    self.unify_at(&con_ret, expected, span)?;
-
-                    let mut bindings = Vec::new();
-                    for (field_pat, field_ty) in fields.iter().zip(field_types.iter()) {
-                        // For fold patterns: if field type matches scrutinee and rec_subst
-                        // is Some, use the substitution type instead.
-                        let bind_ty = if let Some(result_ty) = rec_subst {
-                            let resolved = self.engine.resolve(field_ty);
-                            let scrutinee_resolved = self.engine.resolve(expected);
-                            if self.engine.types_match(&resolved, &scrutinee_resolved) {
-                                result_ty.clone()
-                            } else {
-                                field_ty.clone()
-                            }
-                        } else {
-                            field_ty.clone()
-                        };
-                        match field_pat {
-                            ast::Pattern::Binding(sym) => {
-                                bindings.push((*sym, bind_ty));
-                            }
-                            ast::Pattern::Wildcard => {}
-                            ast::Pattern::Constructor { .. }
-                            | ast::Pattern::Record { .. }
-                            | ast::Pattern::Tuple(_) => {
-                                bindings
-                                    .extend(self.infer_pattern(field_pat, &bind_ty, span, None)?);
-                            }
-                        }
-                    }
-                    Ok(bindings)
+                // Declared constructor (from a `TypeAnno`): use the
+                // stored scheme. Structural constructor (bare
+                // reference to an undeclared uppercase tag): produce
+                // an open TagUnion and unify against the scrutinee.
+                if let Some(scheme) = self.constructors.get(name).cloned() {
+                    return self.infer_declared_con_pattern(
+                        &scheme, fields, expected, span, rec_subst,
+                    );
                 }
+                self.infer_structural_con_pattern(name, fields, expected, span)
             }
             ast::Pattern::Record { fields } => {
                 let rest = self.engine.fresh(); // open rest for row polymorphism

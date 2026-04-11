@@ -51,6 +51,15 @@ pub enum SymbolKind {
     Method,
     /// Type declaration (`Foo : ...`, `Foo := ...`, `Foo :: ...`).
     Type,
+    /// Tag-union constructor. Created both for constructors explicitly
+    /// declared via `TypeAnno`'s `[Tag1, Tag2, ...]` form and for
+    /// structural constructors discovered by the pre-resolver walk
+    /// (uppercase names used in expressions or patterns that weren't
+    /// declared anywhere). Inference treats declared and structural
+    /// constructors differently: declared ones instantiate a stored
+    /// `Scheme`, while structural ones produce an open `Type::TagUnion`
+    /// with a single tag.
+    Constructor,
     /// Local binding: function/lambda parameter, `let`, pattern binding.
     /// Introduced by the name resolver in `ast::from_raw`.
     Local,
