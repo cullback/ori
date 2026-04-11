@@ -639,6 +639,32 @@ fn write_ty(out: &mut String, ty: &Type) {
             }
             out.push_str(" }");
         }
+        Type::TagUnion { tags, rest } => {
+            out.push('[');
+            for (i, (name, payloads)) in tags.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(name);
+                if !payloads.is_empty() {
+                    out.push('(');
+                    for (j, p) in payloads.iter().enumerate() {
+                        if j > 0 {
+                            out.push_str(", ");
+                        }
+                        write_ty(out, p);
+                    }
+                    out.push(')');
+                }
+            }
+            if rest.is_some() {
+                if !tags.is_empty() {
+                    out.push_str(", ");
+                }
+                out.push_str("..");
+            }
+            out.push(']');
+        }
         Type::Tuple(elems) => {
             out.push('(');
             for (i, e) in elems.iter().enumerate() {

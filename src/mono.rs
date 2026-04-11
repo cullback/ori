@@ -737,6 +737,22 @@ fn normalize_type(ty: &Type) -> Type {
                 rest: None,
             }
         }
+        Type::TagUnion { tags, .. } => {
+            // Canonicalize: sort tags by name, recursively normalize
+            // payloads, drop any residual open row. Post-mono types
+            // are always closed.
+            let mut norm_tags: Vec<(String, Vec<Type>)> = tags
+                .iter()
+                .map(|(n, payloads)| {
+                    (n.clone(), payloads.iter().map(normalize_type).collect())
+                })
+                .collect();
+            norm_tags.sort_by(|a, b| a.0.cmp(&b.0));
+            Type::TagUnion {
+                tags: norm_tags,
+                rest: None,
+            }
+        }
         Type::Tuple(elems) => Type::Tuple(elems.iter().map(normalize_type).collect()),
     }
 }
@@ -796,6 +812,26 @@ fn append_type_mangling(out: &mut String, ty: &Type) {
                 append_type_mangling(out, t);
             }
             out.push('}');
+        }
+        Type::TagUnion { tags, .. } => {
+            out.push('[');
+            for (i, (n, payloads)) in tags.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(n);
+                if !payloads.is_empty() {
+                    out.push('(');
+                    for (j, p) in payloads.iter().enumerate() {
+                        if j > 0 {
+                            out.push(',');
+                        }
+                        append_type_mangling(out, p);
+                    }
+                    out.push(')');
+                }
+            }
+            out.push(']');
         }
         Type::Tuple(elems) => {
             out.push('(');
@@ -927,6 +963,18 @@ fn apply_mapping(ty: &Type, mapping: &HashMap<TypeVar, Type>) -> Type {
             fields: fields
                 .iter()
                 .map(|(n, t)| (n.clone(), apply_mapping(t, mapping)))
+                .collect(),
+            rest: None,
+        },
+        Type::TagUnion { tags, .. } => Type::TagUnion {
+            tags: tags
+                .iter()
+                .map(|(n, payloads)| {
+                    (
+                        n.clone(),
+                        payloads.iter().map(|p| apply_mapping(p, mapping)).collect(),
+                    )
+                })
                 .collect(),
             rest: None,
         },
