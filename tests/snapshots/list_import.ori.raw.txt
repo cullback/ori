@@ -1,0 +1,26 @@
+module:
+  type-alias main:
+    Arrow:
+      params:
+        Named I64
+      ret:
+        Named I64
+  fn main(arg):
+    Block:
+      Let xs:
+        ListLit:
+          IntLit 1
+          IntLit 2
+          IntLit 3
+          IntLit 4
+          IntLit 5
+      Let doubled:
+        QualifiedCall List.map:
+          Name xs
+          Lambda(x):
+            BinOp Mul:
+              Name x
+              IntLit 2
+      result:
+        QualifiedCall List.sum:
+          Name doubled

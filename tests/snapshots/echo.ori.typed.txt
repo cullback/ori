@@ -1,0 +1,31 @@
+module:
+  type-alias main:
+    Arrow:
+      params:
+        App List:
+          Named Str
+      ret:
+        App Result:
+          Named Str
+          Named Str
+  fn main(args):
+    If : Result(Str, Str):
+      scrutinee:
+        QualifiedCall List.is_empty : Bool:
+          Name args : List(Str)
+      arm:
+        pattern:
+          Con True
+        body:
+          Call Ok : Result(Str, Str):
+            StrLit "\n" : Str
+      arm:
+        pattern:
+          Con False
+        body:
+          Call Ok : Result(Str, Str):
+            QualifiedCall Str.concat : Str:
+              QualifiedCall List.get : Str:
+                Name args : List(Str)
+                IntLit 0 : U64
+              StrLit "\n" : Str

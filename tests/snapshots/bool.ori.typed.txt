@@ -1,0 +1,51 @@
+module:
+  type-alias not:
+    Arrow:
+      params:
+        Named Bool
+      ret:
+        Named Bool
+  fn bool_to_i64(b):
+    If : I64:
+      scrutinee:
+        Name b : Bool
+      arm:
+        pattern:
+          Con True
+        body:
+          IntLit 1 : I64
+      arm:
+        pattern:
+          Con False
+        body:
+          IntLit 0 : I64
+  type-alias bool_to_i64:
+    Arrow:
+      params:
+        Named Bool
+      ret:
+        Named I64
+  fn not(b):
+    If : Bool:
+      scrutinee:
+        Name b : Bool
+      arm:
+        pattern:
+          Con True
+        body:
+          Name False : Bool
+      arm:
+        pattern:
+          Con False
+        body:
+          Name True : Bool
+  type-alias main:
+    Arrow:
+      params:
+        Named I64
+      ret:
+        Named I64
+  fn main(arg):
+    Call bool_to_i64 : I64:
+      Call not : Bool:
+        Name True : Bool

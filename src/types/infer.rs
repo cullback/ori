@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
+use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeDeclKind, TypeExpr};
 use crate::error::CompileError;
 use crate::source::SourceArena;
-use crate::syntax::ast::{
-    self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeDeclKind, TypeExpr,
-};
+use crate::symbol::{FieldInterner, SymbolId, SymbolTable};
 use crate::types::engine::{Constraint, Scheme, Type, TypeEngine, TypeVar};
 
 /// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
@@ -13,14 +12,12 @@ fn method_key(type_name: &str, method: &str) -> String {
 }
 
 /// Results of type inference, communicated to the lowerer.
+///
+/// Post-Step-2c, `InferResult` only carries data that isn't naturally
+/// attached to `Expr` nodes: top-level schemes for functions/constructors.
+/// Per-expression types, numeric literal defaulting, method resolutions,
+/// and `is` bindings all live on the AST nodes themselves.
 pub struct InferResult {
-    /// Resolved numeric types for literals (by span).
-    pub lit_types: HashMap<Span, NumType>,
-    /// Resolved method calls: span of qualified call → resolved mangled name.
-    pub method_resolutions: HashMap<Span, String>,
-    /// Fully-resolved concrete type for every expression (by span).
-    /// Used by the lowerer for monomorphization and layout computation.
-    pub expr_types: HashMap<Span, Type>,
     /// Resolved type schemes for all functions/methods.
     /// Used by the lowerer to compute type parameter mappings for specialization.
     pub func_schemes: HashMap<String, Scheme>,
@@ -29,20 +26,17 @@ pub struct InferResult {
     pub constructor_schemes: HashMap<String, Scheme>,
 }
 
-/// Resolved numeric type for a literal, used to communicate from inference to lowering.
-#[derive(Debug, Clone, Copy)]
-pub enum NumType {
-    U8,
-    I8,
-    I64,
-    U64,
-    F64,
-}
-
 // ---- Inference context ----
 
-struct InferCtx<'src> {
+struct InferCtx<'a, 'src> {
     engine: TypeEngine,
+    /// Names to schemes. Keyed by display name (string).
+    ///
+    /// Locals (`let`, function params, lambda params, pattern bindings)
+    /// are inserted under `symbols.display(sym)`. Globals (free
+    /// functions, methods, stdlib) are inserted under their mangled
+    /// names (e.g. `"List.map"`). Shadowing is implemented via the
+    /// usual save/restore of `env` around scope exits.
     env: HashMap<String, Scheme>,
     constructors: HashMap<String, Scheme>,
     /// Type aliases: Name -> Scheme (e.g. Point -> { x: I64, y: I64 })
@@ -64,10 +58,15 @@ struct InferCtx<'src> {
     /// Raw (possibly unresolved) types for each expression, keyed by span.
     /// Resolved to concrete types at the end of inference.
     expr_types: HashMap<Span, Type>,
+    /// Borrowed symbol table for display-name lookups.
+    symbols: &'a SymbolTable,
+    /// Borrowed field interner for recovering source names at the
+    /// engine boundary (engine stores record fields as `String`).
+    fields: &'a FieldInterner,
 }
 
-impl<'src> InferCtx<'src> {
-    fn new() -> Self {
+impl<'a, 'src> InferCtx<'a, 'src> {
+    fn new(symbols: &'a SymbolTable, fields: &'a FieldInterner) -> Self {
         Self {
             engine: TypeEngine::new(),
             env: HashMap::new(),
@@ -87,6 +86,8 @@ impl<'src> InferCtx<'src> {
             method_resolutions: HashMap::new(),
             constraint_spans: Vec::new(),
             expr_types: HashMap::new(),
+            symbols,
+            fields,
         }
     }
 
@@ -169,9 +170,9 @@ impl<'src> InferCtx<'src> {
             }
             TypeExpr::Record(fields) => {
                 let mut type_fields = Vec::new();
-                for (name, field_texpr) in fields {
+                for (field_sym, field_texpr) in fields {
                     let field_ty = self.type_expr_to_type(field_texpr, tvar_env)?;
-                    type_fields.push(((*name).to_owned(), field_ty));
+                    type_fields.push((self.fields.get(*field_sym).to_owned(), field_ty));
                 }
                 Ok(Type::Record {
                     fields: type_fields,
@@ -267,8 +268,8 @@ impl<'src> InferCtx<'src> {
                 Ok(ty)
             }
 
-            ExprKind::Name(name) => {
-                let name = *name;
+            ExprKind::Name(sym) => {
+                let name = self.symbols.display(*sym);
                 if let Some(scheme) = self.env.get(name).cloned() {
                     return Ok(self.engine.instantiate(&scheme));
                 }
@@ -315,12 +316,12 @@ impl<'src> InferCtx<'src> {
 
             ExprKind::BinOp { op, lhs, rhs } => self.infer_binop(op, lhs, rhs, expr.span),
 
-            ExprKind::Call { func, args } => {
-                let func = *func;
-                self.infer_call(func, args, expr.span)
+            ExprKind::Call { target, args, .. } => {
+                let func = self.symbols.display(*target).to_owned();
+                self.infer_call(&func, args, expr.span)
             }
 
-            ExprKind::QualifiedCall { segments, args } => {
+            ExprKind::QualifiedCall { segments, args, .. } => {
                 let mangled = segments.join(".");
                 self.infer_call(&mangled, args, expr.span)
             }
@@ -331,24 +332,24 @@ impl<'src> InferCtx<'src> {
                 for stmt in stmts {
                     match stmt {
                         Stmt::TypeHint { name, ty } => {
-                            let name = *name;
-                            pending_hints.insert(name.to_owned(), ty.clone());
+                            pending_hints.insert((*name).to_owned(), ty.clone());
                         }
                         Stmt::Let { name, val } => {
-                            let name = *name;
+                            let name_str = self.symbols.display(*name).to_owned();
                             let val_ty = self.infer_expr(val)?;
                             // If there's a type hint for this binding, enforce it
-                            if let Some(hint) = pending_hints.remove(name) {
+                            if let Some(hint) = pending_hints.remove(&name_str) {
                                 let hint_ty = self.resolve_type_expr(&hint)?;
                                 self.unify_at(&val_ty, &hint_ty, val.span)?;
                             }
                             let scheme = self.engine.generalize(&val_ty, &self.env);
-                            self.env.insert(name.to_owned(), scheme);
+                            self.env.insert(name_str, scheme);
                         }
                         Stmt::Destructure { pattern, val } => {
                             let val_ty = self.infer_expr(val)?;
                             let bindings = self.infer_pattern(pattern, &val_ty, val.span, None)?;
-                            for (name, ty) in bindings {
+                            for (sym, ty) in bindings {
+                                let name = self.symbols.display(sym).to_owned();
                                 let scheme = self.engine.generalize(&ty, &self.env);
                                 self.env.insert(name, scheme);
                             }
@@ -387,7 +388,8 @@ impl<'src> InferCtx<'src> {
                     let bindings =
                         self.infer_pattern(&arm.pattern, &scrutinee_ty, expr.span, None)?;
                     let saved_env = self.env.clone();
-                    for (name, ty) in bindings {
+                    for (sym, ty) in bindings {
+                        let name = self.symbols.display(sym).to_owned();
                         self.env.insert(name, Scheme::mono(ty));
                     }
                     // For True arms of boolean if-then-else, flow Is bindings from scrutinee
@@ -423,7 +425,8 @@ impl<'src> InferCtx<'src> {
                         Some(&result_ty),
                     )?;
                     let saved_env = self.env.clone();
-                    for (name, ty) in bindings {
+                    for (sym, ty) in bindings {
+                        let name = self.symbols.display(sym).to_owned();
                         self.env.insert(name, Scheme::mono(ty));
                     }
                     for guard_expr in &arm.guards {
@@ -441,9 +444,10 @@ impl<'src> InferCtx<'src> {
 
             ExprKind::Record { fields } => {
                 let mut type_fields = Vec::new();
-                for (name, field_expr) in fields {
+                for (field_sym, field_expr) in fields {
                     let field_ty = self.infer_expr(field_expr)?;
-                    type_fields.push(((*name).to_owned(), field_ty));
+                    let name = self.fields.get(*field_sym).to_owned();
+                    type_fields.push((name, field_ty));
                 }
                 Ok(Type::Record {
                     fields: type_fields,
@@ -452,12 +456,12 @@ impl<'src> InferCtx<'src> {
             }
 
             ExprKind::FieldAccess { record, field } => {
-                let field = *field;
                 let record_ty = self.infer_expr(record)?;
                 let field_ty = self.engine.fresh();
                 let rest_row = self.engine.fresh();
+                let field_name = self.fields.get(*field).to_owned();
                 let expected = Type::Record {
-                    fields: vec![(field.to_owned(), field_ty.clone())],
+                    fields: vec![(field_name, field_ty.clone())],
                     rest: Some(Box::new(rest_row)),
                 };
                 self.unify_at(&record_ty, &expected, expr.span)?;
@@ -470,7 +474,8 @@ impl<'src> InferCtx<'src> {
                     .iter()
                     .map(|p| {
                         let ty = self.engine.fresh();
-                        self.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
+                        let name = self.symbols.display(*p).to_owned();
+                        self.env.insert(name, Scheme::mono(ty.clone()));
                         ty
                     })
                     .collect();
@@ -500,6 +505,7 @@ impl<'src> InferCtx<'src> {
                 receiver,
                 method,
                 args,
+                ..
             } => self.infer_method_call(receiver, method, args, expr.span),
 
             ExprKind::Is {
@@ -508,7 +514,14 @@ impl<'src> InferCtx<'src> {
             } => {
                 let inner_ty = self.infer_expr(inner)?;
                 let bindings = self.infer_pattern(pattern, &inner_ty, expr.span, None)?;
-                self.is_bindings.insert(expr.span, bindings);
+                // Store as (display_name, type) — the downstream
+                // `collect_is_bindings` walk inserts into `env` by
+                // display name for scope flow.
+                let named: Vec<(String, Type)> = bindings
+                    .into_iter()
+                    .map(|(sym, ty)| (self.symbols.display(sym).to_owned(), ty))
+                    .collect();
+                self.is_bindings.insert(expr.span, named);
                 Ok(Type::Con("Bool".to_owned()))
             }
         }
@@ -580,7 +593,12 @@ impl<'src> InferCtx<'src> {
                         return Ok(ret);
                     }
                     if let Some(result) = self.resolve_numeric_builtin(
-                        concrete_name, method_name, &var_ty, &arg_types, &resolved, span,
+                        concrete_name,
+                        method_name,
+                        &var_ty,
+                        &arg_types,
+                        &resolved,
+                        span,
                     ) {
                         return result;
                     }
@@ -626,8 +644,7 @@ impl<'src> InferCtx<'src> {
             } else {
                 Type::Var(tv)
             };
-            let method_type =
-                Type::Arrow(vec![Type::Var(tv), Type::Var(tv)], Box::new(ret_ty));
+            let method_type = Type::Arrow(vec![Type::Var(tv), Type::Var(tv)], Box::new(ret_ty));
             self.push_constraint(
                 Constraint {
                     type_var: tv,
@@ -749,7 +766,7 @@ impl<'src> InferCtx<'src> {
         expected: &Type,
         span: Span,
         rec_subst: Option<&Type>,
-    ) -> Result<Vec<(String, Type)>, CompileError> {
+    ) -> Result<Vec<(SymbolId, Type)>, CompileError> {
         match pat {
             ast::Pattern::Constructor { name, fields } => {
                 let name = *name;
@@ -791,8 +808,8 @@ impl<'src> InferCtx<'src> {
                             field_ty.clone()
                         };
                         match field_pat {
-                            ast::Pattern::Binding(n) => {
-                                bindings.push(((*n).to_owned(), bind_ty));
+                            ast::Pattern::Binding(sym) => {
+                                bindings.push((*sym, bind_ty));
                             }
                             ast::Pattern::Wildcard => {}
                             ast::Pattern::Constructor { .. }
@@ -810,9 +827,10 @@ impl<'src> InferCtx<'src> {
                 let rest = self.engine.fresh(); // open rest for row polymorphism
                 let mut type_fields = Vec::new();
                 let mut bindings = Vec::new();
-                for (field_name, field_pat) in fields {
+                for (field_sym, field_pat) in fields {
                     let field_ty = self.engine.fresh();
-                    type_fields.push(((*field_name).to_owned(), field_ty.clone()));
+                    let name = self.fields.get(*field_sym).to_owned();
+                    type_fields.push((name, field_ty.clone()));
                     bindings.extend(self.infer_pattern(field_pat, &field_ty, span, None)?);
                 }
                 let expected_record = Type::Record {
@@ -832,7 +850,7 @@ impl<'src> InferCtx<'src> {
                 }
                 Ok(bindings)
             }
-            ast::Pattern::Binding(name) => Ok(vec![((*name).to_owned(), expected.clone())]),
+            ast::Pattern::Binding(sym) => Ok(vec![(*sym, expected.clone())]),
             ast::Pattern::Wildcard => Ok(vec![]),
         }
     }
@@ -865,12 +883,30 @@ impl<'src> InferCtx<'src> {
     fn infer_func_body(
         &mut self,
         name: &str,
-        params: &[&'src str],
+        params: &[SymbolId],
         body: &Expr<'src>,
     ) -> Result<(), CompileError> {
         let saved_env = self.env.clone();
-        let pre_scheme = self.env[name].clone();
-        let func_ty = self.engine.instantiate(&pre_scheme);
+
+        // Methods still have a pre-declared scheme from Pass 1 and we
+        // reuse it so any earlier call sites that unified with it stay
+        // linked. Free functions no longer get forward-declared (Step 5),
+        // so env lookup returns None and we synthesize a fresh arrow
+        // and register it under the function's name for the duration of
+        // body inference. The self-registration lets `__fold_N` and
+        // similar synthesized recursive helpers resolve calls to
+        // themselves; it's restored/generalized at the end of this
+        // function so no spurious mono scheme leaks into later callers.
+        let func_ty = if let Some(pre_scheme) = self.env.get(name).cloned() {
+            self.engine.instantiate(&pre_scheme)
+        } else {
+            let param_types: Vec<Type> = params.iter().map(|_| self.engine.fresh()).collect();
+            let ret = self.engine.fresh();
+            let func_ty = Type::Arrow(param_types, Box::new(ret));
+            self.env
+                .insert(name.to_owned(), Scheme::mono(func_ty.clone()));
+            func_ty
+        };
 
         let param_types: Vec<Type> = params.iter().map(|_| self.engine.fresh()).collect();
         let ret = self.engine.fresh();
@@ -878,7 +914,8 @@ impl<'src> InferCtx<'src> {
         self.unify_at(&func_ty, &expected, body.span)?;
 
         for (p, ty) in params.iter().zip(param_types.iter()) {
-            self.env.insert((*p).to_owned(), Scheme::mono(ty.clone()));
+            let pname = self.symbols.display(*p).to_owned();
+            self.env.insert(pname, Scheme::mono(ty.clone()));
         }
         let body_ty = self.infer_expr(body)?;
         self.unify_at(&ret, &body_ty, body.span)?;
@@ -943,8 +980,10 @@ impl<'src> InferCtx<'src> {
         Ok(())
     }
 
-    /// Default unresolved literal type vars and build the span -> `NumType` side table.
-    fn resolve_literals(&mut self) -> Result<HashMap<Span, NumType>, CompileError> {
+    /// Default unresolved numeric literal type vars to `I64` / `F64` and
+    /// check that each literal resolves to a valid numeric type. The
+    /// resolved types propagate onto `Expr::ty` via `write_types_back`.
+    fn resolve_literals(&mut self) -> Result<(), CompileError> {
         let i64_ty = Type::Con("I64".to_owned());
         let f64_ty = Type::Con("F64".to_owned());
 
@@ -964,16 +1003,12 @@ impl<'src> InferCtx<'src> {
             }
         }
 
-        // Build side table
-        let mut table = HashMap::new();
+        // Validate that every literal resolved to a supported numeric type.
         for &(tv, span) in &self.int_literal_vars {
             let resolved = self.engine.resolve(&Type::Var(tv));
-            let num_type = match &resolved {
-                Type::Con(name) if name == "U8" => NumType::U8,
-                Type::Con(name) if name == "I8" => NumType::I8,
-                Type::Con(name) if name == "I64" => NumType::I64,
-                Type::Con(name) if name == "U64" => NumType::U64,
-                Type::Con(name) if name == "F64" => NumType::F64,
+            match &resolved {
+                Type::Con(name) if matches!(name.as_str(), "U8" | "I8" | "I64" | "U64" | "F64") => {
+                }
                 other => {
                     return Err(CompileError::at(
                         span,
@@ -983,13 +1018,12 @@ impl<'src> InferCtx<'src> {
                         ),
                     ));
                 }
-            };
-            table.insert(span, num_type);
+            }
         }
         for &(tv, span) in &self.float_literal_vars {
             let resolved = self.engine.resolve(&Type::Var(tv));
-            let num_type = match &resolved {
-                Type::Con(name) if name == "F64" => NumType::F64,
+            match &resolved {
+                Type::Con(name) if name == "F64" => {}
                 other => {
                     return Err(CompileError::at(
                         span,
@@ -999,10 +1033,9 @@ impl<'src> InferCtx<'src> {
                         ),
                     ));
                 }
-            };
-            table.insert(span, num_type);
+            }
         }
-        Ok(table)
+        Ok(())
     }
 }
 
@@ -1014,10 +1047,12 @@ impl<'src> InferCtx<'src> {
 )]
 pub fn check<'src>(
     arena: &'src SourceArena,
-    module: &Module<'src>,
+    module: &mut Module<'src>,
     scope: &crate::resolve::ModuleScope,
+    symbols: &crate::symbol::SymbolTable,
+    fields: &FieldInterner,
 ) -> Result<InferResult, CompileError> {
-    let mut ctx = InferCtx::new();
+    let mut ctx = InferCtx::new(symbols, fields);
 
     // Register to_str for all numeric types (not as full modules — their
     // := {} declaration would incorrectly make them transparent to {}).
@@ -1043,7 +1078,7 @@ pub fn check<'src>(
                 methods,
                 ..
             } => {
-                let name = *name;
+                let name = symbols.display(*name);
                 ctx.register_type_decl(name, type_params, tags)?;
                 // Register method signatures and collect method annotations
                 for method in methods {
@@ -1053,43 +1088,58 @@ pub fn check<'src>(
                             params,
                             ..
                         } => {
-                            let method_name = *method_name;
+                            let method_name = symbols.display(*method_name);
                             let mangled = method_key(name, method_name);
-                            let param_types: Vec<Type> =
-                                params.iter().map(|_| ctx.engine.fresh()).collect();
-                            let ret = ctx.engine.fresh();
-                            let func_ty = Type::Arrow(param_types, Box::new(ret));
+                            // Only register a fresh arrow if the
+                            // preceding `TypeAnno` arm didn't already
+                            // resolve an annotation to a proper scheme —
+                            // otherwise we'd overwrite the user's
+                            // declared type with a fresh unconstrained
+                            // arrow and lose the annotation.
+                            if !ctx.env.contains_key(&mangled) {
+                                let param_types: Vec<Type> =
+                                    params.iter().map(|_| ctx.engine.fresh()).collect();
+                                let ret = ctx.engine.fresh();
+                                let func_ty = Type::Arrow(param_types, Box::new(ret));
+                                ctx.env.insert(mangled.clone(), Scheme::mono(func_ty));
+                            }
                             // Dual-register: module-qualified alias
                             if let Some(mod_name) = scope.qualified_types.get(name) {
                                 let qual = format!("{mod_name}.{mangled}");
-                                ctx.env.insert(qual, Scheme::mono(func_ty.clone()));
+                                if let Some(scheme) = ctx.env.get(&mangled).cloned() {
+                                    ctx.env.insert(qual, scheme);
+                                }
                             }
-                            ctx.env.insert(mangled, Scheme::mono(func_ty));
                         }
                         Decl::TypeAnno {
                             name: method_name,
-                            span: method_span,
                             ty,
                             ..
                         } => {
-                            let method_name = *method_name;
+                            let method_name = symbols.display(*method_name);
                             let mangled = method_key(name, method_name);
                             if let Some(mod_name) = scope.qualified_types.get(name) {
                                 let qual = format!("{mod_name}.{mangled}");
                                 ctx.type_annos.insert(qual, ty.clone());
                             }
                             ctx.type_annos.insert(mangled.clone(), ty.clone());
-                            if arena.path(method_span.file).starts_with("<stdlib:") {
-                                let mut tvar_env = HashMap::new();
-                                let anno_ty = ctx.type_expr_to_type(ty, &mut tvar_env)?;
-                                let tvars: Vec<_> = tvar_env.into_values().collect();
-                                let scheme = Scheme {
-                                    vars: tvars,
-                                    constraints: vec![],
-                                    ty: anno_ty,
-                                };
-                                ctx.env.insert(mangled, scheme);
-                            }
+                            // Eagerly resolve the annotation to a concrete
+                            // scheme so callers see the intended type,
+                            // not a fresh arrow that later unifications
+                            // might pollute. This used to only happen
+                            // for stdlib methods; post-Step 5, free
+                            // functions are inferred before methods, so
+                            // user methods need the same early resolution
+                            // to avoid call-site contamination.
+                            let mut tvar_env = HashMap::new();
+                            let anno_ty = ctx.type_expr_to_type(ty, &mut tvar_env)?;
+                            let tvars: Vec<_> = tvar_env.into_values().collect();
+                            let scheme = Scheme {
+                                vars: tvars,
+                                constraints: vec![],
+                                ty: anno_ty,
+                            };
+                            ctx.env.insert(mangled, scheme);
                         }
                     }
                 }
@@ -1102,7 +1152,7 @@ pub fn check<'src>(
                 kind,
                 ..
             } => {
-                let name = *name;
+                let name = symbols.display(*name);
                 if name.starts_with(|c: char| c.is_ascii_uppercase())
                     && *kind != TypeDeclKind::Alias
                 {
@@ -1116,35 +1166,38 @@ pub fn check<'src>(
                                 params,
                                 ..
                             } => {
-                                let method_name = *method_name;
+                                let method_name = symbols.display(*method_name);
                                 let mangled = method_key(name, method_name);
-                                let param_types: Vec<Type> =
-                                    params.iter().map(|_| ctx.engine.fresh()).collect();
-                                let ret = ctx.engine.fresh();
-                                let func_ty = Type::Arrow(param_types, Box::new(ret));
-                                ctx.env.insert(mangled, Scheme::mono(func_ty));
+                                // See the tag-union branch above: don't
+                                // overwrite a scheme already inserted
+                                // from the method's TypeAnno annotation.
+                                if !ctx.env.contains_key(&mangled) {
+                                    let param_types: Vec<Type> =
+                                        params.iter().map(|_| ctx.engine.fresh()).collect();
+                                    let ret = ctx.engine.fresh();
+                                    let func_ty = Type::Arrow(param_types, Box::new(ret));
+                                    ctx.env.insert(mangled, Scheme::mono(func_ty));
+                                }
                             }
                             Decl::TypeAnno {
                                 name: method_name,
-                                span: method_span,
                                 ty: method_ty,
                                 ..
                             } => {
-                                let method_name = *method_name;
+                                let method_name = symbols.display(*method_name);
                                 let mangled = method_key(name, method_name);
                                 ctx.type_annos.insert(mangled.clone(), method_ty.clone());
-                                if arena.path(method_span.file).starts_with("<stdlib:") {
-                                    let mut tvar_env = HashMap::new();
-                                    let anno_ty =
-                                        ctx.type_expr_to_type(method_ty, &mut tvar_env)?;
-                                    let tvars: Vec<_> = tvar_env.into_values().collect();
-                                    let scheme = Scheme {
-                                        vars: tvars,
-                                        constraints: vec![],
-                                        ty: anno_ty,
-                                    };
-                                    ctx.env.insert(mangled, scheme);
-                                }
+                                // Eagerly resolve the annotation (see the
+                                // tag-union branch above for the rationale).
+                                let mut tvar_env = HashMap::new();
+                                let anno_ty = ctx.type_expr_to_type(method_ty, &mut tvar_env)?;
+                                let tvars: Vec<_> = tvar_env.into_values().collect();
+                                let scheme = Scheme {
+                                    vars: tvars,
+                                    constraints: vec![],
+                                    ty: anno_ty,
+                                };
+                                ctx.env.insert(mangled, scheme);
                             }
                         }
                     }
@@ -1176,71 +1229,61 @@ pub fn check<'src>(
                     ctx.type_annos.insert(name.to_owned(), ty.clone());
                 }
             }
-            Decl::FuncDef { name, params, .. } => {
-                let name = *name;
-                let param_types: Vec<Type> = params.iter().map(|_| ctx.engine.fresh()).collect();
-                let ret = ctx.engine.fresh();
-                let func_ty = Type::Arrow(param_types, Box::new(ret));
-                // Dual-register qualified alias for imported free functions
-                if let Some(mod_name) = scope.qualified_funcs.get(name) {
-                    let qual = format!("{mod_name}.{name}");
-                    ctx.env.insert(qual, Scheme::mono(func_ty.clone()));
-                }
-                ctx.env.insert(name.to_owned(), Scheme::mono(func_ty));
+            Decl::FuncDef { .. } => {
+                // Step 5: free functions are no longer forward-declared
+                // here. They're inferred on first encounter in topo
+                // order, which gives top-level let-polymorphism — each
+                // function is generalized before any later caller sees
+                // it, so the same function can be instantiated at
+                // multiple types across call sites. `topo::compute`
+                // guarantees callees come before callers (and rejects
+                // cycles as System T violations).
             }
         }
     }
 
-    // Pass 2: infer all function bodies
+    // Pass 2a: Set transparency for `:=` nominal types so free functions
+    // in Pass 2b can see through them (the whole point of transparent
+    // types is that their internals are globally visible). `::` opaque
+    // types are NOT made transparent here — their transparency is
+    // scoped to their own method processing in Pass 2c, so code
+    // outside the `.()` block can't see through them.
+    //
+    // Also validate that every method annotation has a matching
+    // definition (body-less methods are only allowed in stdlib).
     for decl in &module.decls {
-        match decl {
-            Decl::FuncDef {
-                name, params, body, ..
-            } => {
-                ctx.infer_func_body(name, params, body)?;
-                // Dual-register qualified alias after inference
-                if let Some(mod_name) = scope.qualified_funcs.get(*name) {
-                    let qual = format!("{mod_name}.{name}");
-                    if let Some(scheme) = ctx.env.get(*name).cloned() {
-                        ctx.env.insert(qual, scheme);
-                    }
-                }
+        if let Decl::TypeAnno {
+            name,
+            ty,
+            kind,
+            methods,
+            ..
+        } = decl
+        {
+            let name = symbols.display(*name);
+            if *kind == TypeDeclKind::Transparent && !matches!(ty, TypeExpr::TagUnion(_)) {
+                let underlying = ctx.resolve_type_expr(ty)?;
+                ctx.engine.transparent.insert(name.to_owned(), underlying);
             }
-            Decl::TypeAnno {
-                name,
-                ty,
-                kind,
-                methods,
-                ..
-            } => {
-                let name = *name;
-                // For nominal types (:= and ::), make the type transparent
-                // so method bodies can convert between the nominal and underlying type.
-                // For transparent (:=), this persists. For opaque (::), removed after.
-                // Tag unions are not transparent — they define distinct sum types.
-                if *kind != TypeDeclKind::Alias && !matches!(ty, TypeExpr::TagUnion(_)) {
-                    let underlying = ctx.resolve_type_expr(ty)?;
-                    ctx.engine.transparent.insert(name.to_owned(), underlying);
-                }
-                // Check for body-less declarations (only valid in stdlib builtins)
-                let func_names: std::collections::HashSet<&str> = methods
-                    .iter()
-                    .filter_map(|m| {
-                        if let Decl::FuncDef { name, .. } = m {
-                            Some(*name)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                for method in methods {
-                    if let Decl::TypeAnno {
-                        span: method_span,
-                        name: method_name,
-                        ..
-                    } = method
-                        && !func_names.contains(method_name)
-                    {
+            let func_names: std::collections::HashSet<&str> = methods
+                .iter()
+                .filter_map(|m| {
+                    if let Decl::FuncDef { name, .. } = m {
+                        Some(symbols.display(*name))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for method in methods {
+                if let Decl::TypeAnno {
+                    span: method_span,
+                    name: method_name,
+                    ..
+                } = method
+                {
+                    let method_name = symbols.display(*method_name);
+                    if !func_names.contains(method_name) {
                         let is_stdlib = arena.path(method_span.file).starts_with("<stdlib:");
                         if !is_stdlib {
                             return Err(CompileError::at(
@@ -1250,39 +1293,84 @@ pub fn check<'src>(
                         }
                     }
                 }
+            }
+        }
+    }
 
-                for method in methods {
-                    if let Decl::FuncDef {
-                        name: method_name,
-                        params,
-                        body,
-                        ..
-                    } = method
-                    {
-                        let mangled = method_key(name, method_name);
-                        ctx.infer_func_body(&mangled, params, body)?;
-                        // Dual-register qualified alias
-                        if let Some(mod_name) = scope.qualified_types.get(name) {
-                            let qual = format!("{mod_name}.{mangled}");
-                            if let Some(scheme) = ctx.env.get(&mangled).cloned() {
-                                ctx.env.insert(qual, scheme);
-                            }
-                        }
-                    }
-                }
-                // Opaque (::): remove transparency so external code can't see through.
-                // Transparent (:=): keep — internals visible everywhere.
-                if *kind == TypeDeclKind::Opaque {
-                    ctx.engine.transparent.remove(name);
+    // Pass 2b: Infer free FuncDef bodies. Must run before any method
+    // body inference so that methods calling fold-lift-synthesized
+    // helpers (e.g. `Lnk.sum` calling `__fold_0`) find the helper's
+    // scheme in env. Free FuncDefs are already in topological order
+    // from `topo::compute`, so callees are generalized before callers.
+    for decl in &module.decls {
+        if let Decl::FuncDef {
+            name, params, body, ..
+        } = decl
+        {
+            let name = symbols.display(*name);
+            ctx.infer_func_body(name, params, body)?;
+            if let Some(mod_name) = scope.qualified_funcs.get(name) {
+                let qual = format!("{mod_name}.{name}");
+                if let Some(scheme) = ctx.env.get(name).cloned() {
+                    ctx.env.insert(qual, scheme);
                 }
             }
         }
     }
 
+    // Pass 2c: Infer method bodies. Opaque types get their transparency
+    // set up only for the duration of their own method processing so
+    // the implementation can see through the nominal wrapper; it's
+    // removed before the next TypeAnno runs.
+    for decl in &module.decls {
+        if let Decl::TypeAnno {
+            name,
+            ty,
+            kind,
+            methods,
+            ..
+        } = decl
+        {
+            let name = symbols.display(*name);
+            let opaque_set_up =
+                if *kind == TypeDeclKind::Opaque && !matches!(ty, TypeExpr::TagUnion(_)) {
+                    let underlying = ctx.resolve_type_expr(ty)?;
+                    ctx.engine.transparent.insert(name.to_owned(), underlying);
+                    true
+                } else {
+                    false
+                };
+            for method in methods {
+                if let Decl::FuncDef {
+                    name: method_name,
+                    params,
+                    body,
+                    ..
+                } = method
+                {
+                    let method_name = symbols.display(*method_name);
+                    let mangled = method_key(name, method_name);
+                    ctx.infer_func_body(&mangled, params, body)?;
+                    if let Some(mod_name) = scope.qualified_types.get(name) {
+                        let qual = format!("{mod_name}.{mangled}");
+                        if let Some(scheme) = ctx.env.get(&mangled).cloned() {
+                            ctx.env.insert(qual, scheme);
+                        }
+                    }
+                }
+            }
+            if opaque_set_up {
+                ctx.engine.transparent.remove(name);
+            }
+        }
+    }
+
     ctx.verify_constraints()?;
-    let lit_types = ctx.resolve_literals()?;
+    ctx.resolve_literals()?;
 
     // Resolve all expression types now that inference is complete.
+    // This map is consumed by `write_types_back` below and is not part of
+    // the public `InferResult`.
     let expr_types: HashMap<Span, Type> = ctx
         .expr_types
         .iter()
@@ -1323,11 +1411,248 @@ pub fn check<'src>(
         })
         .collect();
 
+    // Write resolved types back onto Expr::ty so downstream passes can
+    // read types directly from the AST.
+    write_types_back(module, &expr_types);
+    // Write method resolutions onto MethodCall / QualifiedCall nodes.
+    write_resolutions_back(module, &ctx.method_resolutions);
+
     Ok(InferResult {
-        lit_types,
-        method_resolutions: ctx.method_resolutions,
-        expr_types,
         func_schemes,
         constructor_schemes,
     })
+}
+
+// ---- Write-back of resolved types onto AST nodes ----
+
+/// Walk `module` and copy each expression's resolved type from `expr_types`
+/// into its `Expr::ty` field. `expr_types` already contains fully-resolved
+/// types (including defaulted numeric literals), so this is a simple
+/// span-keyed lookup on every `Expr` node we encounter.
+fn write_types_back(module: &mut Module<'_>, expr_types: &HashMap<Span, Type>) {
+    for decl in &mut module.decls {
+        write_back_decl(decl, expr_types);
+    }
+}
+
+fn write_back_decl(decl: &mut Decl<'_>, expr_types: &HashMap<Span, Type>) {
+    match decl {
+        Decl::FuncDef { body, .. } => write_back_expr(body, expr_types),
+        Decl::TypeAnno { methods, .. } => {
+            for m in methods {
+                write_back_decl(m, expr_types);
+            }
+        }
+    }
+}
+
+fn write_back_expr(expr: &mut Expr<'_>, expr_types: &HashMap<Span, Type>) {
+    if let Some(ty) = expr_types.get(&expr.span) {
+        expr.ty = ty.clone();
+    }
+    match &mut expr.kind {
+        ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) | ExprKind::Name(_) => {}
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            write_back_expr(lhs, expr_types);
+            write_back_expr(rhs, expr_types);
+        }
+        ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
+            for a in args {
+                write_back_expr(a, expr_types);
+            }
+        }
+        ExprKind::Block(stmts, result) => {
+            for s in stmts {
+                write_back_stmt(s, expr_types);
+            }
+            write_back_expr(result, expr_types);
+        }
+        ExprKind::If {
+            expr: scrutinee,
+            arms,
+            else_body,
+        } => {
+            write_back_expr(scrutinee, expr_types);
+            for arm in arms {
+                write_back_arm(arm, expr_types);
+            }
+            if let Some(eb) = else_body {
+                write_back_expr(eb, expr_types);
+            }
+        }
+        ExprKind::Fold {
+            expr: scrutinee,
+            arms,
+        } => {
+            write_back_expr(scrutinee, expr_types);
+            for arm in arms {
+                write_back_arm(arm, expr_types);
+            }
+        }
+        ExprKind::Lambda { body, .. } => write_back_expr(body, expr_types),
+        ExprKind::Record { fields } => {
+            for (_, e) in fields {
+                write_back_expr(e, expr_types);
+            }
+        }
+        ExprKind::FieldAccess { record, .. } => write_back_expr(record, expr_types),
+        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
+            for e in elems {
+                write_back_expr(e, expr_types);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            write_back_expr(receiver, expr_types);
+            for a in args {
+                write_back_expr(a, expr_types);
+            }
+        }
+        ExprKind::Is { expr: inner, .. } => write_back_expr(inner, expr_types),
+    }
+}
+
+fn write_back_arm(arm: &mut ast::MatchArm<'_>, expr_types: &HashMap<Span, Type>) {
+    for g in &mut arm.guards {
+        write_back_expr(g, expr_types);
+    }
+    write_back_expr(&mut arm.body, expr_types);
+}
+
+fn write_back_stmt(stmt: &mut Stmt<'_>, expr_types: &HashMap<Span, Type>) {
+    match stmt {
+        Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
+            write_back_expr(val, expr_types);
+        }
+        Stmt::Guard {
+            condition,
+            return_val,
+        } => {
+            write_back_expr(condition, expr_types);
+            write_back_expr(return_val, expr_types);
+        }
+        Stmt::TypeHint { .. } => {}
+    }
+}
+
+// ---- Write-back of method resolutions onto AST nodes ----
+
+/// Walk `module` and copy each `MethodCall`/`QualifiedCall` resolution
+/// from the side table onto the node's `resolved` field.
+fn write_resolutions_back(module: &mut Module<'_>, resolutions: &HashMap<Span, String>) {
+    for decl in &mut module.decls {
+        write_res_decl(decl, resolutions);
+    }
+}
+
+fn write_res_decl(decl: &mut Decl<'_>, resolutions: &HashMap<Span, String>) {
+    match decl {
+        Decl::FuncDef { body, .. } => write_res_expr(body, resolutions),
+        Decl::TypeAnno { methods, .. } => {
+            for m in methods {
+                write_res_decl(m, resolutions);
+            }
+        }
+    }
+}
+
+fn write_res_expr(expr: &mut Expr<'_>, resolutions: &HashMap<Span, String>) {
+    let span = expr.span;
+    match &mut expr.kind {
+        ExprKind::QualifiedCall { args, resolved, .. } => {
+            if let Some(r) = resolutions.get(&span) {
+                *resolved = Some(r.clone());
+            }
+            for a in args {
+                write_res_expr(a, resolutions);
+            }
+        }
+        ExprKind::MethodCall {
+            receiver,
+            args,
+            resolved,
+            ..
+        } => {
+            if let Some(r) = resolutions.get(&span) {
+                *resolved = Some(r.clone());
+            }
+            write_res_expr(receiver, resolutions);
+            for a in args {
+                write_res_expr(a, resolutions);
+            }
+        }
+        ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) | ExprKind::Name(_) => {}
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            write_res_expr(lhs, resolutions);
+            write_res_expr(rhs, resolutions);
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args {
+                write_res_expr(a, resolutions);
+            }
+        }
+        ExprKind::Block(stmts, result) => {
+            for s in stmts {
+                write_res_stmt(s, resolutions);
+            }
+            write_res_expr(result, resolutions);
+        }
+        ExprKind::If {
+            expr: scrutinee,
+            arms,
+            else_body,
+        } => {
+            write_res_expr(scrutinee, resolutions);
+            for arm in arms {
+                write_res_arm(arm, resolutions);
+            }
+            if let Some(eb) = else_body {
+                write_res_expr(eb, resolutions);
+            }
+        }
+        ExprKind::Fold {
+            expr: scrutinee,
+            arms,
+        } => {
+            write_res_expr(scrutinee, resolutions);
+            for arm in arms {
+                write_res_arm(arm, resolutions);
+            }
+        }
+        ExprKind::Lambda { body, .. } => write_res_expr(body, resolutions),
+        ExprKind::Record { fields } => {
+            for (_, e) in fields {
+                write_res_expr(e, resolutions);
+            }
+        }
+        ExprKind::FieldAccess { record, .. } => write_res_expr(record, resolutions),
+        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
+            for e in elems {
+                write_res_expr(e, resolutions);
+            }
+        }
+        ExprKind::Is { expr: inner, .. } => write_res_expr(inner, resolutions),
+    }
+}
+
+fn write_res_arm(arm: &mut ast::MatchArm<'_>, resolutions: &HashMap<Span, String>) {
+    for g in &mut arm.guards {
+        write_res_expr(g, resolutions);
+    }
+    write_res_expr(&mut arm.body, resolutions);
+}
+
+fn write_res_stmt(stmt: &mut Stmt<'_>, resolutions: &HashMap<Span, String>) {
+    match stmt {
+        Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
+            write_res_expr(val, resolutions);
+        }
+        Stmt::Guard {
+            condition,
+            return_val,
+        } => {
+            write_res_expr(condition, resolutions);
+            write_res_expr(return_val, resolutions);
+        }
+        Stmt::TypeHint { .. } => {}
+    }
 }

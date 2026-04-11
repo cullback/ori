@@ -1,0 +1,41 @@
+module:
+  type-alias Nat:
+    TagUnion:
+      tag Zero
+      tag Succ:
+        Named Nat
+  type-alias to_i64:
+    Arrow:
+      params:
+        Named Nat
+      ret:
+        Named I64
+  fn to_i64(n):
+    Fold:
+      scrutinee:
+        Name n
+      arm:
+        pattern:
+          Con Zero
+        body:
+          IntLit 0
+      arm:
+        pattern:
+          Con Succ:
+            Bind prev
+        body:
+          BinOp Add:
+            Name prev
+            IntLit 1
+  type-alias main:
+    Arrow:
+      params:
+        Named I64
+      ret:
+        Named I64
+  fn main(arg):
+    Call to_i64:
+      Call Succ:
+        Call Succ:
+          Call Succ:
+            Name Zero

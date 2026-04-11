@@ -1,8 +1,21 @@
+//! Post-lower registration data: flat lookups for functions,
+//! constructors, and builtin methods that `ssa::lower` needs while
+//! walking the AST.
+//!
+//! Step 10 stripped this module down from 9 overlapping lookup tables
+//! to just the ones the streamlined lowerer actually reads:
+//! `funcs` / `func_return_types` / `constructors` /
+//! `num_to_str_methods`. The `list_builtins`, `func_aliases`,
+//! `func_arities`, and `func_schemes` / `constructor_schemes` maps
+//! were either never populated or only used by machinery that's gone
+//! now (reachability aliases, defunc HO-arg lookup, etc.).
+
 use std::collections::{HashMap, HashSet};
 
+use crate::ast::{self, Decl, TypeExpr};
 use crate::source::SourceArena;
 use crate::ssa::ScalarType;
-use crate::syntax::ast::{self, Decl, TypeExpr};
+use crate::symbol::SymbolTable;
 use crate::types::engine::{Scheme, Type};
 use crate::types::infer::InferResult;
 
@@ -28,7 +41,7 @@ pub fn type_to_scalar(ty: &Type) -> ScalarType {
 }
 
 /// Extract the return type from a function type scheme.
-pub fn scheme_return_type(scheme: &Scheme) -> ScalarType {
+fn scheme_return_type(scheme: &Scheme) -> ScalarType {
     match &scheme.ty {
         Type::Arrow(_, ret) => type_to_scalar(ret),
         other => type_to_scalar(other),
@@ -37,7 +50,7 @@ pub fn scheme_return_type(scheme: &Scheme) -> ScalarType {
 
 /// Constructor metadata for tag union variants and closure types.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "fields read at lower time")]
 pub struct ConstructorMeta {
     pub tag_index: u64,
     pub num_fields: usize,
@@ -46,16 +59,23 @@ pub struct ConstructorMeta {
     pub field_types: Vec<ScalarType>,
 }
 
-/// Registration data about all declared functions, constructors, and builtins.
+/// Registration data about all declared functions, constructors, and
+/// builtins. Populated by [`build`] and consumed by `ssa::lower`.
 pub struct DeclInfo {
+    /// Every known callable, keyed by its mangled display name
+    /// (e.g. `main`, `List.sum__I64`, `__apply_List.walk_2`).
     pub funcs: HashSet<String>,
+    /// Number of parameters per callable. Defunc reads this when
+    /// registering named-function-reference lambda entries.
     pub func_arities: HashMap<String, usize>,
-    pub constructors: HashMap<String, ConstructorMeta>,
-    pub list_builtins: HashSet<String>,
-    pub num_to_str_methods: HashSet<String>,
-    pub func_aliases: HashMap<String, Vec<String>>,
+    /// Concrete return type per callable. Missing entries default to
+    /// `Ptr` at lookup time (for synthesized apply functions).
     pub func_return_types: HashMap<String, ScalarType>,
-    pub func_schemes: HashMap<String, Scheme>,
+    /// Per-constructor tag index and field layout. Populated from
+    /// user tag unions AND synthesized closure types from defunc.
+    pub constructors: HashMap<String, ConstructorMeta>,
+    /// Raw constructor schemes from inference, used to compute the
+    /// field-type layout during tag-union registration.
     pub constructor_schemes: HashMap<String, Scheme>,
 }
 
@@ -63,148 +83,91 @@ pub struct DeclInfo {
 pub fn build<'src>(
     _arena: &'src SourceArena,
     module: &ast::Module<'src>,
-    scope: &crate::resolve::ModuleScope,
+    _scope: &crate::resolve::ModuleScope,
     infer_result: &InferResult,
+    symbols: &SymbolTable,
 ) -> DeclInfo {
     let mut info = DeclInfo {
         funcs: HashSet::new(),
         func_arities: HashMap::new(),
-        constructors: HashMap::new(),
-        list_builtins: HashSet::new(),
-        num_to_str_methods: HashSet::new(),
-        func_aliases: HashMap::new(),
         func_return_types: HashMap::new(),
-        func_schemes: infer_result.func_schemes.clone(),
+        constructors: HashMap::new(),
         constructor_schemes: infer_result.constructor_schemes.clone(),
     };
 
-    register_comparison_info();
-    register_num_to_str(&mut info);
-
-    // Register user declarations
-    register_decls(&mut info, &module.decls);
-
-    // Register module-qualified aliases for imported types
-    for decl in &module.decls {
-        if let Decl::TypeAnno { name, methods, .. } = decl {
-            let name = *name;
-            if let Some(mod_name) = scope.qualified_types.get(name) {
-                for method_decl in methods {
-                    if let Decl::FuncDef {
-                        name: method_name, ..
-                    } = method_decl
-                    {
-                        let method_name = *method_name;
-                        let internal = method_key(name, method_name);
-                        let qualified = format!("{mod_name}.{internal}");
-                        if info.funcs.contains(&internal) {
-                            info.funcs.insert(qualified.clone());
-                            info.func_aliases
-                                .entry(internal.clone())
-                                .or_default()
-                                .push(qualified.clone());
-                            info.func_aliases
-                                .entry(qualified.clone())
-                                .or_default()
-                                .push(internal.clone());
-                        }
-                        if let Some(&arity) = info.func_arities.get(&internal) {
-                            info.func_arities.insert(qualified, arity);
-                        }
-                    }
-                }
-            }
-        }
+    // Register the num-to-str intrinsic method names as known
+    // callables so higher-order references (e.g. `List.map(xs,
+    // I64.to_str)`) can resolve their target.
+    for ty in ["I8", "U8", "I64", "U64", "F64"] {
+        let key = format!("{ty}.to_str");
+        info.funcs.insert(key.clone());
+        info.func_arities.insert(key, 1);
     }
 
-    // Register module-qualified aliases for imported free functions
     for decl in &module.decls {
-        if let Decl::FuncDef { name, .. } = decl {
-            let name = *name;
-            if let Some(mod_name) = scope.qualified_funcs.get(name) {
-                let qualified = format!("{mod_name}.{name}");
-                if info.funcs.contains(name) {
-                    info.funcs.insert(qualified.clone());
-                    info.func_aliases
-                        .entry(name.to_owned())
-                        .or_default()
-                        .push(qualified.clone());
-                    info.func_aliases
-                        .entry(qualified.clone())
-                        .or_default()
-                        .push(name.to_owned());
-                }
-                if let Some(&arity) = info.func_arities.get(name) {
-                    info.func_arities.insert(qualified, arity);
-                }
-            }
-        }
+        register_decl(&mut info, decl, infer_result, symbols);
     }
 
     info
 }
 
-/// Register all declarations (types, constructors, functions) into `DeclInfo`.
-pub fn register_decls(info: &mut DeclInfo, decls: &[Decl<'_>]) {
-    for decl in decls {
-        match decl {
-            Decl::TypeAnno {
-                name,
-                ty: TypeExpr::TagUnion(tags),
-                methods,
-                ..
-            } => {
-                let name = *name;
-                register_tag_union(info, name, tags);
-                for method_decl in methods {
-                    if let Decl::FuncDef {
-                        name: method_name,
-                        params,
-                        ..
-                    } = method_decl
-                    {
-                        let method_name = *method_name;
-                        let mangled = method_key(name, method_name);
-                        info.funcs.insert(mangled.clone());
-                        info.func_arities.insert(mangled.clone(), params.len());
-                        if let Some(scheme) = info.func_schemes.get(&mangled) {
-                            info.func_return_types
-                                .insert(mangled, scheme_return_type(scheme));
-                        }
-                    }
-                }
+fn register_decl(
+    info: &mut DeclInfo,
+    decl: &Decl<'_>,
+    infer_result: &InferResult,
+    symbols: &SymbolTable,
+) {
+    match decl {
+        Decl::TypeAnno {
+            name,
+            ty: TypeExpr::TagUnion(tags),
+            methods,
+            ..
+        } => {
+            let type_name = symbols.display(*name);
+            register_tag_union(info, type_name, tags);
+            for method_decl in methods {
+                register_method(info, type_name, method_decl, infer_result, symbols);
             }
-            Decl::TypeAnno { name, methods, .. } => {
-                let name = *name;
-                for method_decl in methods {
-                    if let Decl::FuncDef {
-                        name: method_name,
-                        params,
-                        ..
-                    } = method_decl
-                    {
-                        let method_name = *method_name;
-                        let mangled = method_key(name, method_name);
-                        if !info.funcs.contains(&mangled) {
-                            info.funcs.insert(mangled.clone());
-                            info.func_arities.insert(mangled.clone(), params.len());
-                            if let Some(scheme) = info.func_schemes.get(&mangled) {
-                                info.func_return_types
-                                    .insert(mangled, scheme_return_type(scheme));
-                            }
-                        }
-                    }
-                }
+        }
+        Decl::TypeAnno { name, methods, .. } => {
+            let type_name = symbols.display(*name);
+            for method_decl in methods {
+                register_method(info, type_name, method_decl, infer_result, symbols);
             }
-            Decl::FuncDef { name, params, .. } => {
-                let name = *name;
-                info.funcs.insert(name.to_owned());
-                info.func_arities.insert(name.to_owned(), params.len());
-                if let Some(scheme) = info.func_schemes.get(name) {
-                    info.func_return_types
-                        .insert(name.to_owned(), scheme_return_type(scheme));
-                }
+        }
+        Decl::FuncDef { name, params, .. } => {
+            let name_str = symbols.display(*name);
+            info.funcs.insert(name_str.to_owned());
+            info.func_arities.insert(name_str.to_owned(), params.len());
+            if let Some(scheme) = infer_result.func_schemes.get(name_str) {
+                info.func_return_types
+                    .insert(name_str.to_owned(), scheme_return_type(scheme));
             }
+        }
+    }
+}
+
+fn register_method(
+    info: &mut DeclInfo,
+    type_name: &str,
+    method_decl: &Decl<'_>,
+    infer_result: &InferResult,
+    symbols: &SymbolTable,
+) {
+    if let Decl::FuncDef {
+        name: method_name,
+        params,
+        ..
+    } = method_decl
+    {
+        let method_name_str = symbols.display(*method_name);
+        let mangled = method_key(type_name, method_name_str);
+        info.funcs.insert(mangled.clone());
+        info.func_arities.insert(mangled.clone(), params.len());
+        if let Some(scheme) = infer_result.func_schemes.get(&mangled) {
+            info.func_return_types
+                .insert(mangled, scheme_return_type(scheme));
         }
     }
 }
@@ -240,16 +203,3 @@ fn register_tag_union(info: &mut DeclInfo, type_name: &str, tags: &[ast::TagDecl
     }
 }
 
-const fn register_comparison_info() {
-    // Bool's True/False constructors are already registered from the Bool stdlib.
-    // lower_eq handles emission directly — no separate registration needed.
-}
-
-fn register_num_to_str(info: &mut DeclInfo) {
-    for ty in &["I64", "U64", "F64", "U8", "I8"] {
-        let key = format!("{ty}.to_str");
-        info.funcs.insert(key.clone());
-        info.num_to_str_methods.insert(key.clone());
-        info.func_arities.insert(key, 1);
-    }
-}

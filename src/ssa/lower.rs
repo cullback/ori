@@ -1,13 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};
 use crate::decl_info::{self, DeclInfo, method_key, type_to_scalar};
-use crate::defunc::{self, DefuncTable, LambdaSet};
 use crate::error::CompileError;
 use crate::source::SourceArena;
 use crate::ssa::Module;
 use crate::ssa::builder::Builder;
 use crate::ssa::instruction::{BinaryOp, BlockId, ScalarType, Value};
-use crate::syntax::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};
+use crate::symbol::{FieldInterner, SymbolId, SymbolTable};
 use crate::types::engine::Type;
 use crate::types::infer::InferResult;
 
@@ -20,50 +20,48 @@ pub fn lower<'src>(
     module: &ast::Module<'src>,
     scope: &crate::resolve::ModuleScope,
     infer_result: &InferResult,
+    symbols: &crate::symbol::SymbolTable,
+    fields: &FieldInterner,
 ) -> Result<(Module, Vec<Value>), CompileError> {
-    // Pass 1: Registration
-    let mut decls = decl_info::build(arena, module, scope, infer_result);
-
-    // Pass 2: Reachability
-    let reachable = crate::reachable::compute(&decls, module, infer_result);
-
-    // Pass 3: Defunctionalization
-    let defunc_table = defunc::collect(module, &decls, &reachable, infer_result);
-
-    // Merge closure constructors into DeclInfo
-    decls
-        .constructors
-        .extend(defunc_table.closure_constructors.clone());
-
-    // Pass 4: SSA emission
-    lower_to_ssa(module, infer_result, &decls, &reachable, &defunc_table)
+    // Post-Step 9, the module was already pruned by
+    // `reachable::prune`, so every `Decl::FuncDef` here is reachable
+    // from `main` and must be lowered. The reachability side-table
+    // that the lowerer used to maintain is gone.
+    let decls = decl_info::build(arena, module, scope, infer_result, symbols);
+    lower_to_ssa(module, infer_result, &decls, symbols, fields)
 }
 
 // ---- SSA lowering context ----
 
 struct LowerCtx<'a, 'src> {
     builder: Builder,
-    vars: HashMap<String, Value>,
-    ho_vars: HashMap<String, usize>,
-    lambda_arg_counters: HashMap<(String, usize), usize>,
-    fold_counter: usize,
+    /// Locals in scope: binding `SymbolId` → SSA value. Function
+    /// parameters, let-bound names, lambda params, and pattern
+    /// bindings all enter/exit this map as their scopes open and close.
+    vars: HashMap<SymbolId, Value>,
     // Immutable references:
     decls: &'a DeclInfo,
-    defunc: &'a DefuncTable<'src>,
     infer: &'a InferResult,
+    symbols: &'a SymbolTable,
+    fields: &'a FieldInterner,
+    _phantom: std::marker::PhantomData<&'src ()>,
 }
 
 impl<'a, 'src> LowerCtx<'a, 'src> {
-    fn new(decls: &'a DeclInfo, defunc: &'a DefuncTable<'src>, infer: &'a InferResult) -> Self {
+    fn new(
+        decls: &'a DeclInfo,
+        infer: &'a InferResult,
+        symbols: &'a SymbolTable,
+        fields: &'a FieldInterner,
+    ) -> Self {
         Self {
             builder: Builder::new(),
             vars: HashMap::new(),
-            ho_vars: HashMap::new(),
-            lambda_arg_counters: HashMap::new(),
-            fold_counter: 0,
             decls,
-            defunc,
             infer,
+            symbols,
+            fields,
+            _phantom: std::marker::PhantomData,
         }
     }
 }
@@ -76,11 +74,8 @@ struct WalkKind {
 impl<'a, 'src> LowerCtx<'a, 'src> {
     // ---- Type helpers ----
 
-    fn expr_scalar_type(&self, span: ast::Span) -> ScalarType {
-        self.infer
-            .expr_types
-            .get(&span)
-            .map_or(ScalarType::Ptr, |ty| type_to_scalar(ty))
+    fn expr_scalar_type(&self, expr: &Expr<'src>) -> ScalarType {
+        type_to_scalar(&expr.ty)
     }
 
     fn func_ret_type(&self, name: &str) -> ScalarType {
@@ -117,16 +112,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     // ---- Function lowering ----
 
-    fn lower_function(&mut self, name: &str, param_names: &[&str], body: &Expr<'src>) {
+    fn lower_function(&mut self, name: &str, param_syms: &[SymbolId], body: &Expr<'src>) {
         let saved_vars = self.vars.clone();
         let saved_blocks = std::mem::take(&mut self.builder.blocks);
         let saved_current = self.builder.current_block.take();
 
-        let ssa_params: Vec<Value> = param_names
+        let ssa_params: Vec<Value> = param_syms
             .iter()
             .map(|p| {
                 let v = self.builder.fresh_value();
-                self.vars.insert((*p).to_owned(), v);
+                self.vars.insert(*p, v);
                 v
             })
             .collect();
@@ -135,12 +130,17 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.switch_to(entry);
         let result = self.lower_expr(body);
         self.builder.ret(result);
+        // Parameter scalar types come from the function's inferred
+        // scheme when available. Synthesized `__apply_K` functions
+        // don't have schemes — they default to all-`Ptr`, which is
+        // correct since closures carry type-erased captures and
+        // arguments.
         let param_types: Vec<ScalarType> = self
-            .decls
+            .infer
             .func_schemes
             .get(name)
             .map(|scheme| match &scheme.ty {
-                Type::Arrow(params, _) => params.iter().map(|t| type_to_scalar(t)).collect(),
+                Type::Arrow(params, _) => params.iter().map(type_to_scalar).collect(),
                 _ => vec![ScalarType::Ptr; ssa_params.len()],
             })
             .unwrap_or_else(|| vec![ScalarType::Ptr; ssa_params.len()]);
@@ -162,11 +162,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation
             )]
-            ExprKind::IntLit(n) => match self.infer.lit_types.get(&expr.span) {
-                Some(crate::types::infer::NumType::U8) => self.builder.const_u8(*n as u8),
-                Some(crate::types::infer::NumType::I8) => self.builder.const_i8(*n as i8),
-                Some(crate::types::infer::NumType::U64) => self.builder.const_u64(*n as u64),
-                Some(crate::types::infer::NumType::F64) => self.builder.const_f64(*n as f64),
+            ExprKind::IntLit(n) => match &expr.ty {
+                Type::Con(name) if name == "U8" => self.builder.const_u8(*n as u8),
+                Type::Con(name) if name == "I8" => self.builder.const_i8(*n as i8),
+                Type::Con(name) if name == "U64" => self.builder.const_u64(*n as u64),
+                Type::Con(name) if name == "F64" => self.builder.const_f64(*n as f64),
                 _ => self.builder.const_i64(*n),
             },
 
@@ -187,11 +187,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 header
             }
 
-            ExprKind::Name(name) => {
-                let name = *name;
-                if let Some(&val) = self.vars.get(name) {
+            ExprKind::Name(sym) => {
+                if let Some(&val) = self.vars.get(sym) {
                     return val;
                 }
+                let name = self.symbols.display(*sym);
                 if self.decls.constructors.contains_key(name) {
                     return self.lower_constructor_call(name, &[]);
                 }
@@ -218,7 +218,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let l = self.lower_expr(lhs);
                 let r = self.lower_expr(rhs);
-                let ty = self.expr_scalar_type(expr.span);
+                let ty = self.expr_scalar_type(expr);
                 match op {
                     BinOp::Add => self.builder.binop(BinaryOp::Add, l, r, ty),
                     BinOp::Sub => self.builder.binop(BinaryOp::Sub, l, r, ty),
@@ -231,7 +231,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 }
             }
 
-            ExprKind::Call { func, args } => self.lower_call(func, args, expr.span),
+            ExprKind::Call { target, args, .. } => self.lower_call_by_sym(*target, args),
 
             ExprKind::Block(stmts, result) => self.lower_block(stmts, result),
 
@@ -240,7 +240,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 arms,
                 else_body,
             } => {
-                let result_ty = self.expr_scalar_type(expr.span);
+                let result_ty = self.expr_scalar_type(expr);
                 // Detect boolean if-then-else with Is bindings in scrutinee
                 if Self::is_bool_if_with_is(scrutinee_expr, arms) {
                     self.lower_bool_if_with_is(scrutinee_expr, arms, result_ty)
@@ -249,16 +249,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 }
             }
 
-            ExprKind::Fold {
-                expr: scrutinee_expr,
-                arms,
-            } => {
-                let result_ty = self.expr_scalar_type(expr.span);
-                self.lower_fold(scrutinee_expr, arms, result_ty)
+            ExprKind::Fold { .. } => {
+                panic!(
+                    "Fold should have been eliminated by fold_lift before SSA lowering (at {:?})",
+                    expr.span
+                )
             }
 
-            ExprKind::QualifiedCall { segments, args } => {
-                self.lower_qualified_call(segments, args, expr.span)
+            ExprKind::QualifiedCall { segments, args, .. } => {
+                self.lower_qualified_call(segments, args, expr)
             }
 
             ExprKind::Record { fields } => {
@@ -266,7 +265,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let mut sorted: Vec<(usize, &str, &Expr)> = fields
                     .iter()
                     .enumerate()
-                    .map(|(i, (name, expr))| (i, *name, expr))
+                    .map(|(i, (field_sym, expr))| (i, self.fields.get(*field_sym), expr))
                     .collect();
                 sorted.sort_by_key(|(_, name, _)| *name);
                 for (slot, (_, _, field_expr)) in sorted.iter().enumerate() {
@@ -278,12 +277,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
             ExprKind::FieldAccess { record, field } => {
                 let ptr = self.lower_expr(record);
-                let slot = self
-                    .infer
-                    .expr_types
-                    .get(&record.span)
-                    .map_or(0, |ty| Self::field_slot(ty, field));
-                let ty = self.expr_scalar_type(expr.span);
+                let field_name = self.fields.get(*field);
+                let slot = Self::field_slot(&record.ty, field_name);
+                let ty = self.expr_scalar_type(expr);
                 self.builder.load(ptr, slot, ty)
             }
 
@@ -291,7 +287,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 receiver,
                 method,
                 args,
-            } => self.lower_method_call(receiver, method, args, expr.span),
+                ..
+            } => self.lower_method_call(receiver, method, args, expr),
 
             ExprKind::Tuple(elems) => {
                 let ptr = self.builder.alloc(elems.len());
@@ -330,7 +327,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             match stmt {
                 Stmt::Let { name, val } => {
                     let v = self.lower_expr(val);
-                    self.vars.insert((*name).to_owned(), v);
+                    self.vars.insert(*name, v);
                 }
                 Stmt::Destructure { pattern, val } => {
                     let v = self.lower_expr(val);
@@ -356,12 +353,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         let cond_tag = self.builder.load(cond_val, 0, ScalarType::U64);
                         let true_tag = self.decls.constructors["True"].tag_index;
                         let true_val = self.builder.const_u64(true_tag);
-                        let is_true = self.builder.binop(
-                            BinaryOp::Eq,
-                            cond_tag,
-                            true_val,
-                            ScalarType::Bool,
-                        );
+                        let is_true =
+                            self.builder
+                                .binop(BinaryOp::Eq, cond_tag, true_val, ScalarType::Bool);
                         let ret_block = self.builder.create_block();
                         let cont_block = self.builder.create_block();
                         self.builder
@@ -380,33 +374,66 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.lower_expr(result)
     }
 
-    // ---- Qualified / method call lowering ----
+    // ---- Call lowering ----
+    //
+    // After mono + defunc + prune, every call site resolves to a
+    // concrete global callable. There are three AST shapes that
+    // reach the lowerer:
+    //
+    // - `Call { target: SymbolId, args }` — direct call by SymbolId.
+    //   Lowered via `lower_call` (which also handles list-walk
+    //   intrinsics and the other dispatch-table branches).
+    // - `QualifiedCall { segments, resolved, args }` — either a
+    //   static qualified call (`resolved = None`) or a method call
+    //   on a local receiver (`resolved = Some(name)`). The static
+    //   form routes through `lower_call`.
+    // - `MethodCall { receiver, resolved, args }` — always a
+    //   method call with explicit receiver as first arg.
+
+    fn lower_call_by_sym(&mut self, target: SymbolId, args: &[Expr<'src>]) -> Value {
+        let name = self.symbols.display(target).to_owned();
+        self.lower_call(&name, args)
+    }
 
     fn lower_qualified_call(
         &mut self,
         segments: &[&'src str],
         args: &[Expr<'src>],
-        span: ast::Span,
+        outer: &Expr<'src>,
     ) -> Value {
-        // Check if inference resolved this to a method call
-        if let Some(resolved) = self.infer.method_resolutions.get(&span).cloned() {
+        let ExprKind::QualifiedCall { resolved, .. } = &outer.kind else {
+            unreachable!("lower_qualified_call called on non-QualifiedCall");
+        };
+        if let Some(resolved_name) = resolved {
+            // Local-receiver method dispatch. In practice this path
+            // is only hit for `receiver.method(args)` parsed as
+            // `QualifiedCall` when the receiver is a local binding
+            // (the usual form is `MethodCall`). `segments[0]` names
+            // the receiver; look it up in the current scope by
+            // display name.
             let receiver_name = segments[0];
-            let receiver_val = if let Some(&val) = self.vars.get(receiver_name) {
-                val
-            } else if self.decls.constructors.contains_key(receiver_name) {
-                self.lower_constructor_call(receiver_name, &[])
-            } else {
-                panic!("undefined receiver: {receiver_name}");
-            };
-            if let Some(builtin_name) = resolved.strip_prefix("__builtin.") {
-                let r = self.lower_expr(&args[0]);
-                return self.lower_builtin_op(builtin_name, receiver_val, r, span);
+            let receiver_val = self
+                .vars
+                .iter()
+                .find(|(sym, _)| self.symbols.display(**sym) == receiver_name)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| self.lower_constructor_call(receiver_name, &[]));
+            if let Some(op_name) = resolved_name.strip_prefix("__builtin.") {
+                let rhs = self.lower_expr(&args[0]);
+                let ty = self.expr_scalar_type(outer);
+                return self.lower_builtin_op(op_name, receiver_val, rhs, ty);
             }
-            let arg_vals = self.lower_method_args(receiver_val, args, &resolved);
-            return self.emit_function_call(&resolved, arg_vals, span);
+            let mut arg_vals = vec![receiver_val];
+            for a in args {
+                arg_vals.push(self.lower_expr(a));
+            }
+            let ret_ty = self.func_ret_type(resolved_name);
+            return self.builder.call(resolved_name, arg_vals, ret_ty);
         }
+        // Plain static qualified call: treat segments.join(".") as
+        // the callable name and route through `lower_call`.
         let mangled = segments.join(".");
-        self.lower_call(&mangled, args, span)
+        self.lower_call(&mangled, args)
     }
 
     fn lower_method_call(
@@ -414,28 +441,30 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         receiver: &Expr<'src>,
         method: &'src str,
         args: &[Expr<'src>],
-        span: ast::Span,
+        outer: &Expr<'src>,
     ) -> Value {
-        let resolved = self.infer.method_resolutions.get(&span).cloned();
-        let Some(mangled) = resolved else {
-            panic!("no method resolution for .{method}() at {span:?}");
+        let ExprKind::MethodCall { resolved, .. } = &outer.kind else {
+            unreachable!("lower_method_call called on non-MethodCall");
         };
-
-        // List.walk / walk_backwards / walk_until / walk_backwards_until
-        if let Some(walk) = self.classify_walk(&mangled) {
-            let list_val = self.lower_expr(receiver);
+        let Some(mangled) = resolved.clone() else {
+            panic!("no method resolution for .{method}() at {:?}", outer.span);
+        };
+        let recv_val = self.lower_expr(receiver);
+        if let Some(op_name) = mangled.strip_prefix("__builtin.") {
+            let rhs = self.lower_expr(&args[0]);
+            let ty = self.expr_scalar_type(outer);
+            return self.lower_builtin_op(op_name, recv_val, rhs, ty);
+        }
+        // List walks: the walk loop needs untyped Values, so build
+        // them positionally.
+        if let Some(walk) = classify_walk(&mangled) {
+            assert!(args.len() == 2, "List.walk* method form takes 2 args");
             let init_val = self.lower_expr(&args[0]);
-            let acc_ty = self.expr_scalar_type(args[0].span);
-            let key = (mangled.clone(), 2);
-            let closure_val = if self.defunc.ho_param_sets.contains_key(&key) {
-                self.lower_lambda_arg(&args[1], &mangled, 2)
-            } else {
-                self.lower_expr(&args[1])
-            };
-            let ls_idx = self.defunc.ho_param_sets[&key];
-            let apply_name = self.defunc.lambda_sets[ls_idx].apply_name.clone();
+            let acc_ty = self.expr_scalar_type(&args[0]);
+            let closure_val = self.lower_expr(&args[1]);
+            let apply_name = format!("__apply_{mangled}_2");
             return self.lower_list_walk(
-                list_val,
+                recv_val,
                 init_val,
                 closure_val,
                 &apply_name,
@@ -444,36 +473,34 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 acc_ty,
             );
         }
-
-        // Build full args: receiver + method args (with lambda handling)
-        let recv_val = self.lower_expr(receiver);
-        let full_args = self.lower_method_args(recv_val, args, &mangled);
-
-        // Check for builtin arithmetic
-        if let Some(op_name) = mangled.strip_prefix("__builtin.") {
-            return self.lower_builtin_op(op_name, full_args[0], full_args[1], span);
+        let mut arg_vals = Vec::with_capacity(args.len() + 1);
+        arg_vals.push(recv_val);
+        for a in args {
+            arg_vals.push(self.lower_expr(a));
         }
-
-        self.emit_function_call(&mangled, full_args, span)
+        if Self::is_list_builtin(&mangled) {
+            return emit_list_builtin_call(&mut self.builder, &mangled, arg_vals);
+        }
+        if is_num_to_str(&mangled) {
+            return self
+                .builder
+                .call("__num_to_str", vec![arg_vals[0]], ScalarType::Ptr);
+        }
+        let ret_ty = self.func_ret_type(&mangled);
+        self.builder.call(&mangled, arg_vals, ret_ty)
     }
 
-    // ---- Call lowering ----
-
-    fn lower_call(&mut self, func: &str, args: &[Expr<'src>], _span: ast::Span) -> Value {
-        // List.walk / walk_backwards / walk_until / walk_backwards_until
-        if let Some(walk) = self.classify_walk(func) {
+    /// Central dispatch for direct and static qualified calls: list
+    /// walks (which need the walk loop emitted inline), list
+    /// builtins, num-to-str, constructors, and plain function calls.
+    fn lower_call(&mut self, func: &str, args: &[Expr<'src>]) -> Value {
+        if let Some(walk) = classify_walk(func) {
             assert!(args.len() >= 3, "List.walk* takes 3 arguments");
             let list_val = self.lower_expr(&args[0]);
             let init_val = self.lower_expr(&args[1]);
-            let acc_ty = self.expr_scalar_type(args[1].span);
-            let key = (func.to_owned(), 2);
-            let closure_val = if self.defunc.ho_param_sets.contains_key(&key) {
-                self.lower_lambda_arg(&args[2], func, 2)
-            } else {
-                self.lower_expr(&args[2])
-            };
-            let ls_idx = self.defunc.ho_param_sets[&key];
-            let apply_name = self.defunc.lambda_sets[ls_idx].apply_name.clone();
+            let acc_ty = self.expr_scalar_type(&args[1]);
+            let closure_val = self.lower_expr(&args[2]);
+            let apply_name = format!("__apply_{func}_2");
             return self.lower_list_walk(
                 list_val,
                 init_val,
@@ -484,99 +511,35 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 acc_ty,
             );
         }
-
-        // List builtins
-        if self.is_list_builtin(func) {
+        if Self::is_list_builtin(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-            return self.emit_list_builtin(func, arg_vals);
+            return emit_list_builtin_call(&mut self.builder, func, arg_vals);
         }
-
-        // NumToStr
-        if self.decls.num_to_str_methods.contains(func) {
+        if is_num_to_str(func) {
             let arg_val = self.lower_expr(&args[0]);
             return self
                 .builder
                 .call("__num_to_str", vec![arg_val], ScalarType::Ptr);
         }
-
-        // Constructor
         if self.decls.constructors.contains_key(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
             return self.lower_constructor_call(func, &arg_vals);
         }
-
-        // Regular function
         if self.decls.funcs.contains(func) {
             let ret_ty = self.func_ret_type(func);
-            let arg_vals: Vec<Value> = args
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    let key = (func.to_owned(), i);
-                    if self.defunc.ho_param_sets.contains_key(&key) {
-                        self.lower_lambda_arg(a, func, i)
-                    } else {
-                        self.lower_expr(a)
-                    }
-                })
-                .collect();
+            let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
             return self.builder.call(func, arg_vals, ret_ty);
         }
-
-        // Variable used as function (higher-order)
-        if let Some(&var_val) = self.vars.get(func) {
-            if let Some(&ls_idx) = self.ho_vars.get(func) {
-                let apply_name = self.defunc.lambda_sets[ls_idx].apply_name.clone();
-                let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-                let mut full_args = vec![var_val];
-                full_args.extend(arg_vals);
-                return self.builder.call(&apply_name, full_args, ScalarType::Ptr);
-            }
-            panic!("variable '{func}' called as function but has no lambda set");
-        }
-
-        panic!("undefined function or constructor: {func}");
+        panic!("undefined function or constructor: {func}")
     }
 
-    fn emit_function_call(&mut self, name: &str, args: Vec<Value>, _span: ast::Span) -> Value {
-        // Check for list builtins by name
-        if self.is_list_builtin(name) {
-            return self.emit_list_builtin(name, args);
-        }
-        // NumToStr
-        if self.decls.num_to_str_methods.contains(name) {
-            return self
-                .builder
-                .call("__num_to_str", vec![args[0]], ScalarType::Ptr);
-        }
-        let ret_ty = self.func_ret_type(name);
-        self.builder.call(name, args, ret_ty)
-    }
-
-    fn is_list_builtin(&self, name: &str) -> bool {
+    fn is_list_builtin(name: &str) -> bool {
         matches!(name, "List.len" | "List.get" | "List.set" | "List.append")
-            || self.decls.list_builtins.contains(name)
-    }
-
-    fn emit_list_builtin(&mut self, name: &str, args: Vec<Value>) -> Value {
-        let (intrinsic, ret_ty) = if name.ends_with(".len") || name == "List.len" {
-            ("__list_len", ScalarType::U64)
-        } else if name.ends_with(".get") || name == "List.get" {
-            ("__list_get", ScalarType::Ptr)
-        } else if name.ends_with(".set") || name == "List.set" {
-            ("__list_set", ScalarType::Ptr)
-        } else if name.ends_with(".append") || name == "List.append" {
-            ("__list_append", ScalarType::Ptr)
-        } else {
-            panic!("unknown list builtin: {name}");
-        };
-        self.builder.call(intrinsic, args, ret_ty)
     }
 
     // ---- Builtin arithmetic dispatch ----
 
-    fn lower_builtin_op(&mut self, name: &str, lhs: Value, rhs: Value, span: ast::Span) -> Value {
-        let ty = self.expr_scalar_type(span);
+    fn lower_builtin_op(&mut self, name: &str, lhs: Value, rhs: Value, ty: ScalarType) -> Value {
         match name {
             "add" => self.builder.binop(BinaryOp::Add, lhs, rhs, ty),
             "sub" => self.builder.binop(BinaryOp::Sub, lhs, rhs, ty),
@@ -586,65 +549,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             "eq" => self.lower_eq(lhs, rhs, false),
             "neq" => self.lower_eq(lhs, rhs, true),
             _ => panic!("unknown builtin: {name}"),
-        }
-    }
-
-    // ---- Method argument building ----
-
-    fn lower_method_args(
-        &mut self,
-        receiver: Value,
-        args: &[Expr<'src>],
-        callee: &str,
-    ) -> Vec<Value> {
-        let mut vals = vec![receiver];
-        for (i, a) in args.iter().enumerate() {
-            let idx = i + 1;
-            let key = (callee.to_owned(), idx);
-            if self.defunc.ho_param_sets.contains_key(&key) {
-                vals.push(self.lower_lambda_arg(a, callee, idx));
-            } else {
-                vals.push(self.lower_expr(a));
-            }
-        }
-        vals
-    }
-
-    // ---- Lambda argument lowering ----
-
-    #[expect(
-        clippy::arithmetic_side_effects,
-        reason = "index counter for lambda matching"
-    )]
-    fn lower_lambda_arg(&mut self, arg: &Expr<'src>, callee: &str, arg_idx: usize) -> Value {
-        let key = (callee.to_owned(), arg_idx);
-        let ls_idx = self.defunc.ho_param_sets[&key];
-        let counter = self.lambda_arg_counters.entry(key).or_insert(0);
-        let entry_idx = *counter;
-        *counter += 1;
-
-        let entry = &self.defunc.lambda_sets[ls_idx].entries[entry_idx];
-        let tag_name = entry.tag_name.clone();
-        let captures: Vec<&'src str> = entry.captures.clone();
-
-        match &arg.kind {
-            ExprKind::Lambda { .. } => {
-                let capture_vals: Vec<Value> = captures
-                    .iter()
-                    .map(|name| {
-                        *self
-                            .vars
-                            .get(*name)
-                            .unwrap_or_else(|| panic!("captured variable '{name}' not in scope"))
-                    })
-                    .collect();
-                self.lower_constructor_call(&tag_name, &capture_vals)
-            }
-            ExprKind::Name(_) => {
-                // Function reference -- nullary constructor
-                self.lower_constructor_call(&tag_name, &[])
-            }
-            _ => panic!("expected lambda or function reference in higher-order argument"),
         }
     }
 
@@ -662,52 +566,30 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         ptr
     }
 
-    // ---- Eq/Neq emission ----
+    // ---- Bool tagged-union emission from a raw comparison ----
 
+    /// Materialize a `Bool` tagged-union value (`True` or `False`
+    /// ptr) from a raw SSA boolean comparison. Used by `==`/`!=`
+    /// lowering and by `x is Con(..)` expressions. Pass `negate =
+    /// true` to flip which branch emits `True`.
     fn lower_eq(&mut self, lhs: Value, rhs: Value, negate: bool) -> Value {
         let cmp = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::Bool);
+        self.lower_bool_from_cmp_neg(cmp, negate)
+    }
+
+    fn lower_bool_from_cmp(&mut self, cmp: Value) -> Value {
+        self.lower_bool_from_cmp_neg(cmp, false)
+    }
+
+    fn lower_bool_from_cmp_neg(&mut self, cmp: Value, negate: bool) -> Value {
         let true_meta = &self.decls.constructors["True"];
         let false_meta = &self.decls.constructors["False"];
         let alloc_size = 1 + true_meta.max_fields;
-
-        let then_block = self.builder.create_block();
-        let else_block = self.builder.create_block();
-        let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
-
-        self.builder
-            .branch(cmp, then_block, vec![], else_block, vec![]);
-
-        // then: return True (or False if negate)
-        self.builder.switch_to(then_block);
         let (then_tag_idx, else_tag_idx) = if negate {
             (false_meta.tag_index, true_meta.tag_index)
         } else {
             (true_meta.tag_index, false_meta.tag_index)
         };
-        let then_ptr = self.builder.alloc(alloc_size);
-        let then_tag = self.builder.const_u64(then_tag_idx);
-        self.builder.store(then_ptr, 0, then_tag);
-        self.builder.jump(merge, vec![then_ptr]);
-
-        // else: return False (or True if negate)
-        self.builder.switch_to(else_block);
-        let else_ptr = self.builder.alloc(alloc_size);
-        let else_tag = self.builder.const_u64(else_tag_idx);
-        self.builder.store(else_ptr, 0, else_tag);
-        self.builder.jump(merge, vec![else_ptr]);
-
-        self.builder.switch_to(merge);
-        merge_param
-    }
-
-    // ---- Is / And / Or lowering ----
-
-    /// Convert a raw bool SSA comparison result to a Bool tagged union (True/False pointer).
-    fn lower_bool_from_cmp(&mut self, cmp: Value) -> Value {
-        let true_meta = &self.decls.constructors["True"];
-        let false_meta = &self.decls.constructors["False"];
-        let alloc_size = 1 + true_meta.max_fields;
 
         let then_block = self.builder.create_block();
         let else_block = self.builder.create_block();
@@ -719,13 +601,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         self.builder.switch_to(then_block);
         let true_ptr = self.builder.alloc(alloc_size);
-        let true_tag = self.builder.const_u64(true_meta.tag_index);
+        let true_tag = self.builder.const_u64(then_tag_idx);
         self.builder.store(true_ptr, 0, true_tag);
         self.builder.jump(merge, vec![true_ptr]);
 
         self.builder.switch_to(else_block);
         let false_ptr = self.builder.alloc(alloc_size);
-        let false_tag = self.builder.const_u64(false_meta.tag_index);
+        let false_tag = self.builder.const_u64(else_tag_idx);
         self.builder.store(false_ptr, 0, false_tag);
         self.builder.jump(merge, vec![false_ptr]);
 
@@ -808,9 +690,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             self.bind_pattern_field(field_pat, field_val);
                         }
                     }
-                    ast::Pattern::Binding(name) => {
+                    ast::Pattern::Binding(sym) => {
                         // Always matches, bind value
-                        self.vars.insert((*name).to_owned(), scr);
+                        self.vars.insert(*sym, scr);
                     }
                     ast::Pattern::Wildcard => {
                         // Always matches, no binding
@@ -981,9 +863,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let guard_tag = self.builder.load(guard_val, 0, ScalarType::U64);
             let true_tag = self.decls.constructors["True"].tag_index;
             let true_val = self.builder.const_u64(true_tag);
-            let is_true =
-                self.builder
-                    .binop(BinaryOp::Eq, guard_tag, true_val, ScalarType::Bool);
+            let is_true = self
+                .builder
+                .binop(BinaryOp::Eq, guard_tag, true_val, ScalarType::Bool);
             let guard_ok = self.builder.create_block();
             self.builder
                 .branch(is_true, guard_ok, vec![], fail_target, vec![]);
@@ -1040,7 +922,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             if !arm.guards.is_empty() {
                 let default_fail = else_block.unwrap_or(merge);
                 self.lower_guards(
-                    &arm.guards, i, meta.tag_index, &tag_groups, &arm_blocks, default_fail,
+                    &arm.guards,
+                    i,
+                    meta.tag_index,
+                    &tag_groups,
+                    &arm_blocks,
+                    default_fail,
                 );
             }
 
@@ -1066,192 +953,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     fn bind_pattern_field(&mut self, pat: &ast::Pattern<'src>, val: Value) {
         match pat {
-            ast::Pattern::Binding(name) => {
-                self.vars.insert((*name).to_owned(), val);
+            ast::Pattern::Binding(sym) => {
+                self.vars.insert(*sym, val);
             }
             ast::Pattern::Wildcard => {}
             _ => panic!("unsupported nested pattern in match arm field"),
         }
     }
 
-    // ---- Fold lowering ----
-
-    fn lower_fold(
-        &mut self,
-        scrutinee_expr: &Expr<'src>,
-        arms: &[ast::MatchArm<'src>],
-        result_ty: ScalarType,
-    ) -> Value {
-        let fold_name = format!("__fold_{}", self.fold_counter);
-        self.fold_counter += 1;
-
-        // Collect captures from arm bodies (free vars minus pattern bindings)
-        let captures: Vec<(&str, Value)> = self.collect_fold_captures(arms);
-
-        // Save builder state
-        let saved_vars = self.vars.clone();
-        let saved_ho_vars = self.ho_vars.clone();
-        let saved_blocks = std::mem::take(&mut self.builder.blocks);
-        let saved_current = self.builder.current_block.take();
-
-        // Build fold helper function
-        let val_param = self.builder.fresh_value();
-        let mut fold_params = vec![val_param];
-        let mut fold_param_types = vec![ScalarType::Ptr];
-        let mut capture_param_map: HashMap<String, Value> = HashMap::new();
-        for (cap_name, _) in &captures {
-            let p = self.builder.fresh_value();
-            fold_params.push(p);
-            fold_param_types.push(ScalarType::Ptr);
-            capture_param_map.insert((*cap_name).to_owned(), p);
-        }
-
-        let entry = self.builder.create_block();
-        self.builder.switch_to(entry);
-
-        // Set up var_map with capture params and propagate ho_vars for captures
-        let mut fold_ho_vars = HashMap::new();
-        for (cap_name, _) in &captures {
-            if let Some(&ls_idx) = saved_ho_vars.get(*cap_name) {
-                fold_ho_vars.insert((*cap_name).to_owned(), ls_idx);
-            }
-        }
-        self.vars = capture_param_map;
-        self.ho_vars = fold_ho_vars;
-
-        let tag = self.builder.load(val_param, 0, ScalarType::U64);
-
-        let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, result_ty);
-
-        let tag_block = self.builder.current_block.unwrap();
-
-        let arm_blocks: Vec<_> = arms.iter().map(|_| self.builder.create_block()).collect();
-        let tag_groups = self.group_arms_by_tag(arms);
-
-        let switch_arms: Vec<_> = tag_groups
-            .iter()
-            .map(|(tag_idx, arm_indices)| (*tag_idx, arm_blocks[arm_indices[0]], vec![]))
-            .collect();
-
-        for (i, arm) in arms.iter().enumerate() {
-            let ast::Pattern::Constructor {
-                name: con_name,
-                fields,
-            } = &arm.pattern
-            else {
-                panic!("fold arms must use constructor patterns");
-            };
-            assert!(!arm.is_return, "return in fold not yet supported");
-            let meta = self.decls.constructors[*con_name].clone();
-
-            self.builder.switch_to(arm_blocks[i]);
-
-            for (fi, field_pat) in fields.iter().enumerate() {
-                let field_ty = meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
-                let field_val = self.builder.load(val_param, fi + 1, field_ty);
-                self.bind_pattern_field(field_pat, field_val);
-            }
-
-            // For recursive fields, emit recursive call and shadow the binding
-            for (fi, field_pat) in fields.iter().enumerate() {
-                if fi < meta.recursive_flags.len() && meta.recursive_flags[fi] {
-                    let field_ty = meta.field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
-                    let field_val = self.builder.load(val_param, fi + 1, field_ty);
-                    let mut call_args = vec![field_val];
-                    for (cap_name, _) in &captures {
-                        call_args.push(self.vars[*cap_name]);
-                    }
-                    let rec_result = self.builder.call(&fold_name, call_args, result_ty);
-                    if let ast::Pattern::Binding(name) = field_pat {
-                        self.vars.insert((*name).to_owned(), rec_result);
-                    }
-                }
-            }
-
-            if !arm.guards.is_empty() {
-                self.lower_guards(
-                    &arm.guards, i, meta.tag_index, &tag_groups, &arm_blocks, merge,
-                );
-            }
-
-            let result = self.lower_expr(&arm.body);
-            self.builder.jump(merge, vec![result]);
-        }
-
-        // Emit switch from tag block
-        self.builder.switch_to(tag_block);
-        self.builder.switch_int(tag, switch_arms, None);
-
-        // Merge block returns
-        self.builder.switch_to(merge);
-        self.builder.ret(merge_param);
-        self.builder
-            .finish_function(&fold_name, fold_params, fold_param_types, result_ty);
-
-        // Restore parent function's builder state
-        self.builder.blocks = saved_blocks;
-        self.builder.current_block = saved_current;
-        self.vars = saved_vars;
-        self.ho_vars = saved_ho_vars;
-
-        let scr_val = self.lower_expr(scrutinee_expr);
-        let mut call_args = vec![scr_val];
-        for (_, capture_val) in &captures {
-            call_args.push(*capture_val);
-        }
-        self.builder.call(&fold_name, call_args, result_ty)
-    }
-
-    // ---- Free variable collection for fold arms (over AST Expr) ----
-
-    fn collect_fold_captures(&self, arms: &[ast::MatchArm<'src>]) -> Vec<(&'src str, Value)> {
-        let is_known = |name: &str| {
-            self.decls.constructors.contains_key(name) || self.decls.funcs.contains(name)
-        };
-        let mut captures = Vec::new();
-        let mut seen = HashSet::new();
-        for arm in arms {
-            let mut bound = HashSet::new();
-            arm.pattern.bind_names(&mut bound);
-            for expr in arm.guards.iter().chain(std::iter::once(&arm.body)) {
-                for name in ast::free_names(expr, &bound, &mut seen, &is_known) {
-                    if let Some(&val) = self.vars.get(name) {
-                        captures.push((name, val));
-                    }
-                }
-            }
-        }
-        captures
-    }
-
     // ---- List walk lowering ----
-
-    /// Classify a function name as a List walk variant, if it is one.
-    fn classify_walk(&self, name: &str) -> Option<WalkKind> {
-        let base = name
-            .strip_prefix("List.")
-            .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest))?;
-        match base {
-            "walk" => Some(WalkKind {
-                backwards: false,
-                until: false,
-            }),
-            "walk_backwards" => Some(WalkKind {
-                backwards: true,
-                until: false,
-            }),
-            "walk_until" => Some(WalkKind {
-                backwards: false,
-                until: true,
-            }),
-            "walk_backwards_until" => Some(WalkKind {
-                backwards: true,
-                until: true,
-            }),
-            _ => None,
-        }
-    }
+    //
+    // Fold lowering used to live here; it now runs as an AST → AST
+    // rewrite in `src/fold_lift.rs`. The lowerer panics on `Fold`
+    // expressions because fold_lift eliminates them before SSA.
 
     fn lower_list_walk(
         &mut self,
@@ -1335,10 +1049,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 }
             }
             ast::Pattern::Record { fields } => {
-                let mut all_names: Vec<&str> = fields.iter().map(|(n, _)| *n).collect();
+                let mut all_names: Vec<&str> = fields
+                    .iter()
+                    .map(|(sym, _)| self.fields.get(*sym))
+                    .collect();
                 all_names.sort_unstable();
-                for (name, elem) in fields {
-                    let slot = all_names.iter().position(|n| n == name).unwrap();
+                for (field_sym, elem) in fields {
+                    let name = self.fields.get(*field_sym);
+                    let slot = all_names.iter().position(|n| *n == name).unwrap();
                     let field_val = self.builder.load(val, slot, ScalarType::Ptr);
                     self.lower_destructure_elem(elem, field_val);
                 }
@@ -1349,8 +1067,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     fn lower_destructure_elem(&mut self, elem: &ast::Pattern<'src>, val: Value) {
         match elem {
-            ast::Pattern::Binding(name) => {
-                self.vars.insert((*name).to_owned(), val);
+            ast::Pattern::Binding(sym) => {
+                self.vars.insert(*sym, val);
             }
             ast::Pattern::Tuple(_) | ast::Pattern::Record { .. } => {
                 self.lower_destructure(elem, val);
@@ -1360,101 +1078,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
-    // ---- Generate apply functions ----
-
-    fn generate_apply_functions(&mut self) {
-        let sets: Vec<LambdaSet<'src>> = self.defunc.lambda_sets.clone();
-
-        for ls in &sets {
-            let apply_name = ls.apply_name.clone();
-
-            // Save builder state
-            let saved_vars = self.vars.clone();
-            let saved_blocks = std::mem::take(&mut self.builder.blocks);
-            let saved_current = self.builder.current_block.take();
-
-            // Build apply function: (closure, arg0, arg1, ...) -> result
-            let closure_param = self.builder.fresh_value();
-            let arg_params: Vec<Value> =
-                (0..ls.arity).map(|_| self.builder.fresh_value()).collect();
-
-            let entry = self.builder.create_block();
-            self.builder.switch_to(entry);
-
-            // Load tag from closure
-            let tag = self.builder.load(closure_param, 0, ScalarType::U64);
-            let tag_block = self.builder.current_block.unwrap();
-
-            let merge = self.builder.create_block();
-            let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
-
-            let mut switch_arms_vec = Vec::new();
-
-            for entry_data in &ls.entries {
-                let meta = &self.decls.constructors[&entry_data.tag_name];
-                let arm_block = self.builder.create_block();
-                switch_arms_vec.push((meta.tag_index, arm_block, vec![]));
-            }
-
-            self.builder.switch_to(tag_block);
-            self.builder.switch_int(tag, switch_arms_vec.clone(), None);
-
-            for (ei, entry_data) in ls.entries.iter().enumerate() {
-                self.builder.switch_to(switch_arms_vec[ei].1);
-
-                if let Some(func_name) = &entry_data.func_ref {
-                    // Direct dispatch to named function
-                    let ret_ty = self.func_ret_type(func_name);
-                    let result = self.builder.call(func_name, arg_params.clone(), ret_ty);
-                    self.builder.jump(merge, vec![result]);
-                } else {
-                    // Load captures from closure
-                    for (ci, cap_name) in entry_data.captures.iter().enumerate() {
-                        let cap_val = self.builder.load(closure_param, ci + 1, ScalarType::Ptr);
-                        self.vars.insert((*cap_name).to_owned(), cap_val);
-                    }
-                    // Wire up ho_vars for captured higher-order variables
-                    for (cap_name, ho_idx) in
-                        entry_data.captures.iter().zip(entry_data.capture_ho.iter())
-                    {
-                        if let Some(ls_idx) = ho_idx {
-                            self.ho_vars.insert((*cap_name).to_owned(), *ls_idx);
-                        }
-                    }
-                    // Bind params
-                    for (param_name, &arg_val) in entry_data.params.iter().zip(&arg_params) {
-                        self.vars.insert((*param_name).to_owned(), arg_val);
-                    }
-
-                    let result = self.lower_expr(entry_data.body.as_ref().unwrap());
-                    self.builder.jump(merge, vec![result]);
-
-                    // Clean up
-                    for cap_name in &entry_data.captures {
-                        self.vars.remove(*cap_name);
-                        self.ho_vars.remove(*cap_name);
-                    }
-                    for param_name in &entry_data.params {
-                        self.vars.remove(*param_name);
-                    }
-                }
-            }
-
-            self.builder.switch_to(merge);
-            self.builder.ret(merge_param);
-
-            let mut all_params = vec![closure_param];
-            all_params.extend(&arg_params);
-            let all_param_types = vec![ScalarType::Ptr; all_params.len()];
-            self.builder
-                .finish_function(&apply_name, all_params, all_param_types, ScalarType::Ptr);
-
-            // Restore builder state
-            self.builder.blocks = saved_blocks;
-            self.builder.current_block = saved_current;
-            self.vars = saved_vars;
-        }
-    }
 }
 
 // ---- SSA emission (Pass 4) ----
@@ -1463,13 +1086,13 @@ fn lower_to_ssa<'src>(
     module: &ast::Module<'src>,
     infer_result: &InferResult,
     decls: &DeclInfo,
-    reachable: &HashSet<String>,
-    defunc_table: &DefuncTable<'src>,
+    symbols: &SymbolTable,
+    fields: &FieldInterner,
 ) -> Result<(Module, Vec<Value>), CompileError> {
-    let mut ctx = LowerCtx::new(decls, defunc_table, infer_result);
+    let mut ctx = LowerCtx::new(decls, infer_result, symbols, fields);
 
-    let mut main_params = None;
-    let mut main_body = None;
+    let mut main_params: Option<Vec<SymbolId>> = None;
+    let mut main_body: Option<Expr<'src>> = None;
 
     for decl in &module.decls {
         let Decl::FuncDef {
@@ -1478,31 +1101,18 @@ fn lower_to_ssa<'src>(
         else {
             continue;
         };
-        let name = *name;
+        let name_str = symbols.display(*name);
 
-        if name == "main" {
+        if name_str == "main" {
             main_params = Some(params.clone());
             main_body = Some(body.clone());
             continue;
         }
 
-        if !reachable.contains(name) {
-            continue;
-        }
-
-        // Mark higher-order parameters
-        for (i, p) in params.iter().enumerate() {
-            let key = (name.to_owned(), i);
-            if let Some(&ls_idx) = defunc_table.ho_param_sets.get(&key) {
-                ctx.ho_vars.insert((*p).to_owned(), ls_idx);
-            }
-        }
-
-        ctx.lower_function(name, params, body);
+        ctx.lower_function(name_str, params, body);
 
         for p in params {
-            ctx.vars.remove(*p);
-            ctx.ho_vars.remove(*p);
+            ctx.vars.remove(p);
         }
     }
 
@@ -1516,7 +1126,7 @@ fn lower_to_ssa<'src>(
         else {
             continue;
         };
-        let type_name = *type_name;
+        let type_name_str = symbols.display(*type_name);
         for method_decl in methods {
             let Decl::FuncDef {
                 name: method_name,
@@ -1527,48 +1137,25 @@ fn lower_to_ssa<'src>(
             else {
                 continue;
             };
-            let method_name = *method_name;
-            let mangled = method_key(type_name, method_name);
-            if !reachable.contains(&mangled) {
-                continue;
-            }
-
-            for (i, p) in params.iter().enumerate() {
-                let key = (mangled.clone(), i);
-                if let Some(&ls_idx) = defunc_table.ho_param_sets.get(&key) {
-                    ctx.ho_vars.insert((*p).to_owned(), ls_idx);
-                }
-            }
-
+            let method_name_str = symbols.display(*method_name);
+            let mangled = method_key(type_name_str, method_name_str);
             ctx.lower_function(&mangled, params, body);
 
             for p in params {
-                ctx.vars.remove(*p);
-                ctx.ho_vars.remove(*p);
+                ctx.vars.remove(p);
             }
         }
     }
-
-    // Generate apply functions from collected lambda sets
-    ctx.generate_apply_functions();
 
     // Lower main
     let params = main_params.ok_or_else(|| CompileError::new("no 'main' function defined"))?;
     let body = main_body.unwrap();
 
-    // Mark main's higher-order params (unlikely but consistent)
-    for (i, p) in params.iter().enumerate() {
-        let key = ("main".to_owned(), i);
-        if let Some(&ls_idx) = defunc_table.ho_param_sets.get(&key) {
-            ctx.ho_vars.insert((*p).to_owned(), ls_idx);
-        }
-    }
-
     let main_ssa_params: Vec<Value> = params
         .iter()
         .map(|p| {
             let v = ctx.builder.fresh_value();
-            ctx.vars.insert((*p).to_owned(), v);
+            ctx.vars.insert(*p, v);
             v
         })
         .collect();
@@ -1587,4 +1174,50 @@ fn lower_to_ssa<'src>(
 
     let ssa_module = ctx.builder.build("__main");
     Ok((ssa_module, main_ssa_params))
+}
+
+// ---- Free helpers ----
+
+/// Classify a mangled callable name as a `List.walk*` variant.
+/// Returns `None` for every non-walk name. Lives at module level
+/// (not as a method on `LowerCtx`) because it's pure string analysis.
+fn classify_walk(name: &str) -> Option<WalkKind> {
+    let base = name
+        .strip_prefix("List.")
+        .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest))?;
+    match base {
+        "walk" => Some(WalkKind { backwards: false, until: false }),
+        "walk_backwards" => Some(WalkKind { backwards: true, until: false }),
+        "walk_until" => Some(WalkKind { backwards: false, until: true }),
+        "walk_backwards_until" => Some(WalkKind { backwards: true, until: true }),
+        _ => None,
+    }
+}
+
+/// `I64.to_str` / `F64.to_str` / etc. — dispatched to the
+/// `__num_to_str` runtime intrinsic.
+fn is_num_to_str(name: &str) -> bool {
+    matches!(
+        name,
+        "I8.to_str" | "U8.to_str" | "I64.to_str" | "U64.to_str" | "F64.to_str"
+    )
+}
+
+/// Emit a call to one of the built-in list intrinsics
+/// (`List.len` / `List.get` / `List.set` / `List.append`). Assumes
+/// the caller already verified that `name` is a list builtin via
+/// `LowerCtx::is_list_builtin`.
+fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -> Value {
+    let (intrinsic, ret_ty) = if name.ends_with(".len") || name == "List.len" {
+        ("__list_len", ScalarType::U64)
+    } else if name.ends_with(".get") || name == "List.get" {
+        ("__list_get", ScalarType::Ptr)
+    } else if name.ends_with(".set") || name == "List.set" {
+        ("__list_set", ScalarType::Ptr)
+    } else if name.ends_with(".append") || name == "List.append" {
+        ("__list_append", ScalarType::Ptr)
+    } else {
+        panic!("unknown list builtin: {name}");
+    };
+    builder.call(intrinsic, args, ret_ty)
 }

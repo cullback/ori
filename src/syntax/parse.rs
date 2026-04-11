@@ -7,7 +7,7 @@ use pest_derive::Parser;
 
 use crate::error::CompileError;
 use crate::source::FileId;
-use crate::syntax::ast::{
+use crate::syntax::raw::{
     BinOp, ConstraintDecl, Decl, Expr, ExprKind, Import, MatchArm, Module, Pattern, Span, Stmt,
     TagDecl, TypeDeclKind, TypeExpr,
 };

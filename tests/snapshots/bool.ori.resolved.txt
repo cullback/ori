@@ -1,0 +1,8 @@
+resolved:
+  imports: (none)
+  decls by file:
+    <stdlib:Bool>: Bool
+    <stdlib:Result>: Result
+    <stdlib:List>: Step, List
+    <stdlib:Str>: Str
+    bool.ori: not, not, bool_to_i64, bool_to_i64, main, main

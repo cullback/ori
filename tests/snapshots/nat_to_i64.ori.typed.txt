@@ -1,0 +1,49 @@
+module:
+  type-alias Nat:
+    TagUnion:
+      tag Zero
+      tag Succ:
+        Named Nat
+  type-alias to_i64:
+    Arrow:
+      params:
+        Named Nat
+      ret:
+        Named I64
+  fn __fold_0(__fold_scrutinee):
+    If : I64:
+      scrutinee:
+        Name __fold_scrutinee : Nat
+      arm:
+        pattern:
+          Con Zero
+        body:
+          IntLit 0 : I64
+      arm:
+        pattern:
+          Con Succ:
+            Bind prev
+        body:
+          Block : I64:
+            Let prev:
+              Call __fold_0 : I64:
+                Name prev : Nat
+            result:
+              BinOp Add : I64:
+                Name prev : I64
+                IntLit 1 : I64
+  type-alias main:
+    Arrow:
+      params:
+        Named I64
+      ret:
+        Named I64
+  fn to_i64(n):
+    Call __fold_0 : I64:
+      Name n : Nat
+  fn main(arg):
+    Call to_i64 : I64:
+      Call Succ : Nat:
+        Call Succ : Nat:
+          Call Succ : Nat:
+            Name Zero : Nat

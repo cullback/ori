@@ -1,0 +1,56 @@
+module:
+  type-alias Person:
+    Record:
+      name:
+        Named I64
+      age:
+        Named I64
+  fn get_age(person):
+    FieldAccess .age : '_:
+      Name person : { age: '_ | '_ }
+  type-alias main:
+    Arrow:
+      params:
+        Named I64
+      ret:
+        Named I64
+  fn main(arg):
+    Block : I64:
+      TypeHint alice:
+        Named Person
+      Let alice:
+        Record : { name: I64, age: I64 }:
+          name:
+            IntLit 1 : I64
+          age:
+            IntLit 30 : I64
+      Let bob:
+        Record : { age: I64, location: I64 }:
+          age:
+            IntLit 25 : I64
+          location:
+            IntLit 2 : I64
+      Let total_age:
+        BinOp Add : I64:
+          Call get_age : I64:
+            Name alice : { name: I64, age: I64 }
+          Call get_age : I64:
+            Name bob : { age: I64, location: '_ }
+      Let ages:
+        ListLit : List(I64):
+          FieldAccess .age : I64:
+            Name alice : { name: I64, age: I64 }
+          FieldAccess .age : I64:
+            Name bob : { age: I64, location: '_ }
+      Let doubled:
+        QualifiedCall List.map : List(I64):
+          Name ages : List(I64)
+          Lambda(x) : (I64) -> I64:
+            BinOp Mul : I64:
+              Name x : I64
+              IntLit 2 : I64
+      result:
+        BinOp Add : I64:
+          Name total_age : I64
+          QualifiedCall List.sum : I64:
+            Name doubled : List(I64)

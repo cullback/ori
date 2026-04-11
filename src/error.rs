@@ -1,5 +1,5 @@
+use crate::ast::Span;
 use crate::source::SourceArena;
-use crate::syntax::ast::Span;
 
 /// A compiler error with an optional source location.
 #[derive(Debug)]

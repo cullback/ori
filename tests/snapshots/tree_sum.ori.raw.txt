@@ -1,0 +1,49 @@
+module:
+  type-alias Tree:
+    TagUnion:
+      tag Leaf:
+        Named I64
+      tag Branch:
+        Named Tree
+        Named Tree
+  type-alias tree_sum:
+    Arrow:
+      params:
+        Named Tree
+      ret:
+        Named I64
+  fn tree_sum(t):
+    Fold:
+      scrutinee:
+        Name t
+      arm:
+        pattern:
+          Con Leaf:
+            Bind val
+        body:
+          Name val
+      arm:
+        pattern:
+          Con Branch:
+            Bind left
+            Bind right
+        body:
+          BinOp Add:
+            Name left
+            Name right
+  type-alias main:
+    Arrow:
+      params:
+        Named I64
+      ret:
+        Named I64
+  fn main(arg):
+    Call tree_sum:
+      Call Branch:
+        Call Branch:
+          Call Leaf:
+            IntLit 1
+          Call Leaf:
+            IntLit 2
+        Call Leaf:
+          IntLit 3

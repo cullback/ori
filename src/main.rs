@@ -1,6 +1,10 @@
+mod ast;
+mod ast_display;
 mod decl_info;
 mod defunc;
 mod error;
+mod fold_lift;
+mod mono;
 mod reachable;
 mod resolve;
 mod source;
@@ -13,9 +17,11 @@ mod source;
 )]
 mod ssa;
 mod stdlib;
+mod symbol;
 mod syntax;
 #[cfg(test)]
 mod test_frontend;
+mod topo;
 mod types;
 
 use std::io::IsTerminal as _;
@@ -32,9 +38,44 @@ fn compile(
     source_dir: Option<&std::path::Path>,
 ) -> Result<(crate::ssa::Module, Vec<crate::ssa::Value>), CompileError> {
     let parsed = syntax::parse::parse(arena.content(main_file), main_file)?;
-    let resolved = resolve::resolve_imports(parsed, arena, source_dir)?;
-    let infer_result = types::infer::check(arena, &resolved.module, &resolved.scope)?;
-    ssa::lower::lower(arena, &resolved.module, &resolved.scope, &infer_result)
+    let mut resolved = resolve::resolve_imports(parsed, arena, source_dir)?;
+    resolved.module = fold_lift::lift(resolved.module, &mut resolved.symbols);
+    topo::compute(&mut resolved.module, &resolved.symbols)?;
+    let infer_result = types::infer::check(
+        arena,
+        &mut resolved.module,
+        &resolved.scope,
+        &resolved.symbols,
+        &resolved.fields,
+    )?;
+    let (mono_module, mono_infer) =
+        mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
+    let defunc_module = defunc::rewrite(
+        mono_module,
+        arena,
+        &resolved.scope,
+        &mono_infer,
+        &mut resolved.symbols,
+    );
+    // Pruning: drop unreachable decls. Build decl_info on the
+    // defunc'd module so reachable::prune can trace aliases, then
+    // feed the pruned module to ssa::lower.
+    let pre_prune_decls = decl_info::build(
+        arena,
+        &defunc_module,
+        &resolved.scope,
+        &mono_infer,
+        &resolved.symbols,
+    );
+    resolved.module = reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
+    ssa::lower::lower(
+        arena,
+        &resolved.module,
+        &resolved.scope,
+        &mono_infer,
+        &resolved.symbols,
+        &resolved.fields,
+    )
 }
 
 fn bytes_to_scalar(bytes: &[u8], heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {

@@ -7,6 +7,9 @@ edition = "2024"
 pest = "2.8.6"
 pest_derive = "2.8.6"
 
+[dev-dependencies]
+expect-test = "1.5"
+
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
@@ -45,6 +48,7 @@ as_conversions = "allow"
 cognitive_complexity = "allow"
 let_underscore_untyped = "allow"
 pub_use = "allow"
+shadow_reuse = "allow"
 shadow_same = "allow"
 shadow_unrelated = "allow"
 similar_names = "allow"

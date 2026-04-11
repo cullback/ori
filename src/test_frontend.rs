@@ -6,11 +6,43 @@ fn run(source: &str, input: i64) -> Scalar {
     let mut arena = SourceArena::new();
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    let infer_result =
-        crate::types::infer::check(&arena, &resolved.module, &resolved.scope).unwrap();
-    let (ssa_module, input_vals) =
-        crate::ssa::lower::lower(&arena, &resolved.module, &resolved.scope, &infer_result).unwrap();
+    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    let infer_result = crate::types::infer::check(
+        &arena,
+        &mut resolved.module,
+        &resolved.scope,
+        &resolved.symbols,
+        &resolved.fields,
+    )
+    .unwrap();
+    let (mono_module, mono_infer) =
+        crate::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
+    let defunc_module = crate::defunc::rewrite(
+        mono_module,
+        &arena,
+        &resolved.scope,
+        &mono_infer,
+        &mut resolved.symbols,
+    );
+    let pre_prune_decls = crate::decl_info::build(
+        &arena,
+        &defunc_module,
+        &resolved.scope,
+        &mono_infer,
+        &resolved.symbols,
+    );
+    resolved.module = crate::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
+    let (ssa_module, input_vals) = crate::ssa::lower::lower(
+        &arena,
+        &resolved.module,
+        &resolved.scope,
+        &mono_infer,
+        &resolved.symbols,
+        &resolved.fields,
+    )
+    .unwrap();
 
     let mut heap = crate::ssa::eval::new_heap();
     let ssa_args: Vec<Scalar> = input_vals
@@ -1409,7 +1441,7 @@ main = |arg| double(arg)";
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let first_decl = &parsed.decls[0];
     match first_decl {
-        crate::syntax::ast::Decl::TypeAnno { doc, .. } => {
+        crate::syntax::raw::Decl::TypeAnno { doc, .. } => {
             assert_eq!(doc.as_deref(), Some("Doubles a number."));
         }
         _ => panic!("expected TypeAnno"),
@@ -1431,7 +1463,7 @@ main = |arg| double(arg)";
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     match &parsed.decls[0] {
-        crate::syntax::ast::Decl::TypeAnno { doc, .. } => {
+        crate::syntax::raw::Decl::TypeAnno { doc, .. } => {
             assert_eq!(doc.as_deref(), Some("First line.\nSecond line."));
         }
         _ => panic!("expected TypeAnno"),
@@ -1453,7 +1485,7 @@ main = |arg| double(arg)";
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     match &parsed.decls[0] {
-        crate::syntax::ast::Decl::TypeAnno { doc, .. } => {
+        crate::syntax::raw::Decl::TypeAnno { doc, .. } => {
             assert!(doc.is_none());
         }
         _ => panic!("expected TypeAnno"),
@@ -1687,4 +1719,711 @@ fn and_or_precedence() {
 main : I64 -> I64
 main = |arg| if True or False and False then 1 else 0";
     assert_eq!(run_i64(source, 0), 1);
+}
+
+// ============================================================
+// Top-level let-polymorphism (Step 5: inference rework)
+//
+// Pre-Step-5, Pass 1 forward-declared every free function with a
+// monomorphic fresh arrow. That meant if you used `id` in two call
+// sites with different argument types, the first use would lock
+// `id`'s parameter to that type and the second would fail. After
+// Step 5, functions are inferred in topological order and generalized
+// immediately, so each caller instantiates a fresh copy.
+// ============================================================
+
+#[test]
+fn let_poly_same_type_twice() {
+    let source = "\
+id = |x| x
+
+main : I64 -> I64
+main = |arg| id(1) + id(2)";
+    assert_eq!(run_i64(source, 0), 3);
+}
+
+#[test]
+fn let_poly_different_types() {
+    // `id` used at I64 and a tag-union constructor in the same body.
+    // Pre-Step-5 this would fail because `id` was forward-declared as
+    // monomorphic and its tvar would be fixed at the first call site.
+    let source = "\
+Pair : [MkPair(I64, I64)]
+
+id = |x| x
+
+main : I64 -> I64
+main = |arg| (
+    a : I64
+    a = id(5)
+    p : Pair
+    p = id(MkPair(1, 2))
+    if p
+        : MkPair(x, y) then a + x + y
+)";
+    assert_eq!(run_i64(source, 0), 8);
+}
+
+// ============================================================
+// Topological sort — System T cycle detection
+// ============================================================
+
+#[test]
+fn topo_cycle_errors() {
+    // Mutual recursion: `f` and `g` call each other. System T forbids
+    // this, so `topo::compute` should produce an error. We run the
+    // frontend up through topo and assert it fails with a message that
+    // mentions the cycle.
+    let source = "\
+f : I64 -> I64
+f = |x| g(x)
+
+g : I64 -> I64
+g = |x| f(x)
+
+main : I64 -> I64
+main = |arg| f(arg)";
+    let mut arena = crate::source::SourceArena::new();
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    let err = crate::topo::compute(&mut resolved.module, &resolved.symbols)
+        .expect_err("expected cycle detection error");
+    let msg = err.format(&arena);
+    assert!(
+        msg.contains("System T violation"),
+        "expected 'System T violation' in error, got: {msg}"
+    );
+    assert!(
+        msg.contains('f') && msg.contains('g'),
+        "expected both cycle members in error, got: {msg}"
+    );
+}
+
+// ============================================================
+// Name resolver — shadowing and is-binding flow
+//
+// These tests exercise the scope-tracking resolver built into
+// `ast::from_raw`, added in Step 6b. Each tests a specific scoping
+// rule that's easy to get wrong.
+// ============================================================
+
+#[test]
+fn shadowing_let_with_self_reference() {
+    // `let x = x + 1`: the RHS `x` refers to the OUTER x, not the new
+    // one. The resolver is required to resolve `val` before binding
+    // the new `name`.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    x = 10
+    x = x + 5
+    x
+)";
+    assert_eq!(run_i64(source, 0), 15);
+}
+
+#[test]
+fn shadowing_param_then_let() {
+    // Block-local `let` shadows a function parameter.
+    let source = "\
+main : I64 -> I64
+main = |x| (
+    x = x * 2
+    x + 1
+)";
+    assert_eq!(run_i64(source, 4), 9);
+}
+
+#[test]
+fn lambda_captures_outer_let_inline() {
+    // A lambda inlined at a call site captures a name bound in the
+    // enclosing block. The resolver must look the captured name up
+    // through the scope stack and use the outer binding's `SymbolId`.
+    let source = "\
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    x = 10
+    apply(|y| y + x, 5)
+)";
+    assert_eq!(run_i64(source, 0), 15);
+}
+
+// ============================================================
+// Monomorphization (Step 7)
+//
+// Checks that polymorphic functions get specialized per call-site
+// instantiation and that the SSA output contains the specialized
+// names (not the originals).
+// ============================================================
+
+/// Compile the source through the frontend + mono and return the
+/// SSA module. Use this helper to assert specific specialization
+/// names appear in the output.
+fn compile_to_ssa(source: &str) -> crate::ssa::Module {
+    let mut arena = SourceArena::new();
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    let infer_result = crate::types::infer::check(
+        &arena,
+        &mut resolved.module,
+        &resolved.scope,
+        &resolved.symbols,
+        &resolved.fields,
+    )
+    .unwrap();
+    let (mono_module, mono_infer) =
+        crate::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
+    let defunc_module = crate::defunc::rewrite(
+        mono_module,
+        &arena,
+        &resolved.scope,
+        &mono_infer,
+        &mut resolved.symbols,
+    );
+    let pre_prune_decls = crate::decl_info::build(
+        &arena,
+        &defunc_module,
+        &resolved.scope,
+        &mono_infer,
+        &resolved.symbols,
+    );
+    resolved.module = crate::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
+    let (ssa, _) = crate::ssa::lower::lower(
+        &arena,
+        &resolved.module,
+        &resolved.scope,
+        &mono_infer,
+        &resolved.symbols,
+        &resolved.fields,
+    )
+    .unwrap();
+    ssa
+}
+
+fn ssa_has_function(ssa: &crate::ssa::Module, name: &str) -> bool {
+    format!("{ssa}").lines().any(|line| {
+        line.starts_with(&format!("fn {name}(")) || line.starts_with(&format!("fn {name}:"))
+    })
+}
+
+#[test]
+fn mono_list_sum_single_instantiation() {
+    // `List.sum` is polymorphic (`forall a [a.add]. List(a) -> a`).
+    // A call with `List(I64)` should produce exactly one
+    // `List.sum__I64` specialization, no polymorphic original.
+    let source = "\
+main : I64 -> I64
+main = |arg| List.sum([1, 2, 3, 4, 5])";
+    let ssa = compile_to_ssa(source);
+    assert!(
+        ssa_has_function(&ssa, "List.sum__I64"),
+        "expected List.sum__I64 in SSA, got:\n{ssa}"
+    );
+    assert!(
+        !ssa_has_function(&ssa, "List.sum"),
+        "unspecialized List.sum should be dropped"
+    );
+}
+
+#[test]
+fn mono_get_age_two_row_specializations() {
+    // `get_age` is polymorphic on record row. Called with two
+    // differently-shaped records, it should produce two distinct
+    // specializations.
+    let source = "\
+Person : { name: I64, age: I64 }
+
+get_age = |person| person.age
+
+main : I64 -> I64
+main = |arg| (
+    alice : Person
+    alice = { name: 1, age: 30 }
+    bob = { age: 25, location: 2 }
+    get_age(alice) + get_age(bob)
+)";
+    let ssa = compile_to_ssa(source);
+    let out = format!("{ssa}");
+    let spec_count = out.lines().filter(|l| l.contains("fn get_age__")).count();
+    assert_eq!(
+        spec_count, 2,
+        "expected 2 get_age specializations, got {spec_count}\n{out}"
+    );
+    assert!(!ssa_has_function(&ssa, "get_age"), "polymorphic original should be dropped");
+}
+
+#[test]
+fn mono_identity_function_two_types() {
+    // The classic let-polymorphism case: `id` used at two different
+    // types. Mono should produce two specializations.
+    let source = "\
+Pair : [MkPair(I64, I64)]
+
+id = |x| x
+
+main : I64 -> I64
+main = |arg| (
+    a = id(5)
+    p = id(MkPair(1, 2))
+    if p
+        : MkPair(x, y) then a + x + y
+)";
+    let ssa = compile_to_ssa(source);
+    let out = format!("{ssa}");
+    let id_specs: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("fn id__"))
+        .collect();
+    assert!(
+        id_specs.len() >= 2,
+        "expected at least 2 id specializations, got {}\nfull SSA:\n{out}",
+        id_specs.len()
+    );
+}
+
+// ============================================================
+// Defunctionalization (Step 8)
+//
+// Checks that `defunc::rewrite` produces a module with no
+// `ExprKind::Lambda` anywhere, synthesizes the expected
+// `__apply_K` and `__lambda_K` decls, and preserves runtime
+// semantics across every flavor of higher-order call.
+// ============================================================
+
+/// Returns true if any `ExprKind::Lambda` survives in the defunc
+/// output. Used by `mono_no_lambdas_after_defunc` to assert the
+/// rewrite is complete.
+fn any_lambda_in_module(module: &crate::ast::Module<'_>) -> bool {
+    fn in_expr(expr: &crate::ast::Expr<'_>) -> bool {
+        use crate::ast::{ExprKind, Stmt};
+        match &expr.kind {
+            ExprKind::Lambda { .. } => true,
+            ExprKind::BinOp { lhs, rhs, .. } => in_expr(lhs) || in_expr(rhs),
+            ExprKind::Call { args, .. } => args.iter().any(in_expr),
+            ExprKind::QualifiedCall { args, .. } => args.iter().any(in_expr),
+            ExprKind::MethodCall { receiver, args, .. } => {
+                in_expr(receiver) || args.iter().any(in_expr)
+            }
+            ExprKind::Block(stmts, result) => {
+                stmts.iter().any(|s| match s {
+                    Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => in_expr(val),
+                    Stmt::Guard { condition, return_val } => in_expr(condition) || in_expr(return_val),
+                    Stmt::TypeHint { .. } => false,
+                }) || in_expr(result)
+            }
+            ExprKind::If { expr, arms, else_body } => {
+                in_expr(expr)
+                    || arms
+                        .iter()
+                        .any(|a| a.guards.iter().any(in_expr) || in_expr(&a.body))
+                    || else_body.as_deref().is_some_and(in_expr)
+            }
+            ExprKind::Fold { expr, arms } => {
+                in_expr(expr)
+                    || arms
+                        .iter()
+                        .any(|a| a.guards.iter().any(in_expr) || in_expr(&a.body))
+            }
+            ExprKind::Record { fields } => fields.iter().any(|(_, e)| in_expr(e)),
+            ExprKind::FieldAccess { record, .. } => in_expr(record),
+            ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => elems.iter().any(in_expr),
+            ExprKind::Is { expr, .. } => in_expr(expr),
+            ExprKind::Name(_)
+            | ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::StrLit(_) => false,
+        }
+    }
+    for decl in &module.decls {
+        match decl {
+            crate::ast::Decl::FuncDef { body, .. } => {
+                if in_expr(body) {
+                    return true;
+                }
+            }
+            crate::ast::Decl::TypeAnno { methods, .. } => {
+                for m in methods {
+                    if let crate::ast::Decl::FuncDef { body, .. } = m {
+                        if in_expr(body) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Run the frontend through defunc and return the rewritten module.
+#[allow(clippy::needless_pass_by_value, reason = "helper used by tests")]
+fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::symbol::SymbolTable) {
+    // Leak the arena so the returned module has a `'static` lifetime.
+    // This is a test-only helper; the real pipeline doesn't need this.
+    let arena = Box::leak(Box::new(SourceArena::new()));
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    let mut resolved = crate::resolve::resolve_imports(parsed, arena, None).unwrap();
+    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    let infer_result = crate::types::infer::check(
+        arena,
+        &mut resolved.module,
+        &resolved.scope,
+        &resolved.symbols,
+        &resolved.fields,
+    )
+    .unwrap();
+    let (mono_module, mono_infer) =
+        crate::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
+    let defunc_module = crate::defunc::rewrite(
+        mono_module,
+        arena,
+        &resolved.scope,
+        &mono_infer,
+        &mut resolved.symbols,
+    );
+    let pre_prune_decls = crate::decl_info::build(
+        arena,
+        &defunc_module,
+        &resolved.scope,
+        &mono_infer,
+        &resolved.symbols,
+    );
+    let pruned = crate::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
+    (pruned, resolved.symbols)
+}
+
+#[test]
+fn defunc_no_lambdas_in_map_program() {
+    // `List.map` has an inline lambda. After defunc, every lambda
+    // in the module should be replaced with a constructor call.
+    let source = "\
+main : I64 -> I64
+main = |arg| List.sum(List.map([1, 2, 3], |x| x * 2))";
+    let (module, _) = compile_through_defunc(source);
+    assert!(
+        !any_lambda_in_module(&module),
+        "defunc left lambdas in the module: {module:?}",
+    );
+}
+
+#[test]
+fn defunc_no_lambdas_in_user_higher_order() {
+    // User-defined higher-order function with a lambda at the
+    // call site. Exercises the non-list-walk rewrite path.
+    let source = "\
+apply : I64, (I64 -> I64) -> I64
+apply = |x, f| f(x)
+
+main : I64 -> I64
+main = |arg| apply(5, |y| y * 2 + 1)";
+    let (module, _) = compile_through_defunc(source);
+    assert!(
+        !any_lambda_in_module(&module),
+        "defunc left lambdas in the module",
+    );
+}
+
+#[test]
+fn prune_drops_unused_stdlib_methods() {
+    // A minimal program that only uses arithmetic — no stdlib list
+    // methods. After prune, `List.map`, `List.sum`, etc. should be
+    // gone from the module's decls. `List` itself (the TypeAnno)
+    // stays because `decl_info` still reads it.
+    let source = "\
+main : I64 -> I64
+main = |arg| 1 + 2 + 3";
+    let (module, symbols) = compile_through_defunc(source);
+    for decl in &module.decls {
+        if let crate::ast::Decl::TypeAnno {
+            name: type_name,
+            methods,
+            ..
+        } = decl
+        {
+            if symbols.display(*type_name) == "List" {
+                for m in methods {
+                    if let crate::ast::Decl::FuncDef { name, .. } = m {
+                        let method_name = symbols.display(*name);
+                        // Only annotation-only methods (no body) and
+                        // dead-code-eliminated ones should be here;
+                        // this simple program doesn't call any.
+                        panic!(
+                            "unexpected reachable List method after prune: {method_name}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn prune_keeps_reachable_chain() {
+    // A → B → C call chain. All three should survive.
+    let source = "\
+c : I64 -> I64
+c = |x| x + 1
+
+b : I64 -> I64
+b = |x| c(x) * 2
+
+a : I64 -> I64
+a = |x| b(x)
+
+main : I64 -> I64
+main = |arg| a(5)";
+    let (module, symbols) = compile_through_defunc(source);
+    let func_names: Vec<String> = module
+        .decls
+        .iter()
+        .filter_map(|d| {
+            if let crate::ast::Decl::FuncDef { name, .. } = d {
+                Some(symbols.display(*name).to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for expected in ["a", "b", "c", "main"] {
+        assert!(
+            func_names.iter().any(|n| n == expected),
+            "expected {expected} to survive prune, got {func_names:?}"
+        );
+    }
+}
+
+#[test]
+fn defunc_emits_apply_function() {
+    // The `__apply_K` function for a user-defined HO callable
+    // should exist after defunc.
+    let source = "\
+apply : I64, (I64 -> I64) -> I64
+apply = |x, f| f(x)
+
+main : I64 -> I64
+main = |arg| apply(5, |y| y * 2)";
+    let (module, symbols) = compile_through_defunc(source);
+    let has_apply = module.decls.iter().any(|d| {
+        if let crate::ast::Decl::FuncDef { name, .. } = d {
+            symbols.display(*name).starts_with("__apply_apply_")
+        } else {
+            false
+        }
+    });
+    assert!(has_apply, "expected __apply_apply_* in module decls");
+}
+
+// ============================================================
+// AST snapshot tests
+//
+// These snapshot the post-parse AST for representative programs.
+// When the AST format intentionally changes, refresh snapshots with:
+//
+//     UPDATE_EXPECT=1 cargo test ast_snapshots
+//
+// ============================================================
+
+mod ast_snapshots {
+    use crate::ast::{self, Decl};
+    use crate::source::SourceArena;
+    use expect_test::expect_file;
+
+    fn render_raw(source_path: &str, source: &str) -> String {
+        let mut arena = SourceArena::new();
+        let file_id = arena.add(source_path.to_owned(), source.to_owned());
+        let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id)
+            .unwrap_or_else(|e| panic!("parse failed for {source_path}: {e:?}"));
+        format!("{parsed}")
+    }
+
+    /// Render the fully-inferred AST for the user's source file only
+    /// (stdlib decls filtered out). Exercises ast_display with types
+    /// populated by inference. Runs fold-lift between resolve and infer,
+    /// so snapshots show the lifted form rather than the raw `Fold`.
+    fn render_typed(source_path: &str, source: &str) -> String {
+        let mut arena = SourceArena::new();
+        let file_id = arena.add(source_path.to_owned(), source.to_owned());
+        let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id)
+            .unwrap_or_else(|e| panic!("parse failed for {source_path}: {e:?}"));
+        let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None)
+            .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
+        resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+        crate::topo::compute(&mut resolved.module, &resolved.symbols)
+            .unwrap_or_else(|e| panic!("topo failed for {source_path}: {e:?}"));
+        crate::types::infer::check(
+            &arena,
+            &mut resolved.module,
+            &resolved.scope,
+            &resolved.symbols,
+            &resolved.fields,
+        )
+        .unwrap_or_else(|e| panic!("infer failed for {source_path}: {e:?}"));
+
+        // Filter to user-file decls only to keep snapshots compact. The
+        // `file.start == 0` condition catches synthesized `__fold_N`
+        // helpers: they inherit the span of the original fold, which is
+        // in the user file, so they stay in the snapshot.
+        let user_decls: Vec<Decl<'_>> = resolved
+            .module
+            .decls
+            .iter()
+            .filter(|d| d.span().file == file_id)
+            .cloned()
+            .collect();
+        let user_module = ast::Module {
+            exports: resolved.module.exports.clone(),
+            imports: resolved.module.imports.clone(),
+            decls: user_decls,
+        };
+        crate::ast_display::render(&user_module, &resolved.symbols, &resolved.fields)
+    }
+
+    /// Render a compact summary of the resolved module: imports, then decl
+    /// names grouped by source file. Catches regressions in `resolve` (e.g.
+    /// a missing stdlib import) without bloating snapshots with the full
+    /// stdlib AST on every program.
+    fn render_resolved(source_path: &str, source: &str) -> String {
+        let mut arena = SourceArena::new();
+        let file_id = arena.add(source_path.to_owned(), source.to_owned());
+        let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id)
+            .unwrap_or_else(|e| panic!("parse failed for {source_path}: {e:?}"));
+        let resolved = crate::resolve::resolve_imports(parsed, &mut arena, None)
+            .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
+
+        let mut out = String::from("resolved:\n");
+        if resolved.module.imports.is_empty() {
+            out.push_str("  imports: (none)\n");
+        } else {
+            out.push_str("  imports:\n");
+            for imp in &resolved.module.imports {
+                out.push_str("    ");
+                out.push_str(imp.module);
+                if !imp.exposing.is_empty() {
+                    out.push_str(" exposing (");
+                    for (i, name) in imp.exposing.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push_str(name);
+                    }
+                    out.push(')');
+                }
+                out.push('\n');
+            }
+        }
+
+        // Group decl names by source file path (from arena).
+        // Preserves the order decls appear in the module.
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        for decl in &resolved.module.decls {
+            let span = decl.span();
+            let path = arena.path(span.file).to_owned();
+            let name = match decl {
+                Decl::TypeAnno { name, .. } | Decl::FuncDef { name, .. } => {
+                    resolved.symbols.display(*name).to_owned()
+                }
+            };
+            if let Some((_, names)) = groups.iter_mut().find(|(p, _)| *p == path) {
+                names.push(name);
+            } else {
+                groups.push((path, vec![name]));
+            }
+        }
+        out.push_str("  decls by file:\n");
+        for (path, names) in &groups {
+            out.push_str("    ");
+            out.push_str(path);
+            out.push_str(": ");
+            for (i, n) in names.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(n);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    macro_rules! snapshot_raw {
+        ($test_name:ident, $program:literal) => {
+            #[test]
+            fn $test_name() {
+                let source = include_str!(concat!("../programs/", $program));
+                let rendered = render_raw($program, source);
+                expect_file![concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/snapshots/",
+                    $program,
+                    ".raw.txt"
+                )]
+                .assert_eq(&rendered);
+            }
+        };
+    }
+
+    macro_rules! snapshot_resolved {
+        ($test_name:ident, $program:literal) => {
+            #[test]
+            fn $test_name() {
+                let source = include_str!(concat!("../programs/", $program));
+                let rendered = render_resolved($program, source);
+                expect_file![concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/snapshots/",
+                    $program,
+                    ".resolved.txt"
+                )]
+                .assert_eq(&rendered);
+            }
+        };
+    }
+
+    macro_rules! snapshot_typed {
+        ($test_name:ident, $program:literal) => {
+            #[test]
+            fn $test_name() {
+                let source = include_str!(concat!("../programs/", $program));
+                let rendered = render_typed($program, source);
+                expect_file![concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/snapshots/",
+                    $program,
+                    ".typed.txt"
+                )]
+                .assert_eq(&rendered);
+            }
+        };
+    }
+
+    snapshot_raw!(tree_sum_raw, "tree_sum.ori");
+    snapshot_raw!(nat_to_i64_raw, "nat_to_i64.ori");
+    snapshot_raw!(bool_raw, "bool.ori");
+    snapshot_raw!(list_import_raw, "list_import.ori");
+    snapshot_raw!(records_raw, "records.ori");
+    snapshot_raw!(echo_raw, "echo.ori");
+
+    snapshot_resolved!(tree_sum_resolved, "tree_sum.ori");
+    snapshot_resolved!(nat_to_i64_resolved, "nat_to_i64.ori");
+    snapshot_resolved!(bool_resolved, "bool.ori");
+    snapshot_resolved!(list_import_resolved, "list_import.ori");
+    snapshot_resolved!(records_resolved, "records.ori");
+    snapshot_resolved!(echo_resolved, "echo.ori");
+
+    snapshot_typed!(tree_sum_typed, "tree_sum.ori");
+    snapshot_typed!(nat_to_i64_typed, "nat_to_i64.ori");
+    snapshot_typed!(bool_typed, "bool.ori");
+    snapshot_typed!(list_import_typed, "list_import.ori");
+    snapshot_typed!(records_typed, "records.ori");
+    snapshot_typed!(echo_typed, "echo.ori");
 }

@@ -1,8 +1,88 @@
+//! Reachability — DFS the call graph from `main`, prune dead decls.
+//!
+//! Step 9 makes this a `Module → Module` pass: [`prune`] returns a
+//! new `Module` with every unreachable free `FuncDef` and every
+//! unreachable method `FuncDef` dropped. `TypeAnno` decls (and their
+//! constructors) stay as-is so `decl_info` can still register
+//! constructor metadata for pattern-match lowering.
+//!
+//! [`compute`] is still exported because `defunc` uses it internally
+//! to decide which function bodies to scan for lambda sets.
+
 use std::collections::{HashMap, HashSet};
 
+use crate::ast::{self, Decl, Expr, ExprKind, Module, Stmt};
 use crate::decl_info::{DeclInfo, method_key};
-use crate::syntax::ast::{self, Decl, Expr, ExprKind, Stmt};
-use crate::types::infer::InferResult;
+use crate::symbol::SymbolTable;
+
+/// Rewrite `module` so that every remaining `FuncDef` (free function
+/// or method) is reachable from `main`. `TypeAnno` decls are kept
+/// unconditionally — their constructors might be referenced from
+/// match arms, and `decl_info` needs them for tag-index bookkeeping.
+pub fn prune<'src>(
+    module: Module<'src>,
+    decls: &DeclInfo,
+    symbols: &SymbolTable,
+) -> Module<'src> {
+    let reachable_set = compute(decls, &module, symbols);
+
+    let mut new_decls: Vec<Decl<'src>> = Vec::new();
+    for decl in module.decls {
+        match decl {
+            Decl::FuncDef { name, .. } => {
+                let name_str = symbols.display(name).to_owned();
+                if reachable_set.contains(&name_str) {
+                    new_decls.push(decl);
+                }
+            }
+            Decl::TypeAnno {
+                span,
+                name,
+                type_params,
+                ty,
+                where_clause,
+                methods,
+                kind,
+                doc,
+            } => {
+                let type_name = symbols.display(name).to_owned();
+                let kept_methods: Vec<Decl<'src>> = methods
+                    .into_iter()
+                    .filter(|m| match m {
+                        Decl::FuncDef {
+                            name: method_name, ..
+                        } => {
+                            let method_name_str = symbols.display(*method_name);
+                            let mangled = method_key(&type_name, method_name_str);
+                            reachable_set.contains(&mangled)
+                        }
+                        // Annotation-only methods (builtin stdlib
+                        // methods like `List.walk`) stay — they
+                        // don't have bodies and the lowerer
+                        // dispatches them via naming convention.
+                        Decl::TypeAnno { .. } => true,
+                    })
+                    .collect();
+                new_decls.push(Decl::TypeAnno {
+                    span,
+                    name,
+                    type_params,
+                    ty,
+                    where_clause,
+                    methods: kept_methods,
+                    kind,
+                    doc,
+                });
+            }
+        }
+    }
+
+    Module {
+        exports: module.exports,
+        imports: module.imports,
+        decls: new_decls,
+    }
+}
 
 /// Compute the set of reachable function names starting from "main".
 ///
@@ -11,20 +91,21 @@ use crate::types::infer::InferResult;
 pub fn compute(
     decls: &DeclInfo,
     module: &ast::Module<'_>,
-    infer_result: &InferResult,
+    symbols: &SymbolTable,
 ) -> HashSet<String> {
     let mut bodies: HashMap<String, &Expr<'_>> = HashMap::new();
 
     for decl in &module.decls {
         match decl {
             Decl::FuncDef { name, body, .. } => {
-                bodies.insert((*name).to_owned(), body);
+                bodies.insert(symbols.display(*name).to_owned(), body);
             }
             Decl::TypeAnno {
                 name: type_name,
                 methods,
                 ..
             } => {
+                let type_name_str = symbols.display(*type_name);
                 for m in methods {
                     if let Decl::FuncDef {
                         name: method_name,
@@ -32,7 +113,8 @@ pub fn compute(
                         ..
                     } = m
                     {
-                        bodies.insert(method_key(type_name, method_name), body);
+                        let method_name_str = symbols.display(*method_name);
+                        bodies.insert(method_key(type_name_str, method_name_str), body);
                     }
                 }
             }
@@ -46,111 +128,145 @@ pub fn compute(
             continue;
         }
         if let Some(body) = bodies.get(&name) {
-            collect_refs(body, &mut worklist);
+            collect_refs(body, &mut worklist, symbols);
         }
     }
 
-    // Expand reachable: if a name is reachable, all its aliases are too
-    let reachable_snapshot: Vec<String> = reachable.iter().cloned().collect();
-    for key in &reachable_snapshot {
-        if let Some(aliases) = decls.func_aliases.get(key) {
-            for alias in aliases {
-                reachable.insert(alias.clone());
-            }
-        }
-    }
-
-    // Add method-resolved functions to reachable set
-    let resolved_methods: Vec<String> = infer_result.method_resolutions.values().cloned().collect();
-    reachable.extend(resolved_methods);
-
+    // Post-mono every callsite uses its canonical mangled name, so
+    // the old alias-expansion pass (which spread reachability through
+    // `module.foo` ↔ `foo`) is obsolete. `decls` stays as a
+    // parameter for API compatibility with callers that still want
+    // to pass it; it's read only inside `collect_refs`.
+    let _ = decls;
     reachable
 }
 
-fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>) {
+fn is_list_walk(name: &str) -> bool {
+    let base = name
+        .strip_prefix("List.")
+        .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest));
+    matches!(
+        base,
+        Some("walk" | "walk_backwards" | "walk_until" | "walk_backwards_until")
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) {
     match &expr.kind {
-        ExprKind::Call { func, args } => {
-            refs.push((*func).to_owned());
+        ExprKind::Call { target, args, .. } => {
+            refs.push(symbols.display(*target).to_owned());
             for a in args {
-                collect_refs(a, refs);
+                collect_refs(a, refs, symbols);
             }
         }
-        ExprKind::QualifiedCall { segments, args } => {
-            refs.push(segments.join("."));
+        ExprKind::QualifiedCall {
+            segments,
+            args,
+            resolved,
+        } => {
+            let joined = segments.join(".");
+            // Post-defunc, `List.walk` and its variants are lowered
+            // by `ssa::lower` with an implicit call to the
+            // corresponding `__apply_{mangled}_2` function that
+            // defunc synthesized. That call doesn't show up in the
+            // AST — it's emitted directly at lower time — so reachable
+            // has to be told explicitly.
+            if is_list_walk(&joined) {
+                refs.push(format!("__apply_{joined}_2"));
+            }
+            refs.push(joined);
+            if let Some(r) = resolved {
+                if is_list_walk(r) {
+                    refs.push(format!("__apply_{r}_2"));
+                }
+                refs.push(r.clone());
+            }
             for a in args {
-                collect_refs(a, refs);
+                collect_refs(a, refs, symbols);
             }
         }
-        ExprKind::Name(name) => {
-            refs.push((*name).to_owned());
+        ExprKind::Name(sym) => {
+            refs.push(symbols.display(*sym).to_owned());
         }
         ExprKind::BinOp { lhs, rhs, .. } => {
-            collect_refs(lhs, refs);
-            collect_refs(rhs, refs);
+            collect_refs(lhs, refs, symbols);
+            collect_refs(rhs, refs, symbols);
         }
         ExprKind::Block(stmts, result) => {
             for stmt in stmts {
                 match stmt {
                     Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
-                        collect_refs(val, refs);
+                        collect_refs(val, refs, symbols);
                     }
                     Stmt::Guard {
                         condition,
                         return_val,
                     } => {
-                        collect_refs(condition, refs);
-                        collect_refs(return_val, refs);
+                        collect_refs(condition, refs, symbols);
+                        collect_refs(return_val, refs, symbols);
                     }
                     Stmt::TypeHint { .. } => {}
                 }
             }
-            collect_refs(result, refs);
+            collect_refs(result, refs, symbols);
         }
         ExprKind::If {
             expr: e,
             arms,
             else_body,
         } => {
-            collect_refs(e, refs);
+            collect_refs(e, refs, symbols);
             for arm in arms {
                 for guard_expr in &arm.guards {
-                    collect_refs(guard_expr, refs);
+                    collect_refs(guard_expr, refs, symbols);
                 }
-                collect_refs(&arm.body, refs);
+                collect_refs(&arm.body, refs, symbols);
             }
             if let Some(eb) = else_body {
-                collect_refs(eb, refs);
+                collect_refs(eb, refs, symbols);
             }
         }
         ExprKind::Fold { expr: e, arms } => {
-            collect_refs(e, refs);
+            collect_refs(e, refs, symbols);
             for arm in arms {
                 for guard_expr in &arm.guards {
-                    collect_refs(guard_expr, refs);
+                    collect_refs(guard_expr, refs, symbols);
                 }
-                collect_refs(&arm.body, refs);
+                collect_refs(&arm.body, refs, symbols);
             }
         }
-        ExprKind::Lambda { body, .. } => collect_refs(body, refs),
+        ExprKind::Lambda { body, .. } => collect_refs(body, refs, symbols),
         ExprKind::Record { fields } => {
             for (_, e) in fields {
-                collect_refs(e, refs);
+                collect_refs(e, refs, symbols);
             }
         }
-        ExprKind::FieldAccess { record, .. } => collect_refs(record, refs),
-        ExprKind::MethodCall { receiver, args, .. } => {
-            collect_refs(receiver, refs);
+        ExprKind::FieldAccess { record, .. } => collect_refs(record, refs, symbols),
+        ExprKind::MethodCall {
+            receiver,
+            args,
+            resolved,
+            ..
+        } => {
+            collect_refs(receiver, refs, symbols);
+            if let Some(r) = resolved {
+                if is_list_walk(r) {
+                    refs.push(format!("__apply_{r}_2"));
+                }
+                refs.push(r.clone());
+            }
             for a in args {
-                collect_refs(a, refs);
+                collect_refs(a, refs, symbols);
             }
         }
         ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
             for e in elems {
-                collect_refs(e, refs);
+                collect_refs(e, refs, symbols);
             }
         }
         ExprKind::Is { expr: inner, .. } => {
-            collect_refs(inner, refs);
+            collect_refs(inner, refs, symbols);
         }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
     }

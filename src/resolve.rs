@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::ast;
 use crate::error::CompileError;
 use crate::source::SourceArena;
 use crate::stdlib;
-use crate::syntax::ast::{Decl, Module};
 use crate::syntax::parse;
+use crate::syntax::raw::{Decl, Module};
 
 /// Tracks which imported types need module qualification.
 pub struct ModuleScope {
@@ -31,9 +32,17 @@ impl ModuleScope {
 }
 
 /// Resolved module.
+///
+/// `module` is in the elaborated `ast::Module` form, converted from
+/// the raw parser output at the end of [`resolve_imports`] so that
+/// downstream passes never see the raw shape. `symbols` carries the
+/// `SymbolTable` allocated during conversion — passes that need to
+/// recover display names from `SymbolId`s look them up here.
 pub struct Resolved<'src> {
-    pub module: Module<'src>,
+    pub module: ast::Module<'src>,
     pub scope: ModuleScope,
+    pub symbols: crate::symbol::SymbolTable,
+    pub fields: crate::symbol::FieldInterner,
 }
 
 /// Resolve imports by prepending imported declarations to the module.
@@ -175,8 +184,13 @@ pub fn resolve_imports<'src>(
         imports: vec![],
         decls: all_decls,
     };
+    let mut symbols = crate::symbol::SymbolTable::new();
+    let mut fields = crate::symbol::FieldInterner::new();
+    let module = ast::from_raw(resolved, &mut symbols, &mut fields);
     Ok(Resolved {
-        module: resolved,
+        module,
         scope,
+        symbols,
+        fields,
     })
 }

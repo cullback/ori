@@ -1,0 +1,8 @@
+resolved:
+  imports: (none)
+  decls by file:
+    <stdlib:Bool>: Bool
+    <stdlib:Result>: Result
+    <stdlib:List>: Step, List
+    <stdlib:Str>: Str
+    tree_sum.ori: Tree, tree_sum, tree_sum, main, main
