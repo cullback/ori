@@ -584,7 +584,7 @@ fn is_list_walk(name: &str) -> bool {
         .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest));
     matches!(
         base,
-        Some("walk" | "walk_backwards" | "walk_until" | "walk_backwards_until")
+        Some("walk" | "walk_until")
     )
 }
 

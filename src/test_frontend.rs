@@ -1075,13 +1075,25 @@ main = |arg| List.get(List.set([10, 20, 30], 1, 99), 1)";
 }
 
 #[test]
-fn builtin_list_walk_backwards() {
-    // walk_backwards accumulates right-to-left: 0 + 3*100 + 2*10 + 1*1 = 321
+fn builtin_list_reverse_then_walk() {
+    // Right-to-left iteration is expressed as `reverse().walk(...)`.
+    // reversed = [3, 2, 1]; 0 * 10 + 3 = 3; 3 * 10 + 2 = 32; 32 * 10 + 1 = 321.
     let source = "\
 main : I64 -> I64
-main = |arg| List.walk_backwards([1, 2, 3], 0, |acc, x| acc * 10 + x)";
+main = |arg| List.walk(List.reverse([1, 2, 3]), 0, |acc, x| acc * 10 + x)";
 
     assert_eq!(run_i64(source, 0), 321);
+}
+
+#[test]
+fn builtin_list_reverse_standalone() {
+    // `reverse` as a standalone operation — verify the list contents
+    // are actually reordered (by indexing into the reversed list).
+    let source = "\
+main : I64 -> I64
+main = |arg| List.get(List.reverse([10, 20, 30]), 0)";
+
+    assert_eq!(run_i64(source, 0), 30);
 }
 
 #[test]
@@ -1125,11 +1137,12 @@ main = |arg| List.walk_until([1, 2, 3], 0, |acc, x| Continue(acc + x))";
 }
 
 #[test]
-fn walk_backwards_until_break_early() {
-    // Walk backwards, break when we hit 2
+fn reverse_then_walk_until_break_early() {
+    // Right-to-left walk-until via reverse().walk_until(...). Walk
+    // the reversed list [5, 4, 3, 2, 1] and break when we hit 2.
     let source = "\
 main : I64 -> I64
-main = |arg| List.walk_backwards_until([1, 2, 3, 4, 5], 0, |acc, x|
+main = |arg| List.walk_until(List.reverse([1, 2, 3, 4, 5]), 0, |acc, x|
     if x == 2 then Break(acc)
     else Continue(acc + x)
 )";

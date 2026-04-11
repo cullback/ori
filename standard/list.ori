@@ -18,27 +18,21 @@ List := {}.(
     # Returns a new list with the element appended to the end.
     append : List(a), a -> List(a)
 
+    # Returns a new list with the elements in reverse order.
+    # For right-to-left iteration, chain through reverse:
+    # `xs.reverse().walk(init, f)`.
+    reverse : List(a) -> List(a)
+
     # Reduces the list from left to right, threading an accumulator
     # through each element.
     walk : List(a), b, (b, a -> b) -> b
 
-    # Reduces the list from right to left, threading an accumulator
-    # through each element.
-    walk_backwards : List(a), b, (b, a -> b) -> b
-
     # Same as walk, except the callback can stop iteration early.
     walk_until : List(a), b, (b, a -> Step(b)) -> b
-
-    # Same as walk_backwards, except the callback can stop iteration early.
-    walk_backwards_until : List(a), b, (b, a -> Step(b)) -> b
 
     # Returns True if the list has no elements.
     is_empty : List(a) -> Bool
     is_empty = |xs| List.len(xs) == 0
-
-    # Returns a new list with the elements in reverse order.
-    reverse : List(a) -> List(a)
-    reverse = |xs| List.walk_backwards(xs, [], |acc, x| List.append(acc, x))
 
     # Applies a function to every element, returning a new list.
     map : List(a), (a -> a) -> List(a)

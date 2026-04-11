@@ -311,6 +311,30 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(new_list, 2, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
+        "__list_reverse" => {
+            // args: [list_ptr] → new_list_ptr with elements in reverse order
+            let Scalar::Ptr(list_idx) = args[0] else {
+                panic!("__list_reverse: expected Ptr");
+            };
+            let Scalar::U64(len) = heap.load(list_idx, 0) else {
+                panic!("__list_reverse: len is not U64");
+            };
+            let Scalar::Ptr(old_data) = heap.load(list_idx, 2) else {
+                panic!("__list_reverse: data is not Ptr");
+            };
+            #[expect(clippy::cast_possible_truncation)]
+            let len_usize = len as usize;
+            let new_data = heap.alloc(len_usize);
+            for i in 0..len_usize {
+                let elem = heap.load_dyn(old_data, i);
+                heap.store(new_data, len_usize - 1 - i, elem);
+            }
+            let new_list = heap.alloc(3);
+            heap.store(new_list, 0, Scalar::U64(len));
+            heap.store(new_list, 1, Scalar::U64(len));
+            heap.store(new_list, 2, Scalar::Ptr(new_data));
+            Some(Scalar::Ptr(new_list))
+        }
         "__num_to_str" => {
             // args: [number] → str_ptr (List(U8))
             let s = match args[0] {

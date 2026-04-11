@@ -67,7 +67,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 }
 
 struct WalkKind {
-    backwards: bool,
     until: bool,
 }
 
@@ -489,7 +488,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 init_val,
                 closure_val,
                 &apply_name,
-                walk.backwards,
                 walk.until,
                 acc_ty,
             );
@@ -535,7 +533,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 init_val,
                 closure_val,
                 &apply_name,
-                walk.backwards,
                 walk.until,
                 acc_ty,
             );
@@ -570,7 +567,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     fn is_list_builtin(name: &str) -> bool {
-        matches!(name, "List.len" | "List.get" | "List.set" | "List.append")
+        matches!(
+            name,
+            "List.len" | "List.get" | "List.set" | "List.append" | "List.reverse"
+        )
     }
 
     // ---- Builtin arithmetic dispatch ----
@@ -1053,7 +1053,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         init_val: Value,
         step_val: Value,
         apply_name: &str,
-        backwards: bool,
         until: bool,
         acc_ty: ScalarType,
     ) -> Value {
@@ -1078,18 +1077,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .branch(cmp, done, vec![acc_param], body_block, vec![]);
 
         self.builder.switch_to(body_block);
-        let elem = if backwards {
-            let one = self.builder.const_u64(1);
-            let len_minus_1 = self
-                .builder
-                .binop(BinaryOp::Sub, len_val, one, ScalarType::U64);
-            let rev_idx = self
-                .builder
-                .binop(BinaryOp::Sub, len_minus_1, i_param, ScalarType::U64);
-            self.builder.load_dyn(data_ptr, rev_idx, ScalarType::Ptr)
-        } else {
-            self.builder.load_dyn(data_ptr, i_param, ScalarType::Ptr)
-        };
+        let elem = self.builder.load_dyn(data_ptr, i_param, ScalarType::Ptr);
         let result =
             self.builder
                 .call(apply_name, vec![step_val, acc_param, elem], ScalarType::Ptr);
@@ -1302,10 +1290,8 @@ fn classify_walk(name: &str) -> Option<WalkKind> {
         .strip_prefix("List.")
         .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest))?;
     match base {
-        "walk" => Some(WalkKind { backwards: false, until: false }),
-        "walk_backwards" => Some(WalkKind { backwards: true, until: false }),
-        "walk_until" => Some(WalkKind { backwards: false, until: true }),
-        "walk_backwards_until" => Some(WalkKind { backwards: true, until: true }),
+        "walk" => Some(WalkKind { until: false }),
+        "walk_until" => Some(WalkKind { until: true }),
         _ => None,
     }
 }
@@ -1320,9 +1306,9 @@ fn is_num_to_str(name: &str) -> bool {
 }
 
 /// Emit a call to one of the built-in list intrinsics
-/// (`List.len` / `List.get` / `List.set` / `List.append`). Assumes
-/// the caller already verified that `name` is a list builtin via
-/// `LowerCtx::is_list_builtin`.
+/// (`List.len` / `List.get` / `List.set` / `List.append` /
+/// `List.reverse`). Assumes the caller already verified that `name`
+/// is a list builtin via `LowerCtx::is_list_builtin`.
 fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -> Value {
     let (intrinsic, ret_ty) = if name.ends_with(".len") || name == "List.len" {
         ("__list_len", ScalarType::U64)
@@ -1332,6 +1318,8 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
         ("__list_set", ScalarType::Ptr)
     } else if name.ends_with(".append") || name == "List.append" {
         ("__list_append", ScalarType::Ptr)
+    } else if name.ends_with(".reverse") || name == "List.reverse" {
+        ("__list_reverse", ScalarType::Ptr)
     } else {
         panic!("unknown list builtin: {name}");
     };
