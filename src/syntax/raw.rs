@@ -72,7 +72,11 @@ impl Decl<'_> {
 pub enum TypeExpr<'src> {
     Named(&'src str),
     App(&'src str, Vec<TypeExpr<'src>>),
-    TagUnion(Vec<TagDecl<'src>>),
+    /// Tag union annotation. The trailing `bool` is `true` when the
+    /// annotation ends with `..` (open row), `false` when closed.
+    /// Inference converts open rows to `Type::TagUnion { rest:
+    /// Some(fresh) }`, closed rows to `rest: None`.
+    TagUnion(Vec<TagDecl<'src>>, bool),
     Arrow(Vec<TypeExpr<'src>>, Box<TypeExpr<'src>>),
     Record(Vec<(&'src str, TypeExpr<'src>)>),
     Tuple(Vec<TypeExpr<'src>>),

@@ -35,13 +35,13 @@ module:
           Call get_age : I64:
             Name alice : { name: I64, age: I64 }
           Call get_age : I64:
-            Name bob : { age: I64, location: '_ }
+            Name bob : { age: I64, location: I64 }
       Let ages:
         ListLit : List(I64):
           FieldAccess .age : I64:
             Name alice : { name: I64, age: I64 }
           FieldAccess .age : I64:
-            Name bob : { age: I64, location: '_ }
+            Name bob : { age: I64, location: I64 }
       Let doubled:
         QualifiedCall List.map : List(I64):
           Name ages : List(I64)

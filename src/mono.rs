@@ -701,6 +701,47 @@ fn extract_substitution(scheme_ty: &Type, concrete_ty: &Type, out: &mut HashMap<
                 }
             }
         }
+        (
+            Type::TagUnion {
+                tags: t1,
+                rest: r1,
+            },
+            Type::TagUnion {
+                tags: t2,
+                rest: _r2,
+            },
+        ) => {
+            // Unify common tags' payloads recursively.
+            for (name, p1) in t1 {
+                if let Some((_, p2)) = t2.iter().find(|(n, _)| n == name) {
+                    for (x, y) in p1.iter().zip(p2.iter()) {
+                        extract_substitution(x, y, out);
+                    }
+                }
+            }
+            // Row polymorphism: if the scheme has an open row and
+            // the concrete type has extra tags, bind the row
+            // variable to a closed union of the extras so that
+            // later substitutions close the expression types in
+            // the specialized body. Mirrors the record row logic
+            // above.
+            if let Some(row_var_ty) = r1.as_deref() {
+                if let Type::Var(row_var) = row_var_ty {
+                    let extra_tags: Vec<(String, Vec<Type>)> = t2
+                        .iter()
+                        .filter(|(n, _)| !t1.iter().any(|(n2, _)| n2 == n))
+                        .cloned()
+                        .collect();
+                    out.insert(
+                        *row_var,
+                        Type::TagUnion {
+                            tags: extra_tags,
+                            rest: None,
+                        },
+                    );
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -941,6 +982,25 @@ fn substitute_types_in_stmt(stmt: &mut Stmt<'_>, mapping: &HashMap<TypeVar, Type
     }
 }
 
+/// Apply a `TypeVar → Type` mapping at a row-variable position.
+/// Unlike the generic `apply_mapping`, an unresolved row variable
+/// defaults to an empty closed row rather than `Con("I64")`, because
+/// a row position is structurally a "possibly more tags" slot and the
+/// natural default for "no further tags" is an empty closed union.
+/// The caller is expected to run `flatten_rows` afterwards to absorb
+/// the empty row.
+fn apply_mapping_row(ty: &Type, mapping: &HashMap<TypeVar, Type>) -> Type {
+    match ty {
+        Type::Var(v) => mapping.get(v).cloned().unwrap_or_else(|| {
+            Type::TagUnion {
+                tags: Vec::new(),
+                rest: None,
+            }
+        }),
+        _ => apply_mapping(ty, mapping),
+    }
+}
+
 /// Apply a `TypeVar → Type` mapping to a type. Also normalizes
 /// residual vars to the default sentinel so post-mono types are
 /// fully concrete.
@@ -966,18 +1026,32 @@ fn apply_mapping(ty: &Type, mapping: &HashMap<TypeVar, Type>) -> Type {
                 .collect(),
             rest: None,
         },
-        Type::TagUnion { tags, .. } => Type::TagUnion {
-            tags: tags
-                .iter()
-                .map(|(n, payloads)| {
-                    (
-                        n.clone(),
-                        payloads.iter().map(|p| apply_mapping(p, mapping)).collect(),
-                    )
-                })
-                .collect(),
-            rest: None,
-        },
+        Type::TagUnion { tags, rest } => {
+            // Substitute through both the tag payloads and the
+            // row-variable rest. Row vars are handled specially:
+            // if the rest is an unresolved type variable, default
+            // to an empty closed row (no extra tags) rather than
+            // the generic `default_type()` (which is `I64` and
+            // makes no sense at a row position). `flatten_rows`
+            // then folds the empty row into the outer tags. This
+            // path handles open rows that never got closed during
+            // inference — e.g., let-generalized tag values whose
+            // row var stayed unresolved inside the original
+            // function body even though the call site closed it.
+            let substituted = Type::TagUnion {
+                tags: tags
+                    .iter()
+                    .map(|(n, payloads)| {
+                        (
+                            n.clone(),
+                            payloads.iter().map(|p| apply_mapping(p, mapping)).collect(),
+                        )
+                    })
+                    .collect(),
+                rest: rest.as_ref().map(|r| Box::new(apply_mapping_row(r, mapping))),
+            };
+            crate::types::engine::flatten_rows(substituted)
+        }
         Type::Tuple(elems) => Type::Tuple(elems.iter().map(|e| apply_mapping(e, mapping)).collect()),
     }
 }

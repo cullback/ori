@@ -606,7 +606,7 @@ fn build_closure_type_decl<'src>(ls: &LambdaSet<'src>) -> Decl<'src> {
         span: synth_span(),
         name: ls.closure_type_sym.expect("closure_type_sym not allocated"),
         type_params: Vec::new(),
-        ty: TypeExpr::TagUnion(tags),
+        ty: TypeExpr::TagUnion(tags, false),
         where_clause: Vec::new(),
         methods: Vec::new(),
         kind: TypeDeclKind::Transparent,

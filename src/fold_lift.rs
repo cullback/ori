@@ -98,7 +98,7 @@ fn collect_rec_from_decl<'src>(
 ) {
     if let ast::Decl::TypeAnno {
         name: type_name,
-        ty: ast::TypeExpr::TagUnion(tags),
+        ty: ast::TypeExpr::TagUnion(tags, _),
         methods,
         ..
     } = decl

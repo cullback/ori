@@ -182,6 +182,18 @@ an `ssa::Builder`. Notable bits:
 - **Match compiler** — arms lower to a switch on the discriminant
   plus per-tag blocks; `is`-binding flow through `and` chains
   propagates via SSA block parameters.
+- **Constructor layout** — the `con_layout(name, ctx_ty)` helper
+  unifies declared and structural constructor layout lookup.
+  Declared constructors (from `TypeAnno` tag unions like `Color : [Red,
+  Green, Blue]`) read `(tag_index, max_fields, field_types)` from
+  `decl_info.constructors`. Structural constructors (bare uppercase
+  names that aren't declared anywhere) derive the same layout on the
+  fly from the enclosing expression's `Type::TagUnion` — tags are
+  sorted by name, the constructor's position is its tag index, and
+  `max_fields` is the max payload arity across all tags in the union.
+  Per-specialization dense indices, no global tag interner. This is
+  the "layout selection" step from the tag unions design, inlined
+  into lowering rather than run as a separate pass.
 - **List walk loops** — `List.walk(xs, init, f)` emits a loop that
   calls the `__apply_K` dispatcher for each element, not a function
   call. This is why reachability has to seed the apply function.

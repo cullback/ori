@@ -120,7 +120,7 @@ fn register_decl(
     match decl {
         Decl::TypeAnno {
             name,
-            ty: TypeExpr::TagUnion(tags),
+            ty: TypeExpr::TagUnion(tags, _),
             methods,
             ..
         } => {

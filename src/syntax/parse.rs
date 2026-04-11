@@ -711,9 +711,21 @@ fn parse_type_expr(pair: Pair<'_, Rule>) -> TypeExpr<'_> {
                         panic!("unexpected type_atom after name");
                     }
                 }
-                Rule::tag_decl => {
-                    let tags: Vec<TagDecl<'_>> = inner.into_iter().map(parse_tag_decl).collect();
-                    TypeExpr::TagUnion(tags)
+                Rule::tag_decl | Rule::open_row_marker => {
+                    // A tag union may contain any mix of tag_decl
+                    // children plus an optional trailing
+                    // `open_row_marker` (the `..` token). If present,
+                    // the union is open.
+                    let mut tags: Vec<TagDecl<'_>> = Vec::new();
+                    let mut open = false;
+                    for child in inner {
+                        match child.as_rule() {
+                            Rule::tag_decl => tags.push(parse_tag_decl(child)),
+                            Rule::open_row_marker => open = true,
+                            other => panic!("unexpected tag union child: {other:?}"),
+                        }
+                    }
+                    TypeExpr::TagUnion(tags, open)
                 }
                 Rule::field_type => {
                     let fields: Vec<(&str, TypeExpr<'_>)> =

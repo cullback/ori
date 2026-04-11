@@ -168,8 +168,9 @@ fn write_type_expr(f: &mut fmt::Formatter<'_>, ty: &TypeExpr<'_>, level: usize) 
             }
             Ok(())
         }
-        TypeExpr::TagUnion(tags) => {
-            write_line(f, level, format_args!("TagUnion:"))?;
+        TypeExpr::TagUnion(tags, open) => {
+            let label = if *open { "TagUnion (open):" } else { "TagUnion:" };
+            write_line(f, level, format_args!("{label}"))?;
             for t in tags {
                 write_tag_decl(f, t, level + 1)?;
             }

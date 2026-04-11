@@ -39,12 +39,19 @@ type_expr = {
 
 type_atom = {
     name ~ "(" ~ type_atom ~ ("," ~ type_atom)* ~ ")"
-  | "[" ~ (tag_decl ~ ("," ~ tag_decl)*)? ~ "]"
+  | "[" ~ (tag_decl ~ ("," ~ tag_decl)*)? ~ ("," ~ open_row_marker | open_row_marker)? ~ "]"
   | "{" ~ (field_type ~ ("," ~ field_type)*)? ~ "}"
   | "(" ~ type_atom ~ ("," ~ type_atom)+ ~ ")"
   | "(" ~ type_expr ~ ")"
   | name
 }
+
+// Row-polymorphism marker in a tag union annotation. `[Red, Green, ..]`
+// means "at least Red and Green, possibly more"; `[..]` means "any
+// tags." The `..` token gets parsed as a dedicated rule so the parser
+// can detect it in the tag list and set an open-row flag on the AST
+// TagUnion node.
+open_row_marker = { ".." }
 
 tag_decl = { name ~ ("(" ~ type_atom ~ ("," ~ type_atom)* ~ ")")? }
 

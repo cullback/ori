@@ -1661,6 +1661,28 @@ main = |arg| (
 }
 
 #[test]
+fn structural_tag_runtime_open_row_annotation() {
+    // Open-row annotation on a function return type. The body
+    // produces a narrower union; the caller uses a wider (closed)
+    // annotation to pin it. Verifies grammar support for `..` and
+    // that inference/mono/lowering all cooperate.
+    let source = "\
+pick : I64 -> [Red, Green, ..]
+pick = |n| if n == 0 then Red else Green
+
+describe : [Blue, Green, Red] -> I64
+describe = |c| if c
+    : Red then 10
+    : Green then 20
+    : Blue then 30
+
+main : I64 -> I64
+main = |arg| describe(pick(arg))";
+    assert_eq!(run_i64(source, 0), 10);
+    assert_eq!(run_i64(source, 1), 20);
+}
+
+#[test]
 fn structural_tag_runtime_is_expression() {
     // Standalone `is` expression on a structural tag value.
     let source = "\

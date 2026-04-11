@@ -179,7 +179,7 @@ impl<W: Write> Printer<'_, W> {
                 }
                 Ok(())
             }
-            TypeExpr::TagUnion(tags) => {
+            TypeExpr::TagUnion(tags, _) => {
                 self.line(level, format_args!("TagUnion:"))?;
                 for t in tags {
                     self.write_tag_decl(t, level + 1)?;

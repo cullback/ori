@@ -46,7 +46,7 @@ pub enum Type {
 /// through this helper folds the chain into a single flat row so that
 /// downstream consumers (display, mono normalization, tests) see a
 /// canonical form.
-fn flatten_rows(ty: Type) -> Type {
+pub fn flatten_rows(ty: Type) -> Type {
     match ty {
         Type::TagUnion { mut tags, mut rest } => {
             loop {

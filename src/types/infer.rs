@@ -11,6 +11,15 @@ fn method_key(type_name: &str, method: &str) -> String {
     format!("{type_name}.{method}")
 }
 
+/// Value restriction helper: is this expression a syntactic value
+/// safe to let-generalize? Functions (lambdas) are always safe.
+/// Everything else — calls, matches, records, tag values — is not,
+/// because generalizing a non-function let-binding can freeze row
+/// variables prematurely and break structural tag row propagation.
+const fn is_syntactic_value(expr: &Expr<'_>) -> bool {
+    matches!(expr.kind, ExprKind::Lambda { .. })
+}
+
 /// Results of type inference, communicated to the lowerer.
 ///
 /// Post-Step-2c, `InferResult` only carries data that isn't naturally
@@ -164,12 +173,15 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     Box::new(self.type_expr_to_type(ret, tvar_env)?),
                 ))
             }
-            TypeExpr::TagUnion(tags) => {
+            TypeExpr::TagUnion(tags, open) => {
                 // Inline tag union in a type annotation becomes a
-                // closed `Type::TagUnion`. Nominal declarations that
-                // use tag unions still go through `register_type_decl`
-                // and produce a `Type::Con` — this path only fires for
-                // inline annotations like `f : I64 -> [Red, Green]`.
+                // `Type::TagUnion`. Closed (`[Red, Green]`) annotations
+                // set `rest: None`; open (`[Red, ..]`) annotations set
+                // `rest: Some(fresh)` so the row can grow through
+                // unification. Nominal tag-union declarations still
+                // go through `register_type_decl` and produce a
+                // `Type::Con` — this path only fires for inline
+                // annotations on function signatures or let bindings.
                 let mut tag_entries: Vec<(String, Vec<Type>)> = Vec::new();
                 for tag in tags {
                     let mut payload_types = Vec::new();
@@ -178,9 +190,10 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     }
                     tag_entries.push((tag.name.to_owned(), payload_types));
                 }
+                let rest = open.then(|| Box::new(self.engine.fresh()));
                 Ok(Type::TagUnion {
                     tags: tag_entries,
-                    rest: None,
+                    rest,
                 })
             }
             TypeExpr::Record(fields) => {
@@ -371,15 +384,39 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                                 let hint_ty = self.resolve_type_expr(&hint)?;
                                 self.unify_at(&val_ty, &hint_ty, val.span)?;
                             }
-                            let scheme = self.engine.generalize(&val_ty, &self.env);
+                            // Value restriction: only generalize let
+                            // bindings whose value is syntactically a
+                            // function. Non-function values (tag
+                            // union values, numbers, records, etc.)
+                            // keep their fresh type so that later uses
+                            // stay unified with the binding's actual
+                            // runtime value. This avoids a subtle bug
+                            // with structural tag rows: generalizing
+                            // a `let r = parse(1)` where parse's
+                            // return is an open row would freeze the
+                            // row var in r's scheme; later uses would
+                            // re-instantiate to a fresh row var that
+                            // closes independently from the original
+                            // expression's row, producing different
+                            // tag layouts for caller and callee.
+                            let scheme = if is_syntactic_value(val) {
+                                self.engine.generalize(&val_ty, &self.env)
+                            } else {
+                                Scheme::mono(val_ty)
+                            };
                             self.env.insert(name_str, scheme);
                         }
                         Stmt::Destructure { pattern, val } => {
                             let val_ty = self.infer_expr(val)?;
                             let bindings = self.infer_pattern(pattern, &val_ty, val.span, None)?;
+                            let is_value = is_syntactic_value(val);
                             for (sym, ty) in bindings {
                                 let name = self.symbols.display(sym).to_owned();
-                                let scheme = self.engine.generalize(&ty, &self.env);
+                                let scheme = if is_value {
+                                    self.engine.generalize(&ty, &self.env)
+                                } else {
+                                    Scheme::mono(ty)
+                                };
                                 self.env.insert(name, scheme);
                             }
                         }
@@ -1218,7 +1255,7 @@ pub fn check<'src>(
             Decl::TypeAnno {
                 name,
                 type_params,
-                ty: TypeExpr::TagUnion(tags),
+                ty: TypeExpr::TagUnion(tags, _),
                 methods,
                 ..
             } => {
@@ -1405,7 +1442,7 @@ pub fn check<'src>(
         } = decl
         {
             let name = symbols.display(*name);
-            if *kind == TypeDeclKind::Transparent && !matches!(ty, TypeExpr::TagUnion(_)) {
+            if *kind == TypeDeclKind::Transparent && !matches!(ty, TypeExpr::TagUnion(..)) {
                 let underlying = ctx.resolve_type_expr(ty)?;
                 ctx.engine.transparent.insert(name.to_owned(), underlying);
             }
@@ -1477,7 +1514,7 @@ pub fn check<'src>(
         {
             let name = symbols.display(*name);
             let opaque_set_up =
-                if *kind == TypeDeclKind::Opaque && !matches!(ty, TypeExpr::TagUnion(_)) {
+                if *kind == TypeDeclKind::Opaque && !matches!(ty, TypeExpr::TagUnion(..)) {
                     let underlying = ctx.resolve_type_expr(ty)?;
                     ctx.engine.transparent.insert(name.to_owned(), underlying);
                     true

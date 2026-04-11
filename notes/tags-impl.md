@@ -5,6 +5,47 @@ user-visible language feature. This document answers the
 implementation-level questions that the language note leaves open
 and stages the work so it can be picked up across sessions.
 
+## Status (as of commit `b7ae8c5`)
+
+Steps 1–9 have landed. Structural tag unions compile and run
+end-to-end for programs written against the new syntax. Existing
+declared tag unions (`Bool`, `Result`, `Nat`, etc.) continue to
+work unchanged via the `ConstructorMeta` path — the structural
+path is strictly additive, not a replacement.
+
+Landed:
+- ✅ Step 1: `Type::TagUnion` variant in engine (commit `650d7ff`)
+- ✅ Step 2: Unification rules for open/closed tag rows
+- ✅ Step 3: Consumer boilerplate across all `Type` matches
+- ✅ Step 4: Inference produces open tag rows for undeclared
+  uppercase constructors (commit `51c0691`)
+- ✅ Step 5: Structural constructor registration via
+  `collect_structural_constructors` pre-pass in `ast::from_raw`
+- ✅ Step 6: Row closure at exhaustive match arms, fold, and type
+  annotations
+- ✅ Step 7: Mono specialization on closed tag rows (the
+  specialization-key machinery was ready in step 1-3; step 4
+  exercises it end-to-end)
+- ✅ Step 8: Layout selection — **inlined** into `ssa::lower` as
+  `con_layout(name, ctx_ty)` rather than a separate pass. A
+  dedicated layout pass would be the right home for niche
+  optimizations later, but for the basic compact-layout story
+  on-demand works and saves a pipeline phase (commit `b7ae8c5`)
+- ✅ Step 9: `ssa::lower` uses `con_layout` throughout — match
+  arms, `is` expressions, `is`-chain guards, constructor calls
+- ✅ Step 10: Migration sweep — 175 tests pass, no regressions.
+  Declared tag unions left on the old path intentionally.
+
+Still to do (follow-up work, no longer on the critical path):
+- `..` syntax in user type annotations (grammar feature)
+- Niche optimizations (would want a dedicated layout pass)
+- Migration of declared tag unions (`Color : [Red, Green]`) to
+  the structural path — currently deferred because it would need
+  a recursive-type story for the engine's transparent-type
+  handling
+- The `?` operator for error propagation (needs the error-row
+  open-annotation story to be valuable)
+
 ## Goal
 
 Every tag union in an Ori program is a structural type: constructors

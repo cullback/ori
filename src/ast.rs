@@ -111,7 +111,10 @@ impl Decl<'_> {
 pub enum TypeExpr<'src> {
     Named(&'src str),
     App(&'src str, Vec<TypeExpr<'src>>),
-    TagUnion(Vec<TagDecl<'src>>),
+    /// Tag union annotation. The trailing `bool` is `true` when the
+    /// annotation ends with `..` (open row), `false` when closed.
+    /// See `raw::TypeExpr::TagUnion` for the design rationale.
+    TagUnion(Vec<TagDecl<'src>>, bool),
     Arrow(Vec<TypeExpr<'src>>, Box<TypeExpr<'src>>),
     Record(Vec<(FieldSym, TypeExpr<'src>)>),
     Tuple(Vec<TypeExpr<'src>>),
@@ -486,7 +489,7 @@ pub fn from_raw<'src>(
                 top_level.insert(name, id);
                 // Constructors of a tag-union also enter the top-level
                 // namespace so `Call { func: "Ok" }` resolves correctly.
-                if let raw::TypeExpr::TagUnion(tags) = ty {
+                if let raw::TypeExpr::TagUnion(tags, _) = ty {
                     for tag in tags {
                         let cid = symbols.fresh(tag.name, *span, SymbolKind::Constructor);
                         top_level.insert(tag.name, cid);
@@ -1369,9 +1372,10 @@ impl<'src> Resolver<'_, 'src> {
                 name,
                 args.into_iter().map(|t| self.type_expr(t)).collect(),
             ),
-            raw::TypeExpr::TagUnion(tags) => {
-                TypeExpr::TagUnion(tags.into_iter().map(|t| self.tag_decl(t)).collect())
-            }
+            raw::TypeExpr::TagUnion(tags, open) => TypeExpr::TagUnion(
+                tags.into_iter().map(|t| self.tag_decl(t)).collect(),
+                open,
+            ),
             raw::TypeExpr::Arrow(params, ret) => TypeExpr::Arrow(
                 params.into_iter().map(|t| self.type_expr(t)).collect(),
                 Box::new(self.type_expr(*ret)),
