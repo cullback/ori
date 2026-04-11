@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeDeclKind, TypeExpr};
 use crate::error::CompileError;
 use crate::source::SourceArena;
-use crate::symbol::{FieldInterner, SymbolId, SymbolTable};
+use crate::symbol::{FieldInterner, SymbolId, SymbolKind, SymbolTable};
 use crate::types::engine::{Constraint, Scheme, Type, TypeEngine, TypeVar};
 
 /// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
@@ -37,6 +37,21 @@ pub struct InferResult {
 
 // ---- Inference context ----
 
+/// Information a post-inference rewrite needs to eta-expand a bare
+/// constructor reference into an explicit lambda. Populated by
+/// `check_expr` when a constructor `Name` is checked against an arrow
+/// type; consumed by `eta_expand_con_refs` after `write_types_back`.
+struct EtaInfo {
+    /// The constructor's `SymbolId` — used as the `Call.target`
+    /// inside the synthesized lambda body.
+    con_sym: SymbolId,
+    /// Full arrow type for the expression, with concrete payload
+    /// types from the expected arrow. The rewrite uses this to set
+    /// `Lambda.ty`, each parameter's bound type, and the inner call's
+    /// result type.
+    arrow_ty: Type,
+}
+
 struct InferCtx<'a, 'src> {
     engine: TypeEngine,
     /// Names to schemes. Keyed by display name (string).
@@ -67,6 +82,13 @@ struct InferCtx<'a, 'src> {
     /// Raw (possibly unresolved) types for each expression, keyed by span.
     /// Resolved to concrete types at the end of inference.
     expr_types: HashMap<Span, Type>,
+    /// Constructor references that should be eta-expanded by the
+    /// post-inference rewrite. Populated by `check_expr` when a bare
+    /// `Name(con_sym)` is checked against an arrow type and the
+    /// constructor needs to be upgraded from a nullary value to a
+    /// function. Keyed by the `Name` expression's span so the rewrite
+    /// can find and replace it later.
+    eta_expansions: HashMap<Span, EtaInfo>,
     /// Borrowed symbol table for display-name lookups.
     symbols: &'a SymbolTable,
     /// Borrowed field interner for recovering source names at the
@@ -95,6 +117,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             method_resolutions: HashMap::new(),
             constraint_spans: Vec::new(),
             expr_types: HashMap::new(),
+            eta_expansions: HashMap::new(),
             symbols,
             fields,
         }
@@ -276,6 +299,149 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         let ty = self.infer_expr_inner(expr)?;
         self.expr_types.insert(expr.span, ty.clone());
         Ok(ty)
+    }
+
+    /// Bidirectional check: infer `expr` given a type `expected` from
+    /// the surrounding context. For most expression kinds this is
+    /// equivalent to `infer_expr(expr)` followed by unifying the
+    /// result with `expected`. The specialized case: a bare `Name`
+    /// reference to a constructor, in a context where the expected
+    /// type is an arrow, gets upgraded into a function form — the
+    /// constructor's arity is taken from the expected arrow, payload
+    /// types are unified with the arrow's parameters, and the span
+    /// is marked for post-inference rewrite into an explicit lambda.
+    ///
+    /// This is what makes `List.map2(xs, ys, Pair)` work: `Pair` is
+    /// a structural constructor that normally infers as a nullary
+    /// value `[Pair, ..]`, but when passed to a function expecting
+    /// `(a, b) -> c`, it's eta-expanded to `|a, b| Pair(a, b)`.
+    ///
+    /// Applies to both structural constructors and declared
+    /// constructors whose scheme would produce an arrow. The
+    /// detection uses `SymbolKind::Constructor` from the symbol table
+    /// so both share a single code path.
+    /// Try the bidirectional call path. Returns `Ok(Some(ret_ty))`
+    /// when the callee was found in `self.constructors` or `self.env`
+    /// with an arrow-typed instantiated scheme and every argument
+    /// was successfully checked against its parameter type. Returns
+    /// `Ok(None)` when the caller should fall through to the legacy
+    /// synthesize-then-unify path (zero-arg calls, structural
+    /// constructor calls, method-on-var dispatch). Returns `Err` on
+    /// unification failures or arity mismatches.
+    fn try_infer_call_bidir(
+        &mut self,
+        func: &str,
+        args: &[Expr<'src>],
+        span: Span,
+    ) -> Result<Option<Type>, CompileError> {
+        if args.is_empty() {
+            return Ok(None);
+        }
+        let scheme = self
+            .constructors
+            .get(func)
+            .cloned()
+            .or_else(|| self.env.get(func).cloned());
+        let Some(scheme) = scheme else {
+            return Ok(None);
+        };
+        let func_ty = self.engine.instantiate(&scheme);
+        let resolved = self.engine.resolve(&func_ty);
+        let Type::Arrow(params, ret_ty) = resolved else {
+            // Non-arrow scheme with args: fall through to legacy
+            // path so its existing error handling fires.
+            return Ok(None);
+        };
+        if params.len() != args.len() {
+            return Err(Self::type_error(
+                span,
+                &format!(
+                    "'{func}' expected {} arguments, got {}",
+                    params.len(),
+                    args.len()
+                ),
+            ));
+        }
+        for (arg, param_ty) in args.iter().zip(params.iter()) {
+            self.check_expr(arg, param_ty)?;
+        }
+        Ok(Some(*ret_ty))
+    }
+
+    fn check_expr(
+        &mut self,
+        expr: &Expr<'src>,
+        expected: &Type,
+    ) -> Result<Type, CompileError> {
+        if let ExprKind::Name(sym) = &expr.kind
+            && self.symbols.get(*sym).kind == SymbolKind::Constructor
+            && matches!(self.engine.resolve(expected), Type::Arrow(_, _))
+        {
+            return self.check_con_as_function(*sym, expr.span, expected);
+        }
+
+        // Default path: synthesize the expression's type and unify
+        // with the expected type. This covers every expression kind
+        // other than the constructor-reference-in-arrow-context case.
+        let ty = self.infer_expr(expr)?;
+        self.unify_at(&ty, expected, expr.span)?;
+        Ok(ty)
+    }
+
+    /// Upgrade a bare constructor reference to its function form so
+    /// it can be passed as a higher-order argument. Handles both
+    /// declared constructors (whose stored scheme is already an
+    /// arrow for payload variants) and structural constructors
+    /// (whose arrow is synthesized on demand from the expected
+    /// arrow's parameter types). Either way, records the eta
+    /// expansion so the post-inference rewrite replaces the `Name`
+    /// node with an explicit `Lambda`.
+    fn check_con_as_function(
+        &mut self,
+        con_sym: SymbolId,
+        span: Span,
+        expected: &Type,
+    ) -> Result<Type, CompileError> {
+        let name = self.symbols.display(con_sym).to_owned();
+
+        // Declared constructor: use its stored scheme. For payload
+        // constructors the scheme's type is already an arrow
+        // (`a -> Result(a, e)` etc.); unifying with the expected
+        // arrow pins the type variables to the concrete types at
+        // this call site. Nullary declared constructors would fall
+        // through here with a non-arrow instantiated type, and the
+        // unify below would error out with "cannot unify <nominal>
+        // with <arrow>" — which is the right error because a nullary
+        // constructor isn't callable.
+        let con_arrow = if let Some(scheme) = self.constructors.get(&name).cloned() {
+            self.engine.instantiate(&scheme)
+        } else {
+            // Structural constructor: synthesize an arrow using the
+            // expected arrow's param types as the constructor's
+            // payload types. Unification with `expected` then lets
+            // the return slot flow back to the caller.
+            let Type::Arrow(expected_params, _) = self.engine.resolve(expected) else {
+                unreachable!("caller checked expected is Arrow");
+            };
+            let rest = self.engine.fresh();
+            let ret_ty = Type::TagUnion {
+                tags: vec![(name, expected_params.clone())],
+                rest: Some(Box::new(rest)),
+            };
+            Type::Arrow(expected_params, Box::new(ret_ty))
+        };
+
+        self.unify_at(&con_arrow, expected, span)?;
+        let resolved = self.engine.resolve(&con_arrow);
+        self.expr_types.insert(span, resolved.clone());
+        self.eta_expansions.insert(
+            span,
+            EtaInfo {
+                con_sym,
+                arrow_ty: resolved.clone(),
+            },
+        );
+        Ok(resolved)
     }
 
     fn infer_expr_inner(&mut self, expr: &Expr<'src>) -> Result<Type, CompileError> {
@@ -612,6 +778,20 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         args: &[Expr<'src>],
         span: Span,
     ) -> Result<Type, CompileError> {
+        // Bidirectional path: if the callee has a known scheme whose
+        // instantiated type is an arrow, check each argument against
+        // the corresponding parameter type. This lets bare
+        // constructor references (and numeric literals, if later
+        // extended) flow with context. Falls through to the legacy
+        // synthesize-first path for zero-arg calls, structural
+        // constructors, and method-on-var dispatch.
+        if let Some(result) = self.try_infer_call_bidir(func, args, span)? {
+            return Ok(result);
+        }
+
+        // Legacy path: synthesize arg types, then dispatch. Used for
+        // zero-arg calls, structural constructor calls, and method
+        // constraint generation on type variables.
         let mut arg_types = Vec::new();
         for a in args {
             arg_types.push(self.infer_expr(a)?);
@@ -1230,10 +1410,14 @@ pub fn check<'src>(
     arena: &'src SourceArena,
     module: &mut Module<'src>,
     scope: &crate::resolve::ModuleScope,
-    symbols: &crate::symbol::SymbolTable,
+    symbols: &mut crate::symbol::SymbolTable,
     fields: &FieldInterner,
 ) -> Result<InferResult, CompileError> {
-    let mut ctx = InferCtx::new(symbols, fields);
+    // Inference itself only needs an immutable view of the symbol
+    // table. The post-pass that eta-expands constructor references
+    // allocates fresh lambda parameter syms, which is why `check`
+    // takes `&mut`.
+    let mut ctx = InferCtx::new(&*symbols, fields);
 
     // Register to_str for all numeric types (not as full modules — their
     // := {} declaration would incorrectly make them transparent to {}).
@@ -1598,10 +1782,206 @@ pub fn check<'src>(
     // Write method resolutions onto MethodCall / QualifiedCall nodes.
     write_resolutions_back(module, &ctx.method_resolutions);
 
+    // Eta-expand constructor references that were checked against an
+    // arrow type. `check_expr` marked the spans; this rewrite walks
+    // the module and replaces each marked `Name` with an explicit
+    // `Lambda` wrapping a `Call` to the constructor. Allocates fresh
+    // lambda parameter symbols from `symbols`, which is why `check`
+    // takes `&mut SymbolTable`.
+    if !ctx.eta_expansions.is_empty() {
+        eta_expand_con_refs(module, &ctx.eta_expansions, symbols);
+    }
+
     Ok(InferResult {
         func_schemes,
         constructor_schemes,
     })
+}
+
+// ---- Eta-expansion of constructor references ----
+
+/// Rewrite `Name(con_sym)` expressions marked by `check_expr` into
+/// explicit `Lambda` wrappers. See `EtaInfo` and `check_expr` for the
+/// inference-side bookkeeping; this is the mutation side.
+///
+/// For an expression at span `S` marked with `EtaInfo { con_sym,
+/// arrow_ty: Arrow([T1, T2, ..., Tn], ret) }`, rewrite to
+///
+/// ```ignore
+/// Lambda {
+///     params: [p1, p2, ..., pn],
+///     body: Call { target: con_sym, args: [Name(p1), Name(p2), ...] }
+/// }
+/// ```
+///
+/// Types on the synthesized nodes come from the stored arrow: the
+/// lambda itself has type `arrow_ty`, each param Name has the
+/// corresponding `T_i`, and the inner Call has type `ret`.
+fn eta_expand_con_refs(
+    module: &mut Module<'_>,
+    eta: &HashMap<Span, EtaInfo>,
+    symbols: &mut SymbolTable,
+) {
+    for decl in &mut module.decls {
+        eta_expand_decl(decl, eta, symbols);
+    }
+}
+
+fn eta_expand_decl(
+    decl: &mut Decl<'_>,
+    eta: &HashMap<Span, EtaInfo>,
+    symbols: &mut SymbolTable,
+) {
+    match decl {
+        Decl::FuncDef { body, .. } => eta_expand_expr(body, eta, symbols),
+        Decl::TypeAnno { methods, .. } => {
+            for m in methods {
+                eta_expand_decl(m, eta, symbols);
+            }
+        }
+    }
+}
+
+fn eta_expand_expr(
+    expr: &mut Expr<'_>,
+    eta: &HashMap<Span, EtaInfo>,
+    symbols: &mut SymbolTable,
+) {
+    // First recurse into children so inner constructor references
+    // are rewritten before we consider the current node.
+    match &mut expr.kind {
+        ExprKind::IntLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::StrLit(_)
+        | ExprKind::Name(_) => {}
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            eta_expand_expr(lhs, eta, symbols);
+            eta_expand_expr(rhs, eta, symbols);
+        }
+        ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
+            for a in args {
+                eta_expand_expr(a, eta, symbols);
+            }
+        }
+        ExprKind::Block(stmts, result) => {
+            for stmt in stmts {
+                match stmt {
+                    Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
+                        eta_expand_expr(val, eta, symbols);
+                    }
+                    Stmt::Guard {
+                        condition,
+                        return_val,
+                    } => {
+                        eta_expand_expr(condition, eta, symbols);
+                        eta_expand_expr(return_val, eta, symbols);
+                    }
+                    Stmt::TypeHint { .. } => {}
+                }
+            }
+            eta_expand_expr(result, eta, symbols);
+        }
+        ExprKind::If {
+            expr: scrutinee,
+            arms,
+            else_body,
+        } => {
+            eta_expand_expr(scrutinee, eta, symbols);
+            for arm in arms {
+                for g in &mut arm.guards {
+                    eta_expand_expr(g, eta, symbols);
+                }
+                eta_expand_expr(&mut arm.body, eta, symbols);
+            }
+            if let Some(eb) = else_body {
+                eta_expand_expr(eb, eta, symbols);
+            }
+        }
+        ExprKind::Fold {
+            expr: scrutinee,
+            arms,
+        } => {
+            eta_expand_expr(scrutinee, eta, symbols);
+            for arm in arms {
+                for g in &mut arm.guards {
+                    eta_expand_expr(g, eta, symbols);
+                }
+                eta_expand_expr(&mut arm.body, eta, symbols);
+            }
+        }
+        ExprKind::Lambda { body, .. } => eta_expand_expr(body, eta, symbols),
+        ExprKind::Record { fields } => {
+            for (_, e) in fields {
+                eta_expand_expr(e, eta, symbols);
+            }
+        }
+        ExprKind::FieldAccess { record, .. } => eta_expand_expr(record, eta, symbols),
+        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
+            for e in elems {
+                eta_expand_expr(e, eta, symbols);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            eta_expand_expr(receiver, eta, symbols);
+            for a in args {
+                eta_expand_expr(a, eta, symbols);
+            }
+        }
+        ExprKind::Is { expr: inner, .. } => {
+            eta_expand_expr(inner, eta, symbols);
+        }
+    }
+
+    // Post-order rewrite: if this is a marked Name reference,
+    // replace it with a synthesized Lambda.
+    if let Some(info) = eta.get(&expr.span)
+        && matches!(&expr.kind, ExprKind::Name(_))
+        && matches!(&info.arrow_ty, Type::Arrow(_, _))
+    {
+        rewrite_con_ref_to_lambda(expr, info, symbols);
+    }
+}
+
+/// Replace `expr` in place with `|__eta_0, __eta_1, ..| con_sym(...)`.
+/// Assumes the caller already verified that `expr.kind` is a `Name`
+/// reference and `info.arrow_ty` is an `Arrow`.
+fn rewrite_con_ref_to_lambda(
+    expr: &mut Expr<'_>,
+    info: &EtaInfo,
+    symbols: &mut SymbolTable,
+) {
+    let Type::Arrow(param_types, ret_ty) = &info.arrow_ty else {
+        unreachable!("caller checked arrow_ty is Arrow");
+    };
+    let span = expr.span;
+    let param_syms: Vec<SymbolId> = (0..param_types.len())
+        .map(|i| {
+            let name = format!("__eta_{i}");
+            symbols.fresh(name, span, SymbolKind::Local)
+        })
+        .collect();
+    let call_args: Vec<Expr<'_>> = param_syms
+        .iter()
+        .zip(param_types.iter())
+        .map(|(sym, ty)| {
+            let mut name_expr = Expr::new(ExprKind::Name(*sym), span);
+            name_expr.ty = ty.clone();
+            name_expr
+        })
+        .collect();
+    let mut call_expr = Expr::new(
+        ExprKind::Call {
+            target: info.con_sym,
+            args: call_args,
+        },
+        span,
+    );
+    call_expr.ty = (**ret_ty).clone();
+    expr.kind = ExprKind::Lambda {
+        params: param_syms,
+        body: Box::new(call_expr),
+    };
+    expr.ty = info.arrow_ty.clone();
 }
 
 // ---- Write-back of resolved types onto AST nodes ----

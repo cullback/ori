@@ -47,7 +47,7 @@ fn compile(
         arena,
         &mut resolved.module,
         &resolved.scope,
-        &resolved.symbols,
+        &mut resolved.symbols,
         &resolved.fields,
     )?;
     let (mono_module, mono_infer) =

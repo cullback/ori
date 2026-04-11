@@ -14,7 +14,7 @@ fn run(source: &str, input: i64) -> Scalar {
         &arena,
         &mut resolved.module,
         &resolved.scope,
-        &resolved.symbols,
+        &mut resolved.symbols,
         &resolved.fields,
     )
     .unwrap();
@@ -91,7 +91,7 @@ fn infer_func_type(source: &str, func: &str) -> String {
         &arena,
         &mut resolved.module,
         &resolved.scope,
-        &resolved.symbols,
+        &mut resolved.symbols,
         &resolved.fields,
     )
     .unwrap_or_else(|e| panic!("infer failed: {}", e.format(&arena)));
@@ -1626,6 +1626,68 @@ main = |arg| area(Sphere(3))";
 // Structural tag unions
 // ============================================================
 
+// ============================================================
+// Constructor-as-function (bidirectional eta-expansion)
+// ============================================================
+
+#[test]
+fn constructor_as_function_declared() {
+    // A declared constructor (`Ok`) passed directly as a function
+    // argument. Bidirectional inference sees that `apply` expects
+    // an `I64 -> Result(I64, Str)` in its second slot and
+    // eta-expands `Ok` into `|x| Ok(x)` during the post-inference
+    // rewrite.
+    let source = "\
+apply : I64, (I64 -> Result(I64, Str)) -> Result(I64, Str)
+apply = |n, f| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    r = apply(42, Ok)
+    if r
+        : Ok(x) then x
+        : Err(_) then 0
+)";
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+#[test]
+fn constructor_as_function_structural() {
+    // Same thing for a structural constructor that was never
+    // declared anywhere. The expected arrow type from `apply`'s
+    // second parameter gives `Wrapped` arity 1, and the post-
+    // inference rewrite produces `|x| Wrapped(x)` which defunc then
+    // handles like any other lambda argument.
+    let source = "\
+apply : I64, (I64 -> [Wrapped(I64)]) -> [Wrapped(I64)]
+apply = |n, f| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    r = apply(42, Wrapped)
+    if r
+        : Wrapped(x) then x
+)";
+    assert_eq!(run_i64(source, 0), 42);
+}
+
+#[test]
+fn constructor_as_value_stays_nullary() {
+    // Bare `Red` in a value context (no arrow expected) keeps its
+    // nullary-constructor-value interpretation. This is the default
+    // path — no eta-expansion.
+    let source = "\
+describe : [Red, Green, Blue] -> I64
+describe = |c| if c
+    : Red then 1
+    : Green then 2
+    : Blue then 3
+
+main : I64 -> I64
+main = |arg| describe(Red)";
+    assert_eq!(run_i64(source, 0), 1);
+}
+
 #[test]
 fn structural_tag_runtime_nullary() {
     // End-to-end: compile and run a program that uses structural
@@ -2278,7 +2340,7 @@ fn compile_to_ssa(source: &str) -> crate::ssa::Module {
         &arena,
         &mut resolved.module,
         &resolved.scope,
-        &resolved.symbols,
+        &mut resolved.symbols,
         &resolved.fields,
     )
     .unwrap();
@@ -2482,7 +2544,7 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
         arena,
         &mut resolved.module,
         &resolved.scope,
-        &resolved.symbols,
+        &mut resolved.symbols,
         &resolved.fields,
     )
     .unwrap();
@@ -2669,7 +2731,7 @@ mod ast_snapshots {
             &arena,
             &mut resolved.module,
             &resolved.scope,
-            &resolved.symbols,
+            &mut resolved.symbols,
             &resolved.fields,
         )
         .unwrap_or_else(|e| panic!("infer failed for {source_path}: {e:?}"));
