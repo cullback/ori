@@ -858,18 +858,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             default_fail
         };
 
+        // Route every guard through `lower_and_chain` so that any `is`
+        // expressions embedded in the guard (e.g. from
+        // `flatten_patterns` hoisting nested constructor fields) bind
+        // their fields into `self.vars` before the arm body lowers.
+        // Plain boolean guards fall through to the chain's generic
+        // branch-on-True path. Fall-through to the next arm in the
+        // same tag group is wired via `fail_target`.
         for guard_expr in guards {
-            let guard_val = self.lower_expr(guard_expr);
-            let guard_tag = self.builder.load(guard_val, 0, ScalarType::U64);
-            let true_tag = self.decls.constructors["True"].tag_index;
-            let true_val = self.builder.const_u64(true_tag);
-            let is_true = self
-                .builder
-                .binop(BinaryOp::Eq, guard_tag, true_val, ScalarType::Bool);
-            let guard_ok = self.builder.create_block();
-            self.builder
-                .branch(is_true, guard_ok, vec![], fail_target, vec![]);
-            self.builder.switch_to(guard_ok);
+            self.lower_and_chain(guard_expr, fail_target);
         }
     }
 

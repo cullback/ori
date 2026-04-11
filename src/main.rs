@@ -3,6 +3,7 @@ mod ast_display;
 mod decl_info;
 mod defunc;
 mod error;
+mod flatten_patterns;
 mod fold_lift;
 mod mono;
 mod reachable;
@@ -40,6 +41,7 @@ fn compile(
     let parsed = syntax::parse::parse(arena.content(main_file), main_file)?;
     let mut resolved = resolve::resolve_imports(parsed, arena, source_dir)?;
     resolved.module = fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
     topo::compute(&mut resolved.module, &resolved.symbols)?;
     let infer_result = types::infer::check(
         arena,

@@ -8,6 +8,7 @@ fn run(source: &str, input: i64) -> Scalar {
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
     crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(
         &arena,
@@ -1528,6 +1529,111 @@ main = |arg| area(Sphere(3))";
 }
 
 // ============================================================
+// Nested patterns (flatten_patterns pass)
+// ============================================================
+
+#[test]
+fn nested_pattern_ok_branch() {
+    // Constructor-in-constructor pattern; taken via the Ok branch.
+    let source = "\
+Pair : [Pair(Result(I64, I64), I64)]
+compute : Pair -> I64
+compute = |p| if p
+    : Pair(Ok(x), y) then x + y
+    : Pair(Err(x), y) then x - y
+main : I64 -> I64
+main = |arg| compute(Pair(Ok(42), 7))";
+    assert_eq!(run_i64(source, 0), 49);
+}
+
+#[test]
+fn nested_pattern_err_branch() {
+    // Same shape, but the inner match falls through from Ok to Err.
+    let source = "\
+Pair : [Pair(Result(I64, I64), I64)]
+compute : Pair -> I64
+compute = |p| if p
+    : Pair(Ok(x), y) then x + y
+    : Pair(Err(x), y) then x - y
+main : I64 -> I64
+main = |arg| compute(Pair(Err(100), 7))";
+    assert_eq!(run_i64(source, 0), 93);
+}
+
+#[test]
+fn nested_pattern_double_nesting() {
+    // Constructor nested inside constructor nested inside constructor.
+    // Each arm exercises a different fallthrough path.
+    let source = "\
+Box : [Box(Result(Result(I64, I64), I64))]
+compute : Box -> I64
+compute = |b| if b
+    : Box(Ok(Ok(x))) then x * 10
+    : Box(Ok(Err(x))) then x + 1
+    : Box(Err(x)) then x - 1
+main : I64 -> I64
+main = |arg| compute(Box(Ok(Ok(5))))";
+    assert_eq!(run_i64(source, 0), 50);
+}
+
+#[test]
+fn nested_pattern_double_nesting_middle() {
+    let source = "\
+Box : [Box(Result(Result(I64, I64), I64))]
+compute : Box -> I64
+compute = |b| if b
+    : Box(Ok(Ok(x))) then x * 10
+    : Box(Ok(Err(x))) then x + 1
+    : Box(Err(x)) then x - 1
+main : I64 -> I64
+main = |arg| compute(Box(Ok(Err(5))))";
+    assert_eq!(run_i64(source, 0), 6);
+}
+
+#[test]
+fn nested_pattern_double_nesting_outer() {
+    let source = "\
+Box : [Box(Result(Result(I64, I64), I64))]
+compute : Box -> I64
+compute = |b| if b
+    : Box(Ok(Ok(x))) then x * 10
+    : Box(Ok(Err(x))) then x + 1
+    : Box(Err(x)) then x - 1
+main : I64 -> I64
+main = |arg| compute(Box(Err(5)))";
+    assert_eq!(run_i64(source, 0), 4);
+}
+
+#[test]
+fn nested_pattern_is_expr() {
+    // Nested Constructor pattern inside a standalone `is` expression,
+    // not a match arm — exercises the `flatten_is_expr` path. Uses a
+    // user-defined type so the test is self-contained.
+    let source = "\
+Boxed : [Boxed(Result(I64, I64))]
+main : I64 -> I64
+main = |arg| (
+    b = Boxed(Ok(77))
+    if b is Boxed(Ok(x)) then x else 0
+)";
+    assert_eq!(run_i64(source, 0), 77);
+}
+
+#[test]
+fn nested_pattern_is_expr_no_match() {
+    // Same shape, but the inner pattern doesn't match — exercises the
+    // false fallthrough of the synthesized is-chain.
+    let source = "\
+Boxed : [Boxed(Result(I64, I64))]
+main : I64 -> I64
+main = |arg| (
+    b = Boxed(Err(77))
+    if b is Boxed(Ok(x)) then x else 0
+)";
+    assert_eq!(run_i64(source, 0), 0);
+}
+
+// ============================================================
 // Guards (and condition)
 // ============================================================
 
@@ -1870,6 +1976,7 @@ fn compile_to_ssa(source: &str) -> crate::ssa::Module {
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
     crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(
         &arena,
@@ -2073,6 +2180,7 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::resolve::resolve_imports(parsed, arena, None).unwrap();
     resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
     crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(
         arena,
@@ -2258,6 +2366,7 @@ mod ast_snapshots {
         let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None)
             .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
         resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+        resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
         crate::topo::compute(&mut resolved.module, &resolved.symbols)
             .unwrap_or_else(|e| panic!("topo failed for {source_path}: {e:?}"));
         crate::types::infer::check(
