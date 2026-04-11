@@ -505,7 +505,7 @@ pub fn from_raw<'src>(
     // allocate a fresh `SymbolKind::Constructor`. This makes bare
     // references like `Red` resolvable even when no `TypeAnno`
     // declares them — the inference pass then produces an open
-    // `Type::TagUnion` for them. See `notes/tags-impl.md`.
+    // `Type::TagUnion` for them.
     collect_structural_constructors(&module, symbols, &mut top_level);
 
     // Pass 2: walk each decl with the resolver to fill in SymbolIds on

@@ -29,8 +29,7 @@ pub enum Type {
     /// (e.g. `Red` has inferred type `[Red, ..ρ]`). Rows close at match
     /// exhaustiveness, type annotations, and function-boundary
     /// generalization. By the time monomorphization runs, every tag
-    /// union that reaches code generation is closed. See
-    /// `notes/tags-impl.md` for the full design.
+    /// union that reaches code generation is closed.
     TagUnion {
         tags: Vec<(String, Vec<Type>)>,
         rest: Option<Box<Type>>,

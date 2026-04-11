@@ -476,7 +476,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 // uppercase name that wasn't declared. Inference
                 // produces an open tag union `[Name, ..ρ]` for it;
                 // later unifications narrow or widen the row as
-                // needed. See `notes/tags-impl.md` step 4.
+                // needed.
                 if name.starts_with(|c: char| c.is_ascii_uppercase()) {
                     let rest = self.engine.fresh();
                     return Ok(Type::TagUnion {
@@ -644,7 +644,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 } else {
                     // Exhaustive match with no else branch: if the
                     // scrutinee's type is still an open tag union
-                    // row, close it. See `notes/tags-impl.md` step 6.
+                    // row, close it.
                     self.close_open_tag_row(&scrutinee_ty);
                 }
                 Ok(result_ty)
@@ -819,7 +819,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         // Structural constructor call: `Ok(42)` where `Ok` isn't in
         // any declared `TypeAnno`. Produces an open tag union with
         // one tag whose payload types are the inferred arg types.
-        // See `notes/tags-impl.md` step 4.
         if func.starts_with(|c: char| c.is_ascii_uppercase()) {
             let rest = self.engine.fresh();
             return Ok(Type::TagUnion {
