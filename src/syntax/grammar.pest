@@ -80,13 +80,16 @@ base_atom = {
   | int_lit
 }
 
-// Postfix: .method(args), .field, or is pattern
+// Postfix: .method(args), .field, `is` pattern test, or `?` for
+// error propagation.
 method_head = @{ "." ~ name ~ "(" }
 is_keyword = @{ "is" ~ !(ASCII_ALPHANUMERIC | "_") }
+try_op = { "?" }
 postfix = {
     method_head ~ args? ~ ")"
   | is_keyword ~ pattern
   | "." ~ name
+  | try_op
 }
 
 list_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }

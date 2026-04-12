@@ -2068,6 +2068,113 @@ main = |arg| extract(B(5))";
 }
 
 // ============================================================
+// ? operator (error propagation)
+// ============================================================
+
+#[test]
+fn try_op_ok_passes_through() {
+    // `?` on an Ok value extracts the payload and continues.
+    let source = "\
+validate : I64 -> Result(I64, Str)
+validate = |n| if n == 0 then Err(\"zero\") else Ok(n)
+
+double : I64 -> Result(I64, Str)
+double = |n| (
+    x = validate(n)?
+    Ok(x * 2)
+)
+
+unwrap : Result(I64, Str) -> I64
+unwrap = |r| if r
+    : Ok(x) then x
+    : Err(_) then 0 - 1
+
+main : I64 -> I64
+main = |arg| unwrap(double(5))";
+    assert_eq!(run_i64(source, 0), 10);
+}
+
+#[test]
+fn try_op_err_returns_early() {
+    // `?` on an Err value returns the Err directly, bypassing the
+    // rest of the enclosing function.
+    let source = "\
+validate : I64 -> Result(I64, Str)
+validate = |n| if n == 0 then Err(\"zero\") else Ok(n)
+
+double : I64 -> Result(I64, Str)
+double = |n| (
+    x = validate(n)?
+    Ok(x * 2)
+)
+
+unwrap : Result(I64, Str) -> I64
+unwrap = |r| if r
+    : Ok(x) then x
+    : Err(_) then 0 - 1
+
+main : I64 -> I64
+main = |arg| unwrap(double(0))";
+    assert_eq!(run_i64(source, 0), -1);
+}
+
+#[test]
+fn try_op_chain_two() {
+    // Two `?` in sequence. The error row of the enclosing function
+    // grows to include both inner error types via row polymorphism.
+    let source = "\
+a : I64 -> Result(I64, Str)
+a = |n| if n == 1 then Err(\"from_a\") else Ok(n + 10)
+
+b : I64 -> Result(I64, Str)
+b = |n| if n == 2 then Err(\"from_b\") else Ok(n + 100)
+
+pipeline : I64 -> Result(I64, Str)
+pipeline = |n| (
+    x = a(n)?
+    y = b(x)?
+    Ok(y)
+)
+
+unwrap : Result(I64, Str) -> I64
+unwrap = |r| if r
+    : Ok(x) then x
+    : Err(_) then 0 - 1
+
+main : I64 -> I64
+main = |arg| unwrap(pipeline(5))";
+    // 5 -> a -> Ok(15); 15 -> b -> Ok(115)
+    assert_eq!(run_i64(source, 0), 115);
+}
+
+#[test]
+fn try_op_chain_first_fails() {
+    // First ? in the chain returns Err. Second call never runs.
+    let source = "\
+a : I64 -> Result(I64, Str)
+a = |n| if n == 1 then Err(\"from_a\") else Ok(n + 10)
+
+b : I64 -> Result(I64, Str)
+b = |n| if n == 2 then Err(\"from_b\") else Ok(n + 100)
+
+pipeline : I64 -> Result(I64, Str)
+pipeline = |n| (
+    x = a(n)?
+    y = b(x)?
+    Ok(y)
+)
+
+unwrap : Result(I64, Str) -> I64
+unwrap = |r| if r
+    : Ok(x) then x
+    : Err(_) then 0 - 1
+
+main : I64 -> I64
+main = |arg| unwrap(pipeline(1))";
+    assert_eq!(run_i64(source, 0), -1);
+}
+
+// ============================================================
 // Guard clause: if condition return val
 // ============================================================
 

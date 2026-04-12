@@ -89,6 +89,13 @@ struct InferCtx<'a, 'src> {
     /// function. Keyed by the `Name` expression's span so the rewrite
     /// can find and replace it later.
     eta_expansions: HashMap<Span, EtaInfo>,
+    /// Stack of enclosing function / lambda return types. The top of
+    /// the stack is the return type of the innermost enclosing
+    /// function body currently being inferred; `return` statements
+    /// (arm-level `is_return` and `Stmt::Guard::return_val`) unify
+    /// their value against it. Push in `infer_func_body` and
+    /// `ExprKind::Lambda`; pop on exit.
+    ret_ty_stack: Vec<Type>,
     /// Borrowed symbol table for display-name lookups.
     symbols: &'a SymbolTable,
     /// Borrowed field interner for recovering source names at the
@@ -118,6 +125,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             constraint_spans: Vec::new(),
             expr_types: HashMap::new(),
             eta_expansions: HashMap::new(),
+            ret_ty_stack: Vec::new(),
             symbols,
             fields,
         }
@@ -596,9 +604,14 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                             // Flow Is bindings from condition into return_val scope
                             let guard_saved_env = self.env.clone();
                             self.collect_is_bindings(condition);
-                            // The return value must match the enclosing function's return type.
-                            // For now, just infer it; the caller's context will unify as needed.
-                            let _ret_ty = self.infer_expr(return_val)?;
+                            // The return value flows to the enclosing
+                            // function's return type. Without this,
+                            // `if cond return err` would let `err`'s
+                            // type drift unconstrained.
+                            let ret_val_ty = self.infer_expr(return_val)?;
+                            if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
+                                self.unify_at(&ret_val_ty, &fn_ret, return_val.span)?;
+                            }
                             self.env = guard_saved_env;
                         }
                     }
@@ -635,7 +648,18 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         self.collect_is_bindings(guard_expr);
                     }
                     let body_ty = self.infer_expr(&arm.body)?;
-                    self.unify_at(&result_ty, &body_ty, arm.body.span)?;
+                    if arm.is_return {
+                        // `return` arms flow their body to the
+                        // enclosing function's return type, not to
+                        // the if's result type. The arm contributes
+                        // nothing to the if's value — control leaves
+                        // the enclosing function on this branch.
+                        if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
+                            self.unify_at(&body_ty, &fn_ret, arm.body.span)?;
+                        }
+                    } else {
+                        self.unify_at(&result_ty, &body_ty, arm.body.span)?;
+                    }
                     self.env = saved_env;
                 }
                 if let Some(eb) = else_body {
@@ -724,9 +748,16 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         ty
                     })
                     .collect();
+                // Fresh return var so `return` inside the lambda
+                // body flows to the lambda's return, not to the
+                // enclosing function's return.
+                let ret = self.engine.fresh();
+                self.ret_ty_stack.push(ret.clone());
                 let body_ty = self.infer_expr(body)?;
+                self.ret_ty_stack.pop();
+                self.unify_at(&ret, &body_ty, body.span)?;
                 self.env = saved_env;
-                Ok(Type::Arrow(param_types, Box::new(body_ty)))
+                Ok(Type::Arrow(param_types, Box::new(ret)))
             }
 
             ExprKind::Tuple(elems) => {
@@ -1277,7 +1308,11 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             let pname = self.symbols.display(*p).to_owned();
             self.env.insert(pname, Scheme::mono(ty.clone()));
         }
+        // Push the return type so any `return` statement inside the
+        // body can flow its value here.
+        self.ret_ty_stack.push(ret.clone());
         let body_ty = self.infer_expr(body)?;
+        self.ret_ty_stack.pop();
         self.unify_at(&ret, &body_ty, body.span)?;
 
         // If there's an annotation, unify with it and use it as the external type

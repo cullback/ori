@@ -304,6 +304,7 @@ impl ParseCtx {
                             },
                             postfix_span,
                         ),
+                        Rule::try_op => desugar_try(receiver, postfix_span),
                         _ => panic!("unexpected postfix rule: {:?}", first.as_rule()),
                     }
                 })
@@ -754,6 +755,71 @@ fn parse_tag_decl(pair: Pair<'_, Rule>) -> TagDecl<'_> {
     let name = inner.next().unwrap().as_str();
     let fields: Vec<TypeExpr<'_>> = inner.map(parse_type_expr).collect();
     TagDecl { name, fields }
+}
+
+/// Desugar `receiver?` into an explicit if-match that propagates
+/// the `Err` case via `return`:
+///
+/// ```ignore
+/// if receiver
+///     : Ok(__try_val_N) then __try_val_N
+///     : Err(__try_err_N) return Err(__try_err_N)
+/// ```
+///
+/// The bindings are span-based to avoid shadowing between nested or
+/// sequential `?` uses. The resulting AST goes through the same
+/// inference as hand-written code — the `return` arm's body type
+/// flows to the enclosing function's return type, growing its error
+/// row by the inner error's tags. That's the open-row error
+/// propagation story from `tags.md`, made ergonomic.
+fn desugar_try(receiver: Expr<'_>, span: Span) -> Expr<'_> {
+    // Span-unique name parts leaked to `'static` so they satisfy any
+    // `'src` lifetime. Each `?` occurrence has a distinct span, so
+    // names don't collide across uses. Leak cost is `O(?-count)`,
+    // which matches the rest of the compiler's arena behavior.
+    let val_name: &'static str =
+        Box::leak(format!("__try_val_{}", span.start).into_boxed_str());
+    let err_name: &'static str =
+        Box::leak(format!("__try_err_{}", span.start).into_boxed_str());
+
+    let ok_body = Expr::new(ExprKind::Name(val_name), span);
+    let err_return = Expr::new(
+        ExprKind::Call {
+            func: "Err",
+            args: vec![Expr::new(ExprKind::Name(err_name), span)],
+        },
+        span,
+    );
+
+    let arms = vec![
+        MatchArm {
+            pattern: Pattern::Constructor {
+                name: "Ok",
+                fields: vec![Pattern::Binding(val_name)],
+            },
+            guards: Vec::new(),
+            body: ok_body,
+            is_return: false,
+        },
+        MatchArm {
+            pattern: Pattern::Constructor {
+                name: "Err",
+                fields: vec![Pattern::Binding(err_name)],
+            },
+            guards: Vec::new(),
+            body: err_return,
+            is_return: true,
+        },
+    ];
+
+    Expr::new(
+        ExprKind::If {
+            expr: Box::new(receiver),
+            arms,
+            else_body: None,
+        },
+        span,
+    )
 }
 
 fn parse_field_type(pair: Pair<'_, Rule>) -> (&str, TypeExpr<'_>) {
