@@ -5,8 +5,7 @@ I64 := {}.(
     sub : I64, I64 -> I64
     mul : I64, I64 -> I64
     div : I64, I64 -> I64
-    rem : I64, I64 -> I64
-    eq : I64, I64 -> Bool
-    neq : I64, I64 -> Bool
+    mod : I64, I64 -> I64
+    equals : I64, I64 -> Bool
     to_str : I64 -> Str
 )

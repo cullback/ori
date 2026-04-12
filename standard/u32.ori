@@ -5,8 +5,7 @@ U32 := {}.(
     sub : U32, U32 -> U32
     mul : U32, U32 -> U32
     div : U32, U32 -> U32
-    rem : U32, U32 -> U32
-    eq : U32, U32 -> Bool
-    neq : U32, U32 -> Bool
+    mod : U32, U32 -> U32
+    equals : U32, U32 -> Bool
     to_str : U32 -> Str
 )

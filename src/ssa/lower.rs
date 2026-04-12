@@ -615,9 +615,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             "sub" => self.builder.binop(BinaryOp::Sub, lhs, rhs, ty),
             "mul" => self.builder.binop(BinaryOp::Mul, lhs, rhs, ty),
             "div" => self.builder.binop(BinaryOp::Div, lhs, rhs, ty),
-            "rem" => self.builder.binop(BinaryOp::Rem, lhs, rhs, ty),
-            "eq" => self.lower_eq(lhs, rhs, false),
-            "neq" => self.lower_eq(lhs, rhs, true),
+            "mod" => self.builder.binop(BinaryOp::Rem, lhs, rhs, ty),
+            "equals" => self.lower_eq(lhs, rhs, false),
             _ => panic!("unknown builtin: {name}"),
         }
     }

@@ -5,8 +5,7 @@ I8 := {}.(
     sub : I8, I8 -> I8
     mul : I8, I8 -> I8
     div : I8, I8 -> I8
-    rem : I8, I8 -> I8
-    eq : I8, I8 -> Bool
-    neq : I8, I8 -> Bool
+    mod : I8, I8 -> I8
+    equals : I8, I8 -> Bool
     to_str : I8 -> Str
 )

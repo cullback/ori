@@ -1042,14 +1042,16 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
 
         let is_eq = matches!(op, BinOp::Eq | BinOp::Neq);
+        // `!=` requires the same `equals` method as `==` — the
+        // negation is handled at the lowering level, not as a
+        // separate method on the type.
         let method_name = match op {
             BinOp::Add => "add",
             BinOp::Sub => "sub",
             BinOp::Mul => "mul",
             BinOp::Div => "div",
-            BinOp::Rem => "rem",
-            BinOp::Eq => "eq",
-            BinOp::Neq => "neq",
+            BinOp::Rem => "mod",
+            BinOp::Eq | BinOp::Neq => "equals",
             BinOp::And | BinOp::Or => unreachable!(),
         };
 
@@ -1455,7 +1457,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     /// `__builtin.<method>` in `method_resolutions` so the lowerer
     /// can distinguish them from user-defined methods.
     const NUMERIC_BUILTIN_METHODS: &'static [&'static str] =
-        &["add", "sub", "mul", "div", "rem", "eq", "neq", "to_str"];
+        &["add", "sub", "mul", "div", "mod", "equals", "to_str"];
 
     /// True if `type_name.method` is a compiler-intrinsic numeric
     /// method that should resolve to `__builtin.<method>` instead of

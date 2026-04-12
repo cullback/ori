@@ -5,8 +5,7 @@ U64 := {}.(
     sub : U64, U64 -> U64
     mul : U64, U64 -> U64
     div : U64, U64 -> U64
-    rem : U64, U64 -> U64
-    eq : U64, U64 -> Bool
-    neq : U64, U64 -> Bool
+    mod : U64, U64 -> U64
+    equals : U64, U64 -> Bool
     to_str : U64 -> Str
 )

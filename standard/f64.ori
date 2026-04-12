@@ -5,7 +5,6 @@ F64 := {}.(
     sub : F64, F64 -> F64
     mul : F64, F64 -> F64
     div : F64, F64 -> F64
-    eq : F64, F64 -> Bool
-    neq : F64, F64 -> Bool
+    equals : F64, F64 -> Bool
     to_str : F64 -> Str
 )
