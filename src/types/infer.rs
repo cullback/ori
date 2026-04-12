@@ -1559,7 +1559,12 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         for &(tv, span) in &self.int_literal_vars {
             let resolved = self.engine.resolve(&Type::Var(tv));
             match &resolved {
-                Type::Con(name) if matches!(name.as_str(), "U8" | "I8" | "I64" | "U64" | "F64") => {
+                Type::Con(name)
+                    if matches!(
+                        name.as_str(),
+                        "I8" | "U8" | "I16" | "U16" | "I32" | "U32" | "I64" | "U64" | "F64"
+                    ) =>
+                {
                 }
                 other => {
                     return Err(CompileError::at(
