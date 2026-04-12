@@ -512,9 +512,14 @@ impl TypeEngine {
                 };
                 self.unify(rest_var, &tail)
             }
-            // Both open: unify each rest var with a union containing the
-            // other side's extras, plus a fresh shared row variable.
+            // Both open: if there are no extras on either side, just
+            // unify the two rest vars directly. Otherwise, unify each
+            // rest var with a union of the other side's extras plus a
+            // fresh shared row variable.
             (Some(rv1), Some(rv2)) => {
+                if only_lhs.is_empty() && only_rhs.is_empty() {
+                    return self.unify(rv1, rv2);
+                }
                 let new_rest = self.fresh();
                 let tail1 = Type::TagUnion {
                     tags: only_rhs,
