@@ -1446,25 +1446,12 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         Ok(())
     }
 
-    /// Numeric types whose body-less method declarations in the
-    /// stdlib are backed by compiler intrinsics rather than user code.
-    const NUMERIC_TYPES: &'static [&'static str] =
-        &["I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64", "F64"];
-
-    /// Methods on numeric types dispatched as compiler intrinsics.
-    /// Arithmetic ops become SSA binary ops; `to_str` becomes the
-    /// `__num_to_str` runtime call. All are resolved to
-    /// `__builtin.<method>` in `method_resolutions` so the lowerer
-    /// can distinguish them from user-defined methods.
-    const NUMERIC_BUILTIN_METHODS: &'static [&'static str] =
-        &["add", "sub", "mul", "div", "mod", "equals", "to_str"];
-
     /// True if `type_name.method` is a compiler-intrinsic numeric
     /// method that should resolve to `__builtin.<method>` instead of
     /// the env-provided scheme name.
     fn is_numeric_builtin(type_name: &str, method: &str) -> bool {
-        Self::NUMERIC_TYPES.contains(&type_name)
-            && Self::NUMERIC_BUILTIN_METHODS.contains(&method)
+        crate::numeric::NumericType::from_name(type_name)
+            .is_some_and(|num| num.has_builtin_method(method))
     }
 
     /// If `func` is a dotted `Type.method` that matches a numeric
@@ -1560,12 +1547,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             let resolved = self.engine.resolve(&Type::Var(tv));
             match &resolved {
                 Type::Con(name)
-                    if matches!(
-                        name.as_str(),
-                        "I8" | "U8" | "I16" | "U16" | "I32" | "U32" | "I64" | "U64" | "F64"
-                    ) =>
-                {
-                }
+                    if crate::numeric::NumericType::from_name(name).is_some() => {}
                 other => {
                     return Err(CompileError::at(
                         span,
@@ -1580,7 +1562,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         for &(tv, span) in &self.float_literal_vars {
             let resolved = self.engine.resolve(&Type::Var(tv));
             match &resolved {
-                Type::Con(name) if name == "F64" => {}
+                Type::Con(name)
+                    if crate::numeric::NumericType::from_name(name)
+                        .is_some_and(|n| !n.is_integer()) => {}
                 other => {
                     return Err(CompileError::at(
                         span,
@@ -1617,9 +1601,9 @@ pub fn check<'src>(
 
     // Register to_str for all numeric types (not as full modules — their
     // := {} declaration would incorrectly make them transparent to {}).
-    for ty in &["I64", "U64", "F64", "U8", "I8"] {
-        let mangled = format!("{ty}.to_str");
-        let param_ty = Type::Con((*ty).to_owned());
+    for num in crate::numeric::ALL {
+        let mangled = format!("{}.to_str", num.name());
+        let param_ty = Type::Con(num.name().to_owned());
         let ret_ty = Type::Con("Str".to_owned());
         let scheme = Scheme {
             vars: vec![],

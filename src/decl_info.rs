@@ -27,19 +27,15 @@ pub fn method_key(type_name: &str, method: &str) -> String {
 /// Map a resolved concrete type to the SSA scalar type used at runtime.
 pub fn type_to_scalar(ty: &Type) -> ScalarType {
     match ty {
-        Type::Con(name) => match name.as_str() {
-            "I8" => ScalarType::I8,
-            "U8" => ScalarType::U8,
-            "I16" => ScalarType::I16,
-            "U16" => ScalarType::U16,
-            "I32" => ScalarType::I32,
-            "U32" => ScalarType::U32,
-            "I64" => ScalarType::I64,
-            "U64" => ScalarType::U64,
-            "F64" => ScalarType::F64,
-            "Bool" => ScalarType::Bool,
-            _ => ScalarType::Ptr,
-        },
+        Type::Con(name) => {
+            if let Some(num) = crate::numeric::NumericType::from_name(name) {
+                num.scalar_type()
+            } else if name == "Bool" {
+                ScalarType::Bool
+            } else {
+                ScalarType::Ptr
+            }
+        }
         _ => ScalarType::Ptr,
     }
 }
@@ -102,8 +98,8 @@ pub fn build<'src>(
     // Register the num-to-str intrinsic method names as known
     // callables so higher-order references (e.g. `List.map(xs,
     // I64.to_str)`) can resolve their target.
-    for ty in ["I8", "U8", "I64", "U64", "F64"] {
-        let key = format!("{ty}.to_str");
+    for num in crate::numeric::ALL {
+        let key = format!("{}.to_str", num.name());
         info.funcs.insert(key.clone());
         info.func_arities.insert(key, 1);
     }

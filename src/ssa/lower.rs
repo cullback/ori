@@ -161,17 +161,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation
             )]
-            ExprKind::IntLit(n) => match &expr.ty {
-                Type::Con(name) if name == "U8" => self.builder.const_u8(*n as u8),
-                Type::Con(name) if name == "I8" => self.builder.const_i8(*n as i8),
-                Type::Con(name) if name == "U16" => self.builder.const_u16(*n as u16),
-                Type::Con(name) if name == "I16" => self.builder.const_i16(*n as i16),
-                Type::Con(name) if name == "U32" => self.builder.const_u32(*n as u32),
-                Type::Con(name) if name == "I32" => self.builder.const_i32(*n as i32),
-                Type::Con(name) if name == "U64" => self.builder.const_u64(*n as u64),
-                Type::Con(name) if name == "F64" => self.builder.const_f64(*n as f64),
-                _ => self.builder.const_i64(*n),
-            },
+            ExprKind::IntLit(n) => {
+                lower_int_const(&mut self.builder, *n, &expr.ty)
+            }
 
             ExprKind::FloatLit(n) => self.builder.const_f64(*n),
 
@@ -1412,6 +1404,33 @@ fn classify_walk(name: &str) -> Option<WalkKind> {
 /// (`List.len` / `List.get` / `List.set` / `List.append` /
 /// `List.reverse`). Assumes the caller already verified that `name`
 /// is a list builtin via `LowerCtx::is_list_builtin`.
+/// Emit an SSA constant for an integer literal, dispatching to the
+/// correct width based on the resolved type.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
+fn lower_int_const(builder: &mut Builder, n: i64, ty: &Type) -> Value {
+    use crate::numeric::NumericType;
+    if let Type::Con(name) = ty {
+        if let Some(num) = NumericType::from_name(name) {
+            return match num {
+                NumericType::I8 => builder.const_i8(n as i8),
+                NumericType::U8 => builder.const_u8(n as u8),
+                NumericType::I16 => builder.const_i16(n as i16),
+                NumericType::U16 => builder.const_u16(n as u16),
+                NumericType::I32 => builder.const_i32(n as i32),
+                NumericType::U32 => builder.const_u32(n as u32),
+                NumericType::I64 => builder.const_i64(n),
+                NumericType::U64 => builder.const_u64(n as u64),
+                NumericType::F64 => builder.const_f64(n as f64),
+            };
+        }
+    }
+    builder.const_i64(n)
+}
+
 fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -> Value {
     let (intrinsic, ret_ty) = if name.ends_with(".len") || name == "List.len" {
         ("__list_len", ScalarType::U64)

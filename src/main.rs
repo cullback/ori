@@ -6,6 +6,7 @@ mod error;
 mod flatten_patterns;
 mod fold_lift;
 mod mono;
+mod numeric;
 mod reachable;
 mod resolve;
 mod source;
