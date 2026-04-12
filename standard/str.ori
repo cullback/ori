@@ -18,9 +18,9 @@ Str := List(U8).(
     concat : Str, Str -> Str
     concat = |a, b| List.walk(b, a, |acc, byte| List.append(acc, byte))
 
-    # Wraps a byte list as a string.
-    from_bytes : List(U8) -> Str
-    from_bytes = |bytes| bytes
+    # Converts a byte list to a string. Does not validate UTF-8 yet.
+    from_utf8 : List(U8) -> Result(Str, [InvalidUtf8])
+    from_utf8 = |bytes| Ok(bytes)
 
     # Returns the underlying byte list.
     to_utf8 : Str -> List(U8)
