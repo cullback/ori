@@ -37,19 +37,34 @@ pub struct InferResult {
 
 // ---- Inference context ----
 
-/// Information a post-inference rewrite needs to eta-expand a bare
-/// constructor reference into an explicit lambda. Populated by
-/// `check_expr` when a constructor `Name` is checked against an arrow
-/// type; consumed by `eta_expand_con_refs` after `write_types_back`.
-struct EtaInfo {
-    /// The constructor's `SymbolId` — used as the `Call.target`
-    /// inside the synthesized lambda body.
-    con_sym: SymbolId,
-    /// Full arrow type for the expression, with concrete payload
-    /// types from the expected arrow. The rewrite uses this to set
-    /// `Lambda.ty`, each parameter's bound type, and the inner call's
-    /// result type.
-    arrow_ty: Type,
+/// Information a post-inference rewrite needs to turn a bare
+/// callable reference into an explicit lambda. Two shapes:
+///
+/// - `Constructor` — a bare constructor name (declared or
+///   structural) used where a function is expected, like
+///   `List.map(xs, Ok)`. The rewrite produces `|a| Ok(a)`.
+/// - `Method` — a qualified method name like `I64.add` used as
+///   a value, like `xs.scan(0, I64.add)`. The rewrite produces
+///   `|a, b| I64.add(a, b)` via a `QualifiedCall`.
+///
+/// In both cases the arrow type is read from `expr.ty` at rewrite
+/// time (populated by `write_types_back`), so the stored info only
+/// needs the kind-specific bits. This way any further unification
+/// between inference-populate time and end-of-inference resolve
+/// flows through to the rewrite automatically.
+enum EtaInfo {
+    /// Constructor eta-expansion. Carries the constructor's
+    /// `SymbolId` so the rewrite can emit `Call { target }`.
+    Constructor { con_sym: SymbolId },
+    /// Method-reference eta-expansion. Carries the type and
+    /// method names so the rewrite can emit the `QualifiedCall`
+    /// that the method dispatch pipeline expects. Stored as
+    /// `String` (rather than `&'src str`) so the rewrite can
+    /// leak them to `'static` without lifetime gymnastics.
+    Method {
+        type_name: String,
+        method_name: String,
+    },
 }
 
 struct InferCtx<'a, 'src> {
@@ -111,13 +126,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             constructors: HashMap::new(),
             type_aliases: HashMap::new(),
             type_annos: HashMap::new(),
-            known_types: std::collections::HashSet::from([
-                "U8".to_owned(),
-                "I8".to_owned(),
-                "I64".to_owned(),
-                "U64".to_owned(),
-                "F64".to_owned(),
-            ]),
+            known_types: std::collections::HashSet::new(),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
             is_bindings: HashMap::new(),
@@ -491,13 +500,8 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         self.unify_at(&con_arrow, expected, span)?;
         let resolved = self.engine.resolve(&con_arrow);
         self.expr_types.insert(span, resolved.clone());
-        self.eta_expansions.insert(
-            span,
-            EtaInfo {
-                con_sym,
-                arrow_ty: resolved.clone(),
-            },
-        );
+        self.eta_expansions
+            .insert(span, EtaInfo::Constructor { con_sym });
         Ok(resolved)
     }
 
@@ -519,67 +523,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 Ok(ty)
             }
 
-            ExprKind::Name(sym) => {
-                let name = self.symbols.display(*sym);
-                if let Some(scheme) = self.env.get(name).cloned() {
-                    return Ok(self.engine.instantiate(&scheme));
-                }
-                if let Some(scheme) = self.constructors.get(name).cloned() {
-                    return Ok(self.engine.instantiate(&scheme));
-                }
-                // Structural constructor: the pre-resolver in
-                // `ast::from_raw::collect_structural_constructors`
-                // allocates a `SymbolKind::Constructor` for every
-                // uppercase name that wasn't declared. Inference
-                // produces an open tag union `[Name, ..ρ]` for it;
-                // later unifications narrow or widen the row as
-                // needed.
-                if name.starts_with(|c: char| c.is_ascii_uppercase()) {
-                    let rest = self.engine.fresh();
-                    return Ok(Type::TagUnion {
-                        tags: vec![(name.to_owned(), vec![])],
-                        rest: Some(Box::new(rest)),
-                    });
-                }
-                Err(Self::type_error(
-                    expr.span,
-                    &format!("undefined name '{name}'"),
-                ))
-            }
+            ExprKind::Name(sym) => self.infer_name(*sym, expr.span),
 
-            ExprKind::BinOp {
-                op: BinOp::And,
-                lhs,
-                rhs,
-            } => {
-                let lhs_ty = self.infer_expr(lhs)?;
-                let bool_ty = Type::Con("Bool".to_owned());
-                self.unify_at(&lhs_ty, &bool_ty, lhs.span)?;
-
-                // Collect Is bindings from LHS and add to env for RHS
-                let saved_env = self.env.clone();
-                self.collect_is_bindings(lhs);
-
-                let rhs_ty = self.infer_expr(rhs)?;
-                self.unify_at(&rhs_ty, &bool_ty, rhs.span)?;
-                self.env = saved_env;
-                Ok(bool_ty)
-            }
-
-            ExprKind::BinOp {
-                op: BinOp::Or,
-                lhs,
-                rhs,
-            } => {
-                let lhs_ty = self.infer_expr(lhs)?;
-                let bool_ty = Type::Con("Bool".to_owned());
-                self.unify_at(&lhs_ty, &bool_ty, lhs.span)?;
-                let rhs_ty = self.infer_expr(rhs)?;
-                self.unify_at(&rhs_ty, &bool_ty, rhs.span)?;
-                Ok(bool_ty)
-            }
-
-            ExprKind::BinOp { op, lhs, rhs } => self.infer_binop(op, lhs, rhs, expr.span),
+            ExprKind::BinOp { op, lhs, rhs } => match op {
+                BinOp::And => self.infer_bool_binop(lhs, rhs, true),
+                BinOp::Or => self.infer_bool_binop(lhs, rhs, false),
+                _ => self.infer_binop(*op, lhs, rhs, expr.span),
+            },
 
             ExprKind::Call { target, args, .. } => {
                 let func = self.symbols.display(*target).to_owned();
@@ -591,199 +541,18 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 self.infer_call(&mangled, args, expr.span)
             }
 
-            ExprKind::Block(stmts, result) => {
-                let saved_env = self.env.clone();
-                let mut pending_hints: HashMap<String, TypeExpr<'src>> = HashMap::new();
-                for stmt in stmts {
-                    match stmt {
-                        Stmt::TypeHint { name, ty } => {
-                            pending_hints.insert((*name).to_owned(), ty.clone());
-                        }
-                        Stmt::Let { name, val } => {
-                            let name_str = self.symbols.display(*name).to_owned();
-                            let val_ty = self.infer_expr(val)?;
-                            // If there's a type hint for this binding, enforce it
-                            if let Some(hint) = pending_hints.remove(&name_str) {
-                                let hint_ty = self.resolve_type_expr(&hint)?;
-                                self.unify_expected(
-                                    &val_ty,
-                                    &hint_ty,
-                                    val.span,
-                                    &format!("let binding `{name_str}`"),
-                                )?;
-                            }
-                            // Value restriction: only generalize let
-                            // bindings whose value is syntactically a
-                            // function. Non-function values (tag
-                            // union values, numbers, records, etc.)
-                            // keep their fresh type so that later uses
-                            // stay unified with the binding's actual
-                            // runtime value. This avoids a subtle bug
-                            // with structural tag rows: generalizing
-                            // a `let r = parse(1)` where parse's
-                            // return is an open row would freeze the
-                            // row var in r's scheme; later uses would
-                            // re-instantiate to a fresh row var that
-                            // closes independently from the original
-                            // expression's row, producing different
-                            // tag layouts for caller and callee.
-                            let scheme = if is_syntactic_value(val) {
-                                self.engine.generalize(&val_ty, &self.env)
-                            } else {
-                                Scheme::mono(val_ty)
-                            };
-                            self.env.insert(name_str, scheme);
-                        }
-                        Stmt::Destructure { pattern, val } => {
-                            let val_ty = self.infer_expr(val)?;
-                            let bindings = self.infer_pattern(pattern, &val_ty, val.span, None)?;
-                            let is_value = is_syntactic_value(val);
-                            for (sym, ty) in bindings {
-                                let name = self.symbols.display(sym).to_owned();
-                                let scheme = if is_value {
-                                    self.engine.generalize(&ty, &self.env)
-                                } else {
-                                    Scheme::mono(ty)
-                                };
-                                self.env.insert(name, scheme);
-                            }
-                        }
-                        Stmt::Guard {
-                            condition,
-                            return_val,
-                        } => {
-                            let cond_ty = self.infer_expr(condition)?;
-                            let bool_ty = Type::Con("Bool".to_owned());
-                            self.unify_at(&cond_ty, &bool_ty, condition.span)?;
-                            // Flow Is bindings from condition into return_val scope
-                            let guard_saved_env = self.env.clone();
-                            self.collect_is_bindings(condition);
-                            // The return value flows to the enclosing
-                            // function's return type. Without this,
-                            // `if cond return err` would let `err`'s
-                            // type drift unconstrained.
-                            let ret_val_ty = self.infer_expr(return_val)?;
-                            if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
-                                self.unify_expected(
-                                    &ret_val_ty,
-                                    &fn_ret,
-                                    return_val.span,
-                                    "`return` value of guard clause",
-                                )?;
-                            }
-                            self.env = guard_saved_env;
-                        }
-                    }
-                }
-                let result_ty = self.infer_expr(result)?;
-                self.env = saved_env;
-                Ok(result_ty)
-            }
+            ExprKind::Block(stmts, result) => self.infer_block(stmts, result),
 
             ExprKind::If {
                 expr: scrutinee,
                 arms,
                 else_body,
-            } => {
-                let scrutinee_ty = self.infer_expr(scrutinee)?;
-                let result_ty = self.engine.fresh();
-                let bool_ty = Type::Con("Bool".to_owned());
-                for arm in arms {
-                    let bindings =
-                        self.infer_pattern(&arm.pattern, &scrutinee_ty, expr.span, None)?;
-                    let saved_env = self.env.clone();
-                    for (sym, ty) in bindings {
-                        let name = self.symbols.display(sym).to_owned();
-                        self.env.insert(name, Scheme::mono(ty));
-                    }
-                    // For True arms of boolean if-then-else, flow Is bindings from scrutinee
-                    if let ast::Pattern::Constructor { name: "True", .. } = &arm.pattern {
-                        self.collect_is_bindings(scrutinee);
-                    }
-                    for guard_expr in &arm.guards {
-                        let guard_ty = self.infer_expr(guard_expr)?;
-                        self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
-                        // Flow Is bindings from guard into subsequent guards and arm body
-                        self.collect_is_bindings(guard_expr);
-                    }
-                    let body_ty = self.infer_expr(&arm.body)?;
-                    if arm.is_return {
-                        // `return` arms flow their body to the
-                        // enclosing function's return type, not to
-                        // the if's result type. The arm contributes
-                        // nothing to the if's value — control leaves
-                        // the enclosing function on this branch.
-                        if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
-                            self.unify_expected(
-                                &body_ty,
-                                &fn_ret,
-                                arm.body.span,
-                                "`return` value of match arm",
-                            )?;
-                        }
-                    } else {
-                        self.unify_expected(
-                            &body_ty,
-                            &result_ty,
-                            arm.body.span,
-                            "match arm body",
-                        )?;
-                    }
-                    self.env = saved_env;
-                }
-                if let Some(eb) = else_body {
-                    let eb_ty = self.infer_expr(eb)?;
-                    self.unify_expected(&eb_ty, &result_ty, eb.span, "`else` branch")?;
-                } else {
-                    // Exhaustive match with no else branch: if the
-                    // scrutinee's type is still an open tag union
-                    // row, close it.
-                    self.close_open_tag_row(&scrutinee_ty);
-                }
-                Ok(result_ty)
-            }
+            } => self.infer_if(scrutinee, arms, else_body.as_deref(), expr.span),
 
             ExprKind::Fold {
                 expr: scrutinee,
                 arms,
-            } => {
-                let scrutinee_ty = self.infer_expr(scrutinee)?;
-                let result_ty = self.engine.fresh();
-                let bool_ty = Type::Con("Bool".to_owned());
-                for arm in arms {
-                    // In fold, recursive fields bind to the result type, not the scrutinee type
-                    let bindings = self.infer_pattern(
-                        &arm.pattern,
-                        &scrutinee_ty,
-                        expr.span,
-                        Some(&result_ty),
-                    )?;
-                    let saved_env = self.env.clone();
-                    for (sym, ty) in bindings {
-                        let name = self.symbols.display(sym).to_owned();
-                        self.env.insert(name, Scheme::mono(ty));
-                    }
-                    for guard_expr in &arm.guards {
-                        let guard_ty = self.infer_expr(guard_expr)?;
-                        self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
-                        // Flow Is bindings from guard into subsequent guards and arm body
-                        self.collect_is_bindings(guard_expr);
-                    }
-                    let body_ty = self.infer_expr(&arm.body)?;
-                    self.unify_expected(
-                        &body_ty,
-                        &result_ty,
-                        arm.body.span,
-                        "fold arm body",
-                    )?;
-                    self.env = saved_env;
-                }
-                // Fold always consumes the entire collection, so its
-                // arm coverage must be exhaustive — close any open row
-                // on the scrutinee the same way `If` does.
-                self.close_open_tag_row(&scrutinee_ty);
-                Ok(result_ty)
-            }
+            } => self.infer_fold(scrutinee, arms, expr.span),
 
             ExprKind::Record { fields } => {
                 let mut type_fields = Vec::new();
@@ -799,40 +568,10 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
 
             ExprKind::FieldAccess { record, field } => {
-                let record_ty = self.infer_expr(record)?;
-                let field_ty = self.engine.fresh();
-                let rest_row = self.engine.fresh();
-                let field_name = self.fields.get(*field).to_owned();
-                let expected = Type::Record {
-                    fields: vec![(field_name, field_ty.clone())],
-                    rest: Some(Box::new(rest_row)),
-                };
-                self.unify_at(&record_ty, &expected, expr.span)?;
-                Ok(field_ty)
+                self.infer_field_access(record, *field, expr.span)
             }
 
-            ExprKind::Lambda { params, body } => {
-                let saved_env = self.env.clone();
-                let param_types: Vec<Type> = params
-                    .iter()
-                    .map(|p| {
-                        let ty = self.engine.fresh();
-                        let name = self.symbols.display(*p).to_owned();
-                        self.env.insert(name, Scheme::mono(ty.clone()));
-                        ty
-                    })
-                    .collect();
-                // Fresh return var so `return` inside the lambda
-                // body flows to the lambda's return, not to the
-                // enclosing function's return.
-                let ret = self.engine.fresh();
-                self.ret_ty_stack.push(ret.clone());
-                let body_ty = self.infer_expr(body)?;
-                self.ret_ty_stack.pop();
-                self.unify_at(&ret, &body_ty, body.span)?;
-                self.env = saved_env;
-                Ok(Type::Arrow(param_types, Box::new(ret)))
-            }
+            ExprKind::Lambda { params, body } => self.infer_lambda(params, body),
 
             ExprKind::Tuple(elems) => {
                 let mut elem_types = Vec::new();
@@ -877,6 +616,278 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
     }
 
+    // ---- Extracted match arms from infer_expr_inner ----
+
+    fn infer_block(
+        &mut self,
+        stmts: &[Stmt<'src>],
+        result: &Expr<'src>,
+    ) -> Result<Type, CompileError> {
+        let saved_env = self.env.clone();
+        let mut pending_hints: HashMap<String, TypeExpr<'src>> = HashMap::new();
+        for stmt in stmts {
+            match stmt {
+                Stmt::TypeHint { name, ty } => {
+                    pending_hints.insert((*name).to_owned(), ty.clone());
+                }
+                Stmt::Let { name, val } => {
+                    let name_str = self.symbols.display(*name).to_owned();
+                    let val_ty = self.infer_expr(val)?;
+                    if let Some(hint) = pending_hints.remove(&name_str) {
+                        let hint_ty = self.resolve_type_expr(&hint)?;
+                        self.unify_expected(
+                            &val_ty,
+                            &hint_ty,
+                            val.span,
+                            &format!("let binding `{name_str}`"),
+                        )?;
+                    }
+                    // Value restriction: only generalize let bindings
+                    // whose value is syntactically a function.
+                    let scheme = if is_syntactic_value(val) {
+                        self.engine.generalize(&val_ty, &self.env)
+                    } else {
+                        Scheme::mono(val_ty)
+                    };
+                    self.env.insert(name_str, scheme);
+                }
+                Stmt::Destructure { pattern, val } => {
+                    let val_ty = self.infer_expr(val)?;
+                    let bindings = self.infer_pattern(pattern, &val_ty, val.span, None)?;
+                    let is_value = is_syntactic_value(val);
+                    for (sym, ty) in bindings {
+                        let name = self.symbols.display(sym).to_owned();
+                        let scheme = if is_value {
+                            self.engine.generalize(&ty, &self.env)
+                        } else {
+                            Scheme::mono(ty)
+                        };
+                        self.env.insert(name, scheme);
+                    }
+                }
+                Stmt::Guard {
+                    condition,
+                    return_val,
+                } => {
+                    let cond_ty = self.infer_expr(condition)?;
+                    let bool_ty = Type::Con("Bool".to_owned());
+                    self.unify_at(&cond_ty, &bool_ty, condition.span)?;
+                    let guard_saved_env = self.env.clone();
+                    self.collect_is_bindings(condition);
+                    let ret_val_ty = self.infer_expr(return_val)?;
+                    if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
+                        self.unify_expected(
+                            &ret_val_ty,
+                            &fn_ret,
+                            return_val.span,
+                            "`return` value of guard clause",
+                        )?;
+                    }
+                    self.env = guard_saved_env;
+                }
+            }
+        }
+        let result_ty = self.infer_expr(result)?;
+        self.env = saved_env;
+        Ok(result_ty)
+    }
+
+    fn infer_if(
+        &mut self,
+        scrutinee: &Expr<'src>,
+        arms: &[ast::MatchArm<'src>],
+        else_body: Option<&Expr<'src>>,
+        span: Span,
+    ) -> Result<Type, CompileError> {
+        let scrutinee_ty = self.infer_expr(scrutinee)?;
+        let result_ty = self.engine.fresh();
+        let bool_ty = Type::Con("Bool".to_owned());
+        for arm in arms {
+            let bindings = self.infer_pattern(&arm.pattern, &scrutinee_ty, span, None)?;
+            let saved_env = self.env.clone();
+            for (sym, ty) in bindings {
+                let name = self.symbols.display(sym).to_owned();
+                self.env.insert(name, Scheme::mono(ty));
+            }
+            if let ast::Pattern::Constructor { name: "True", .. } = &arm.pattern {
+                self.collect_is_bindings(scrutinee);
+            }
+            for guard_expr in &arm.guards {
+                let guard_ty = self.infer_expr(guard_expr)?;
+                self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
+                self.collect_is_bindings(guard_expr);
+            }
+            let body_ty = self.infer_expr(&arm.body)?;
+            if arm.is_return {
+                if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
+                    self.unify_expected(
+                        &body_ty,
+                        &fn_ret,
+                        arm.body.span,
+                        "`return` value of match arm",
+                    )?;
+                }
+            } else {
+                self.unify_expected(&body_ty, &result_ty, arm.body.span, "match arm body")?;
+            }
+            self.env = saved_env;
+        }
+        if let Some(eb) = else_body {
+            let eb_ty = self.infer_expr(eb)?;
+            self.unify_expected(&eb_ty, &result_ty, eb.span, "`else` branch")?;
+        } else {
+            self.close_open_tag_row(&scrutinee_ty);
+        }
+        Ok(result_ty)
+    }
+
+    fn infer_fold(
+        &mut self,
+        scrutinee: &Expr<'src>,
+        arms: &[ast::MatchArm<'src>],
+        span: Span,
+    ) -> Result<Type, CompileError> {
+        let scrutinee_ty = self.infer_expr(scrutinee)?;
+        let result_ty = self.engine.fresh();
+        let bool_ty = Type::Con("Bool".to_owned());
+        for arm in arms {
+            let bindings = self.infer_pattern(
+                &arm.pattern,
+                &scrutinee_ty,
+                span,
+                Some(&result_ty),
+            )?;
+            let saved_env = self.env.clone();
+            for (sym, ty) in bindings {
+                let name = self.symbols.display(sym).to_owned();
+                self.env.insert(name, Scheme::mono(ty));
+            }
+            for guard_expr in &arm.guards {
+                let guard_ty = self.infer_expr(guard_expr)?;
+                self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
+                self.collect_is_bindings(guard_expr);
+            }
+            let body_ty = self.infer_expr(&arm.body)?;
+            self.unify_expected(&body_ty, &result_ty, arm.body.span, "fold arm body")?;
+            self.env = saved_env;
+        }
+        self.close_open_tag_row(&scrutinee_ty);
+        Ok(result_ty)
+    }
+
+    /// Infer `lhs and rhs` or `lhs or rhs`. Both sides must be Bool.
+    /// `and` flows `is`-bindings from LHS into RHS scope; `or` does not.
+    fn infer_bool_binop(
+        &mut self,
+        lhs: &Expr<'src>,
+        rhs: &Expr<'src>,
+        flow_is_bindings: bool,
+    ) -> Result<Type, CompileError> {
+        let lhs_ty = self.infer_expr(lhs)?;
+        let bool_ty = Type::Con("Bool".to_owned());
+        self.unify_at(&lhs_ty, &bool_ty, lhs.span)?;
+        let saved_env = flow_is_bindings.then(|| {
+            let saved = self.env.clone();
+            self.collect_is_bindings(lhs);
+            saved
+        });
+        let rhs_ty = self.infer_expr(rhs)?;
+        self.unify_at(&rhs_ty, &bool_ty, rhs.span)?;
+        if let Some(saved) = saved_env {
+            self.env = saved;
+        }
+        Ok(bool_ty)
+    }
+
+    fn infer_name(&mut self, sym: SymbolId, span: Span) -> Result<Type, CompileError> {
+        let name = self.symbols.display(sym);
+        if let Some(scheme) = self.env.get(name).cloned() {
+            return Ok(self.engine.instantiate(&scheme));
+        }
+        if let Some(scheme) = self.constructors.get(name).cloned() {
+            return Ok(self.engine.instantiate(&scheme));
+        }
+        // Structural constructor: uppercase name not in any declaration
+        // produces an open tag union `[Name, ..ρ]`.
+        if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+            let rest = self.engine.fresh();
+            return Ok(Type::TagUnion {
+                tags: vec![(name.to_owned(), vec![])],
+                rest: Some(Box::new(rest)),
+            });
+        }
+        Err(Self::type_error(span, &format!("undefined name '{name}'")))
+    }
+
+    fn infer_field_access(
+        &mut self,
+        record: &Expr<'src>,
+        field: crate::symbol::FieldSym,
+        span: Span,
+    ) -> Result<Type, CompileError> {
+        // Method reference via `Type.method`: if the record is a
+        // `Name` referencing a type symbol and there's a registered
+        // method scheme under `"Type.method"`, produce the method's
+        // arrow type as a first-class function value. The post-
+        // inference eta-expansion pass rewrites the node into an
+        // explicit lambda + `QualifiedCall`.
+        if let ExprKind::Name(sym) = &record.kind
+            && self.symbols.get(*sym).kind == SymbolKind::Type
+        {
+            let type_name = self.symbols.display(*sym).to_owned();
+            let field_name = self.fields.get(field).to_owned();
+            let mangled = format!("{type_name}.{field_name}");
+            if let Some(scheme) = self.env.get(&mangled).cloned() {
+                let method_ty = self.engine.instantiate(&scheme);
+                self.expr_types.insert(span, method_ty.clone());
+                self.eta_expansions.insert(
+                    span,
+                    EtaInfo::Method {
+                        type_name,
+                        method_name: field_name,
+                    },
+                );
+                return Ok(method_ty);
+            }
+        }
+        let record_ty = self.infer_expr(record)?;
+        let field_ty = self.engine.fresh();
+        let rest_row = self.engine.fresh();
+        let field_name = self.fields.get(field).to_owned();
+        let expected = Type::Record {
+            fields: vec![(field_name, field_ty.clone())],
+            rest: Some(Box::new(rest_row)),
+        };
+        self.unify_at(&record_ty, &expected, span)?;
+        Ok(field_ty)
+    }
+
+    fn infer_lambda(
+        &mut self,
+        params: &[SymbolId],
+        body: &Expr<'src>,
+    ) -> Result<Type, CompileError> {
+        let saved_env = self.env.clone();
+        let param_types: Vec<Type> = params
+            .iter()
+            .map(|p| {
+                let ty = self.engine.fresh();
+                let name = self.symbols.display(*p).to_owned();
+                self.env.insert(name, Scheme::mono(ty.clone()));
+                ty
+            })
+            .collect();
+        let ret = self.engine.fresh();
+        self.ret_ty_stack.push(ret.clone());
+        let body_ty = self.infer_expr(body)?;
+        self.ret_ty_stack.pop();
+        self.unify_at(&ret, &body_ty, body.span)?;
+        self.env = saved_env;
+        Ok(Type::Arrow(param_types, Box::new(ret)))
+    }
+
+    // ---- Call inference ----
+
     fn infer_call(
         &mut self,
         func: &str,
@@ -891,6 +902,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         // synthesize-first path for zero-arg calls, structural
         // constructors, and method-on-var dispatch.
         if let Some(result) = self.try_infer_call_bidir(func, args, span)? {
+            self.maybe_mark_numeric_builtin(func, span);
             return Ok(result);
         }
 
@@ -918,6 +930,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             let func_ty = self.engine.instantiate(&scheme);
             let expected = Type::Arrow(arg_types, Box::new(ret.clone()));
             self.unify_at(&func_ty, &expected, span)?;
+            self.maybe_mark_numeric_builtin(func, span);
             return Ok(ret);
         }
 
@@ -963,19 +976,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         full_args.extend(arg_types);
                         let expected = Type::Arrow(full_args, Box::new(ret.clone()));
                         self.unify_at(&func_ty, &expected, span)?;
-                        // Record resolution for the lowerer
-                        self.method_resolutions.insert(span, mangled);
+                        let resolution = if Self::is_numeric_builtin(concrete_name, method_name) {
+                            format!("__builtin.{method_name}")
+                        } else {
+                            mangled
+                        };
+                        self.method_resolutions.insert(span, resolution);
                         return Ok(ret);
-                    }
-                    if let Some(result) = self.resolve_numeric_builtin(
-                        concrete_name,
-                        method_name,
-                        &var_ty,
-                        &arg_types,
-                        &resolved,
-                        span,
-                    ) {
-                        return result;
                     }
                 }
             }
@@ -991,7 +998,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
 
     fn infer_binop(
         &mut self,
-        op: &BinOp,
+        op: BinOp,
         lhs: &Expr<'src>,
         rhs: &Expr<'src>,
         span: Span,
@@ -1078,7 +1085,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         let ret = self.engine.fresh();
         let resolved = self.engine.resolve(&recv_ty);
 
-        // Concrete type: look up Type.method
+        // Concrete type: look up Type.method in env. For numeric
+        // builtins, write `__builtin.<method>` so the lowerer emits
+        // an SSA op instead of a function call.
         if let Type::Con(name) | Type::App(name, _) = &resolved {
             let mangled = format!("{name}.{method}");
             if let Some(scheme) = self.env.get(&mangled).cloned() {
@@ -1087,13 +1096,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 full_args.extend(arg_types);
                 let expected = Type::Arrow(full_args, Box::new(ret.clone()));
                 self.unify_at(&func_ty, &expected, span)?;
-                self.method_resolutions.insert(span, mangled);
+                let resolution = if Self::is_numeric_builtin(name, method) {
+                    format!("__builtin.{method}")
+                } else {
+                    mangled
+                };
+                self.method_resolutions.insert(span, resolution);
                 return Ok(ret);
-            }
-            if let Some(result) =
-                self.resolve_numeric_builtin(name, method, &recv_ty, &arg_types, &resolved, span)
-            {
-                return result;
             }
         }
 
@@ -1120,41 +1129,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 self.engine.display_type(&resolved)
             ),
         ))
-    }
-
-    // ---- Numeric builtin resolution ----
-
-    /// Try to resolve a method call as a numeric builtin (add, sub, eq, etc.).
-    /// Returns `Some(Ok(ty))` if it matched, `None` if not a numeric builtin.
-    fn resolve_numeric_builtin(
-        &mut self,
-        type_name: &str,
-        method: &str,
-        recv_ty: &Type,
-        arg_types: &[Type],
-        resolved: &Type,
-        span: Span,
-    ) -> Option<Result<Type, CompileError>> {
-        if !Self::NUMERIC_TYPES.contains(&type_name) || !Self::ARITHMETIC_METHODS.contains(&method)
-        {
-            return None;
-        }
-        let concrete_ty = resolved.clone();
-        if let Err(e) = self.unify_at(recv_ty, &concrete_ty, span) {
-            return Some(Err(e));
-        }
-        for arg_ty in arg_types {
-            if let Err(e) = self.unify_at(arg_ty, &concrete_ty, span) {
-                return Some(Err(e));
-            }
-        }
-        self.method_resolutions
-            .insert(span, format!("__builtin.{method}"));
-        if method == "eq" || method == "neq" {
-            Some(Ok(Type::Con("Bool".to_owned())))
-        } else {
-            Some(Ok(concrete_ty))
-        }
     }
 
     // ---- Match exhaustiveness closure ----
@@ -1444,10 +1418,41 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         Ok(())
     }
 
-    /// Numeric types that implicitly satisfy arithmetic constraints.
+    /// Numeric types whose body-less method declarations in the
+    /// stdlib are backed by compiler intrinsics rather than user code.
     const NUMERIC_TYPES: &'static [&'static str] = &["I8", "U8", "I64", "U64", "F64"];
-    const ARITHMETIC_METHODS: &'static [&'static str] =
-        &["add", "sub", "mul", "div", "rem", "eq", "neq"];
+
+    /// Methods on numeric types dispatched as compiler intrinsics.
+    /// Arithmetic ops become SSA binary ops; `to_str` becomes the
+    /// `__num_to_str` runtime call. All are resolved to
+    /// `__builtin.<method>` in `method_resolutions` so the lowerer
+    /// can distinguish them from user-defined methods.
+    const NUMERIC_BUILTIN_METHODS: &'static [&'static str] =
+        &["add", "sub", "mul", "div", "rem", "eq", "neq", "to_str"];
+
+    /// True if `type_name.method` is a compiler-intrinsic numeric
+    /// method that should resolve to `__builtin.<method>` instead of
+    /// the env-provided scheme name.
+    fn is_numeric_builtin(type_name: &str, method: &str) -> bool {
+        Self::NUMERIC_TYPES.contains(&type_name)
+            && Self::NUMERIC_BUILTIN_METHODS.contains(&method)
+    }
+
+    /// If `func` is a dotted `Type.method` that matches a numeric
+    /// builtin, insert the `__builtin.<method>` marker into
+    /// `method_resolutions` at `span`. Called after `infer_call` /
+    /// `try_infer_call_bidir` resolve a `QualifiedCall` via env so
+    /// the lowerer routes it through the intrinsic path.
+    fn maybe_mark_numeric_builtin(&mut self, func: &str, span: Span) {
+        if let Some(dot) = func.find('.') {
+            let type_name = &func[..dot];
+            let method = &func[dot + 1..];
+            if Self::is_numeric_builtin(type_name, method) {
+                self.method_resolutions
+                    .insert(span, format!("__builtin.{method}"));
+            }
+        }
+    }
 
     /// Verify constraints whose type vars resolved to concrete types,
     /// and store method resolutions for the lowerer.
@@ -1458,16 +1463,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 continue; // still polymorphic or structural, stays as constraint
             };
             let maybe_span = self.constraint_spans.get(i).copied();
-            // Numeric types implicitly have arithmetic methods
-            if Self::NUMERIC_TYPES.contains(&type_name.as_str())
-                && Self::ARITHMETIC_METHODS.contains(&c.method_name.as_str())
-            {
-                if let Some(s) = maybe_span {
-                    self.method_resolutions
-                        .insert(s, format!("__builtin.{}", c.method_name));
-                }
-                continue;
-            }
             let mangled = format!("{type_name}.{}", c.method_name);
             if let Some(scheme) = self.env.get(&mangled).cloned() {
                 // Unify the constraint's method type with the actual method signature
@@ -1475,7 +1470,12 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 let actual_ty = self.engine.instantiate(&scheme);
                 drop(self.engine.unify(&c.method_type, &actual_ty));
                 if let Some(s) = maybe_span {
-                    self.method_resolutions.insert(s, mangled);
+                    let resolution = if Self::is_numeric_builtin(type_name, &c.method_name) {
+                        format!("__builtin.{}", c.method_name)
+                    } else {
+                        mangled
+                    };
+                    self.method_resolutions.insert(s, resolution);
                 }
             } else {
                 return Err(CompileError::new(format!(
@@ -1588,6 +1588,21 @@ pub fn check<'src>(
             ty: Type::Arrow(vec![param_ty], Box::new(ret_ty)),
         };
         ctx.env.insert(mangled, scheme);
+    }
+
+    // Pre-register all type names into `known_types` before Pass 1
+    // processes method signatures. This breaks dependency cycles
+    // between stdlib modules — e.g. I64's `to_str : I64 -> Str`
+    // references Str, which isn't processed until later. Forward
+    // type-name references are fine; only the name needs to exist in
+    // `known_types` for `type_expr_to_type` to accept it.
+    for decl in &module.decls {
+        if let Decl::TypeAnno { name, kind, .. } = decl {
+            let n = symbols.display(*name);
+            if n.starts_with(|c: char| c.is_ascii_uppercase()) && *kind != TypeDeclKind::Alias {
+                ctx.known_types.insert(n.to_owned());
+            }
+        }
     }
 
     // Pass 1: register all type declarations and function signatures
@@ -2089,26 +2104,38 @@ fn eta_expand_expr(
         }
     }
 
-    // Post-order rewrite: if this is a marked Name reference,
-    // replace it with a synthesized Lambda.
+    // Post-order rewrite: replace marked callable references
+    // (Name → constructor, FieldAccess → method) with synthesized
+    // Lambdas. The arrow type comes from `expr.ty` which was
+    // resolved by `write_types_back` immediately before this pass
+    // runs, so any post-creation unification on the reference's
+    // type flows through automatically.
     if let Some(info) = eta.get(&expr.span)
-        && matches!(&expr.kind, ExprKind::Name(_))
-        && matches!(&info.arrow_ty, Type::Arrow(_, _))
+        && matches!(
+            &expr.kind,
+            ExprKind::Name(_) | ExprKind::FieldAccess { .. }
+        )
+        && matches!(&expr.ty, Type::Arrow(_, _))
     {
-        rewrite_con_ref_to_lambda(expr, info, symbols);
+        rewrite_callable_ref_to_lambda(expr, info, symbols);
     }
 }
 
-/// Replace `expr` in place with `|__eta_0, __eta_1, ..| con_sym(...)`.
-/// Assumes the caller already verified that `expr.kind` is a `Name`
-/// reference and `info.arrow_ty` is an `Arrow`.
-fn rewrite_con_ref_to_lambda(
+/// Replace a marked callable reference (either a bare constructor
+/// `Name` or a `Type.method` `FieldAccess`) with an explicit Lambda
+/// that forwards its arguments to the underlying call.
+///
+/// Assumes the caller has verified that `expr.ty` is an `Arrow`
+/// and that `expr.kind` is one of the two supported reference
+/// shapes. The arrow's parameter count determines the lambda's
+/// arity; fresh `SymbolId`s are allocated for each parameter.
+fn rewrite_callable_ref_to_lambda(
     expr: &mut Expr<'_>,
     info: &EtaInfo,
     symbols: &mut SymbolTable,
 ) {
-    let Type::Arrow(param_types, ret_ty) = &info.arrow_ty else {
-        unreachable!("caller checked arrow_ty is Arrow");
+    let Type::Arrow(param_types, ret_ty) = expr.ty.clone() else {
+        unreachable!("caller checked expr.ty is Arrow");
     };
     let span = expr.span;
     let param_syms: Vec<SymbolId> = (0..param_types.len())
@@ -2126,19 +2153,56 @@ fn rewrite_con_ref_to_lambda(
             name_expr
         })
         .collect();
-    let mut call_expr = Expr::new(
-        ExprKind::Call {
-            target: info.con_sym,
+
+    // Build the inner call based on which kind of reference we
+    // have. Constructors emit `Call { target, args }`; methods
+    // emit `QualifiedCall { segments, args, resolved }` so the
+    // existing method dispatch pipeline in mono and lowering
+    // picks them up the same way a hand-written call would.
+    let inner_kind = match info {
+        EtaInfo::Constructor { con_sym } => ExprKind::Call {
+            target: *con_sym,
             args: call_args,
         },
-        span,
-    );
-    call_expr.ty = (**ret_ty).clone();
+        EtaInfo::Method {
+            type_name,
+            method_name,
+        } => {
+            // Leak segment strings to 'static so they satisfy the
+            // 'src lifetime of the AST. Parse-time synthesized
+            // names already follow this pattern (fold_lift,
+            // desugar_try). Leak cost is O(methods-passed-as-args).
+            let type_seg: &'static str =
+                Box::leak(type_name.clone().into_boxed_str());
+            let method_seg: &'static str =
+                Box::leak(method_name.clone().into_boxed_str());
+            // Numeric builtin methods (`I64.add` etc.) are dispatched
+            // via the `__builtin.<op>` marker that `resolve_numeric_builtin`
+            // and the method-call path already use; populating it here
+            // lets the lowerer's existing `strip_prefix("__builtin.")`
+            // handle the eta-expanded call uniformly with hand-written
+            // `x.add(y)` method calls. Non-numeric method references
+            // leave `resolved` at `None` so normal function-call
+            // dispatch handles them.
+            let resolved =
+                InferCtx::is_numeric_builtin(type_name, method_name)
+                    .then(|| format!("__builtin.{method_name}"));
+            ExprKind::QualifiedCall {
+                segments: vec![type_seg, method_seg],
+                args: call_args,
+                resolved,
+            }
+        }
+    };
+    let mut inner_expr = Expr::new(inner_kind, span);
+    inner_expr.ty = *ret_ty;
+
     expr.kind = ExprKind::Lambda {
         params: param_syms,
-        body: Box::new(call_expr),
+        body: Box::new(inner_expr),
     };
-    expr.ty = info.arrow_ty.clone();
+    // `expr.ty` is already the correct arrow type — set when
+    // inference populated expr_types and copied back.
 }
 
 // ---- Write-back of resolved types onto AST nodes ----

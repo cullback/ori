@@ -1,3 +1,5 @@
+exports [U8]
+
 U8 := {}.(
     add : U8, U8 -> U8
     sub : U8, U8 -> U8

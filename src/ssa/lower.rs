@@ -416,13 +416,42 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let ExprKind::QualifiedCall { resolved, .. } = &outer.kind else {
             unreachable!("lower_qualified_call called on non-QualifiedCall");
         };
+        // `__builtin.<op>` dispatch: the call came out of either the
+        // numeric method-call resolution (`x.add(y)` where x : I64)
+        // or the eta-expansion of a numeric method reference (`I64.add`
+        // used as a first-class function). Both shapes share this
+        // path — the difference is only in whether `segments[0]` is
+        // a local binding or the type name.
+        if let Some(resolved_name) = resolved
+            && let Some(op_name) = resolved_name.strip_prefix("__builtin.")
+        {
+            // Numeric builtin intrinsic. `segments[0]` is either a
+            // local binding (receiver for `x.add(y)`) or a type name
+            // (`I64` for eta-expanded `I64.add(a, b)`).
+            let local_val = self
+                .vars
+                .iter()
+                .find(|(sym, _)| self.symbols.display(**sym) == segments[0])
+                .map(|(_, v)| *v);
+            if op_name == "to_str" {
+                // Unary: `x.to_str()` or eta-expanded `I64.to_str(x)`
+                let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
+                return self
+                    .builder
+                    .call("__num_to_str", vec![arg], ScalarType::Ptr);
+            }
+            // Binary arithmetic op
+            let (lhs, rhs) = if let Some(local_val) = local_val {
+                (local_val, self.lower_expr(&args[0]))
+            } else {
+                (self.lower_expr(&args[0]), self.lower_expr(&args[1]))
+            };
+            let ty = self.expr_scalar_type(&args[0]);
+            return self.lower_builtin_op(op_name, lhs, rhs, ty);
+        }
         if let Some(resolved_name) = resolved {
-            // Local-receiver method dispatch. In practice this path
-            // is only hit for `receiver.method(args)` parsed as
-            // `QualifiedCall` when the receiver is a local binding
-            // (the usual form is `MethodCall`). `segments[0]` names
-            // the receiver; look it up in the current scope by
-            // display name.
+            // Non-builtin method dispatch on a local receiver (the
+            // qualified-call form of `receiver.method(args)`).
             let receiver_name = segments[0];
             let receiver_val = self
                 .vars
@@ -436,11 +465,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     // path — they go through `ExprKind::Call` instead.
                     self.lower_constructor_call(receiver_name, &[], None)
                 });
-            if let Some(op_name) = resolved_name.strip_prefix("__builtin.") {
-                let rhs = self.lower_expr(&args[0]);
-                let ty = self.expr_scalar_type(outer);
-                return self.lower_builtin_op(op_name, receiver_val, rhs, ty);
-            }
             let mut arg_vals = vec![receiver_val];
             for a in args {
                 arg_vals.push(self.lower_expr(a));
@@ -471,6 +495,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         };
         let recv_val = self.lower_expr(receiver);
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
+            if op_name == "to_str" {
+                return self
+                    .builder
+                    .call("__num_to_str", vec![recv_val], ScalarType::Ptr);
+            }
             let rhs = self.lower_expr(&args[0]);
             let ty = self.expr_scalar_type(outer);
             return self.lower_builtin_op(op_name, recv_val, rhs, ty);
@@ -499,11 +528,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
         if Self::is_list_builtin(&mangled) {
             return emit_list_builtin_call(&mut self.builder, &mangled, arg_vals);
-        }
-        if is_num_to_str(&mangled) {
-            return self
-                .builder
-                .call("__num_to_str", vec![arg_vals[0]], ScalarType::Ptr);
         }
         let ret_ty = self.func_ret_type(&mangled);
         self.builder.call(&mangled, arg_vals, ret_ty)
@@ -540,12 +564,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         if Self::is_list_builtin(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
             return emit_list_builtin_call(&mut self.builder, func, arg_vals);
-        }
-        if is_num_to_str(func) {
-            let arg_val = self.lower_expr(&args[0]);
-            return self
-                .builder
-                .call("__num_to_str", vec![arg_val], ScalarType::Ptr);
         }
         if self.decls.constructors.contains_key(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -1294,15 +1312,6 @@ fn classify_walk(name: &str) -> Option<WalkKind> {
         "walk_until" => Some(WalkKind { until: true }),
         _ => None,
     }
-}
-
-/// `I64.to_str` / `F64.to_str` / etc. — dispatched to the
-/// `__num_to_str` runtime intrinsic.
-fn is_num_to_str(name: &str) -> bool {
-    matches!(
-        name,
-        "I8.to_str" | "U8.to_str" | "I64.to_str" | "U64.to_str" | "F64.to_str"
-    )
 }
 
 /// Emit a call to one of the built-in list intrinsics

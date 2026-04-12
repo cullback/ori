@@ -1,3 +1,5 @@
+exports [I8]
+
 I8 := {}.(
     add : I8, I8 -> I8
     sub : I8, I8 -> I8

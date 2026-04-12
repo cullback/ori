@@ -1752,6 +1752,45 @@ main = |arg| (
 }
 
 #[test]
+fn method_ref_i64_add_in_scan() {
+    // `I64.add` used as a first-class function via method reference.
+    // Eta-expansion produces `|a, b| I64.add(a, b)`, defunc builds a
+    // closure, and lower routes the inner call to the builtin add op.
+    // [1, 2, 3, 4].scan(0, I64.add) = [1, 3, 6, 10], index 3 = 10.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    sums = List.scan([1, 2, 3, 4], 0, I64.add)
+    List.get(sums, 3)
+)";
+    assert_eq!(run_i64(source, 0), 10);
+}
+
+#[test]
+fn method_ref_i64_mul_in_scan() {
+    // Same path with a different builtin op, to catch mishandling
+    // that would only break one operator.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    ps = List.scan([2, 3, 4], 1, I64.mul)
+    List.get(ps, 2)
+)";
+    assert_eq!(run_i64(source, 0), 24);
+}
+
+#[test]
+fn method_ref_i64_add_in_walk() {
+    // Method reference as the reducer for a plain walk (not scan).
+    // Exercises the same eta-expansion path through a different HO
+    // call site.
+    let source = "\
+main : I64 -> I64
+main = |arg| List.walk([1, 2, 3, 4], 0, I64.add)";
+    assert_eq!(run_i64(source, 0), 10);
+}
+
+#[test]
 fn constructor_as_value_stays_nullary() {
     // Bare `Red` in a value context (no arrow expected) keeps its
     // nullary-constructor-value interpretation. This is the default

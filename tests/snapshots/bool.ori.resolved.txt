@@ -2,6 +2,11 @@ resolved:
   imports: (none)
   decls by file:
     <stdlib:Bool>: Bool
+    <stdlib:I8>: I8
+    <stdlib:U8>: U8
+    <stdlib:I64>: I64
+    <stdlib:U64>: U64
+    <stdlib:F64>: F64
     <stdlib:Result>: Result
     <stdlib:List>: Step, List
     <stdlib:Str>: Str
