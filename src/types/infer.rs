@@ -1998,10 +1998,11 @@ pub fn check<'src>(
         }
     }
 
-    // Literals must be defaulted before constraints are verified,
-    // because constraint resolution needs concrete types (e.g.
-    // `x.to_str()` where `x` is an int literal that defaults to I64).
+    ctx.verify_constraints()?;
     ctx.resolve_literals()?;
+    // Second pass: constraints that depended on literal defaulting
+    // (e.g. `x.to_str()` where `x` was an unresolved int literal
+    // that just got defaulted to I64) can now resolve.
     ctx.verify_constraints()?;
 
     // Resolve all expression types now that inference is complete.
