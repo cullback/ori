@@ -261,11 +261,7 @@ impl ParseCtx {
                 let base = self.parse_expr(inner.next().unwrap());
                 // Fold postfix chains: .method(args) or .field
                 inner.fold(base, |receiver, postfix| {
-                    let postfix_span = Span {
-                        file: self.file,
-                        start: receiver.span.start,
-                        end: self.span_of(&postfix).end,
-                    };
+                    let postfix_span = self.span_of(&postfix);
                     let mut parts = postfix.into_inner();
                     let first = parts.next().unwrap();
                     match first.as_rule() {
