@@ -1139,56 +1139,56 @@ main = |arg| List.sum([1, 2, 3, 4, 5])";
 }
 
 #[test]
-fn builtin_list_scan_running_sum() {
-    // scan with an add reducer gives running totals:
-    // [1, 2, 3, 4].scan(0, add) = [1, 3, 6, 10]
+fn builtin_list_trail_running_sum() {
+    // trail with an add reducer gives running totals:
+    // [1, 2, 3, 4].trail(0, add) = [1, 3, 6, 10]
     let source = "\
 main : I64 -> I64
 main = |arg| (
-    sums = List.scan([1, 2, 3, 4], 0, |acc, x| acc + x)
+    sums = List.trail([1, 2, 3, 4], 0, |acc, x| acc + x)
     List.get(sums, 3)
 )";
     assert_eq!(run_i64(source, 0), 10);
 }
 
 #[test]
-fn builtin_list_scan_middle_element() {
+fn builtin_list_trail_middle_element() {
     // Verify an intermediate element of the running-sum output,
     // not just the last — catches accidental reverses or
     // off-by-ones.
     let source = "\
 main : I64 -> I64
 main = |arg| (
-    sums = List.scan([1, 2, 3, 4], 0, |acc, x| acc + x)
+    sums = List.trail([1, 2, 3, 4], 0, |acc, x| acc + x)
     List.get(sums, 1)
 )";
     assert_eq!(run_i64(source, 0), 3);
 }
 
 #[test]
-fn builtin_list_scan_running_product() {
-    // Running product via scan: [2, 3, 4].scan(1, mul)
+fn builtin_list_trail_running_product() {
+    // Running product via trail: [2, 3, 4].trail(1, mul)
     //   result[0] = 1 * 2 = 2
     //   result[1] = 2 * 3 = 6
     //   result[2] = 6 * 4 = 24
     let source = "\
 main : I64 -> I64
 main = |arg| (
-    ps = List.scan([2, 3, 4], 1, |acc, x| acc * x)
+    ps = List.trail([2, 3, 4], 1, |acc, x| acc * x)
     List.get(ps, 2)
 )";
     assert_eq!(run_i64(source, 0), 24);
 }
 
 #[test]
-fn builtin_list_scan_empty() {
+fn builtin_list_trail_empty() {
     // Empty input produces empty output (length 0).
     let source = "\
 main : I64 -> U64
 main = |arg| (
     empty : List(I64)
     empty = []
-    sums = List.scan(empty, 0, |acc, x| acc + x)
+    sums = List.trail(empty, 0, |acc, x| acc + x)
     List.len(sums)
 )";
     assert_eq!(run_u64(source, 0), 0);
@@ -1752,28 +1752,28 @@ main = |arg| (
 }
 
 #[test]
-fn method_ref_i64_add_in_scan() {
+fn method_ref_i64_add_in_trail() {
     // `I64.add` used as a first-class function via method reference.
     // Eta-expansion produces `|a, b| I64.add(a, b)`, defunc builds a
     // closure, and lower routes the inner call to the builtin add op.
-    // [1, 2, 3, 4].scan(0, I64.add) = [1, 3, 6, 10], index 3 = 10.
+    // [1, 2, 3, 4].trail(0, I64.add) = [1, 3, 6, 10], index 3 = 10.
     let source = "\
 main : I64 -> I64
 main = |arg| (
-    sums = List.scan([1, 2, 3, 4], 0, I64.add)
+    sums = List.trail([1, 2, 3, 4], 0, I64.add)
     List.get(sums, 3)
 )";
     assert_eq!(run_i64(source, 0), 10);
 }
 
 #[test]
-fn method_ref_i64_mul_in_scan() {
+fn method_ref_i64_mul_in_trail() {
     // Same path with a different builtin op, to catch mishandling
     // that would only break one operator.
     let source = "\
 main : I64 -> I64
 main = |arg| (
-    ps = List.scan([2, 3, 4], 1, I64.mul)
+    ps = List.trail([2, 3, 4], 1, I64.mul)
     List.get(ps, 2)
 )";
     assert_eq!(run_i64(source, 0), 24);
@@ -1781,7 +1781,7 @@ main = |arg| (
 
 #[test]
 fn method_ref_i64_add_in_walk() {
-    // Method reference as the reducer for a plain walk (not scan).
+    // Method reference as the reducer for a plain walk (not trail).
     // Exercises the same eta-expansion path through a different HO
     // call site.
     let source = "\
