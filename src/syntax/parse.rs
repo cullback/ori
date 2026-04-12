@@ -390,6 +390,9 @@ impl ParseCtx {
                 let n: i64 = pair.as_str().parse().unwrap();
                 Expr::new(ExprKind::IntLit(n), span)
             }
+            Rule::dot_lambda => {
+                self.desugar_dot_lambda(pair, span)
+            }
             Rule::neg_expr => {
                 let inner = pair.into_inner().next().unwrap();
                 Expr::new(
@@ -650,6 +653,37 @@ impl ParseCtx {
     fn parse_tuple<'src>(&self, pair: Pair<'src, Rule>, span: Span) -> Expr<'src> {
         let elements: Vec<Expr<'_>> = pair.into_inner().map(|p| self.parse_expr(p)).collect();
         Expr::new(ExprKind::Tuple(elements), span)
+    }
+
+    /// Desugar `.method(args)` in atom position to
+    /// `|__dot_N| __dot_N.method(args)`.
+    fn desugar_dot_lambda<'src>(&self, pair: Pair<'src, Rule>, span: Span) -> Expr<'src> {
+        let mut inner = pair.into_inner();
+        let head = inner.next().unwrap();
+        let text = head.as_str();
+        let method = &text[1..text.len() - 1];
+        let args: Vec<Expr<'src>> = inner
+            .find(|p| p.as_rule() == Rule::args)
+            .map(|p| p.into_inner().map(|a| self.parse_expr(a)).collect())
+            .unwrap_or_default();
+        let param: &'static str =
+            Box::leak(format!("__dot_{}", span.start).into_boxed_str());
+        let receiver = Expr::new(ExprKind::Name(param), span);
+        let body = Expr::new(
+            ExprKind::MethodCall {
+                receiver: Box::new(receiver),
+                method,
+                args,
+            },
+            span,
+        );
+        Expr::new(
+            ExprKind::Lambda {
+                params: vec![param],
+                body: Box::new(body),
+            },
+            span,
+        )
     }
 }
 

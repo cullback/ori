@@ -78,7 +78,13 @@ base_atom = {
   | char_lit
   | float_lit
   | int_lit
+  | dot_lambda
 }
+
+// Point-free method lambda: `.method(args)` desugars to
+// `|x| x.method(args)`. Appears in atom position only (no
+// preceding receiver).
+dot_lambda = { method_head ~ args? ~ ")" }
 
 // Postfix: .method(args), .field, `is` pattern test, or `?` for
 // error propagation.

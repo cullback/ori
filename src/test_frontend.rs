@@ -1860,6 +1860,34 @@ main = |arg| if arg
     run_i64(source, 0);
 }
 
+// ============================================================
+// Dot-lambda syntax
+// ============================================================
+
+#[test]
+fn dot_lambda_method_call() {
+    // `.add(10)` desugars to `|x| x.add(10)`, used as map callback.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    xs = List.map([1, 2, 3], .add(10))
+    List.get(xs, 1)
+)";
+    assert_eq!(run_i64(source, 0), 12);
+}
+
+#[test]
+fn dot_lambda_mul() {
+    // `.mul(3)` desugars to `|x| x.mul(3)`.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    xs = List.map([2, 3, 4], .mul(3))
+    List.get(xs, 0)
+)";
+    assert_eq!(run_i64(source, 0), 6);
+}
+
 #[test]
 fn constructor_as_value_stays_nullary() {
     // Bare `Red` in a value context (no arrow expected) keeps its
