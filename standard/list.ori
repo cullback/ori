@@ -69,6 +69,20 @@ List := {}.(
         result.found
     )
 
+    # Splits the list on every occurrence of the delimiter,
+    # returning a list of sub-lists. The delimiter itself is
+    # not included in any sub-list.
+    # `[1, 2, 3, 2, 4].split_on(2)` produces `[[1], [3], [4]]`.
+    split_on : List(a), a -> List(List(a)) where [a.equals]
+    split_on = |xs, delim| (
+        state = List.walk(xs, { chunks: [], current: [] }, |s, x|
+            if x == delim
+                then { chunks: List.append(s.chunks, s.current), current: [] }
+                else { chunks: s.chunks, current: List.append(s.current, x) }
+        )
+        List.append(state.chunks, state.current)
+    )
+
     # Returns the sum of all elements.
     sum : List(a) -> a where [a.add]
     sum = |xs| List.walk(xs, 0, |acc, x| acc + x)
