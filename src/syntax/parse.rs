@@ -320,8 +320,10 @@ impl ParseCtx {
                             }
                         }
                         Rule::interpolation => {
-                            let inner = self.parse_expr(child.into_inner().next().unwrap());
-                            segments.push(wrap_to_str(inner, span));
+                            let interp_pair = child.into_inner().next().unwrap();
+                            let interp_span = self.span_of(&interp_pair);
+                            let inner = self.parse_expr(interp_pair);
+                            segments.push(wrap_to_str(inner, span.file));
                         }
                         _ => {}
                     }
@@ -353,8 +355,10 @@ impl ParseCtx {
                         Rule::interpolation => {
                             is_first = false;
                             at_line_start = false;
-                            let inner = self.parse_expr(child.into_inner().next().unwrap());
-                            segments.push(wrap_to_str(inner, span));
+                            let interp_pair = child.into_inner().next().unwrap();
+                            let interp_span = self.span_of(&interp_pair);
+                            let inner = self.parse_expr(interp_pair);
+                            segments.push(wrap_to_str(inner, span.file));
                         }
                         _ => {}
                     }
@@ -1020,19 +1024,33 @@ fn unescape_char(s: &str) -> i64 {
     }
 }
 
-/// Wrap an interpolated expression in `.to_str()` for automatic string conversion.
-fn wrap_to_str(expr: Expr<'_>, span: Span) -> Expr<'_> {
+/// Mint a unique synthetic span that won't collide with any real
+/// source span or with other synthetic spans.
+fn synth_span(file: FileId) -> Span {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Span {
+        file,
+        start: usize::MAX - id,
+        end: usize::MAX - id,
+    }
+}
+
+/// Wrap an interpolated expression in `.to_str()` for automatic
+/// string conversion. Uses a synthetic span so the `MethodCall`
+/// doesn't collide with the inner expression in span-keyed maps.
+fn wrap_to_str(expr: Expr<'_>, file: FileId) -> Expr<'_> {
     Expr::new(
         ExprKind::MethodCall {
             receiver: Box::new(expr),
             method: "to_str",
             args: vec![],
         },
-        span,
+        synth_span(file),
     )
 }
 
-/// Build a concat chain from string segments, or a single expression / empty `StrLit`.
+/// Build a concat chain from string segments via `acc.concat(seg)` method calls.
 fn concat_string_segments(segments: Vec<Expr<'_>>, span: Span) -> Expr<'_> {
     if segments.is_empty() {
         return Expr::new(ExprKind::StrLit(vec![]), span);
@@ -1043,13 +1061,13 @@ fn concat_string_segments(segments: Vec<Expr<'_>>, span: Span) -> Expr<'_> {
     let mut iter = segments.into_iter();
     let first = iter.next().unwrap();
     iter.fold(first, |acc, seg| {
-        // Use Call with pre-joined name to avoid span-keyed method resolution conflicts
         Expr::new(
-            ExprKind::Call {
-                func: "Str.concat",
-                args: vec![acc, seg],
+            ExprKind::MethodCall {
+                receiver: Box::new(acc),
+                method: "concat",
+                args: vec![seg],
             },
-            span,
+            synth_span(span.file),
         )
     })
 }

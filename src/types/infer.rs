@@ -1096,7 +1096,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
         let ret = self.engine.fresh();
         let resolved = self.engine.resolve(&recv_ty);
-
         // Concrete type: look up Type.method in env. For numeric
         // builtins, write `__builtin.<method>` so the lowerer emits
         // an SSA op instead of a function call.
@@ -1332,10 +1331,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             ast::Pattern::Binding(sym) => Ok(vec![(*sym, expected.clone())]),
             ast::Pattern::Wildcard => Ok(vec![]),
             ast::Pattern::IntLit(_) => {
-                let ty = self.engine.fresh();
-                let Type::Var(tv) = ty else { unreachable!() };
-                self.int_literal_vars.push((tv, span));
-                self.unify_at(&ty, expected, span)?;
+                // Pattern literals get their type from the scrutinee —
+                // don't push to int_literal_vars (which would default
+                // them to I64 and corrupt the scrutinee's type).
                 Ok(vec![])
             }
             ast::Pattern::StrLit(_) => {
@@ -1942,8 +1940,11 @@ pub fn check<'src>(
         }
     }
 
-    ctx.verify_constraints()?;
+    // Literals must be defaulted before constraints are verified,
+    // because constraint resolution needs concrete types (e.g.
+    // `x.to_str()` where `x` is an int literal that defaults to I64).
     ctx.resolve_literals()?;
+    ctx.verify_constraints()?;
 
     // Resolve all expression types now that inference is complete.
     // This map is consumed by `write_types_back` below and is not part of

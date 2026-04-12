@@ -1,18 +1,27 @@
 
 # Advent of Code 2015, Day 1: Not Quite Lisp
 
-part1 : Str -> I64
-part1 = |input| input
-        .to_utf8()
-        .walk(0, |count, x|
-            count + if x == '(' then 1
-            else if x == ')' then -1
-            else 0
+parse : Str -> List(I32)
+parse = |input|
+        input.to_utf8().map(
+          |c| if c
+            : '(' then 1
+            : ')' then -1
+            else crash("bad '${c}'")
         )
 
+part1 : Str -> I32
+part1 = |input| parse(input).sum()
 
+part2 : Str -> U64
+part2 = |input| parse(input)
+            .trail(0, I32.add)
+            .find_index(.equals(-1))
+            .unwrap()
+            .add(1)
 
 main : List(Str), Str -> Result(Str, Str)
 main = |args, input| (
-    Ok(part1(input).to_str())
+    # Ok(input)
+    Ok(part2(input).to_str())
 )

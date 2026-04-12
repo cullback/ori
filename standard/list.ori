@@ -35,7 +35,7 @@ List := {}.(
     is_empty = |xs| List.len(xs) == 0
 
     # Applies a function to every element, returning a new list.
-    map : List(a), (a -> a) -> List(a)
+    map : List(a), (a -> b) -> List(b)
     map = |xs, f| List.walk(xs, [], |acc, x| List.append(acc, f(x)))
 
     # Like walk, but yields every intermediate accumulator value as
