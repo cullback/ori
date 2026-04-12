@@ -321,7 +321,6 @@ impl ParseCtx {
                         }
                         Rule::interpolation => {
                             let interp_pair = child.into_inner().next().unwrap();
-                            let interp_span = self.span_of(&interp_pair);
                             let inner = self.parse_expr(interp_pair);
                             segments.push(wrap_to_str(inner, span.file));
                         }
@@ -356,7 +355,6 @@ impl ParseCtx {
                             is_first = false;
                             at_line_start = false;
                             let interp_pair = child.into_inner().next().unwrap();
-                            let interp_span = self.span_of(&interp_pair);
                             let inner = self.parse_expr(interp_pair);
                             segments.push(wrap_to_str(inner, span.file));
                         }

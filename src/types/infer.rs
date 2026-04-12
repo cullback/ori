@@ -441,6 +441,18 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             return self.check_con_as_function(*sym, expr.span, expected);
         }
 
+        // Lambda against arrow: push expected param types into env
+        // BEFORE inferring the body so method calls on parameters
+        // see concrete types, not fresh vars.
+        if let ExprKind::Lambda { params, body } = &expr.kind {
+            let resolved_expected = self.engine.resolve(expected);
+            if let Type::Arrow(expected_params, expected_ret) = &resolved_expected
+                && expected_params.len() == params.len()
+            {
+                return self.check_lambda(params, body, expected_params, expected_ret, expr.span);
+            }
+        }
+
         // Default path: synthesize the expression's type and unify
         // with the expected type. On failure, the context (if any)
         // gives a "in argument N of `func`" prefix; otherwise the
@@ -870,6 +882,38 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         };
         self.unify_at(&record_ty, &expected, span)?;
         Ok(field_ty)
+    }
+
+    /// Bidirectional lambda check: infer the lambda body with
+    /// parameter types pushed from the expected arrow type. This
+    /// ensures method calls on parameters see concrete types during
+    /// inference, not fresh vars that only resolve after the body.
+    fn check_lambda(
+        &mut self,
+        params: &[SymbolId],
+        body: &Expr<'src>,
+        expected_params: &[Type],
+        expected_ret: &Type,
+        span: Span,
+    ) -> Result<Type, CompileError> {
+        let saved_env = self.env.clone();
+        let param_types: Vec<Type> = params
+            .iter()
+            .zip(expected_params.iter())
+            .map(|(p, expected_ty)| {
+                let name = self.symbols.display(*p).to_owned();
+                self.env.insert(name, Scheme::mono(expected_ty.clone()));
+                expected_ty.clone()
+            })
+            .collect();
+        let ret = self.engine.fresh();
+        self.ret_ty_stack.push(ret.clone());
+        let body_ty = self.infer_expr(body)?;
+        self.ret_ty_stack.pop();
+        self.unify_at(&ret, &body_ty, body.span)?;
+        self.unify_at(&ret, expected_ret, span)?;
+        self.env = saved_env;
+        Ok(Type::Arrow(param_types, Box::new(ret)))
     }
 
     fn infer_lambda(
@@ -1469,13 +1513,21 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     }
 
     /// Verify constraints whose type vars resolved to concrete types,
-    /// and store method resolutions for the lowerer.
+    /// and store method resolutions for the lowerer. Runs in a loop
+    /// because constraint resolution can trigger further unifications
+    /// that resolve previously-unresolved type vars.
     fn verify_constraints(&mut self) -> Result<(), CompileError> {
-        for (i, c) in self.engine.constraints.clone().iter().enumerate() {
-            let resolved = self.engine.resolve(&Type::Var(c.type_var));
-            let (Type::Con(type_name) | Type::App(type_name, _)) = &resolved else {
-                continue; // still polymorphic or structural, stays as constraint
-            };
+        let mut remaining: Vec<usize> = (0..self.engine.constraints.len()).collect();
+        loop {
+            let mut progress = false;
+            let mut still_remaining = Vec::new();
+            for i in remaining {
+                let c = self.engine.constraints[i].clone();
+                let resolved = self.engine.resolve(&Type::Var(c.type_var));
+                let (Type::Con(type_name) | Type::App(type_name, _)) = &resolved else {
+                    still_remaining.push(i);
+                    continue;
+                };
             let maybe_span = self.constraint_spans.get(i).copied();
             let mangled = format!("{type_name}.{}", c.method_name);
             if let Some(scheme) = self.env.get(&mangled).cloned() {
@@ -1501,6 +1553,12 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     "no method '{0}' on type {type_name}",
                     c.method_name
                 )));
+            }
+                progress = true;
+            }
+            remaining = still_remaining;
+            if !progress {
+                break;
             }
         }
         Ok(())

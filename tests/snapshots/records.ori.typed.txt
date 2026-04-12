@@ -45,7 +45,7 @@ module:
       Let doubled:
         QualifiedCall List.map : List(I64):
           Name ages : List(I64)
-          Lambda(x) : (I64) -> I64:
+          Lambda(x) : '_:
             BinOp Mul : I64:
               Name x : I64
               IntLit 2 : I64
