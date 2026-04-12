@@ -38,6 +38,24 @@ List := {}.(
     map : List(a), (a -> a) -> List(a)
     map = |xs, f| List.walk(xs, [], |acc, x| List.append(acc, f(x)))
 
+    # Like walk, but yields every intermediate accumulator value as
+    # a list. Output length equals input length — the initial value
+    # is threaded through but NOT included in the result. Example:
+    # `[1, 2, 3, 4].scan(0, |acc, x| acc + x)` produces
+    # `[1, 3, 6, 10]` (running totals).
+    #
+    # The accumulator type `b` can differ from the element type `a`,
+    # so scan handles state machines and type-transforming folds as
+    # naturally as plain running aggregates.
+    scan : List(a), b, (b, a -> b) -> List(b)
+    scan = |xs, init, f| (
+        final = List.walk(xs, { acc: init, out: [] }, |state, x| (
+            new_acc = f(state.acc, x)
+            { acc: new_acc, out: List.append(state.out, new_acc) }
+        ))
+        final.out
+    )
+
     # Returns the sum of all elements.
     sum : List(a) -> a where [a.add]
     sum = |xs| List.walk(xs, 0, |acc, x| acc + x)

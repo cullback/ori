@@ -1139,6 +1139,62 @@ main = |arg| List.sum([1, 2, 3, 4, 5])";
 }
 
 #[test]
+fn builtin_list_scan_running_sum() {
+    // scan with an add reducer gives running totals:
+    // [1, 2, 3, 4].scan(0, add) = [1, 3, 6, 10]
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    sums = List.scan([1, 2, 3, 4], 0, |acc, x| acc + x)
+    List.get(sums, 3)
+)";
+    assert_eq!(run_i64(source, 0), 10);
+}
+
+#[test]
+fn builtin_list_scan_middle_element() {
+    // Verify an intermediate element of the running-sum output,
+    // not just the last — catches accidental reverses or
+    // off-by-ones.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    sums = List.scan([1, 2, 3, 4], 0, |acc, x| acc + x)
+    List.get(sums, 1)
+)";
+    assert_eq!(run_i64(source, 0), 3);
+}
+
+#[test]
+fn builtin_list_scan_running_product() {
+    // Running product via scan: [2, 3, 4].scan(1, mul)
+    //   result[0] = 1 * 2 = 2
+    //   result[1] = 2 * 3 = 6
+    //   result[2] = 6 * 4 = 24
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    ps = List.scan([2, 3, 4], 1, |acc, x| acc * x)
+    List.get(ps, 2)
+)";
+    assert_eq!(run_i64(source, 0), 24);
+}
+
+#[test]
+fn builtin_list_scan_empty() {
+    // Empty input produces empty output (length 0).
+    let source = "\
+main : I64 -> U64
+main = |arg| (
+    empty : List(I64)
+    empty = []
+    sums = List.scan(empty, 0, |acc, x| acc + x)
+    List.len(sums)
+)";
+    assert_eq!(run_u64(source, 0), 0);
+}
+
+#[test]
 fn walk_until_break_early() {
     // Sum elements until we hit a value > 3, then break
     let source = "\
