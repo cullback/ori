@@ -146,6 +146,43 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             .map_err(|msg| Self::type_error(span, &msg))
     }
 
+    /// Unify `found` against `expected`, and on failure produce a
+    /// context-attributed error of the form
+    ///
+    /// ```text
+    /// in {what}, expected `{expected}`, got `{found}`
+    /// ```
+    ///
+    /// where both types are resolved and pretty-printed. The `what`
+    /// is a short noun phrase identifying the site — "match arm
+    /// body", "argument 2 of `foo`", "`if` guard return value",
+    /// and so on. Both "expected" and "got" are user-facing
+    /// framings: the former is whatever the context demanded (a
+    /// declared annotation, a previously-inferred sibling type, or
+    /// the enclosing function's return type), and the latter is
+    /// what the local expression produced.
+    fn unify_expected(
+        &mut self,
+        found: &Type,
+        expected: &Type,
+        span: Span,
+        what: &str,
+    ) -> Result<(), CompileError> {
+        if self.unify_at(found, expected, span).is_err() {
+            let resolved_expected = self.engine.resolve(expected);
+            let resolved_found = self.engine.resolve(found);
+            return Err(Self::type_error(
+                span,
+                &format!(
+                    "in {what}, expected `{}`, got `{}`",
+                    self.engine.display_type(&resolved_expected),
+                    self.engine.display_type(&resolved_found)
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     // ---- Convert surface TypeExpr to inference Type ----
 
     /// Convert a type expression without pre-existing type variable bindings.
@@ -396,32 +433,15 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
 
         // Default path: synthesize the expression's type and unify
-        // with the expected type. This covers every expression kind
-        // other than the constructor-reference-in-arrow-context case.
+        // with the expected type. On failure, the context (if any)
+        // gives a "in argument N of `func`" prefix; otherwise the
+        // error just says "expected X, got Y" without a site hint.
         let ty = self.infer_expr(expr)?;
-        if self.unify_at(&ty, expected, expr.span).is_err() {
-            // Rewrap with attribution. The "expected ... got ..."
-            // form plus the call-site prefix makes it clear which
-            // side came from the function signature and which came
-            // from the argument expression — something the raw
-            // `cannot unify X with Y` phrasing hides.
-            let resolved_expected = self.engine.resolve(expected);
-            let resolved_actual = self.engine.resolve(&ty);
-            let expected_str = self.engine.display_type(&resolved_expected);
-            let actual_str = self.engine.display_type(&resolved_actual);
-            let prefix = match ctx {
-                Some((func, idx)) => {
-                    format!("in argument {idx} of `{func}`, ")
-                }
-                None => String::new(),
-            };
-            return Err(Self::type_error(
-                expr.span,
-                &format!(
-                    "{prefix}expected `{expected_str}`, got `{actual_str}`"
-                ),
-            ));
-        }
+        let what = match ctx {
+            Some((func, idx)) => format!("argument {idx} of `{func}`"),
+            None => "expression".to_owned(),
+        };
+        self.unify_expected(&ty, expected, expr.span, &what)?;
         Ok(ty)
     }
 
@@ -585,7 +605,12 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                             // If there's a type hint for this binding, enforce it
                             if let Some(hint) = pending_hints.remove(&name_str) {
                                 let hint_ty = self.resolve_type_expr(&hint)?;
-                                self.unify_at(&val_ty, &hint_ty, val.span)?;
+                                self.unify_expected(
+                                    &val_ty,
+                                    &hint_ty,
+                                    val.span,
+                                    &format!("let binding `{name_str}`"),
+                                )?;
                             }
                             // Value restriction: only generalize let
                             // bindings whose value is syntactically a
@@ -639,7 +664,12 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                             // type drift unconstrained.
                             let ret_val_ty = self.infer_expr(return_val)?;
                             if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
-                                self.unify_at(&ret_val_ty, &fn_ret, return_val.span)?;
+                                self.unify_expected(
+                                    &ret_val_ty,
+                                    &fn_ret,
+                                    return_val.span,
+                                    "`return` value of guard clause",
+                                )?;
                             }
                             self.env = guard_saved_env;
                         }
@@ -684,16 +714,26 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         // nothing to the if's value — control leaves
                         // the enclosing function on this branch.
                         if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
-                            self.unify_at(&body_ty, &fn_ret, arm.body.span)?;
+                            self.unify_expected(
+                                &body_ty,
+                                &fn_ret,
+                                arm.body.span,
+                                "`return` value of match arm",
+                            )?;
                         }
                     } else {
-                        self.unify_at(&result_ty, &body_ty, arm.body.span)?;
+                        self.unify_expected(
+                            &body_ty,
+                            &result_ty,
+                            arm.body.span,
+                            "match arm body",
+                        )?;
                     }
                     self.env = saved_env;
                 }
                 if let Some(eb) = else_body {
                     let eb_ty = self.infer_expr(eb)?;
-                    self.unify_at(&result_ty, &eb_ty, eb.span)?;
+                    self.unify_expected(&eb_ty, &result_ty, eb.span, "`else` branch")?;
                 } else {
                     // Exhaustive match with no else branch: if the
                     // scrutinee's type is still an open tag union
@@ -730,7 +770,12 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         self.collect_is_bindings(guard_expr);
                     }
                     let body_ty = self.infer_expr(&arm.body)?;
-                    self.unify_at(&result_ty, &body_ty, arm.body.span)?;
+                    self.unify_expected(
+                        &body_ty,
+                        &result_ty,
+                        arm.body.span,
+                        "fold arm body",
+                    )?;
                     self.env = saved_env;
                 }
                 // Fold always consumes the entire collection, so its
@@ -953,7 +998,31 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     ) -> Result<Type, CompileError> {
         let lt = self.infer_expr(lhs)?;
         let rt = self.infer_expr(rhs)?;
-        self.unify_at(&lt, &rt, span)?;
+        let op_name = match op {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Rem => "%",
+            BinOp::Eq => "==",
+            BinOp::Neq => "!=",
+            BinOp::And | BinOp::Or => unreachable!(),
+        };
+        if self.unify_at(&lt, &rt, span).is_err() {
+            // Binop sides are symmetric — neither is "expected" —
+            // so use a "left ... right" framing instead of the
+            // unify_expected "expected/got" shape.
+            let resolved_l = self.engine.resolve(&lt);
+            let resolved_r = self.engine.resolve(&rt);
+            return Err(Self::type_error(
+                span,
+                &format!(
+                    "in `{op_name}`, left operand is `{}` but right operand is `{}`",
+                    self.engine.display_type(&resolved_l),
+                    self.engine.display_type(&resolved_r)
+                ),
+            ));
+        }
 
         let is_eq = matches!(op, BinOp::Eq | BinOp::Neq);
         let method_name = match op {
@@ -1342,12 +1411,26 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         self.ret_ty_stack.push(ret.clone());
         let body_ty = self.infer_expr(body)?;
         self.ret_ty_stack.pop();
-        self.unify_at(&ret, &body_ty, body.span)?;
+        self.unify_expected(
+            &body_ty,
+            &ret,
+            body.span,
+            &format!("body of function `{name}`"),
+        )?;
 
-        // If there's an annotation, unify with it and use it as the external type
+        // If there's an annotation, unify with it and use it as
+        // the external type. A mismatch here is the classic
+        // "function body doesn't match its signature" error —
+        // attribute it to the function name so the user knows
+        // which definition is wrong, not just that a unify failed.
         let external_ty = if let Some(anno) = self.type_annos.get(name).cloned() {
             let anno_ty = self.resolve_type_expr(&anno)?;
-            self.unify_at(&func_ty, &anno_ty, body.span)?;
+            self.unify_expected(
+                &func_ty,
+                &anno_ty,
+                body.span,
+                &format!("function `{name}`"),
+            )?;
             anno_ty
         } else {
             self.engine.resolve(&func_ty)
@@ -1411,19 +1494,30 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         let i64_ty = Type::Con("I64".to_owned());
         let f64_ty = Type::Con("F64".to_owned());
 
-        // Default unresolved int literals to I64
+        // Default unresolved int literals to I64. Use `unify`
+        // rather than inserting into `subst` directly so the
+        // default propagates to the *root* of the var's
+        // substitution chain — direct inserts can orphan a
+        // downstream var in the chain when the literal's var
+        // points transitively to another unresolved var (which
+        // happens whenever `unify_at(lit_var, other_var)` set
+        // lit_var := other_var earlier). Unification cannot fail
+        // here because the chain root is a free Var.
         for &(tv, _) in &self.int_literal_vars {
-            let resolved = self.engine.resolve(&Type::Var(tv));
-            if matches!(resolved, Type::Var(_)) {
-                self.engine.subst.insert(tv, i64_ty.clone());
+            if matches!(self.engine.resolve(&Type::Var(tv)), Type::Var(_))
+                && self.engine.unify(&Type::Var(tv), &i64_ty).is_err()
+            {
+                unreachable!("unresolved var cannot fail to unify with I64");
             }
         }
 
-        // Default unresolved float literals to F64
+        // Default unresolved float literals to F64 (same
+        // consideration as above).
         for &(tv, _) in &self.float_literal_vars {
-            let resolved = self.engine.resolve(&Type::Var(tv));
-            if matches!(resolved, Type::Var(_)) {
-                self.engine.subst.insert(tv, f64_ty.clone());
+            if matches!(self.engine.resolve(&Type::Var(tv)), Type::Var(_))
+                && self.engine.unify(&Type::Var(tv), &f64_ty).is_err()
+            {
+                unreachable!("unresolved var cannot fail to unify with F64");
             }
         }
 

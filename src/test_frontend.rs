@@ -1514,7 +1514,7 @@ main = |arg| unwrap(Foo.new(42))";
 }
 
 #[test]
-#[should_panic(expected = "unify")]
+#[should_panic(expected = "expected `Foo -> I64`")]
 fn opaque_hidden_outside() {
     // :: opaque — internals hidden outside .() block
     // A function outside the block cannot treat Foo as I64
@@ -2132,6 +2132,94 @@ main = |arg| add3(1, \"oops\", 3)";
     assert!(
         err.contains("in argument 2 of `add3`"),
         "expected argument-2 attribution, got: {err}"
+    );
+}
+
+#[test]
+fn error_msg_binop_mismatch() {
+    // Binop operands are symmetric, so the error uses a
+    // "left/right" framing rather than "expected/got".
+    let source = "\
+intfn : I64 -> I64
+intfn = |n| n
+
+strfn : I64 -> Str
+strfn = |n| \"x\"
+
+main : I64 -> I64
+main = |arg| intfn(arg) + strfn(arg)";
+    let err = infer_err(source);
+    assert!(
+        err.contains("in `+`"),
+        "expected binop attribution, got: {err}"
+    );
+    assert!(
+        err.contains("left operand is `I64`") && err.contains("right operand is `Str`"),
+        "expected left/right framing, got: {err}"
+    );
+}
+
+#[test]
+fn error_msg_match_arm_body() {
+    // A match arm whose body type conflicts with a previous arm's
+    // type produces an attribution pointing at "match arm body".
+    let source = "\
+intfn : I64 -> I64
+intfn = |n| n
+strfn : I64 -> Str
+strfn = |n| \"x\"
+
+pick : I64 -> I64
+pick = |n| if n == 0 then intfn(n) else strfn(n)";
+    let err = infer_err(source);
+    assert!(
+        err.contains("in match arm body"),
+        "expected match arm attribution, got: {err}"
+    );
+    assert!(
+        err.contains("expected `I64`") && err.contains("got `Str`"),
+        "expected expected/got format, got: {err}"
+    );
+}
+
+#[test]
+fn error_msg_function_annotation_mismatch() {
+    // The function body's inferred type doesn't match the declared
+    // annotation. The error names the function by name.
+    let source = "\
+double : I64 -> Str
+double = |n| n * 2";
+    let err = infer_err(source);
+    assert!(
+        err.contains("function `double`"),
+        "expected function attribution, got: {err}"
+    );
+    assert!(
+        err.contains("expected `I64 -> Str`") || err.contains("expected `I64`"),
+        "expected concrete expected type in message, got: {err}"
+    );
+}
+
+#[test]
+fn error_msg_let_hint_mismatch() {
+    // A let binding with a TypeHint whose concrete type doesn't
+    // match a concrete RHS produces an attribution pointing at
+    // the binding name.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    y : I64
+    y = \"hello\"
+    arg
+)";
+    let err = infer_err(source);
+    assert!(
+        err.contains("let binding `y`"),
+        "expected let binding attribution, got: {err}"
+    );
+    assert!(
+        err.contains("expected `I64`") && err.contains("got `Str`"),
+        "expected expected/got format, got: {err}"
     );
 }
 
