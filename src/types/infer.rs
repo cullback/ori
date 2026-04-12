@@ -370,16 +370,23 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 ),
             ));
         }
-        for (arg, param_ty) in args.iter().zip(params.iter()) {
-            self.check_expr(arg, param_ty)?;
+        for (i, (arg, param_ty)) in args.iter().zip(params.iter()).enumerate() {
+            self.check_expr(arg, param_ty, Some((func, i + 1)))?;
         }
         Ok(Some(*ret_ty))
     }
 
+    /// Check an expression against an `expected` type, optionally
+    /// with attribution context `(func_name, arg_index)` used for
+    /// error messages. If unification fails, the context is baked
+    /// into the error as `"in argument N of `func`: expected X,
+    /// got Y"`, which is friendlier than the bare
+    /// `"cannot unify X with Y"` form.
     fn check_expr(
         &mut self,
         expr: &Expr<'src>,
         expected: &Type,
+        ctx: Option<(&str, usize)>,
     ) -> Result<Type, CompileError> {
         if let ExprKind::Name(sym) = &expr.kind
             && self.symbols.get(*sym).kind == SymbolKind::Constructor
@@ -392,7 +399,29 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         // with the expected type. This covers every expression kind
         // other than the constructor-reference-in-arrow-context case.
         let ty = self.infer_expr(expr)?;
-        self.unify_at(&ty, expected, expr.span)?;
+        if self.unify_at(&ty, expected, expr.span).is_err() {
+            // Rewrap with attribution. The "expected ... got ..."
+            // form plus the call-site prefix makes it clear which
+            // side came from the function signature and which came
+            // from the argument expression — something the raw
+            // `cannot unify X with Y` phrasing hides.
+            let resolved_expected = self.engine.resolve(expected);
+            let resolved_actual = self.engine.resolve(&ty);
+            let expected_str = self.engine.display_type(&resolved_expected);
+            let actual_str = self.engine.display_type(&resolved_actual);
+            let prefix = match ctx {
+                Some((func, idx)) => {
+                    format!("in argument {idx} of `{func}`, ")
+                }
+                None => String::new(),
+            };
+            return Err(Self::type_error(
+                expr.span,
+                &format!(
+                    "{prefix}expected `{expected_str}`, got `{actual_str}`"
+                ),
+            ));
+        }
         Ok(ty)
     }
 

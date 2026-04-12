@@ -150,6 +150,30 @@ fn render_scheme(ty: &crate::types::engine::Type) -> String {
     }
 }
 
+/// Compile a program up through inference and return the type
+/// error message, or panic if inference succeeded. Used by tests
+/// that pin the shape of specific error messages.
+#[allow(dead_code, reason = "used by error-message tests")]
+fn infer_err(source: &str) -> String {
+    let mut arena = SourceArena::new();
+    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
+    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    match crate::types::infer::check(
+        &arena,
+        &mut resolved.module,
+        &resolved.scope,
+        &mut resolved.symbols,
+        &resolved.fields,
+    ) {
+        Ok(_) => panic!("expected inference to fail, but it succeeded"),
+        Err(e) => e.format(&arena),
+    }
+}
+
 fn run_u64(source: &str, input: i64) -> u64 {
     match run(source, input) {
         Scalar::U64(n) => n,
@@ -2065,6 +2089,75 @@ extract = |v| if v
 main : I64 -> I64
 main = |arg| extract(B(5))";
     assert_eq!(run_i64(source, 0), 10);
+}
+
+// ============================================================
+// Error message attribution on call arguments
+// ============================================================
+
+#[test]
+fn error_msg_call_arg_attribution() {
+    // A bad argument to a named function gets an error that names
+    // both the function and the argument position, and renders
+    // expected vs actual types rather than an unattributed
+    // "cannot unify" message.
+    let source = "\
+double : I64 -> I64
+double = |n| n * 2
+
+main : I64 -> I64
+main = |arg| double(\"not a number\")";
+    let err = infer_err(source);
+    assert!(
+        err.contains("in argument 1 of `double`"),
+        "expected call-context attribution, got: {err}"
+    );
+    assert!(
+        err.contains("expected `I64`") && err.contains("got `Str`"),
+        "expected expected/got format, got: {err}"
+    );
+}
+
+#[test]
+fn error_msg_call_arg_index() {
+    // The argument index is the 1-based position within the call,
+    // not a flat counter across all calls in the program.
+    let source = "\
+add3 : I64, I64, I64 -> I64
+add3 = |a, b, c| a + b + c
+
+main : I64 -> I64
+main = |arg| add3(1, \"oops\", 3)";
+    let err = infer_err(source);
+    assert!(
+        err.contains("in argument 2 of `add3`"),
+        "expected argument-2 attribution, got: {err}"
+    );
+}
+
+#[test]
+fn error_msg_tag_union_mismatch_in_call() {
+    // When the expected type is a closed tag union and the argument
+    // is an open row containing an unlisted tag, the error shows
+    // both rendered forms so the user can see which tag is extra.
+    let source = "\
+describe : [Red, Green, Blue] -> I64
+describe = |c| if c
+    : Red then 1
+    : Green then 2
+    : Blue then 3
+
+main : I64 -> I64
+main = |arg| describe(Yellow)";
+    let err = infer_err(source);
+    assert!(
+        err.contains("in argument 1 of `describe`"),
+        "expected call-context attribution, got: {err}"
+    );
+    assert!(
+        err.contains("[Red, Green, Blue]") && err.contains("Yellow"),
+        "expected to see both expected and actual tag unions, got: {err}"
+    );
 }
 
 // ============================================================
