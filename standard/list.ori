@@ -60,8 +60,8 @@ List := {}.(
     # or `Err(NotFound)` if no element matches.
     # Returns the index of the first element satisfying the predicate,
     # or `Err(NotFound)` if no element matches.
-    find_first_index : List(a), (a -> Bool) -> Result(U64, [NotFound])
-    find_first_index = |xs, pred| (
+    find_index : List(a), (a -> Bool) -> Result(U64, [NotFound])
+    find_index = |xs, pred| (
         result = List.walk_until(xs, { i: 0, found: Err(NotFound) }, |state, x|
             if pred(x) then Break({ i: state.i, found: Ok(state.i) })
             else Continue({ i: state.i + 1, found: state.found })
