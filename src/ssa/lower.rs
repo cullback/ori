@@ -196,6 +196,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 if name.starts_with(|c: char| c.is_ascii_uppercase()) {
                     return self.lower_constructor_call(name, &[], Some(&expr.ty));
                 }
+                // Builtins like `crash` can appear as bare Name
+                // references when defunc captures them as free
+                // variables in a closure. They're not real values —
+                // they'll be called at the Call site. Return a dummy.
+                if name == "crash" {
+                    return self.builder.const_i64(0);
+                }
                 panic!("undefined name: {name}");
             }
 
