@@ -465,6 +465,12 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
         ExprKind::Is { expr: inner, .. } => {
             scan_expr(ctx, inner);
         }
+        ExprKind::RecordUpdate { base, updates } => {
+            scan_expr(ctx, base);
+            for (_, e) in updates {
+                scan_expr(ctx, e);
+            }
+        }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) | ExprKind::Name(_) => {}
     }
 }
@@ -900,6 +906,12 @@ impl<'src> Rewriter<'_, 'src> {
                 }
             }
             ExprKind::Is { expr: inner, .. } => self.rewrite_expr(inner),
+            ExprKind::RecordUpdate { base, updates } => {
+                self.rewrite_expr(base);
+                for (_, e) in updates.iter_mut() {
+                    self.rewrite_expr(e);
+                }
+            }
             ExprKind::IntLit(_)
             | ExprKind::FloatLit(_)
             | ExprKind::StrLit(_)

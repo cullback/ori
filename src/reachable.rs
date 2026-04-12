@@ -268,6 +268,12 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) 
         ExprKind::Is { expr: inner, .. } => {
             collect_refs(inner, refs, symbols);
         }
+        ExprKind::RecordUpdate { base, updates } => {
+            collect_refs(base, refs, symbols);
+            for (_, e) in updates {
+                collect_refs(e, refs, symbols);
+            }
+        }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
     }
 }

@@ -517,6 +517,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         Ok(resolved)
     }
 
+    #[expect(clippy::too_many_lines)]
     fn infer_expr_inner(&mut self, expr: &Expr<'src>) -> Result<Type, CompileError> {
         match &expr.kind {
             ExprKind::IntLit(_) => {
@@ -624,6 +625,28 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     .collect();
                 self.is_bindings.insert(expr.span, named);
                 Ok(Type::Con("Bool".to_owned()))
+            }
+
+            ExprKind::RecordUpdate { base, updates } => {
+                // The base must be a record. Infer it, then check that
+                // each update field exists in the record type. The result
+                // type is the same as the base type.
+                let base_ty = self.infer_expr(base)?;
+                for (field_sym, val_expr) in updates {
+                    let field_name = self.fields.get(*field_sym).to_owned();
+                    let field_ty = self.engine.fresh();
+                    let rest = self.engine.fresh();
+                    // The base must have this field.
+                    let expected = Type::Record {
+                        fields: vec![(field_name, field_ty.clone())],
+                        rest: Some(Box::new(rest)),
+                    };
+                    self.unify_at(&base_ty, &expected, expr.span)?;
+                    // The update value must match the field type.
+                    let val_ty = self.infer_expr(val_expr)?;
+                    self.unify_at(&val_ty, &field_ty, val_expr.span)?;
+                }
+                Ok(base_ty)
             }
         }
     }
@@ -1272,7 +1295,8 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 | ast::Pattern::StrLit(_) => {}
                 ast::Pattern::Constructor { .. }
                 | ast::Pattern::Record { .. }
-                | ast::Pattern::Tuple(_) => {
+                | ast::Pattern::Tuple(_)
+                | ast::Pattern::List(_) => {
                     bindings.extend(self.infer_pattern(field_pat, &bind_ty, span, None)?);
                 }
             }
@@ -1316,7 +1340,8 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 | ast::Pattern::StrLit(_) => {}
                 ast::Pattern::Constructor { .. }
                 | ast::Pattern::Record { .. }
-                | ast::Pattern::Tuple(_) => {
+                | ast::Pattern::Tuple(_)
+                | ast::Pattern::List(_) => {
                     bindings.extend(self.infer_pattern(field_pat, field_ty, span, None)?);
                 }
             }
@@ -1345,7 +1370,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 }
                 self.infer_structural_con_pattern(name, fields, expected, span)
             }
-            ast::Pattern::Record { fields } => {
+            ast::Pattern::Record { fields, .. } => {
                 let rest = self.engine.fresh(); // open rest for row polymorphism
                 let mut type_fields = Vec::new();
                 let mut bindings = Vec::new();
@@ -1384,6 +1409,25 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 let str_ty = Type::Con("Str".to_owned());
                 self.unify_at(&str_ty, expected, span)?;
                 Ok(vec![])
+            }
+            ast::Pattern::List(elems) => {
+                let elem_ty = self.engine.fresh();
+                let list_ty = Type::App("List".to_owned(), vec![elem_ty.clone()]);
+                self.unify_at(&list_ty, expected, span)?;
+                let mut bindings = Vec::new();
+                for elem in elems {
+                    match elem {
+                        ast::ListPatternElem::Pattern(p) => {
+                            bindings.extend(self.infer_pattern(p, &elem_ty, span, None)?);
+                        }
+                        ast::ListPatternElem::Spread(Some(sym)) => {
+                            // Spread captures a sub-list of the same type.
+                            bindings.push((*sym, list_ty.clone()));
+                        }
+                        ast::ListPatternElem::Spread(None) => {}
+                    }
+                }
+                Ok(bindings)
             }
         }
     }
@@ -2202,6 +2246,12 @@ fn eta_expand_expr(
         ExprKind::Is { expr: inner, .. } => {
             eta_expand_expr(inner, eta, symbols);
         }
+        ExprKind::RecordUpdate { base, updates } => {
+            eta_expand_expr(base, eta, symbols);
+            for (_, e) in updates {
+                eta_expand_expr(e, eta, symbols);
+            }
+        }
     }
 
     // Post-order rewrite: replace marked callable references
@@ -2390,6 +2440,12 @@ fn write_back_expr(expr: &mut Expr<'_>, expr_types: &HashMap<Span, Type>) {
             }
         }
         ExprKind::Is { expr: inner, .. } => write_back_expr(inner, expr_types),
+        ExprKind::RecordUpdate { base, updates } => {
+            write_back_expr(base, expr_types);
+            for (_, e) in updates {
+                write_back_expr(e, expr_types);
+            }
+        }
     }
 }
 
@@ -2513,6 +2569,12 @@ fn write_res_expr(expr: &mut Expr<'_>, resolutions: &HashMap<Span, String>) {
             }
         }
         ExprKind::Is { expr: inner, .. } => write_res_expr(inner, resolutions),
+        ExprKind::RecordUpdate { base, updates } => {
+            write_res_expr(base, resolutions);
+            for (_, e) in updates {
+                write_res_expr(e, resolutions);
+            }
+        }
     }
 }
 

@@ -291,6 +291,16 @@ impl<W: Write> Printer<'_, W> {
                 expr: inner,
                 pattern,
             } => self.write_is_expr(level, inner, pattern, &t),
+            ExprKind::RecordUpdate { base, updates } => {
+                self.line(level, format_args!("RecordUpdate : {t}:"))?;
+                self.write_expr(base, level + 1)?;
+                for (field_sym, val) in updates {
+                    let name = self.fields.get(*field_sym);
+                    self.line(level + 1, format_args!("& {name}:"))?;
+                    self.write_expr(val, level + 2)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -522,7 +532,7 @@ impl<W: Write> Printer<'_, W> {
                     Ok(())
                 }
             }
-            Pattern::Record { fields } => {
+            Pattern::Record { fields, .. } => {
                 if fields.is_empty() {
                     self.line(level, format_args!("PRecord {{}}"))
                 } else {
@@ -550,6 +560,28 @@ impl<W: Write> Printer<'_, W> {
             Pattern::StrLit(b) => {
                 let s = String::from_utf8_lossy(b);
                 self.line(level, format_args!("\"{s}\""))
+            }
+            Pattern::List(elems) => {
+                if elems.is_empty() {
+                    self.line(level, format_args!("PList []"))
+                } else {
+                    self.line(level, format_args!("PList:"))?;
+                    for elem in elems {
+                        match elem {
+                            crate::ast::ListPatternElem::Pattern(p) => {
+                                self.write_pattern(p, level + 1)?;
+                            }
+                            crate::ast::ListPatternElem::Spread(Some(sym)) => {
+                                let name = self.symbols.display(*sym);
+                                self.line(level + 1, format_args!("..{name}"))?;
+                            }
+                            crate::ast::ListPatternElem::Spread(None) => {
+                                self.line(level + 1, format_args!(".."))?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
             }
         }
     }

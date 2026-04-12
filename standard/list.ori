@@ -27,6 +27,10 @@ List := {}.(
     # through each element.
     walk : List(a), b, (b, a -> b) -> b
 
+    # Returns a sub-list starting at index `start` with `count` elements.
+    # Panics if `start + count > len`.
+    sublist : List(a), U64, U64 -> List(a)
+
     # Same as walk, except the callback can stop iteration early.
     walk_until : List(a), b, (b, a -> Step(b)) -> b
 

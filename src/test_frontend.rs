@@ -2979,6 +2979,9 @@ fn any_lambda_in_module(module: &crate::ast::Module<'_>) -> bool {
                         .any(|a| a.guards.iter().any(in_expr) || in_expr(&a.body))
             }
             ExprKind::Record { fields } => fields.iter().any(|(_, e)| in_expr(e)),
+            ExprKind::RecordUpdate { base, updates } => {
+                in_expr(base) || updates.iter().any(|(_, e)| in_expr(e))
+            }
             ExprKind::FieldAccess { record, .. } => in_expr(record),
             ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => elems.iter().any(in_expr),
             ExprKind::Is { expr, .. } => in_expr(expr),

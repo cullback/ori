@@ -262,6 +262,15 @@ fn write_expr(f: &mut fmt::Formatter<'_>, expr: &Expr<'_>, level: usize) -> fmt:
             expr: inner,
             pattern,
         } => write_is_expr(f, level, inner, pattern),
+        ExprKind::RecordUpdate { base, updates } => {
+            write_line(f, level, format_args!("RecordUpdate:"))?;
+            write_expr(f, base, level + 1)?;
+            for (name, val) in updates {
+                write_line(f, level + 1, format_args!("& {name}:"))?;
+                write_expr(f, val, level + 2)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -472,7 +481,7 @@ fn write_pattern(f: &mut fmt::Formatter<'_>, pat: &Pattern<'_>, level: usize) ->
                 Ok(())
             }
         }
-        Pattern::Record { fields } => {
+        Pattern::Record { fields, .. } => {
             if fields.is_empty() {
                 write_line(f, level, format_args!("PRecord {{}}"))
             } else {
@@ -499,6 +508,27 @@ fn write_pattern(f: &mut fmt::Formatter<'_>, pat: &Pattern<'_>, level: usize) ->
         Pattern::StrLit(b) => {
             let s = String::from_utf8_lossy(b);
             write_line(f, level, format_args!("\"{s}\""))
+        }
+        Pattern::List(elems) => {
+            if elems.is_empty() {
+                write_line(f, level, format_args!("PList []"))
+            } else {
+                write_line(f, level, format_args!("PList:"))?;
+                for elem in elems {
+                    match elem {
+                        crate::syntax::raw::ListPatternElem::Pattern(p) => {
+                            write_pattern(f, p, level + 1)?;
+                        }
+                        crate::syntax::raw::ListPatternElem::Spread(Some(name)) => {
+                            write_line(f, level + 1, format_args!("..{name}"))?;
+                        }
+                        crate::syntax::raw::ListPatternElem::Spread(None) => {
+                            write_line(f, level + 1, format_args!(".."))?;
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }

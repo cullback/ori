@@ -209,6 +209,12 @@ fn lift_expr<'src>(ctx: &mut LiftCtx<'_, 'src>, expr: &mut ast::Expr<'src>) {
             }
         }
         ast::ExprKind::Is { expr: inner, .. } => lift_expr(ctx, inner),
+        ast::ExprKind::RecordUpdate { base, updates } => {
+            lift_expr(ctx, base);
+            for (_, e) in updates {
+                lift_expr(ctx, e);
+            }
+        }
     }
 
     // Post-order transform: if this is a Fold, replace it.
@@ -589,6 +595,12 @@ fn substitute_expr(expr: &mut ast::Expr<'_>, subst: &HashMap<SymbolId, SymbolId>
             }
         }
         ast::ExprKind::Is { expr: inner, .. } => substitute_expr(inner, subst),
+        ast::ExprKind::RecordUpdate { base, updates } => {
+            substitute_expr(base, subst);
+            for (_, e) in updates {
+                substitute_expr(e, subst);
+            }
+        }
         ast::ExprKind::IntLit(_) | ast::ExprKind::FloatLit(_) | ast::ExprKind::StrLit(_) => {}
     }
 }

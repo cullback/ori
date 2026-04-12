@@ -145,6 +145,10 @@ pub enum ExprKind<'src> {
     Record {
         fields: Vec<(&'src str, Expr<'src>)>,
     },
+    RecordUpdate {
+        base: Box<Expr<'src>>,
+        updates: Vec<(&'src str, Expr<'src>)>,
+    },
     FieldAccess {
         record: Box<Expr<'src>>,
         field: &'src str,
@@ -178,12 +182,33 @@ pub enum Pattern<'src> {
     },
     Record {
         fields: Vec<(&'src str, Pattern<'src>)>,
+        rest: RecordPatternRest<'src>,
     },
+    List(Vec<ListPatternElem<'src>>),
     Tuple(Vec<Pattern<'src>>),
     IntLit(i64),
     StrLit(Vec<u8>),
     Wildcard,
     Binding(&'src str),
+}
+
+/// What happens with unmatched record fields in a record pattern.
+#[derive(Debug, Clone)]
+pub enum RecordPatternRest<'src> {
+    /// No `..` — inference still uses open rows, so extra fields are allowed.
+    None,
+    /// `..` — explicitly ignore extra fields (same behavior as None, documentation).
+    Ignore,
+    /// `..name` — capture remaining fields as a new record binding.
+    Capture(&'src str),
+}
+
+/// Element in a list pattern: either a sub-pattern or a `..`/`..name` spread.
+#[derive(Debug, Clone)]
+pub enum ListPatternElem<'src> {
+    Pattern(Pattern<'src>),
+    /// `..` (discard rest) or `..name` (capture rest as List).
+    Spread(Option<&'src str>),
 }
 
 #[derive(Debug, Clone)]

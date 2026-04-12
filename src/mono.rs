@@ -469,6 +469,12 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                 }
             }
             ExprKind::Is { expr: inner, .. } => self.rewrite_calls_in_expr(inner),
+            ExprKind::RecordUpdate { base, updates } => {
+                self.rewrite_calls_in_expr(base);
+                for (_, e) in updates.iter_mut() {
+                    self.rewrite_calls_in_expr(e);
+                }
+            }
             ExprKind::Name(sym) => {
                 // Bare function reference (e.g. passing `add1` as a
                 // higher-order arg). If `sym` points at a known
@@ -959,6 +965,12 @@ fn substitute_types_in_expr(expr: &mut Expr<'_>, mapping: &HashMap<TypeVar, Type
             }
         }
         ExprKind::Is { expr: inner, .. } => substitute_types_in_expr(inner, mapping),
+        ExprKind::RecordUpdate { base, updates } => {
+            substitute_types_in_expr(base, mapping);
+            for (_, e) in updates.iter_mut() {
+                substitute_types_in_expr(e, mapping);
+            }
+        }
         ExprKind::IntLit(_)
         | ExprKind::FloatLit(_)
         | ExprKind::StrLit(_)

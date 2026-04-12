@@ -156,11 +156,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     fn lower_expr(&mut self, expr: &Expr<'src>) -> Value {
         match &expr.kind {
-            #[expect(
-                clippy::cast_sign_loss,
-                clippy::cast_precision_loss,
-                clippy::cast_possible_truncation
-            )]
             ExprKind::IntLit(n) => {
                 lower_int_const(&mut self.builder, *n, &expr.ty)
             }
@@ -319,6 +314,37 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 panic!("lambdas are only supported as direct arguments to function calls");
             }
 
+            ExprKind::RecordUpdate { base, updates } => {
+                let base_val = self.lower_expr(base);
+                // Get all field names from the base record type, sorted.
+                let all_fields: Vec<String> = match &base.ty {
+                    Type::Record { fields, .. } => {
+                        let mut names: Vec<String> =
+                            fields.iter().map(|(n, _)| n.clone()).collect();
+                        names.sort_unstable();
+                        names
+                    }
+                    _ => panic!("RecordUpdate base is not a record type"),
+                };
+                let num_fields = all_fields.len();
+                let ptr = self.builder.alloc(num_fields);
+                // Build a map of update field name → expression.
+                let update_map: HashMap<String, &Expr> = updates
+                    .iter()
+                    .map(|(sym, e)| (self.fields.get(*sym).to_owned(), e))
+                    .collect();
+                // For each field slot, either use the update value or copy from base.
+                for (slot, field_name) in all_fields.iter().enumerate() {
+                    let val = if let Some(upd_expr) = update_map.get(field_name) {
+                        self.lower_expr(upd_expr)
+                    } else {
+                        self.builder.load(base_val, slot, ScalarType::Ptr)
+                    };
+                    self.builder.store(ptr, slot, val);
+                }
+                ptr
+            }
+
             ExprKind::ListLit(elems) => {
                 let len = elems.len();
                 let data = self.builder.alloc(len);
@@ -347,7 +373,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 }
                 Stmt::Destructure { pattern, val } => {
                     let v = self.lower_expr(val);
-                    self.lower_destructure(pattern, v);
+                    self.lower_destructure(pattern, v, &val.ty);
                 }
                 Stmt::Guard {
                     condition,
@@ -602,7 +628,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     fn is_list_builtin(name: &str) -> bool {
         matches!(
             name,
-            "List.len" | "List.get" | "List.set" | "List.append" | "List.reverse"
+            "List.len"
+                | "List.get"
+                | "List.set"
+                | "List.append"
+                | "List.reverse"
+                | "List.sublist"
         )
     }
 
@@ -1219,7 +1250,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     // ---- Destructure lowering ----
 
-    fn lower_destructure(&mut self, pattern: &ast::Pattern<'src>, val: Value) {
+    fn lower_destructure(
+        &mut self,
+        pattern: &ast::Pattern<'src>,
+        val: Value,
+        val_ty: &Type,
+    ) {
         match pattern {
             ast::Pattern::Tuple(elems) => {
                 for (i, elem) in elems.iter().enumerate() {
@@ -1227,12 +1263,30 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     self.lower_destructure_elem(elem, field_val);
                 }
             }
-            ast::Pattern::Record { fields } => {
-                let mut all_names: Vec<&str> = fields
-                    .iter()
-                    .map(|(sym, _)| self.fields.get(*sym))
-                    .collect();
-                all_names.sort_unstable();
+            ast::Pattern::Record { fields, .. } => {
+                // Get ALL field names from the record TYPE (not just the
+                // pattern fields) to compute correct slot indices. The
+                // pattern may use `..` to ignore some fields.
+                let all_names: Vec<&str> = match val_ty {
+                    Type::Record {
+                        fields: type_fields,
+                        ..
+                    } => {
+                        let mut names: Vec<&str> =
+                            type_fields.iter().map(|(n, _)| n.as_str()).collect();
+                        names.sort_unstable();
+                        names
+                    }
+                    _ => {
+                        // Fallback: use pattern field names (old behavior).
+                        let mut names: Vec<&str> = fields
+                            .iter()
+                            .map(|(sym, _)| self.fields.get(*sym))
+                            .collect();
+                        names.sort_unstable();
+                        names
+                    }
+                };
                 for (field_sym, elem) in fields {
                     let name = self.fields.get(*field_sym);
                     let slot = all_names.iter().position(|n| *n == name).unwrap();
@@ -1250,7 +1304,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 self.vars.insert(*sym, val);
             }
             ast::Pattern::Tuple(_) | ast::Pattern::Record { .. } => {
-                self.lower_destructure(elem, val);
+                // Nested destructure: use a dummy type (falls back to
+                // pattern-field-only slot computation, which is correct
+                // when the pattern names all fields).
+                let dummy_ty = Type::Var(crate::types::engine::TypeVar(0));
+                self.lower_destructure(elem, val, &dummy_ty);
             }
             ast::Pattern::Wildcard => {}
             _ => panic!("unsupported pattern in destructure"),
@@ -1449,6 +1507,8 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
         ("__list_append", ScalarType::Ptr)
     } else if name.ends_with(".reverse") || name == "List.reverse" {
         ("__list_reverse", ScalarType::Ptr)
+    } else if name.ends_with(".sublist") || name == "List.sublist" {
+        ("__list_sublist", ScalarType::Ptr)
     } else {
         panic!("unknown list builtin: {name}");
     };

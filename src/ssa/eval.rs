@@ -339,6 +339,28 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(new_list, 2, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
+        "__list_sublist" => {
+            // args: [list_ptr, start_u64, count_u64] → new_list_ptr
+            let Scalar::Ptr(list_idx) = args[0] else {
+                panic!("__list_sublist: expected Ptr");
+            };
+            let start = scalar_to_usize(args[1]);
+            let count = scalar_to_usize(args[2]);
+            let Scalar::Ptr(old_data) = heap.load(list_idx, 2) else {
+                panic!("__list_sublist: data is not Ptr");
+            };
+            let new_data = heap.alloc(count);
+            for i in 0..count {
+                let elem = heap.load_dyn(old_data, start + i);
+                heap.store(new_data, i, elem);
+            }
+            let new_list = heap.alloc(3);
+            let count_u64 = count as u64;
+            heap.store(new_list, 0, Scalar::U64(count_u64));
+            heap.store(new_list, 1, Scalar::U64(count_u64));
+            heap.store(new_list, 2, Scalar::Ptr(new_data));
+            Some(Scalar::Ptr(new_list))
+        }
         "__num_to_str" => {
             // args: [number] → str_ptr (List(U8))
             let s = match args[0] {

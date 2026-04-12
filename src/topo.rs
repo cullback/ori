@@ -204,6 +204,12 @@ fn collect_callees(expr: &Expr<'_>, out: &mut HashSet<String>, symbols: &SymbolT
             }
         }
         ExprKind::Is { expr: inner, .. } => collect_callees(inner, out, symbols),
+        ExprKind::RecordUpdate { base, updates } => {
+            collect_callees(base, out, symbols);
+            for (_, e) in updates {
+                collect_callees(e, out, symbols);
+            }
+        }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
     }
 }

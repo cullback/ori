@@ -139,9 +139,10 @@ irrefutable = {
   | name
 }
 
-field_irrefutable = { name ~ ":" ~ irrefutable | name }
+field_irrefutable = { ".." ~ name | ".." | name ~ ":" ~ irrefutable | name }
 
-record_literal = { "{" ~ (field_init ~ ("," ~ field_init)*)? ~ "}" }
+record_literal = { "{" ~ record_body ~ "}" | "{" ~ "}" }
+record_body = { expr ~ "&" ~ field_init ~ ("," ~ field_init)* | field_init ~ ("," ~ field_init)* }
 
 field_init = { name ~ ":" ~ expr }
 
@@ -183,6 +184,7 @@ arm_end = { "then" | "return" }
 pattern = {
     name ~ "(" ~ (pattern ~ ("," ~ pattern)*)? ~ ")"
   | "{" ~ (field_pattern ~ ("," ~ field_pattern)*)? ~ "}"
+  | "[" ~ (list_pat_elem ~ ("," ~ list_pat_elem)*)? ~ "]"
   | "(" ~ pattern ~ ("," ~ pattern)+ ~ ")"
   | "_"
   | char_lit
@@ -194,8 +196,12 @@ pattern = {
 
 neg_pattern = { "-" ~ int_lit }
 
+list_pat_elem = { ".." ~ name | ".." | pattern }
+
 field_pattern = {
-    name ~ ":" ~ pattern
+    ".." ~ name
+  | ".."
+  | name ~ ":" ~ pattern
   | name
 }
 

@@ -8,8 +8,8 @@ use pest_derive::Parser;
 use crate::error::CompileError;
 use crate::source::FileId;
 use crate::syntax::raw::{
-    BinOp, ConstraintDecl, Decl, Expr, ExprKind, Import, MatchArm, Module, Pattern, Span, Stmt,
-    TagDecl, TypeDeclKind, TypeExpr,
+    BinOp, ConstraintDecl, Decl, Expr, ExprKind, Import, ListPatternElem, MatchArm, Module,
+    Pattern, RecordPatternRest, Span, Stmt, TagDecl, TypeDeclKind, TypeExpr,
 };
 
 #[derive(Parser)]
@@ -636,16 +636,43 @@ impl ParseCtx {
     }
 
     fn parse_record_literal<'src>(&self, pair: Pair<'src, Rule>, span: Span) -> Expr<'src> {
-        let fields: Vec<(&str, Expr<'_>)> = pair
-            .into_inner()
-            .map(|fi| {
-                let mut inner = fi.into_inner();
-                let name = inner.next().unwrap().as_str();
-                let val = self.parse_expr(inner.next().unwrap());
-                (name, val)
-            })
-            .collect();
-        Expr::new(ExprKind::Record { fields }, span)
+        let inner: Vec<Pair<'src, Rule>> = pair.into_inner().collect();
+        // Empty record: `{}`
+        if inner.is_empty() {
+            return Expr::new(ExprKind::Record { fields: vec![] }, span);
+        }
+        // record_body has one child
+        let body = inner.into_iter().next().unwrap();
+        let body_children: Vec<Pair<'src, Rule>> = body.into_inner().collect();
+
+        // Check if first child is a field_init (regular record) or an
+        // expr (record update: `{ base & field: val, ... }`)
+        if !body_children.is_empty() && body_children[0].as_rule() != Rule::field_init {
+            // Record update: first child is the base expression
+            let base = self.parse_expr(body_children[0].clone());
+            let updates: Vec<(&str, Expr<'_>)> = body_children[1..]
+                .iter()
+                .map(|fi| {
+                    let mut inner = fi.clone().into_inner();
+                    let name = inner.next().unwrap().as_str();
+                    let val = self.parse_expr(inner.next().unwrap());
+                    (name, val)
+                })
+                .collect();
+            Expr::new(ExprKind::RecordUpdate { base: Box::new(base), updates }, span)
+        } else {
+            // Regular record literal
+            let fields: Vec<(&str, Expr<'_>)> = body_children
+                .into_iter()
+                .map(|fi| {
+                    let mut inner = fi.into_inner();
+                    let name = inner.next().unwrap().as_str();
+                    let val = self.parse_expr(inner.next().unwrap());
+                    (name, val)
+                })
+                .collect();
+            Expr::new(ExprKind::Record { fields }, span)
+        }
     }
 
     fn parse_tuple<'src>(&self, pair: Pair<'src, Rule>, span: Span) -> Expr<'src> {
@@ -901,20 +928,28 @@ fn parse_irrefutable(pair: Pair<'_, Rule>) -> Pattern<'_> {
             Pattern::Tuple(sub_pats)
         }
         Rule::field_irrefutable => {
-            // Record pattern: { x, y: z }
-            let fields: Vec<(&str, Pattern<'_>)> = inner
-                .into_iter()
-                .map(|fi| {
-                    let mut fi_inner = fi.into_inner();
+            // Record pattern: { x, y: z, .. } or { x, ..rest }
+            let mut fields = Vec::new();
+            let mut rest = RecordPatternRest::None;
+            for fi in inner {
+                let text = fi.as_str().trim();
+                let mut fi_inner = fi.into_inner();
+                if text.starts_with("..") {
+                    if let Some(name_pair) = fi_inner.next() {
+                        rest = RecordPatternRest::Capture(name_pair.as_str());
+                    } else {
+                        rest = RecordPatternRest::Ignore;
+                    }
+                } else {
                     let name = fi_inner.next().unwrap().as_str();
                     if let Some(pat) = fi_inner.next() {
-                        (name, parse_irrefutable(pat))
+                        fields.push((name, parse_irrefutable(pat)));
                     } else {
-                        (name, Pattern::Binding(name))
+                        fields.push((name, Pattern::Binding(name)));
                     }
-                })
-                .collect();
-            Pattern::Record { fields }
+                }
+            }
+            Pattern::Record { fields, rest }
         }
         _ => panic!("unexpected irrefutable pattern: {:?}", first.as_rule()),
     }
@@ -933,6 +968,9 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern<'_> {
     if inner.is_empty() {
         if text == "_" {
             return Pattern::Wildcard;
+        }
+        if text == "[]" {
+            return Pattern::List(vec![]);
         }
         panic!("empty pattern: '{text}'");
     }
@@ -957,9 +995,33 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern<'_> {
             }
         }
         Rule::field_pattern => {
-            let fields: Vec<(&str, Pattern<'_>)> =
-                inner.into_iter().map(parse_field_pattern).collect();
-            Pattern::Record { fields }
+            let mut fields = Vec::new();
+            let mut rest = RecordPatternRest::None;
+            for fp in inner {
+                let text = fp.as_str().trim();
+                let mut fp_inner = fp.into_inner();
+                if text.starts_with("..") {
+                    // ".." or "..name"
+                    if let Some(name_pair) = fp_inner.next() {
+                        rest = RecordPatternRest::Capture(name_pair.as_str());
+                    } else {
+                        rest = RecordPatternRest::Ignore;
+                    }
+                } else {
+                    let name = fp_inner.next().unwrap().as_str();
+                    if let Some(pat) = fp_inner.next() {
+                        fields.push((name, parse_pattern(pat)));
+                    } else {
+                        fields.push((name, Pattern::Binding(name)));
+                    }
+                }
+            }
+            Pattern::Record { fields, rest }
+        }
+        Rule::list_pat_elem => {
+            let elems: Vec<ListPatternElem<'_>> =
+                inner.into_iter().map(parse_list_pat_elem).collect();
+            Pattern::List(elems)
         }
         Rule::pattern => {
             // Tuple pattern: all children are sub-patterns
@@ -995,13 +1057,18 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern<'_> {
     }
 }
 
-fn parse_field_pattern(pair: Pair<'_, Rule>) -> (&str, Pattern<'_>) {
+fn parse_list_pat_elem(pair: Pair<'_, Rule>) -> ListPatternElem<'_> {
+    let text = pair.as_str().trim();
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str();
-    if let Some(pat) = inner.next() {
-        (name, parse_pattern(pat))
+    if text.starts_with("..") {
+        // ".." or "..name"
+        if let Some(name_pair) = inner.next() {
+            ListPatternElem::Spread(Some(name_pair.as_str()))
+        } else {
+            ListPatternElem::Spread(None)
+        }
     } else {
-        (name, Pattern::Binding(name))
+        ListPatternElem::Pattern(parse_pattern(inner.next().unwrap()))
     }
 }
 

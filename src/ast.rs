@@ -207,6 +207,10 @@ pub enum ExprKind<'src> {
     Record {
         fields: Vec<(FieldSym, Expr<'src>)>,
     },
+    RecordUpdate {
+        base: Box<Expr<'src>>,
+        updates: Vec<(FieldSym, Expr<'src>)>,
+    },
     FieldAccess {
         record: Box<Expr<'src>>,
         field: FieldSym,
@@ -243,12 +247,33 @@ pub enum Pattern<'src> {
     },
     Record {
         fields: Vec<(FieldSym, Pattern<'src>)>,
+        rest: RecordPatternRest,
     },
+    List(Vec<ListPatternElem<'src>>),
     Tuple(Vec<Pattern<'src>>),
     IntLit(i64),
     StrLit(Vec<u8>),
     Wildcard,
     Binding(SymbolId),
+}
+
+/// What happens with unmatched record fields in a record pattern.
+#[derive(Debug, Clone)]
+pub enum RecordPatternRest {
+    /// No `..` — inference still uses open rows, so extra fields are allowed.
+    None,
+    /// `..` — explicitly ignore extra fields.
+    Ignore,
+    /// `..name` — capture remaining fields as a new record binding.
+    Capture(SymbolId),
+}
+
+/// Element in a list pattern: either a sub-pattern or a spread.
+#[derive(Debug, Clone)]
+pub enum ListPatternElem<'src> {
+    Pattern(Pattern<'src>),
+    /// `..` (discard rest) or `..name` (capture rest as List).
+    Spread(Option<SymbolId>),
 }
 
 #[derive(Debug, Clone)]
@@ -302,9 +327,23 @@ impl Pattern<'_> {
                     f.bind_syms(bound);
                 }
             }
-            Pattern::Record { fields } => {
+            Pattern::Record { fields, rest } => {
                 for (_, pat) in fields {
                     pat.bind_syms(bound);
+                }
+                if let RecordPatternRest::Capture(sym) = rest {
+                    bound.insert(*sym);
+                }
+            }
+            Pattern::List(elems) => {
+                for elem in elems {
+                    match elem {
+                        ListPatternElem::Pattern(p) => p.bind_syms(bound),
+                        ListPatternElem::Spread(Some(sym)) => {
+                            bound.insert(*sym);
+                        }
+                        ListPatternElem::Spread(None) => {}
+                    }
                 }
             }
             Pattern::Tuple(elems) => {
@@ -429,6 +468,12 @@ fn free_names_inner<F: Fn(SymbolId) -> bool>(
         }
         ExprKind::Record { fields } => {
             for (_, e) in fields {
+                free_names_inner(e, bound, seen, is_known, out);
+            }
+        }
+        ExprKind::RecordUpdate { base, updates } => {
+            free_names_inner(base, bound, seen, is_known, out);
+            for (_, e) in updates {
                 free_names_inner(e, bound, seen, is_known, out);
             }
         }
@@ -666,6 +711,12 @@ fn collect_in_expr<'src>(
                 collect_in_expr(e, span, symbols, top_level);
             }
         }
+        raw::ExprKind::RecordUpdate { base, updates } => {
+            collect_in_expr(base, span, symbols, top_level);
+            for (_, e) in updates {
+                collect_in_expr(e, span, symbols, top_level);
+            }
+        }
         raw::ExprKind::FieldAccess { record, .. } => {
             collect_in_expr(record, span, symbols, top_level);
         }
@@ -723,7 +774,7 @@ fn collect_in_pattern<'src>(
                 collect_in_pattern(f, span, symbols, top_level);
             }
         }
-        raw::Pattern::Record { fields } => {
+        raw::Pattern::Record { fields, .. } => {
             for (_, f) in fields {
                 collect_in_pattern(f, span, symbols, top_level);
             }
@@ -734,6 +785,13 @@ fn collect_in_pattern<'src>(
             }
         }
         raw::Pattern::Wildcard | raw::Pattern::Binding(_) | raw::Pattern::IntLit(_) | raw::Pattern::StrLit(_) => {}
+        raw::Pattern::List(elems) => {
+            for elem in elems {
+                if let raw::ListPatternElem::Pattern(p) = elem {
+                    collect_in_pattern(p, span, symbols, top_level);
+                }
+            }
+        }
     }
 }
 
@@ -1045,6 +1103,16 @@ impl<'src> Resolver<'_, 'src> {
                     })
                     .collect(),
             },
+            raw::ExprKind::RecordUpdate { base, updates } => ExprKind::RecordUpdate {
+                base: Box::new(self.resolve_expr(*base)),
+                updates: updates
+                    .into_iter()
+                    .map(|(n, e)| {
+                        let sym = self.fields.intern(n);
+                        (sym, self.resolve_expr(e))
+                    })
+                    .collect(),
+            },
             raw::ExprKind::FieldAccess { record, field } => ExprKind::FieldAccess {
                 record: Box::new(self.resolve_expr(*record)),
                 field: self.fields.intern(field),
@@ -1153,7 +1221,7 @@ impl<'src> Resolver<'_, 'src> {
                     .map(|p| self.resolve_pattern_alloc(p, span))
                     .collect(),
             },
-            raw::Pattern::Record { fields } => Pattern::Record {
+            raw::Pattern::Record { fields, rest } => Pattern::Record {
                 fields: fields
                     .into_iter()
                     .map(|(n, p)| {
@@ -1161,7 +1229,30 @@ impl<'src> Resolver<'_, 'src> {
                         (sym, self.resolve_pattern_alloc(p, span))
                     })
                     .collect(),
+                rest: match rest {
+                    raw::RecordPatternRest::None => RecordPatternRest::None,
+                    raw::RecordPatternRest::Ignore => RecordPatternRest::Ignore,
+                    raw::RecordPatternRest::Capture(name) => {
+                        let id = self.symbols.fresh(name, span, SymbolKind::Local);
+                        RecordPatternRest::Capture(id)
+                    }
+                },
             },
+            raw::Pattern::List(elems) => Pattern::List(
+                elems
+                    .into_iter()
+                    .map(|e| match e {
+                        raw::ListPatternElem::Pattern(p) => {
+                            ListPatternElem::Pattern(self.resolve_pattern_alloc(p, span))
+                        }
+                        raw::ListPatternElem::Spread(None) => ListPatternElem::Spread(None),
+                        raw::ListPatternElem::Spread(Some(name)) => {
+                            let id = self.symbols.fresh(name, span, SymbolKind::Local);
+                            ListPatternElem::Spread(Some(id))
+                        }
+                    })
+                    .collect(),
+            ),
             raw::Pattern::Tuple(elems) => Pattern::Tuple(
                 elems
                     .into_iter()
@@ -1270,7 +1361,7 @@ impl<'src> Resolver<'_, 'src> {
                     .map(|p| self.resolve_and_bind_pattern(p, span))
                     .collect(),
             },
-            raw::Pattern::Record { fields } => Pattern::Record {
+            raw::Pattern::Record { fields, rest } => Pattern::Record {
                 fields: fields
                     .into_iter()
                     .map(|(n, p)| {
@@ -1278,7 +1369,30 @@ impl<'src> Resolver<'_, 'src> {
                         (sym, self.resolve_and_bind_pattern(p, span))
                     })
                     .collect(),
+                rest: match rest {
+                    raw::RecordPatternRest::None => RecordPatternRest::None,
+                    raw::RecordPatternRest::Ignore => RecordPatternRest::Ignore,
+                    raw::RecordPatternRest::Capture(name) => {
+                        let id = self.bind_local(name, span);
+                        RecordPatternRest::Capture(id)
+                    }
+                },
             },
+            raw::Pattern::List(elems) => Pattern::List(
+                elems
+                    .into_iter()
+                    .map(|e| match e {
+                        raw::ListPatternElem::Pattern(p) => {
+                            ListPatternElem::Pattern(self.resolve_and_bind_pattern(p, span))
+                        }
+                        raw::ListPatternElem::Spread(None) => ListPatternElem::Spread(None),
+                        raw::ListPatternElem::Spread(Some(name)) => {
+                            let id = self.bind_local(name, span);
+                            ListPatternElem::Spread(Some(id))
+                        }
+                    })
+                    .collect(),
+            ),
             raw::Pattern::Tuple(elems) => Pattern::Tuple(
                 elems
                     .into_iter()
@@ -1338,9 +1452,25 @@ fn collect_pattern_bindings(
                 collect_pattern_bindings(f, symbols, out);
             }
         }
-        Pattern::Record { fields } => {
+        Pattern::Record { fields, rest } => {
             for (_, p) in fields {
                 collect_pattern_bindings(p, symbols, out);
+            }
+            if let RecordPatternRest::Capture(sym) = rest {
+                out.push((symbols.display(*sym).to_owned(), *sym));
+            }
+        }
+        Pattern::List(elems) => {
+            for elem in elems {
+                match elem {
+                    ListPatternElem::Pattern(p) => {
+                        collect_pattern_bindings(p, symbols, out);
+                    }
+                    ListPatternElem::Spread(Some(sym)) => {
+                        out.push((symbols.display(*sym).to_owned(), *sym));
+                    }
+                    ListPatternElem::Spread(None) => {}
+                }
             }
         }
         Pattern::Tuple(elems) => {
