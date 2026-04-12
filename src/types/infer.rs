@@ -1504,9 +1504,14 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     };
                     self.method_resolutions.insert(s, resolution);
                 }
+            } else if let Some(s) = maybe_span {
+                return Err(CompileError::at(
+                    s,
+                    format!("no method '{0}' on type {type_name}", c.method_name),
+                ));
             } else {
                 return Err(CompileError::new(format!(
-                    "type error: {type_name} has no method '{}'",
+                    "no method '{0}' on type {type_name}",
                     c.method_name
                 )));
             }
