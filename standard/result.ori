@@ -2,8 +2,9 @@ exports [Result]
 
 # A value that is either a success or a failure.
 Result(ok, err) := [Ok(ok), Err(err)].(
-    # Extracts the Ok value, panicking on Err.
+    # Extracts the Ok value, or crashes on Err.
     unwrap : Result(ok, err) -> ok
     unwrap = |r| if r
         : Ok(val) then val
+        else crash("called unwrap on Err")
 )

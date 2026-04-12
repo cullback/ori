@@ -571,6 +571,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 acc_ty,
             );
         }
+        if func == "crash" {
+            let msg_val = self.lower_expr(&args[0]);
+            return self
+                .builder
+                .call("__crash", vec![msg_val], ScalarType::Ptr);
+        }
         if Self::is_list_builtin(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
             return emit_list_builtin_call(&mut self.builder, func, arg_vals);

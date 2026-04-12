@@ -361,6 +361,34 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(list, 2, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
+        "__crash" => {
+            // args: [str_ptr] — print message to stderr and abort.
+            let Scalar::Ptr(list_idx) = args[0] else {
+                eprintln!("crash: <non-string argument>");
+                std::process::exit(1);
+            };
+            let Scalar::U64(len) = heap.load(list_idx, 0) else {
+                eprintln!("crash: <malformed string>");
+                std::process::exit(1);
+            };
+            let Scalar::Ptr(data_idx) = heap.load(list_idx, 2) else {
+                eprintln!("crash: <malformed string>");
+                std::process::exit(1);
+            };
+            #[expect(clippy::cast_possible_truncation)]
+            let len = len as usize;
+            let mut bytes = Vec::with_capacity(len);
+            for i in 0..len {
+                let Scalar::U8(b) = heap.load(data_idx, i) else {
+                    bytes.push(b'?');
+                    continue;
+                };
+                bytes.push(b);
+            }
+            let msg = String::from_utf8_lossy(&bytes);
+            eprintln!("crash: {msg}");
+            std::process::exit(1);
+        }
         _ => None,
     }
 }

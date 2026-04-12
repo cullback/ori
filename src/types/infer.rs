@@ -1617,6 +1617,23 @@ pub fn check<'src>(
         ctx.env.insert(mangled, scheme);
     }
 
+    // `crash : Str -> a` — polymorphic return; aborts with a message.
+    let crash_ret = ctx.engine.fresh();
+    let Type::Var(crash_tv) = crash_ret else {
+        unreachable!()
+    };
+    ctx.env.insert(
+        "crash".to_owned(),
+        Scheme {
+            vars: vec![crash_tv],
+            constraints: vec![],
+            ty: Type::Arrow(
+                vec![Type::Con("Str".to_owned())],
+                Box::new(Type::Var(crash_tv)),
+            ),
+        },
+    );
+
     // Pre-register all type names into `known_types` before Pass 1
     // processes method signatures. This breaks dependency cycles
     // between stdlib modules — e.g. I64's `to_str : I64 -> Str`
