@@ -288,7 +288,7 @@ fn flatten_field<'src>(
     destructures: &mut Vec<Stmt<'src>>,
 ) {
     match field {
-        Pattern::Binding(_) | Pattern::Wildcard => {}
+        Pattern::Binding(_) | Pattern::Wildcard | Pattern::IntLit(_) | Pattern::StrLit(_) => {}
 
         Pattern::Constructor { .. } => {
             let tmp = ctx.fresh_local(span);
@@ -378,7 +378,7 @@ fn flatten_is_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) {
 /// it from the `is`-expression rewrite path.
 fn is_pattern_flattenable(pat: &Pattern<'_>) -> bool {
     match pat {
-        Pattern::Binding(_) | Pattern::Wildcard => true,
+        Pattern::Binding(_) | Pattern::Wildcard | Pattern::IntLit(_) | Pattern::StrLit(_) => true,
         Pattern::Constructor { fields, .. } => fields.iter().all(is_pattern_flattenable),
         Pattern::Tuple(_) | Pattern::Record { .. } => false,
     }

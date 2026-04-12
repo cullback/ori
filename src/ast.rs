@@ -245,6 +245,8 @@ pub enum Pattern<'src> {
         fields: Vec<(FieldSym, Pattern<'src>)>,
     },
     Tuple(Vec<Pattern<'src>>),
+    IntLit(i64),
+    StrLit(Vec<u8>),
     Wildcard,
     Binding(SymbolId),
 }
@@ -313,7 +315,7 @@ impl Pattern<'_> {
             Pattern::Binding(sym) => {
                 bound.insert(*sym);
             }
-            Pattern::Wildcard => {}
+            Pattern::Wildcard | Pattern::IntLit(_) | Pattern::StrLit(_) => {}
         }
     }
 }
@@ -731,7 +733,7 @@ fn collect_in_pattern<'src>(
                 collect_in_pattern(e, span, symbols, top_level);
             }
         }
-        raw::Pattern::Wildcard | raw::Pattern::Binding(_) => {}
+        raw::Pattern::Wildcard | raw::Pattern::Binding(_) | raw::Pattern::IntLit(_) | raw::Pattern::StrLit(_) => {}
     }
 }
 
@@ -1171,6 +1173,8 @@ impl<'src> Resolver<'_, 'src> {
                 let id = self.symbols.fresh(name, span, SymbolKind::Local);
                 Pattern::Binding(id)
             }
+            raw::Pattern::IntLit(n) => Pattern::IntLit(n),
+            raw::Pattern::StrLit(b) => Pattern::StrLit(b),
         }
     }
 
@@ -1286,6 +1290,8 @@ impl<'src> Resolver<'_, 'src> {
                 let id = self.bind_local(name, span);
                 Pattern::Binding(id)
             }
+            raw::Pattern::IntLit(n) => Pattern::IntLit(n),
+            raw::Pattern::StrLit(b) => Pattern::StrLit(b),
         }
     }
 }
@@ -1342,7 +1348,7 @@ fn collect_pattern_bindings(
                 collect_pattern_bindings(e, symbols, out);
             }
         }
-        Pattern::Wildcard => {}
+        Pattern::Wildcard | Pattern::IntLit(_) | Pattern::StrLit(_) => {}
     }
 }
 

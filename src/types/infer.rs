@@ -736,6 +736,16 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             let eb_ty = self.infer_expr(eb)?;
             self.unify_expected(&eb_ty, &result_ty, eb.span, "`else` branch")?;
         } else {
+            // Literal patterns can never be exhaustive — require else.
+            let has_literal = arms
+                .iter()
+                .any(|a| matches!(a.pattern, ast::Pattern::IntLit(_) | ast::Pattern::StrLit(_)));
+            if has_literal {
+                return Err(Self::type_error(
+                    span,
+                    "match on literal patterns requires an `else` branch",
+                ));
+            }
             self.close_open_tag_row(&scrutinee_ty);
         }
         Ok(result_ty)
@@ -1212,7 +1222,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 ast::Pattern::Binding(sym) => {
                     bindings.push((*sym, bind_ty));
                 }
-                ast::Pattern::Wildcard => {}
+                ast::Pattern::Wildcard
+                | ast::Pattern::IntLit(_)
+                | ast::Pattern::StrLit(_) => {}
                 ast::Pattern::Constructor { .. }
                 | ast::Pattern::Record { .. }
                 | ast::Pattern::Tuple(_) => {
@@ -1254,7 +1266,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 ast::Pattern::Binding(sym) => {
                     bindings.push((*sym, field_ty.clone()));
                 }
-                ast::Pattern::Wildcard => {}
+                ast::Pattern::Wildcard
+                | ast::Pattern::IntLit(_)
+                | ast::Pattern::StrLit(_) => {}
                 ast::Pattern::Constructor { .. }
                 | ast::Pattern::Record { .. }
                 | ast::Pattern::Tuple(_) => {
@@ -1315,6 +1329,18 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
             ast::Pattern::Binding(sym) => Ok(vec![(*sym, expected.clone())]),
             ast::Pattern::Wildcard => Ok(vec![]),
+            ast::Pattern::IntLit(_) => {
+                let ty = self.engine.fresh();
+                let Type::Var(tv) = ty else { unreachable!() };
+                self.int_literal_vars.push((tv, span));
+                self.unify_at(&ty, expected, span)?;
+                Ok(vec![])
+            }
+            ast::Pattern::StrLit(_) => {
+                let str_ty = Type::Con("Str".to_owned());
+                self.unify_at(&str_ty, expected, span)?;
+                Ok(vec![])
+            }
         }
     }
 

@@ -179,8 +179,14 @@ pattern = {
   | "{" ~ (field_pattern ~ ("," ~ field_pattern)*)? ~ "}"
   | "(" ~ pattern ~ ("," ~ pattern)+ ~ ")"
   | "_"
+  | char_lit
+  | neg_pattern
+  | int_lit
+  | string_lit
   | name
 }
+
+neg_pattern = { "-" ~ int_lit }
 
 field_pattern = {
     name ~ ":" ~ pattern

@@ -546,6 +546,11 @@ impl<W: Write> Printer<'_, W> {
                     Ok(())
                 }
             }
+            Pattern::IntLit(n) => self.line(level, format_args!("{n}")),
+            Pattern::StrLit(b) => {
+                let s = String::from_utf8_lossy(b);
+                self.line(level, format_args!("\"{s}\""))
+            }
         }
     }
 

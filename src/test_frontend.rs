@@ -1790,6 +1790,76 @@ main = |arg| List.walk([1, 2, 3, 4], 0, I64.add)";
     assert_eq!(run_i64(source, 0), 10);
 }
 
+// ============================================================
+// Literal patterns
+// ============================================================
+
+#[test]
+fn literal_pattern_int_match() {
+    let source = "\
+classify : I64 -> I64
+classify = |n| if n
+    : 1 then 10
+    : 2 then 20
+    : 3 then 30
+    else 0
+
+main : I64 -> I64
+main = |arg| classify(2)";
+    assert_eq!(run_i64(source, 0), 20);
+}
+
+#[test]
+fn literal_pattern_char_lit() {
+    // Char literal in pattern position: '(' is 40 as U8.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    c : U8
+    c = 40
+    if c
+        : '(' then 1
+        : ')' then 2
+        else 0
+)";
+    assert_eq!(run_i64(source, 0), 1);
+}
+
+#[test]
+fn literal_pattern_negative() {
+    let source = "\
+sign : I64 -> I64
+sign = |n| if n
+    : 0 then 0
+    : -1 then 99
+    else 1
+
+main : I64 -> I64
+main = |arg| sign(-1)";
+    assert_eq!(run_i64(source, 0), 99);
+}
+
+#[test]
+fn literal_pattern_else_fallthrough() {
+    let source = "\
+main : I64 -> I64
+main = |arg| if arg
+    : 42 then 1
+    else 0";
+    assert_eq!(run_i64(source, 5), 0);
+}
+
+#[test]
+#[should_panic(expected = "requires an `else` branch")]
+fn literal_pattern_no_else_errors() {
+    let source = "\
+main : I64 -> I64
+main = |arg| if arg
+    : 1 then 10
+    : 2 then 20";
+    run_i64(source, 0);
+}
+
 #[test]
 fn constructor_as_value_stays_nullary() {
     // Bare `Red` in a value context (no arrow expected) keeps its

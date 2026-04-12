@@ -495,6 +495,11 @@ fn write_pattern(f: &mut fmt::Formatter<'_>, pat: &Pattern<'_>, level: usize) ->
                 Ok(())
             }
         }
+        Pattern::IntLit(n) => write_line(f, level, format_args!("{n}")),
+        Pattern::StrLit(b) => {
+            let s = String::from_utf8_lossy(b);
+            write_line(f, level, format_args!("\"{s}\""))
+        }
     }
 }
 

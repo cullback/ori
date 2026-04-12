@@ -56,6 +56,14 @@ List := {}.(
         final.out
     )
 
+    # Returns the index of the first element satisfying the predicate,
+    # or `Err(NotFound)` if no element matches.
+    # Returns the index of the first element satisfying the predicate,
+    # or `Err(NotFound)` if no element matches.
+    # NOTE: body commented out pending mono bug with structural tags
+    # as type parameters to polymorphic functions.
+    find_first_index : List(a), (a -> Bool) -> Result(U64, [NotFound])
+
     # Returns the sum of all elements.
     sum : List(a) -> a where [a.add]
     sum = |xs| List.walk(xs, 0, |acc, x| acc + x)

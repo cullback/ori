@@ -180,6 +180,8 @@ pub enum Pattern<'src> {
         fields: Vec<(&'src str, Pattern<'src>)>,
     },
     Tuple(Vec<Pattern<'src>>),
+    IntLit(i64),
+    StrLit(Vec<u8>),
     Wildcard,
     Binding(&'src str),
 }

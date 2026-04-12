@@ -252,9 +252,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 else_body,
             } => {
                 let result_ty = self.expr_scalar_type(expr);
-                // Detect boolean if-then-else with Is bindings in scrutinee
                 if Self::is_bool_if_with_is(scrutinee_expr, arms) {
                     self.lower_bool_if_with_is(scrutinee_expr, arms, result_ty)
+                } else if Self::is_literal_match(arms) {
+                    self.lower_literal_match(
+                        scrutinee_expr,
+                        arms,
+                        else_body.as_deref(),
+                        result_ty,
+                    )
                 } else {
                     self.lower_match(scrutinee_expr, arms, else_body.as_deref(), result_ty)
                 }
@@ -721,6 +727,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
                 self.lower_bool_from_cmp(matches)
             }
+            ast::Pattern::IntLit(n) => {
+                let scr_ty = self.expr_scalar_type(inner);
+                let lit_val = self.builder.const_i64(*n);
+                let eq = self
+                    .builder
+                    .binop(BinaryOp::Eq, scr, lit_val, scr_ty);
+                self.lower_bool_from_cmp(eq)
+            }
             ast::Pattern::Wildcard | ast::Pattern::Binding(_) => {
                 // Always matches — emit a declared Bool::True.
                 self.lower_constructor_call("True", &[], None)
@@ -973,6 +987,77 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
+    // ---- Literal match lowering ----
+
+    /// True if every arm's pattern is `IntLit` or `StrLit`.
+    fn is_literal_match(arms: &[ast::MatchArm<'_>]) -> bool {
+        arms.iter().all(|arm| {
+            matches!(
+                arm.pattern,
+                ast::Pattern::IntLit(_) | ast::Pattern::StrLit(_)
+            )
+        })
+    }
+
+    /// Lower a match on literal patterns as a chain of equality checks.
+    /// Each arm becomes `if scrutinee == literal then body else next_arm`.
+    fn lower_literal_match(
+        &mut self,
+        scrutinee_expr: &Expr<'src>,
+        arms: &[ast::MatchArm<'src>],
+        else_body: Option<&Expr<'src>>,
+        result_ty: ScalarType,
+    ) -> Value {
+        let scr_val = self.lower_expr(scrutinee_expr);
+        let scr_ty = self.expr_scalar_type(scrutinee_expr);
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, result_ty);
+
+        for arm in arms {
+            let next_block = self.builder.create_block();
+            let body_block = self.builder.create_block();
+            let lit_val = match &arm.pattern {
+                ast::Pattern::IntLit(n) => match scr_ty {
+                    ScalarType::I8 => self.builder.const_i8(*n as i8),
+                    ScalarType::U8 => self.builder.const_u8(*n as u8),
+                    ScalarType::I16 => self.builder.const_i16(*n as i16),
+                    ScalarType::U16 => self.builder.const_u16(*n as u16),
+                    ScalarType::I32 => self.builder.const_i32(*n as i32),
+                    ScalarType::U32 => self.builder.const_u32(*n as u32),
+                    ScalarType::U64 => self.builder.const_u64(*n as u64),
+                    _ => self.builder.const_i64(*n),
+                },
+                ast::Pattern::StrLit(_) => {
+                    panic!("string literal pattern matching not yet supported in lowering")
+                }
+                _ => unreachable!(),
+            };
+            let eq = self
+                .builder
+                .binop(BinaryOp::Eq, scr_val, lit_val, ScalarType::Bool);
+            self.builder.branch(eq, body_block, vec![], next_block, vec![]);
+
+            self.builder.switch_to(body_block);
+            let body_val = self.lower_expr(&arm.body);
+            self.builder.jump(merge, vec![body_val]);
+
+            self.builder.switch_to(next_block);
+        }
+
+        // Else / unreachable fallthrough
+        if let Some(eb) = else_body {
+            let else_val = self.lower_expr(eb);
+            self.builder.jump(merge, vec![else_val]);
+        } else {
+            // No else — unreachable. Jump with a dummy value.
+            let dummy = self.builder.const_i64(0);
+            self.builder.jump(merge, vec![dummy]);
+        }
+
+        self.builder.switch_to(merge);
+        merge_param
+    }
+
     // ---- Match lowering ----
 
     fn lower_match(
@@ -1058,7 +1143,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ast::Pattern::Binding(sym) => {
                 self.vars.insert(*sym, val);
             }
-            ast::Pattern::Wildcard => {}
+            ast::Pattern::Wildcard | ast::Pattern::IntLit(_) | ast::Pattern::StrLit(_) => {}
             _ => panic!("unsupported nested pattern in match arm field"),
         }
     }

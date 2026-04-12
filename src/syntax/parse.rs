@@ -934,6 +934,25 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern<'_> {
             let elements: Vec<Pattern<'_>> = inner.into_iter().map(parse_pattern).collect();
             Pattern::Tuple(elements)
         }
+        Rule::char_lit => {
+            let raw = first.as_str();
+            let inner_str = &raw[1..raw.len() - 1];
+            Pattern::IntLit(unescape_char(inner_str))
+        }
+        Rule::int_lit => {
+            let n: i64 = first.as_str().parse().unwrap();
+            Pattern::IntLit(n)
+        }
+        Rule::neg_pattern => {
+            let int_pair = first.clone().into_inner().next().unwrap();
+            let n: i64 = int_pair.as_str().parse().unwrap();
+            Pattern::IntLit(-n)
+        }
+        Rule::string_lit => {
+            let raw = first.as_str();
+            let bytes = unescape_string(&raw[1..raw.len() - 1]);
+            Pattern::StrLit(bytes)
+        }
         _ => {
             if first.as_str() == "_" {
                 Pattern::Wildcard
