@@ -1,0 +1,12 @@
+exports [I32]
+
+I32 := {}.(
+    add : I32, I32 -> I32
+    sub : I32, I32 -> I32
+    mul : I32, I32 -> I32
+    div : I32, I32 -> I32
+    rem : I32, I32 -> I32
+    eq : I32, I32 -> Bool
+    neq : I32, I32 -> Bool
+    to_str : I32 -> Str
+)

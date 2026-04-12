@@ -4,6 +4,10 @@ resolved:
     <stdlib:Bool>: Bool
     <stdlib:I8>: I8
     <stdlib:U8>: U8
+    <stdlib:I16>: I16
+    <stdlib:U16>: U16
+    <stdlib:I32>: I32
+    <stdlib:U32>: U32
     <stdlib:I64>: I64
     <stdlib:U64>: U64
     <stdlib:F64>: F64

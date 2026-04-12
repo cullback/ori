@@ -1,0 +1,12 @@
+exports [U16]
+
+U16 := {}.(
+    add : U16, U16 -> U16
+    sub : U16, U16 -> U16
+    mul : U16, U16 -> U16
+    div : U16, U16 -> U16
+    rem : U16, U16 -> U16
+    eq : U16, U16 -> Bool
+    neq : U16, U16 -> Bool
+    to_str : U16 -> Str
+)

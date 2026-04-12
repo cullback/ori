@@ -1,0 +1,12 @@
+exports [I16]
+
+I16 := {}.(
+    add : I16, I16 -> I16
+    sub : I16, I16 -> I16
+    mul : I16, I16 -> I16
+    div : I16, I16 -> I16
+    rem : I16, I16 -> I16
+    eq : I16, I16 -> Bool
+    neq : I16, I16 -> Bool
+    to_str : I16 -> Str
+)

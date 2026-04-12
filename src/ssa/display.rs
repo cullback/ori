@@ -110,6 +110,10 @@ impl fmt::Display for ScalarType {
         match self {
             Self::I8 => write!(f, "i8"),
             Self::U8 => write!(f, "u8"),
+            Self::I16 => write!(f, "i16"),
+            Self::U16 => write!(f, "u16"),
+            Self::I32 => write!(f, "i32"),
+            Self::U32 => write!(f, "u32"),
             Self::I64 => write!(f, "i64"),
             Self::U64 => write!(f, "u64"),
             Self::F64 => write!(f, "f64"),

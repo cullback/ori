@@ -1420,7 +1420,8 @@ impl<'a, 'src> InferCtx<'a, 'src> {
 
     /// Numeric types whose body-less method declarations in the
     /// stdlib are backed by compiler intrinsics rather than user code.
-    const NUMERIC_TYPES: &'static [&'static str] = &["I8", "U8", "I64", "U64", "F64"];
+    const NUMERIC_TYPES: &'static [&'static str] =
+        &["I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64", "F64"];
 
     /// Methods on numeric types dispatched as compiler intrinsics.
     /// Arithmetic ops become SSA binary ops; `to_str` becomes the

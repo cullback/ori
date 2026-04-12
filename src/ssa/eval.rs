@@ -6,11 +6,15 @@ use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, V
 /// A scalar runtime value that fits in a register.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scalar {
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
     I64(i64),
     U64(u64),
     F64(f64),
-    U8(u8),
-    I8(i8),
     Bool(bool),
     Ptr(usize), // index into heap
 }
@@ -367,6 +371,10 @@ fn bits_to_scalar(ty: ScalarType, bits: u64) -> Scalar {
     match ty {
         ScalarType::I8 => Scalar::I8(bits as i8),
         ScalarType::U8 => Scalar::U8(bits as u8),
+        ScalarType::I16 => Scalar::I16(bits as i16),
+        ScalarType::U16 => Scalar::U16(bits as u16),
+        ScalarType::I32 => Scalar::I32(bits as i32),
+        ScalarType::U32 => Scalar::U32(bits as u32),
         ScalarType::I64 => Scalar::I64(bits as i64),
         ScalarType::U64 => Scalar::U64(bits),
         ScalarType::F64 => Scalar::F64(f64::from_bits(bits)),
@@ -377,10 +385,14 @@ fn bits_to_scalar(ty: ScalarType, bits: u64) -> Scalar {
 
 fn scalar_to_u64(s: Scalar) -> u64 {
     match s {
+        Scalar::I8(n) => n as u64,
+        Scalar::U8(n) => u64::from(n),
+        Scalar::I16(n) => n as u64,
+        Scalar::U16(n) => u64::from(n),
+        Scalar::I32(n) => n as u64,
+        Scalar::U32(n) => u64::from(n),
         Scalar::I64(n) => n as u64,
         Scalar::U64(n) => n,
-        Scalar::U8(n) => u64::from(n),
-        Scalar::I8(n) => n as u64,
         Scalar::Bool(b) => u64::from(b),
         Scalar::Ptr(p) => p as u64,
         Scalar::F64(_) => panic!("switch on float"),
@@ -431,6 +443,38 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Rem, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a % b),
         (BinaryOp::Eq, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a != b),
+
+        (BinaryOp::Add, Scalar::I16(a), Scalar::I16(b)) => Scalar::I16(a.wrapping_add(b)),
+        (BinaryOp::Sub, Scalar::I16(a), Scalar::I16(b)) => Scalar::I16(a.wrapping_sub(b)),
+        (BinaryOp::Mul, Scalar::I16(a), Scalar::I16(b)) => Scalar::I16(a.wrapping_mul(b)),
+        (BinaryOp::Div, Scalar::I16(a), Scalar::I16(b)) => Scalar::I16(a / b),
+        (BinaryOp::Rem, Scalar::I16(a), Scalar::I16(b)) => Scalar::I16(a % b),
+        (BinaryOp::Eq, Scalar::I16(a), Scalar::I16(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::I16(a), Scalar::I16(b)) => Scalar::Bool(a != b),
+
+        (BinaryOp::Add, Scalar::U16(a), Scalar::U16(b)) => Scalar::U16(a.wrapping_add(b)),
+        (BinaryOp::Sub, Scalar::U16(a), Scalar::U16(b)) => Scalar::U16(a.wrapping_sub(b)),
+        (BinaryOp::Mul, Scalar::U16(a), Scalar::U16(b)) => Scalar::U16(a.wrapping_mul(b)),
+        (BinaryOp::Div, Scalar::U16(a), Scalar::U16(b)) => Scalar::U16(a / b),
+        (BinaryOp::Rem, Scalar::U16(a), Scalar::U16(b)) => Scalar::U16(a % b),
+        (BinaryOp::Eq, Scalar::U16(a), Scalar::U16(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::U16(a), Scalar::U16(b)) => Scalar::Bool(a != b),
+
+        (BinaryOp::Add, Scalar::I32(a), Scalar::I32(b)) => Scalar::I32(a.wrapping_add(b)),
+        (BinaryOp::Sub, Scalar::I32(a), Scalar::I32(b)) => Scalar::I32(a.wrapping_sub(b)),
+        (BinaryOp::Mul, Scalar::I32(a), Scalar::I32(b)) => Scalar::I32(a.wrapping_mul(b)),
+        (BinaryOp::Div, Scalar::I32(a), Scalar::I32(b)) => Scalar::I32(a / b),
+        (BinaryOp::Rem, Scalar::I32(a), Scalar::I32(b)) => Scalar::I32(a % b),
+        (BinaryOp::Eq, Scalar::I32(a), Scalar::I32(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::I32(a), Scalar::I32(b)) => Scalar::Bool(a != b),
+
+        (BinaryOp::Add, Scalar::U32(a), Scalar::U32(b)) => Scalar::U32(a.wrapping_add(b)),
+        (BinaryOp::Sub, Scalar::U32(a), Scalar::U32(b)) => Scalar::U32(a.wrapping_sub(b)),
+        (BinaryOp::Mul, Scalar::U32(a), Scalar::U32(b)) => Scalar::U32(a.wrapping_mul(b)),
+        (BinaryOp::Div, Scalar::U32(a), Scalar::U32(b)) => Scalar::U32(a / b),
+        (BinaryOp::Rem, Scalar::U32(a), Scalar::U32(b)) => Scalar::U32(a % b),
+        (BinaryOp::Eq, Scalar::U32(a), Scalar::U32(b)) => Scalar::Bool(a == b),
+        (BinaryOp::Neq, Scalar::U32(a), Scalar::U32(b)) => Scalar::Bool(a != b),
 
         (BinaryOp::Add, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a + b),
         (BinaryOp::Sub, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a - b),

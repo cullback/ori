@@ -90,6 +90,34 @@ impl Builder {
         v
     }
 
+    pub fn const_u16(&mut self, n: u16) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::Const(v, ScalarType::U16, u64::from(n)));
+        self.set_type(v, ScalarType::U16);
+        v
+    }
+
+    pub fn const_i16(&mut self, n: i16) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::Const(v, ScalarType::I16, n as u64));
+        self.set_type(v, ScalarType::I16);
+        v
+    }
+
+    pub fn const_u32(&mut self, n: u32) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::Const(v, ScalarType::U32, u64::from(n)));
+        self.set_type(v, ScalarType::U32);
+        v
+    }
+
+    pub fn const_i32(&mut self, n: i32) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::Const(v, ScalarType::I32, n as u64));
+        self.set_type(v, ScalarType::I32);
+        v
+    }
+
     pub fn const_bool(&mut self, b: bool) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::Bool, u64::from(b)));

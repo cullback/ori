@@ -164,6 +164,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ExprKind::IntLit(n) => match &expr.ty {
                 Type::Con(name) if name == "U8" => self.builder.const_u8(*n as u8),
                 Type::Con(name) if name == "I8" => self.builder.const_i8(*n as i8),
+                Type::Con(name) if name == "U16" => self.builder.const_u16(*n as u16),
+                Type::Con(name) if name == "I16" => self.builder.const_i16(*n as i16),
+                Type::Con(name) if name == "U32" => self.builder.const_u32(*n as u32),
+                Type::Con(name) if name == "I32" => self.builder.const_i32(*n as i32),
                 Type::Con(name) if name == "U64" => self.builder.const_u64(*n as u64),
                 Type::Con(name) if name == "F64" => self.builder.const_f64(*n as f64),
                 _ => self.builder.const_i64(*n),

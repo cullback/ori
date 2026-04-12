@@ -30,6 +30,10 @@ pub fn type_to_scalar(ty: &Type) -> ScalarType {
         Type::Con(name) => match name.as_str() {
             "I8" => ScalarType::I8,
             "U8" => ScalarType::U8,
+            "I16" => ScalarType::I16,
+            "U16" => ScalarType::U16,
+            "I32" => ScalarType::I32,
+            "U32" => ScalarType::U32,
             "I64" => ScalarType::I64,
             "U64" => ScalarType::U64,
             "F64" => ScalarType::F64,
