@@ -154,9 +154,11 @@ pub struct TypeEngine {
     pub subst: HashMap<TypeVar, Type>,
     /// Accumulated constraints during inference.
     pub constraints: Vec<Constraint>,
-    /// Nominal types currently transparent (name → underlying type).
+    /// Nominal types currently transparent (name → (type param vars, underlying type)).
     /// During method body inference, the nominal type unifies with its underlying type.
-    pub transparent: HashMap<String, Type>,
+    /// For parameterized types like `Parser(a)`, the vars list records which `TypeVar`s
+    /// correspond to the type parameters so `App` unification can substitute them.
+    pub transparent: HashMap<String, (Vec<TypeVar>, Type)>,
 }
 
 impl TypeEngine {
@@ -255,9 +257,12 @@ impl TypeEngine {
                     rest: r2,
                 },
             ) => self.unify_tag_unions(t1, r1.as_deref(), t2, r2.as_deref()),
-            // Transparent nominal: Con vs non-Con (e.g. Str vs List(U8))
+            // Transparent nominal: try Con first (resolves Str → List(U8)),
+            // then App (resolves Parser(a) → Arrow). Con before App
+            // ensures Str vs List(t) resolves Str first, producing
+            // List(U8) vs List(t) which hits the App-App case above.
             (Type::Con(a), _) => {
-                if let Some(underlying) = self.transparent.get(a).cloned() {
+                if let Some((_, underlying)) = self.transparent.get(a).cloned() {
                     return self.unify(&underlying, &rhs);
                 }
                 Err(format!(
@@ -267,7 +272,33 @@ impl TypeEngine {
                 ))
             }
             (_, Type::Con(b)) => {
-                if let Some(underlying) = self.transparent.get(b).cloned() {
+                if let Some((_, underlying)) = self.transparent.get(b).cloned() {
+                    return self.unify(&lhs, &underlying);
+                }
+                Err(format!(
+                    "cannot unify {} with {}",
+                    self.display_type(&lhs),
+                    self.display_type(&rhs)
+                ))
+            }
+            (Type::App(name, args), _) => {
+                if let Some((param_vars, underlying)) = self.transparent.get(name).cloned() {
+                    for (var, arg) in param_vars.iter().zip(args.iter()) {
+                        self.unify(&Type::Var(*var), arg)?;
+                    }
+                    return self.unify(&underlying, &rhs);
+                }
+                Err(format!(
+                    "cannot unify {} with {}",
+                    self.display_type(&lhs),
+                    self.display_type(&rhs)
+                ))
+            }
+            (_, Type::App(name, args)) => {
+                if let Some((param_vars, underlying)) = self.transparent.get(name).cloned() {
+                    for (var, arg) in param_vars.iter().zip(args.iter()) {
+                        self.unify(&Type::Var(*var), arg)?;
+                    }
                     return self.unify(&lhs, &underlying);
                 }
                 Err(format!(
@@ -372,10 +403,10 @@ impl TypeEngine {
         if a == b {
             return Ok(());
         }
-        if let Some(underlying) = self.transparent.get(a).cloned() {
+        if let Some((_, underlying)) = self.transparent.get(a).cloned() {
             return self.unify(&underlying, rhs);
         }
-        if let Some(underlying) = self.transparent.get(b).cloned() {
+        if let Some((_, underlying)) = self.transparent.get(b).cloned() {
             return self.unify(lhs, &underlying);
         }
         Err(format!("cannot unify {a} with {b}"))
@@ -672,7 +703,7 @@ impl TypeEngine {
         let resolved = self.resolve(ty);
         // Show the nominal name if this type matches a transparent underlying type
         #[expect(clippy::iter_over_hash_type, reason = "display order doesn't matter")]
-        for (name, underlying) in &self.transparent {
+        for (name, (_, underlying)) in &self.transparent {
             if self.types_match(&resolved, underlying) {
                 return name.clone();
             }

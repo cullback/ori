@@ -199,6 +199,27 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         self.type_expr_to_type(texpr, &mut HashMap::new())
     }
 
+    /// Resolve a type expression AND return the `TypeVar`s for the given
+    /// type parameters. Used for transparent/opaque type registration
+    /// where we need to know which vars correspond to the declaration's params.
+    fn resolve_type_expr_with_params(
+        &mut self,
+        texpr: &TypeExpr<'src>,
+        type_params: &[&str],
+    ) -> Result<(Vec<TypeVar>, Type), CompileError> {
+        let mut tvar_env = HashMap::new();
+        let ty = self.type_expr_to_type(texpr, &mut tvar_env)?;
+        let param_vars: Vec<TypeVar> = type_params
+            .iter()
+            .map(|p| tvar_env.get(*p).copied().unwrap_or_else(|| {
+                let t = self.engine.fresh();
+                let Type::Var(tv) = t else { unreachable!() };
+                tv
+            }))
+            .collect();
+        Ok((param_vars, ty))
+    }
+
     /// Convert a type expression, accumulating implicit type variable bindings
     /// into `tvar_env` (so `a` in `a -> a` resolves to the same variable).
     fn type_expr_to_type(
@@ -1948,6 +1969,7 @@ pub fn check<'src>(
     for decl in &module.decls {
         if let Decl::TypeAnno {
             name,
+            type_params,
             ty,
             kind,
             methods,
@@ -1956,8 +1978,17 @@ pub fn check<'src>(
         {
             let name = symbols.display(*name);
             if *kind == TypeDeclKind::Transparent && !matches!(ty, TypeExpr::TagUnion(..)) {
-                let underlying = ctx.resolve_type_expr(ty)?;
-                ctx.engine.transparent.insert(name.to_owned(), underlying);
+                // Skip transparency for `Type := {}` — the empty record
+                // body means "compiler builtin, no real underlying type."
+                // Registering these as transparent to {} would make all
+                // builtins unify with each other through the empty record.
+                if !matches!(ty, TypeExpr::Record(fields) if fields.is_empty()) {
+                    let (param_vars, underlying) =
+                        ctx.resolve_type_expr_with_params(ty, type_params)?;
+                    ctx.engine
+                        .transparent
+                        .insert(name.to_owned(), (param_vars, underlying));
+                }
             }
             let func_names: std::collections::HashSet<&str> = methods
                 .iter()
@@ -2019,6 +2050,7 @@ pub fn check<'src>(
     for decl in &module.decls {
         if let Decl::TypeAnno {
             name,
+            type_params,
             ty,
             kind,
             methods,
@@ -2028,8 +2060,11 @@ pub fn check<'src>(
             let name = symbols.display(*name);
             let opaque_set_up =
                 if *kind == TypeDeclKind::Opaque && !matches!(ty, TypeExpr::TagUnion(..)) {
-                    let underlying = ctx.resolve_type_expr(ty)?;
-                    ctx.engine.transparent.insert(name.to_owned(), underlying);
+                    let (param_vars, underlying) =
+                        ctx.resolve_type_expr_with_params(ty, type_params)?;
+                    ctx.engine
+                        .transparent
+                        .insert(name.to_owned(), (param_vars, underlying));
                     true
                 } else {
                     false
