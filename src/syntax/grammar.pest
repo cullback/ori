@@ -147,9 +147,9 @@ irrefutable = {
 field_irrefutable = { ".." ~ name | ".." | name ~ ":" ~ irrefutable | name }
 
 record_literal = { "{" ~ record_body ~ "}" | "{" ~ "}" }
-record_body = { expr ~ "&" ~ field_init ~ ("," ~ field_init)* | field_init ~ ("," ~ field_init)* }
+record_body = { expr ~ "&" ~ field_init ~ ("," ~ field_init)* ~ ","? | field_init ~ ("," ~ field_init)* ~ ","? }
 
-field_init = { name ~ ":" ~ expr }
+field_init = { name ~ ":" ~ expr | name }
 
 lambda = { "|" ~ (lambda_param ~ ("," ~ lambda_param)*)? ~ "|" ~ expr }
 

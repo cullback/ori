@@ -106,12 +106,16 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     #     # Ok((['1', '2', '3'], "a"))
     zero_or_more : Parser(a) -> Parser(List(a))
     zero_or_more = |p|
-        |input|
-            (values, rest) = List.walk_until(input, ([], input), |(acc, remaining), _|
+        |input| (
+            result = List.walk_until(input, ([], input), |state, _| (
+                (acc, remaining) = state
                 if p(remaining)
                     : Ok({ value, rest }) then Continue((List.append(acc, value), rest))
-                    : Err(_) then Break((acc, remaining)))
+                    : Err(_) then Break((acc, remaining))
+            ))
+            (values, rest) = result
             Ok({ value: values, rest })
+        )
 
     # Parse one or more occurrences. Fails if the first attempt fails.
     #
@@ -119,7 +123,7 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     #     # Ok((['1', '2', '3'], "a"))
     one_or_more : Parser(a) -> Parser(List(a))
     one_or_more = |p|
-        p.sequence(p.zero_or_more(), |head, tail| tail.prepend(head))
+        p.sequence(p.zero_or_more(), |head, tail| List.prepend(tail, head))
 
     # Parse values separated by a delimiter. Matches zero or more;
     # always succeeds.
@@ -127,11 +131,12 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     #     natural.separated_by(symbol(',')).run("1,2,3end")
     #     # Ok(([1, 2, 3], "end"))
     separated_by : Parser(a), Parser(b) -> Parser(List(a))
-    separated_by = |element, delim|
+    separated_by = |element, delim| (
         element.sequence(
             delim.and_drop_left(element).zero_or_more(),
-            |head, tail| tail.prepend(head),
+            |head, tail| List.prepend(tail, head)
         ).or_else(Parser.succeed([]))
+    )
 
     # A parser that always succeeds with `value`, consuming nothing.
     succeed : a -> Parser(a)
@@ -142,6 +147,10 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     fail : Str -> Parser(a)
     fail = |msg|
         |_| Err(msg)
+
+    # Wrap a raw parse function into a Parser.
+    from_fn : (List(U8) -> Result({ value: a, rest: List(U8) }, Str)) -> Parser(a)
+    from_fn = |f| f
 )
 
 # --- Byte-level primitives ---
@@ -157,14 +166,14 @@ chr = |b|
 #     # Ok(('x', "yz"))
 symbol : U8 -> Parser(U8)
 symbol = |c|
-    |input|
+    Parser.from_fn(|input|
         if input
             : [first, ..rest] and first == c then
                 Ok({ value: c, rest })
             : [first, ..] then
                 Err("expected '${chr(c)}', got '${chr(first)}'")
             : [] then
-                Err("expected '${chr(c)}', got EOF")
+                Err("expected '${chr(c)}', got EOF"))
 
 # Match any byte in the inclusive range `[lo, hi]`.
 #
@@ -172,14 +181,14 @@ symbol = |c|
 #     # Ok(('7', "x"))
 in_range : U8, U8 -> Parser(U8)
 in_range = |lo, hi|
-    |input|
+    Parser.from_fn(|input|
         if input
             : [first, ..rest] and first >= lo and first <= hi then
                 Ok({ value: first, rest })
             : [first, ..] then
                 Err("expected byte in ['${chr(lo)}'..'${chr(hi)}'], got '${chr(first)}'")
             : [] then
-                Err("expected byte in ['${chr(lo)}'..'${chr(hi)}'], got EOF")
+                Err("expected byte in ['${chr(lo)}'..'${chr(hi)}'], got EOF"))
 
 # Match a single ASCII digit ('0'..'9').
 digit : Parser(U8)
@@ -210,10 +219,13 @@ boxes : Parser(List({ l: U64, w: U64, h: U64 }))
 boxes = box.separated_by(symbol('\n'))
 
 paper : { l: U64, w: U64, h: U64 } -> U64
-paper = |{ l, w, h }| (
+paper = |r| (
+    l = r.l
+    w = r.w
+    h = r.h
     sides = [l * w, w * h, h * l]
-    smallest = sides.walk(sides.first().unwrap(), |a, b| a.min(b))
-    sides.walk(0, |sum, s| sum + 2 * s) + smallest
+    smallest = List.walk(sides, List.first(sides).unwrap(), |a, b| U64.min(a, b))
+    List.walk(sides, 0, |sum, s| sum + 2 * s) + smallest
 )
 
 # --- Tests ---

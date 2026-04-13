@@ -124,7 +124,7 @@ impl ParseCtx {
                     let name: &str = leak_string(format!("__expect_{i}"));
                     Stmt::Let {
                         name: "_",
-                        val: Expr::new(ExprKind::Call { func: name, args: vec![] }, span),
+                        val: Expr::new(ExprKind::Name(name), span),
                     }
                 })
                 .collect();
@@ -757,24 +757,14 @@ impl ParseCtx {
             let base = self.parse_expr(body_children[0].clone());
             let updates: Vec<(&str, Expr<'_>)> = body_children[1..]
                 .iter()
-                .map(|fi| {
-                    let mut inner = fi.clone().into_inner();
-                    let name = inner.next().unwrap().as_str();
-                    let val = self.parse_expr(inner.next().unwrap());
-                    (name, val)
-                })
+                .map(|fi| parse_field_init(self, fi.clone(), span))
                 .collect();
             Expr::new(ExprKind::RecordUpdate { base: Box::new(base), updates }, span)
         } else {
             // Regular record literal
             let fields: Vec<(&str, Expr<'_>)> = body_children
                 .into_iter()
-                .map(|fi| {
-                    let mut inner = fi.into_inner();
-                    let name = inner.next().unwrap().as_str();
-                    let val = self.parse_expr(inner.next().unwrap());
-                    (name, val)
-                })
+                .map(|fi| parse_field_init(self, fi, span))
                 .collect();
             Expr::new(ExprKind::Record { fields }, span)
         }
@@ -1160,6 +1150,22 @@ fn parse_pattern(pair: Pair<'_, Rule>) -> Pattern<'_> {
                 panic!("unexpected pattern: {:?}", first.as_rule());
             }
         }
+    }
+}
+
+/// Parse a `field_init`: either `name: expr` or shorthand `name` (punning).
+fn parse_field_init<'src>(
+    ctx: &ParseCtx,
+    pair: Pair<'src, Rule>,
+    span: Span,
+) -> (&'src str, Expr<'src>) {
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str();
+    if let Some(val_pair) = inner.next() {
+        (name, ctx.parse_expr(val_pair))
+    } else {
+        // Field punning: `{ value }` means `{ value: value }`
+        (name, Expr::new(ExprKind::Name(name), span))
     }
 }
 

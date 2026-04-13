@@ -1471,6 +1471,17 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     ) -> Result<(), CompileError> {
         let saved_env = self.env.clone();
 
+        // Zero-param bindings without a type annotation are value
+        // bindings, not zero-arg functions. Infer the body directly
+        // and register the result type (not wrapped in Arrow).
+        if params.is_empty() && !self.env.contains_key(name) {
+            let body_ty = self.infer_expr(body)?;
+            let scheme = self.engine.generalize(&body_ty, &self.env);
+            self.env = saved_env;
+            self.env.insert(name.to_owned(), scheme);
+            return Ok(());
+        }
+
         // Methods still have a pre-declared scheme from Pass 1 and we
         // reuse it so any earlier call sites that unified with it stay
         // linked. Free functions no longer get forward-declared (Step 5),
