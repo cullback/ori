@@ -195,6 +195,27 @@ impl TypeEngine {
         flatten_rows(resolved)
     }
 
+    /// Replace specific type variables with given types, without modifying
+    /// the global substitution. Used to instantiate transparent type
+    /// templates with concrete args.
+    pub fn substitute_vars(&self, ty: &Type, mappings: &[(TypeVar, Type)]) -> Type {
+        match ty {
+            Type::Var(tv) => {
+                // Check our mappings first
+                for (from, to) in mappings {
+                    if from == tv {
+                        return to.clone();
+                    }
+                }
+                // Then check global substitution
+                self.subst
+                    .get(tv)
+                    .map_or_else(|| ty.clone(), |t| self.substitute_vars(t, mappings))
+            }
+            other => other.map_children(&mut |child| self.substitute_vars(child, mappings)),
+        }
+    }
+
     pub fn occurs_in(&self, tv: TypeVar, ty: &Type) -> bool {
         let resolved = self.resolve(ty);
         match &resolved {
@@ -283,10 +304,15 @@ impl TypeEngine {
             }
             (Type::App(name, args), _) => {
                 if let Some((param_vars, underlying)) = self.transparent.get(name).cloned() {
-                    for (var, arg) in param_vars.iter().zip(args.iter()) {
-                        self.unify(&Type::Var(*var), arg)?;
-                    }
-                    return self.unify(&underlying, &rhs);
+                    // Substitute stored param vars with concrete args
+                    // to produce the instantiated underlying type.
+                    let mappings: Vec<(TypeVar, Type)> = param_vars
+                        .iter()
+                        .zip(args.iter())
+                        .map(|(v, a)| (*v, a.clone()))
+                        .collect();
+                    let instantiated = self.substitute_vars(&underlying, &mappings);
+                    return self.unify(&instantiated, &rhs);
                 }
                 Err(format!(
                     "cannot unify {} with {}",
@@ -296,10 +322,13 @@ impl TypeEngine {
             }
             (_, Type::App(name, args)) => {
                 if let Some((param_vars, underlying)) = self.transparent.get(name).cloned() {
-                    for (var, arg) in param_vars.iter().zip(args.iter()) {
-                        self.unify(&Type::Var(*var), arg)?;
-                    }
-                    return self.unify(&lhs, &underlying);
+                    let mappings: Vec<(TypeVar, Type)> = param_vars
+                        .iter()
+                        .zip(args.iter())
+                        .map(|(v, a)| (*v, a.clone()))
+                        .collect();
+                    let instantiated = self.substitute_vars(&underlying, &mappings);
+                    return self.unify(&lhs, &instantiated);
                 }
                 Err(format!(
                     "cannot unify {} with {}",

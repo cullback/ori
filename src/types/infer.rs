@@ -467,10 +467,43 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         // see concrete types, not fresh vars.
         if let ExprKind::Lambda { params, body } = &expr.kind {
             let resolved_expected = self.engine.resolve(expected);
-            if let Type::Arrow(expected_params, expected_ret) = &resolved_expected
+            // Look through transparent types: if the expected type is
+            // an App that's transparent to an Arrow (e.g. Parser(a) ::
+            // (List(U8) -> Result(...))), resolve it so the lambda
+            // gets bidirectional checking.
+            let arrow_expected = match &resolved_expected {
+                Type::Arrow(..) => Some(resolved_expected.clone()),
+                Type::App(name, args) => {
+                    if let Some((param_vars, underlying)) =
+                        self.engine.transparent.get(name).cloned()
+                    {
+                        // Create fresh copies of param vars and substitute
+                        // them into the underlying type, then unify the
+                        // fresh vars with the concrete args. This avoids
+                        // polluting the stored param vars across uses.
+                        let fresh_map: Vec<(TypeVar, Type)> = param_vars
+                            .iter()
+                            .zip(args.iter())
+                            .map(|(old_var, arg)| (*old_var, arg.clone()))
+                            .collect();
+                        let substituted = self.engine.substitute_vars(&underlying, &fresh_map);
+                        let resolved_sub = self.engine.resolve(&substituted);
+                        matches!(resolved_sub, Type::Arrow(..)).then_some(resolved_sub)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(Type::Arrow(expected_params, expected_ret)) = &arrow_expected
                 && expected_params.len() == params.len()
             {
-                return self.check_lambda(params, body, expected_params, expected_ret, expr.span);
+                let result =
+                    self.check_lambda(params, body, expected_params, expected_ret, expr.span)?;
+                // Also unify the lambda result with the original expected
+                // type so the opaque wrapper is properly linked.
+                self.unify_at(&result, expected, expr.span)?;
+                return Ok(result);
             }
         }
 
@@ -1533,9 +1566,12 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             self.env.insert(pname, Scheme::mono(ty.clone()));
         }
         // Push the return type so any `return` statement inside the
-        // body can flow its value here.
+        // body can flow its value here. Use check_expr to push the
+        // expected return type into lambdas bidirectionally — this
+        // enables opaque type transparency (e.g. Parser(a) → Arrow)
+        // to flow into nested lambda param types.
         self.ret_ty_stack.push(ret.clone());
-        let body_ty = self.infer_expr(body)?;
+        let body_ty = self.check_expr(body, &ret, Some((name, 0)))?;
         self.ret_ty_stack.pop();
         self.unify_expected(
             &body_ty,
