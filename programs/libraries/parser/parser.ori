@@ -1,0 +1,246 @@
+# Parser combinators for structured input parsing.
+#
+# A `Parser(a)` consumes bytes from the front of a `List(U8)` and
+# either produces a value plus the remaining input, or fails with
+# an error message. Combinators compose parsers into larger parsers
+# without manual plumbing — dot dispatch chains transformations,
+# and record builder syntax assembles record results.
+#
+#     # Parse "2x3x4" into { l: 3, w: 3, h: 4 }
+#     box = Parser.sequence({
+#         l: natural.and_drop_right(symbol('x')),
+#         w: natural.and_drop_right(symbol('x')),
+#         h: natural,
+#     })
+#
+#     box.run("2x3x4")
+#     # Ok(({ l: 2, w: 3, h: 4 }, ""))
+
+lib {}
+
+exports [Parser, symbol, in_range, digit, natural]
+
+# A parser function from input bytes to a parse result.
+#
+# Parsers are opaque — build them from primitives (`symbol`,
+# `digit`, ...) and combinators (`map`, `sequence`, ...).
+#
+# Inside the .() block the type is transparent — parameters with
+# type Parser(a) unwrap to the inner function, and return values
+# wrap automatically via context-based construction.
+Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
+    # Run a parser against a `Str`, returning the parsed value
+    # and the unconsumed suffix.
+    #
+    #     natural.run("42rest")
+    #     # Ok((42, "rest"))
+    run : Parser(a), Str -> Result((a, Str), Str)
+    run = |p, input| (
+        { value, rest } = p(Str.to_utf8(input))?
+        suffix = Str.from_utf8(rest)
+            .map_err(|_| "remaining input is not valid utf-8")?
+        Ok((value, suffix))
+    )
+
+    # Transform the parsed value.
+    #
+    #     digit.map(|d| d - '0').run("3")
+    #     # Ok((3, ""))
+    map : Parser(a), (a -> b) -> Parser(b)
+    map = |p, f|
+        |input| (
+            { value, rest } = p(input)?
+            Ok({ value: f(value), rest })
+        )
+
+    # Run two parsers in sequence, combining results with `f`.
+    #
+    # Has the map2 signature — called with a record literal, the
+    # compiler desugars to nested `sequence` calls in source order.
+    # Since parsers consume input, field order IS parse order.
+    #
+    #     Parser.sequence({
+    #         l: natural.and_drop_right(symbol('x')),
+    #         w: natural.and_drop_right(symbol('x')),
+    #         h: natural,
+    #     })
+    sequence : Parser(a), Parser(b), (a, b -> c) -> Parser(c)
+    sequence = |pa, pb, f|
+        |input| (
+            { value: va, rest: ra } = pa(input)?
+            { value: vb, rest: rb } = pb(ra)?
+            Ok({ value: f(va, vb), rest: rb })
+        )
+
+    # Sequence two parsers, keeping only the left result.
+    # Useful for consuming delimiters after a value.
+    #
+    #     natural.and_drop_right(symbol('x')).run("42x")
+    #     # Ok((42, ""))
+    and_drop_right : Parser(a), Parser(b) -> Parser(a)
+    and_drop_right = |pa, pb| pa.sequence(pb, |a, _| a)
+
+    # Sequence two parsers, keeping only the right result.
+    # Useful for skipping delimiters before a value.
+    #
+    #     symbol('x').and_drop_left(natural).run("x42")
+    #     # Ok((42, ""))
+    and_drop_left : Parser(a), Parser(b) -> Parser(b)
+    and_drop_left = |pa, pb| pa.sequence(pb, |_, b| b)
+
+    # Try the first parser; if it fails, try the second on the
+    # same input.
+    #
+    #     symbol('a').or_else(symbol('b')).run("bc")
+    #     # Ok(('b', "c"))
+    or_else : Parser(a), Parser(a) -> Parser(a)
+    or_else = |pa, pb|
+        |input|
+            if pa(input)
+                : Ok(r) then Ok(r)
+                : Err(_) then pb(input)
+
+    # Parse zero or more occurrences, collecting results.
+    #
+    #     digit.zero_or_more().run("123a")
+    #     # Ok((['1', '2', '3'], "a"))
+    zero_or_more : Parser(a) -> Parser(List(a))
+    zero_or_more = |p|
+        |input|
+            (values, rest) = List.walk_until(input, ([], input), |(acc, remaining), _|
+                if p(remaining)
+                    : Ok({ value, rest }) then Continue((List.append(acc, value), rest))
+                    : Err(_) then Break((acc, remaining)))
+            Ok({ value: values, rest })
+
+    # Parse one or more occurrences. Fails if the first attempt fails.
+    #
+    #     digit.one_or_more().run("123a")
+    #     # Ok((['1', '2', '3'], "a"))
+    one_or_more : Parser(a) -> Parser(List(a))
+    one_or_more = |p|
+        p.sequence(p.zero_or_more(), |head, tail| tail.prepend(head))
+
+    # Parse values separated by a delimiter. Matches zero or more;
+    # always succeeds.
+    #
+    #     natural.separated_by(symbol(',')).run("1,2,3end")
+    #     # Ok(([1, 2, 3], "end"))
+    separated_by : Parser(a), Parser(b) -> Parser(List(a))
+    separated_by = |element, delim|
+        element.sequence(
+            delim.and_drop_left(element).zero_or_more(),
+            |head, tail| tail.prepend(head),
+        ).or_else(Parser.succeed([]))
+
+    # A parser that always succeeds with `value`, consuming nothing.
+    succeed : a -> Parser(a)
+    succeed = |value|
+        |input| Ok({ value, rest: input })
+
+    # A parser that always fails with the given message.
+    fail : Str -> Parser(a)
+    fail = |msg|
+        |_| Err(msg)
+)
+
+# --- Byte-level primitives ---
+
+# Internal: format a byte for error messages.
+chr : U8 -> Str
+chr = |b|
+    if Str.from_utf8([b]) is Ok(s) then s else "?"
+
+# Match a specific byte.
+#
+#     symbol('x').run("xyz")
+#     # Ok(('x', "yz"))
+symbol : U8 -> Parser(U8)
+symbol = |c|
+    |input|
+        if input
+            : [first, ..rest] and first == c then
+                Ok({ value: c, rest })
+            : [first, ..] then
+                Err("expected '${chr(c)}', got '${chr(first)}'")
+            : [] then
+                Err("expected '${chr(c)}', got EOF")
+
+# Match any byte in the inclusive range `[lo, hi]`.
+#
+#     in_range('0', '9').run("7x")
+#     # Ok(('7', "x"))
+in_range : U8, U8 -> Parser(U8)
+in_range = |lo, hi|
+    |input|
+        if input
+            : [first, ..rest] and first >= lo and first <= hi then
+                Ok({ value: first, rest })
+            : [first, ..] then
+                Err("expected byte in ['${chr(lo)}'..'${chr(hi)}'], got '${chr(first)}'")
+            : [] then
+                Err("expected byte in ['${chr(lo)}'..'${chr(hi)}'], got EOF")
+
+# Match a single ASCII digit ('0'..'9').
+digit : Parser(U8)
+digit = in_range('0', '9')
+
+# Match a natural number (one or more digits) as U64.
+#
+#     natural.run("42rest")
+#     # Ok((42, "rest"))
+natural : Parser(U64)
+natural =
+    digit.one_or_more().map(|digits|
+        digits.walk(0, |acc, d| acc * 10 + U64.from_u8(d - '0')))
+
+# --- Example: AoC 2015 Day 2 ---
+#
+# Parse "2x3x4\n1x1x10" into a list of { l, w, h } records,
+# then compute total wrapping paper.
+
+box : Parser({ l: U64, w: U64, h: U64 })
+box = Parser.sequence({
+    l: natural.and_drop_right(symbol('x')),
+    w: natural.and_drop_right(symbol('x')),
+    h: natural,
+})
+
+boxes : Parser(List({ l: U64, w: U64, h: U64 }))
+boxes = box.separated_by(symbol('\n'))
+
+paper : { l: U64, w: U64, h: U64 } -> U64
+paper = |{ l, w, h }| (
+    sides = [l * w, w * h, h * l]
+    smallest = sides.walk(sides.first().unwrap(), |a, b| a.min(b))
+    sides.walk(0, |sum, s| sum + 2 * s) + smallest
+)
+
+# --- Tests ---
+
+expect symbol('x').run("xyz") == Ok(('x', "yz"))
+expect symbol('x').run("abc") is Err(_)
+
+expect digit.run("7xy") == Ok(('7', "xy"))
+expect digit.run("xy") is Err(_)
+
+expect natural.run("42rest") == Ok((42, "rest"))
+expect natural.run("0end") == Ok((0, "end"))
+expect natural.run("abc") is Err(_)
+
+expect natural.and_drop_right(symbol('x')).run("42x")
+    == Ok((42, ""))
+
+expect natural.separated_by(symbol(',')).run("1,2,3end")
+    == Ok(([1, 2, 3], "end"))
+expect natural.separated_by(symbol(',')).run("")
+    == Ok(([], ""))
+
+expect box.run("2x3x4") == Ok(({ l: 2, w: 3, h: 4 }, ""))
+expect box.run("1x1x10") == Ok(({ l: 1, w: 1, h: 10 }, ""))
+
+expect boxes.run("2x3x4\n1x1x10")
+    == Ok(([{ l: 2, w: 3, h: 4 }, { l: 1, w: 1, h: 10 }], ""))
+
+expect paper({ l: 2, w: 3, h: 4 }) == 58
+expect paper({ l: 1, w: 1, h: 10 }) == 43

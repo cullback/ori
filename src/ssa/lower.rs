@@ -230,6 +230,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     BinOp::Rem => self.builder.binop(BinaryOp::Rem, l, r, ty),
                     BinOp::Eq => self.lower_eq(l, r, false),
                     BinOp::Neq => self.lower_eq(l, r, true),
+                    BinOp::Lt => self.lower_cmp(l, r, BinaryOp::Lt),
+                    BinOp::Gt => self.lower_cmp(l, r, BinaryOp::Gt),
+                    BinOp::Le => self.lower_cmp(l, r, BinaryOp::Le),
+                    BinOp::Ge => self.lower_cmp(l, r, BinaryOp::Ge),
                     BinOp::And | BinOp::Or => unreachable!(),
                 }
             }
@@ -475,6 +479,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .builder
                     .call("__num_to_str", vec![arg], ScalarType::Ptr);
             }
+            if op_name == "from_u8" {
+                // Unary widening conversion: `U64.from_u8(x)`
+                let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
+                return self
+                    .builder
+                    .call("__u64_from_u8", vec![arg], ScalarType::U64);
+            }
             // Binary arithmetic op
             let (lhs, rhs) = if let Some(local_val) = local_val {
                 (local_val, self.lower_expr(&args[0]))
@@ -535,8 +546,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .builder
                     .call("__num_to_str", vec![recv_val], ScalarType::Ptr);
             }
+            if op_name == "from_u8" {
+                return self
+                    .builder
+                    .call("__u64_from_u8", vec![recv_val], ScalarType::U64);
+            }
             let rhs = self.lower_expr(&args[0]);
-            let ty = self.expr_scalar_type(outer);
+            let ty = self.expr_scalar_type(receiver);
             return self.lower_builtin_op(op_name, recv_val, rhs, ty);
         }
         // List walks: the walk loop needs untyped Values, so build
@@ -647,8 +663,57 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             "div" => self.builder.binop(BinaryOp::Div, lhs, rhs, ty),
             "mod" => self.builder.binop(BinaryOp::Rem, lhs, rhs, ty),
             "equals" => self.lower_eq(lhs, rhs, false),
+            "compare" => self.lower_compare(lhs, rhs, ty),
             _ => panic!("unknown builtin: {name}"),
         }
+    }
+
+    /// Emit a compare operation returning an Order tag union (Lt/Eq/Gt).
+    fn lower_compare(&mut self, lhs: Value, rhs: Value, _ty: ScalarType) -> Value {
+        let lt_meta = &self.decls.constructors["Lt"];
+        let eq_meta = &self.decls.constructors["Eq"];
+        let gt_meta = &self.decls.constructors["Gt"];
+        let alloc_size = 1; // Order tags have no payload
+
+        let lt_tag_idx = lt_meta.tag_index;
+        let eq_tag_idx = eq_meta.tag_index;
+        let gt_tag_idx = gt_meta.tag_index;
+
+        let is_lt = self.builder.binop(BinaryOp::Lt, lhs, rhs, ScalarType::Bool);
+        let is_eq = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::Bool);
+
+        let lt_block = self.builder.create_block();
+        let not_lt_block = self.builder.create_block();
+        let eq_block = self.builder.create_block();
+        let gt_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
+
+        self.builder.branch(is_lt, lt_block, vec![], not_lt_block, vec![]);
+
+        self.builder.switch_to(lt_block);
+        let lt_ptr = self.builder.alloc(alloc_size);
+        let lt_tag = self.builder.const_u64(lt_tag_idx);
+        self.builder.store(lt_ptr, 0, lt_tag);
+        self.builder.jump(merge, vec![lt_ptr]);
+
+        self.builder.switch_to(not_lt_block);
+        self.builder.branch(is_eq, eq_block, vec![], gt_block, vec![]);
+
+        self.builder.switch_to(eq_block);
+        let eq_ptr = self.builder.alloc(alloc_size);
+        let eq_tag = self.builder.const_u64(eq_tag_idx);
+        self.builder.store(eq_ptr, 0, eq_tag);
+        self.builder.jump(merge, vec![eq_ptr]);
+
+        self.builder.switch_to(gt_block);
+        let gt_ptr = self.builder.alloc(alloc_size);
+        let gt_tag = self.builder.const_u64(gt_tag_idx);
+        self.builder.store(gt_ptr, 0, gt_tag);
+        self.builder.jump(merge, vec![gt_ptr]);
+
+        self.builder.switch_to(merge);
+        merge_param
     }
 
     // ---- Constructor layout ----
@@ -708,6 +773,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     fn lower_eq(&mut self, lhs: Value, rhs: Value, negate: bool) -> Value {
         let cmp = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::Bool);
         self.lower_bool_from_cmp_neg(cmp, negate)
+    }
+
+    fn lower_cmp(&mut self, lhs: Value, rhs: Value, op: BinaryOp) -> Value {
+        let cmp = self.builder.binop(op, lhs, rhs, ScalarType::Bool);
+        self.lower_bool_from_cmp(cmp)
     }
 
     fn lower_bool_from_cmp(&mut self, cmp: Value) -> Value {

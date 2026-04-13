@@ -7,5 +7,12 @@ U16 := {}.(
     div : U16, U16 -> U16
     mod : U16, U16 -> U16
     equals : U16, U16 -> Bool
+    compare : U16, U16 -> Order
     to_str : U16 -> Str
+
+    min : U16, U16 -> U16
+    min = |a, b| if a <= b then a else b
+
+    max : U16, U16 -> U16
+    max = |a, b| if a >= b then a else b
 )

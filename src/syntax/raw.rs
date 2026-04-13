@@ -243,6 +243,10 @@ pub enum BinOp {
     Rem,
     Eq,
     Neq,
+    Lt,
+    Gt,
+    Le,
+    Ge,
     And,
     Or,
 }

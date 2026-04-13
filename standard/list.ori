@@ -38,6 +38,14 @@ List := {}.(
     is_empty : List(a) -> Bool
     is_empty = |xs| List.len(xs) == 0
 
+    # Returns the first element, or Err(Empty) if the list is empty.
+    first : List(a) -> Result(a, [Empty])
+    first = |xs| if List.is_empty(xs) then Err(Empty) else Ok(List.get(xs, 0))
+
+    # Returns a new list with the element added to the front.
+    prepend : List(a), a -> List(a)
+    prepend = |xs, x| List.walk(xs, [x], |acc, elem| List.append(acc, elem))
+
     # Applies a function to every element, returning a new list.
     map : List(a), (a -> b) -> List(b)
     map = |xs, f| List.walk(xs, [], |acc, x| List.append(acc, f(x)))

@@ -7,5 +7,12 @@ I64 := {}.(
     div : I64, I64 -> I64
     mod : I64, I64 -> I64
     equals : I64, I64 -> Bool
+    compare : I64, I64 -> Order
     to_str : I64 -> Str
+
+    min : I64, I64 -> I64
+    min = |a, b| if a <= b then a else b
+
+    max : I64, I64 -> I64
+    max = |a, b| if a >= b then a else b
 )

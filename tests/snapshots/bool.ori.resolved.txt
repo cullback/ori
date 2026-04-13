@@ -2,6 +2,7 @@ resolved:
   imports: (none)
   decls by file:
     <stdlib:Bool>: Bool
+    <stdlib:Order>: Order
     <stdlib:I8>: I8
     <stdlib:U8>: U8
     <stdlib:I16>: I16

@@ -1,0 +1,4 @@
+exports [Order]
+
+# Result of comparing two values.
+Order := [Lt, Eq, Gt]

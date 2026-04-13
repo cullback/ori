@@ -241,6 +241,10 @@ impl ParseCtx {
                             "%" => BinOp::Rem,
                             "==" => BinOp::Eq,
                             "!=" => BinOp::Neq,
+                            "<" => BinOp::Lt,
+                            ">" => BinOp::Gt,
+                            "<=" => BinOp::Le,
+                            ">=" => BinOp::Ge,
                             "and" => BinOp::And,
                             "or" => BinOp::Or,
                             other => panic!("unknown operator: {other}"),
@@ -894,6 +898,7 @@ fn pratt_parser() -> PrattParser<Rule> {
     PrattParser::new()
         .op(Op::infix(Rule::or_op, Assoc::Left))
         .op(Op::infix(Rule::and_op, Assoc::Left))
+        .op(Op::infix(Rule::ord_op, Assoc::Left))
         .op(Op::infix(Rule::cmp_op, Assoc::Left))
         .op(Op::infix(Rule::add_op, Assoc::Left))
         .op(Op::infix(Rule::mul_op, Assoc::Left))

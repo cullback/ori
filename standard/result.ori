@@ -7,4 +7,10 @@ Result(ok, err) := [Ok(ok), Err(err)].(
     unwrap = |r| if r
         : Ok(val) then val
         else crash("called unwrap on Err")
+
+    # Transforms the error value, leaving Ok unchanged.
+    map_err : Result(ok, a), (a -> b) -> Result(ok, b)
+    map_err = |r, f| if r
+        : Ok(val) then Ok(val)
+        : Err(e) then Err(f(e))
 )

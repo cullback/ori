@@ -7,5 +7,12 @@ U32 := {}.(
     div : U32, U32 -> U32
     mod : U32, U32 -> U32
     equals : U32, U32 -> Bool
+    compare : U32, U32 -> Order
     to_str : U32 -> Str
+
+    min : U32, U32 -> U32
+    min = |a, b| if a <= b then a else b
+
+    max : U32, U32 -> U32
+    max = |a, b| if a >= b then a else b
 )

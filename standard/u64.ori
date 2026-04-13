@@ -7,5 +7,13 @@ U64 := {}.(
     div : U64, U64 -> U64
     mod : U64, U64 -> U64
     equals : U64, U64 -> Bool
+    compare : U64, U64 -> Order
     to_str : U64 -> Str
+    from_u8 : U8 -> U64
+
+    min : U64, U64 -> U64
+    min = |a, b| if a <= b then a else b
+
+    max : U64, U64 -> U64
+    max = |a, b| if a >= b then a else b
 )

@@ -2,10 +2,10 @@
 /// top of every compilation so their declarations (types, constructors,
 /// and body-less method signatures) are in scope everywhere.
 pub const MODULES: &[&str] = &[
-    // Dependency order: Bool first (no deps), then numeric types
-    // (reference Bool in eq/neq), then Result, List (references U64),
-    // Str (references List, U8, U64, Bool).
-    "Bool",
+    // Dependency order: Bool first (no deps), then Order (no deps),
+    // then numeric types (reference Bool, Order), then Result,
+    // List (references U64), Str (references List, U8, U64, Bool).
+    "Bool", "Order",
     "I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64", "F64",
     "Result", "List", "Str",
 ];
@@ -25,6 +25,7 @@ pub fn get(name: &str) -> Option<&'static str> {
         "i64" | "I64" => Some(include_str!("../standard/i64.ori")),
         "u64" | "U64" => Some(include_str!("../standard/u64.ori")),
         "f64" | "F64" => Some(include_str!("../standard/f64.ori")),
+        "order" | "Order" => Some(include_str!("../standard/order.ori")),
         _ => None,
     }
 }

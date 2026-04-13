@@ -6,5 +6,12 @@ F64 := {}.(
     mul : F64, F64 -> F64
     div : F64, F64 -> F64
     equals : F64, F64 -> Bool
+    compare : F64, F64 -> Order
     to_str : F64 -> Str
+
+    min : F64, F64 -> F64
+    min = |a, b| if a <= b then a else b
+
+    max : F64, F64 -> F64
+    max = |a, b| if a >= b then a else b
 )

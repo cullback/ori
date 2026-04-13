@@ -1090,6 +1090,10 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             BinOp::Rem => "%",
             BinOp::Eq => "==",
             BinOp::Neq => "!=",
+            BinOp::Lt => "<",
+            BinOp::Gt => ">",
+            BinOp::Le => "<=",
+            BinOp::Ge => ">=",
             BinOp::And | BinOp::Or => unreachable!(),
         };
         if self.unify_at(&lt, &rt, span).is_err() {
@@ -1109,6 +1113,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
 
         let is_eq = matches!(op, BinOp::Eq | BinOp::Neq);
+        let is_ord = matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge);
         // `!=` requires the same `equals` method as `==` — the
         // negation is handled at the lowering level, not as a
         // separate method on the type.
@@ -1119,12 +1124,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             BinOp::Div => "div",
             BinOp::Rem => "mod",
             BinOp::Eq | BinOp::Neq => "equals",
+            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => "compare",
             BinOp::And | BinOp::Or => unreachable!(),
         };
 
         let resolved = self.engine.resolve(&lt);
         if let Type::Var(tv) = resolved {
-            let ret_ty = if is_eq {
+            let ret_ty = if is_eq || is_ord {
                 Type::Con("Bool".to_owned())
             } else {
                 Type::Var(tv)
@@ -1140,7 +1146,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             );
         }
 
-        if is_eq {
+        if is_eq || is_ord {
             Ok(Type::Con("Bool".to_owned()))
         } else {
             Ok(lt)

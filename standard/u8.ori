@@ -7,5 +7,12 @@ U8 := {}.(
     div : U8, U8 -> U8
     mod : U8, U8 -> U8
     equals : U8, U8 -> Bool
+    compare : U8, U8 -> Order
     to_str : U8 -> Str
+
+    min : U8, U8 -> U8
+    min = |a, b| if a <= b then a else b
+
+    max : U8, U8 -> U8
+    max = |a, b| if a >= b then a else b
 )

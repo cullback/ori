@@ -312,6 +312,10 @@ pub enum BinOp {
     Rem,
     Eq,
     Neq,
+    Lt,
+    Gt,
+    Le,
+    Ge,
     And,
     Or,
 }
@@ -1545,6 +1549,10 @@ const fn bin_op_from_raw(op: raw::BinOp) -> BinOp {
         raw::BinOp::Rem => BinOp::Rem,
         raw::BinOp::Eq => BinOp::Eq,
         raw::BinOp::Neq => BinOp::Neq,
+        raw::BinOp::Lt => BinOp::Lt,
+        raw::BinOp::Gt => BinOp::Gt,
+        raw::BinOp::Le => BinOp::Le,
+        raw::BinOp::Ge => BinOp::Ge,
         raw::BinOp::And => BinOp::And,
         raw::BinOp::Or => BinOp::Or,
     }

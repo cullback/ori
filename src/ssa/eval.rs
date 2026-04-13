@@ -383,6 +383,13 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(list, 2, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
+        "__u64_from_u8" => {
+            // args: [u8] → u64 (widening conversion)
+            let Scalar::U8(n) = args[0] else {
+                panic!("__u64_from_u8: expected U8");
+            };
+            Some(Scalar::U64(u64::from(n)))
+        }
         "__crash" => {
             // args: [str_ptr] — print message to stderr and abort.
             let Scalar::Ptr(list_idx) = args[0] else {
@@ -468,6 +475,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Max, Scalar::I64(a), Scalar::I64(b)) => Scalar::I64(a.max(b)),
         (BinaryOp::Eq, Scalar::I64(a), Scalar::I64(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::I64(a), Scalar::I64(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::I64(a), Scalar::I64(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::I64(a), Scalar::I64(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::I64(a), Scalar::I64(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::I64(a), Scalar::I64(b)) => Scalar::Bool(a >= b),
 
         (BinaryOp::Add, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.wrapping_add(b)),
         (BinaryOp::Sub, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.wrapping_sub(b)),
@@ -477,6 +488,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Max, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.max(b)),
         (BinaryOp::Eq, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a >= b),
 
         (BinaryOp::Add, Scalar::U8(a), Scalar::U8(b)) => Scalar::U8(a.wrapping_add(b)),
         (BinaryOp::Sub, Scalar::U8(a), Scalar::U8(b)) => Scalar::U8(a.wrapping_sub(b)),
@@ -485,6 +500,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Rem, Scalar::U8(a), Scalar::U8(b)) => Scalar::U8(a % b),
         (BinaryOp::Eq, Scalar::U8(a), Scalar::U8(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::U8(a), Scalar::U8(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::U8(a), Scalar::U8(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::U8(a), Scalar::U8(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::U8(a), Scalar::U8(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::U8(a), Scalar::U8(b)) => Scalar::Bool(a >= b),
 
         (BinaryOp::Add, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a.wrapping_add(b)),
         (BinaryOp::Sub, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a.wrapping_sub(b)),
@@ -493,6 +512,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Rem, Scalar::I8(a), Scalar::I8(b)) => Scalar::I8(a % b),
         (BinaryOp::Eq, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::I8(a), Scalar::I8(b)) => Scalar::Bool(a >= b),
 
         (BinaryOp::Add, Scalar::I16(a), Scalar::I16(b)) => Scalar::I16(a.wrapping_add(b)),
         (BinaryOp::Sub, Scalar::I16(a), Scalar::I16(b)) => Scalar::I16(a.wrapping_sub(b)),
@@ -501,6 +524,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Rem, Scalar::I16(a), Scalar::I16(b)) => Scalar::I16(a % b),
         (BinaryOp::Eq, Scalar::I16(a), Scalar::I16(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::I16(a), Scalar::I16(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::I16(a), Scalar::I16(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::I16(a), Scalar::I16(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::I16(a), Scalar::I16(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::I16(a), Scalar::I16(b)) => Scalar::Bool(a >= b),
 
         (BinaryOp::Add, Scalar::U16(a), Scalar::U16(b)) => Scalar::U16(a.wrapping_add(b)),
         (BinaryOp::Sub, Scalar::U16(a), Scalar::U16(b)) => Scalar::U16(a.wrapping_sub(b)),
@@ -509,6 +536,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Rem, Scalar::U16(a), Scalar::U16(b)) => Scalar::U16(a % b),
         (BinaryOp::Eq, Scalar::U16(a), Scalar::U16(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::U16(a), Scalar::U16(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::U16(a), Scalar::U16(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::U16(a), Scalar::U16(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::U16(a), Scalar::U16(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::U16(a), Scalar::U16(b)) => Scalar::Bool(a >= b),
 
         (BinaryOp::Add, Scalar::I32(a), Scalar::I32(b)) => Scalar::I32(a.wrapping_add(b)),
         (BinaryOp::Sub, Scalar::I32(a), Scalar::I32(b)) => Scalar::I32(a.wrapping_sub(b)),
@@ -517,6 +548,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Rem, Scalar::I32(a), Scalar::I32(b)) => Scalar::I32(a % b),
         (BinaryOp::Eq, Scalar::I32(a), Scalar::I32(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::I32(a), Scalar::I32(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::I32(a), Scalar::I32(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::I32(a), Scalar::I32(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::I32(a), Scalar::I32(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::I32(a), Scalar::I32(b)) => Scalar::Bool(a >= b),
 
         (BinaryOp::Add, Scalar::U32(a), Scalar::U32(b)) => Scalar::U32(a.wrapping_add(b)),
         (BinaryOp::Sub, Scalar::U32(a), Scalar::U32(b)) => Scalar::U32(a.wrapping_sub(b)),
@@ -525,6 +560,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Rem, Scalar::U32(a), Scalar::U32(b)) => Scalar::U32(a % b),
         (BinaryOp::Eq, Scalar::U32(a), Scalar::U32(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::U32(a), Scalar::U32(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::U32(a), Scalar::U32(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::U32(a), Scalar::U32(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::U32(a), Scalar::U32(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::U32(a), Scalar::U32(b)) => Scalar::Bool(a >= b),
 
         (BinaryOp::Add, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a + b),
         (BinaryOp::Sub, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a - b),
@@ -532,6 +571,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Div, Scalar::F64(a), Scalar::F64(b)) => Scalar::F64(a / b),
         (BinaryOp::Eq, Scalar::F64(a), Scalar::F64(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::F64(a), Scalar::F64(b)) => Scalar::Bool(a != b),
+        (BinaryOp::Lt, Scalar::F64(a), Scalar::F64(b)) => Scalar::Bool(a < b),
+        (BinaryOp::Le, Scalar::F64(a), Scalar::F64(b)) => Scalar::Bool(a <= b),
+        (BinaryOp::Gt, Scalar::F64(a), Scalar::F64(b)) => Scalar::Bool(a > b),
+        (BinaryOp::Ge, Scalar::F64(a), Scalar::F64(b)) => Scalar::Bool(a >= b),
 
         _ => panic!("unsupported binop {op:?} on {lhs:?}, {rhs:?}"),
     }

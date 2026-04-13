@@ -732,6 +732,10 @@ const fn bin_op(op: BinOp) -> &'static str {
         BinOp::Rem => "Rem",
         BinOp::Eq => "Eq",
         BinOp::Neq => "Neq",
+        BinOp::Lt => "Lt",
+        BinOp::Gt => "Gt",
+        BinOp::Le => "Le",
+        BinOp::Ge => "Ge",
         BinOp::And => "And",
         BinOp::Or => "Or",
     }

@@ -133,6 +133,10 @@ impl fmt::Display for BinaryOp {
             Self::Rem => write!(f, "rem"),
             Self::Eq => write!(f, "eq"),
             Self::Neq => write!(f, "neq"),
+            Self::Lt => write!(f, "lt"),
+            Self::Le => write!(f, "le"),
+            Self::Gt => write!(f, "gt"),
+            Self::Ge => write!(f, "ge"),
             Self::Max => write!(f, "max"),
         }
     }

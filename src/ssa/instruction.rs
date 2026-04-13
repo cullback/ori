@@ -46,6 +46,10 @@ pub enum BinaryOp {
     Rem,
     Eq,
     Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     Max,
 }
 
