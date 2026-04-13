@@ -850,7 +850,8 @@ fn desugar_list_match<'src>(
         let body = if arm.guards.is_empty() {
             arm.body
         } else {
-            // Combine guards into an and-chain, then wrap body.
+            // Combine guards into an and-chain, then wrap as
+            // `if guard then body else <fall-through>`.
             let guard_expr = arm.guards.into_iter().reduce(|acc, g| {
                 let gsp = ctx.fresh_span(span);
                 Expr::new(
@@ -866,14 +867,30 @@ fn desugar_list_match<'src>(
             Expr::new(
                 ExprKind::If {
                     expr: Box::new(guard_expr),
-                    arms: vec![],
+                    arms: vec![
+                        MatchArm {
+                            pattern: Pattern::Constructor {
+                                name: "True",
+                                fields: vec![],
+                            },
+                            guards: vec![],
+                            body: arm.body,
+                            is_return: false,
+                        },
+                        MatchArm {
+                            pattern: Pattern::Constructor {
+                                name: "False",
+                                fields: vec![],
+                            },
+                            guards: vec![],
+                            body: result.clone(),
+                            is_return: false,
+                        },
+                    ],
                     else_body: None,
                 },
                 gsp,
             )
-            // Actually guards in list pattern arms need more careful handling.
-            // For now, just embed the body in a block with the guard.
-            // TODO: revisit
         };
 
         let arm_body = if stmts.is_empty() {
