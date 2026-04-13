@@ -477,11 +477,9 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
             }
             ExprKind::Name(sym) => {
                 // Bare function reference (e.g. passing `add1` as a
-                // higher-order arg). If `sym` points at a known
-                // global function, ensure its identity specialization
-                // is on the worklist. For free functions the sym
-                // doesn't change; for methods it's impossible (you
-                // can't reference `Foo.bar` as a bare Name).
+                // higher-order arg, or referencing a zero-param value
+                // binding). If `sym` points at a known global function,
+                // ensure its identity specialization is on the worklist.
                 let name = self.symbols.display(*sym).to_owned();
                 if let Some(stored) = self.decl_bodies.get(&name) {
                     if stored.scheme.vars.is_empty() && !stored.is_method {
@@ -498,6 +496,10 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                             });
                         }
                     }
+                } else {
+                    // Not a known function — might be a local variable.
+                    // This is fine; Name references to locals are handled
+                    // by the vars map in the lowerer.
                 }
             }
             ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}

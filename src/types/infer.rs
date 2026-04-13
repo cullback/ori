@@ -1525,14 +1525,25 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     ) -> Result<(), CompileError> {
         let saved_env = self.env.clone();
 
-        // Zero-param bindings without a type annotation are value
-        // bindings, not zero-arg functions. Infer the body directly
-        // and register the result type (not wrapped in Arrow).
-        if params.is_empty() && !self.env.contains_key(name) {
+        // Zero-param bindings are value bindings, not zero-arg functions.
+        // Infer the body directly and register the result type (not
+        // wrapped in Arrow). If there's a type annotation, unify with it.
+        if params.is_empty() {
             let body_ty = self.infer_expr(body)?;
-            let scheme = self.engine.generalize(&body_ty, &self.env);
+            // Check annotation if present
+            if let Some(anno) = self.type_annos.get(name).cloned() {
+                let anno_ty = self.resolve_type_expr(&anno)?;
+                self.unify_expected(
+                    &body_ty,
+                    &anno_ty,
+                    body.span,
+                    &format!("value `{name}`"),
+                )?;
+            }
             self.env = saved_env;
-            self.env.insert(name.to_owned(), scheme);
+            self.env.remove(name);
+            let generalized = self.engine.generalize(&body_ty, &self.env);
+            self.env.insert(name.to_owned(), generalized);
             return Ok(());
         }
 

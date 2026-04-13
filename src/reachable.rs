@@ -154,6 +154,11 @@ fn is_list_walk(name: &str) -> bool {
 #[allow(clippy::too_many_lines)]
 fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) {
     match &expr.kind {
+        ExprKind::Name(sym) => {
+            // A bare name reference might refer to a top-level value
+            // binding (zero-param function). Mark it reachable.
+            refs.push(symbols.display(*sym).to_owned());
+        }
         ExprKind::Call { target, args, .. } => {
             refs.push(symbols.display(*target).to_owned());
             for a in args {
@@ -185,9 +190,6 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) 
             for a in args {
                 collect_refs(a, refs, symbols);
             }
-        }
-        ExprKind::Name(sym) => {
-            refs.push(symbols.display(*sym).to_owned());
         }
         ExprKind::BinOp { lhs, rhs, .. } => {
             collect_refs(lhs, refs, symbols);
