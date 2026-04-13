@@ -10,6 +10,7 @@ source
   ↓ parse                raw::Module
   ↓ resolve_imports      ast::Module + ModuleScope + SymbolTable + FieldInterner
   ↓ fold_lift            ast::Module (no Fold nodes)
+  ↓ flatten_patterns     ast::Module (shallow patterns, no list patterns)
   ↓ topo                 ast::Module (decls in call-graph order)
   ↓ infer                ast::Module with Expr.ty filled in, InferResult
   ↓ mono                 ast::Module (monomorphic only)
@@ -22,9 +23,18 @@ source
 
 ## parse — `src/syntax/parse.rs`
 
-Recursive-descent parser. Produces `raw::Module<'src>`, a shallow
-syntax tree that still holds names as `&'src str`. No scoping, no
-types. Sole output: raw AST + per-node spans into `SourceArena`.
+PEG parser (pest) with Pratt operator precedence. Produces
+`raw::Module<'src>`, a shallow syntax tree that still holds names as
+`&'src str`. No scoping, no types.
+
+Parse-time desugars:
+- **Char literals** — `'x'` → `IntLit(code_point)`
+- **String interpolation** — `"${e}"` → `MethodCall` concat chain
+- **Dot-lambdas** — `.method(args)` → `|x| x.method(args)`
+- **Record field punning** — `{ value, rest }` → `{ value: value, rest: rest }`
+- **Record builder** — `Type.method({ f1: e1, f2: e2 })` → nested `map2` calls
+- **`expect` declarations** — `expect expr` → `__expect_N` value binding + synthetic `main` if no user main
+- **`lib {}` header** — parsed and ignored (future use)
 
 ## resolve_imports — `src/resolve.rs`
 
@@ -72,6 +82,27 @@ allowed for `__fold_N` helpers.
 order, and **before infer** so free functions are inferred in
 dependency order, enabling real top-level let-polymorphism.
 
+## flatten_patterns — `src/flatten_patterns.rs`
+
+Normalizes patterns so the lowerer only handles shallow cases.
+
+- **Nested constructor patterns** — `Ok(Cons(h, t))` → fresh temp +
+  `is` guard chain: `Ok(__pat_0) and __pat_0 is Cons(h, t)`.
+- **Nested tuple/record patterns** — hoisted to `Destructure`
+  statements prepended to the arm body.
+- **List patterns** — `[first, ..rest]` desugared to length checks +
+  `List.get` / `List.sublist` calls. The entire `If` with list pattern
+  arms becomes a nested if-else chain on `List.len`. Guards on list
+  pattern arms become inner if-then-else on the guard expression.
+- **List `is` patterns** — `x is [first, ..rest]` → length comparison.
+
+After this pass, no `Pattern::List` survives in the AST. Each
+synthesized expression gets a unique span via `fresh_span` to avoid
+span collisions in inference's `expr_types` side table.
+
+**Runs before infer** so synthesized expressions have placeholder
+`Expr.ty` that inference fills in naturally.
+
 ## infer — `src/types/infer.rs`
 
 Hindley-Milner with row polymorphism, driven through `types/engine.rs`
@@ -80,12 +111,28 @@ place.
 
 Three sub-passes:
 - **2a** — transparency setup (`Str := List(U8)`), body-less
-  validation of user method annotations.
+  validation of user method annotations. Parameterized transparent
+  types store `(Vec<TypeVar>, Type)` in the transparent map so App
+  unification can substitute type params. `Type := {}` builtins are
+  excluded from transparency to prevent all numeric types unifying
+  through the empty record.
 - **2b** — infer free `FuncDef` bodies in topo order, generalizing
   each scheme on exit. A function self-registers its own mono scheme
   during body inference so `__fold_N` recursive calls resolve.
+  Zero-param value bindings infer the body directly (not wrapped in
+  Arrow) and unify with annotations if present.
 - **2c** — infer method bodies per `TypeAnno`, with opaque
   transparency scoped to that block.
+
+Bidirectional type checking: `check_expr` pushes expected types into
+lambdas. When the expected type is an opaque `App` that's transparent
+to an `Arrow`, the underlying Arrow's param types flow into the
+lambda's environment via `check_lambda`. This enables calling opaque
+values as functions inside `.()` blocks (e.g. `p(input)` where
+`p : Parser(a)`).
+
+Comparison operators `<`, `>`, `<=`, `>=` push a `compare` method
+constraint (like `==` pushes `equals`), returning `Bool`.
 
 Method annotations are eagerly resolved to `Scheme`s in Pass 1
 (previously only stdlib methods did this) to avoid polluting free
@@ -160,9 +207,11 @@ Used by `reachable::prune` (for `__apply_{walk}_2` aliasing) and by
 ## reachable::prune — `src/reachable.rs`
 
 DFS from `main` over `Call.target` / `MethodCall.resolved` /
-`QualifiedCall` segments. Drops unreachable `FuncDef`s at both the
-top level and inside `TypeAnno.methods`. `TypeAnno` decls themselves
-stay so `decl_info` keeps constructor bookkeeping.
+`QualifiedCall` segments / `Name` references. Drops unreachable
+`FuncDef`s at both the top level and inside `TypeAnno.methods`.
+`TypeAnno` decls themselves stay so `decl_info` keeps constructor
+bookkeeping. Zero-param value bindings are always kept (defunc may
+rewrite their Name references in ways that break the trace).
 
 Special case: `List.walk` and its variants are lowered with an
 implicit `__apply_{mangled}_2` call that's emitted at lower time
@@ -197,10 +246,17 @@ an `ssa::Builder`. Notable bits:
 - **List walk loops** — `List.walk(xs, init, f)` emits a loop that
   calls the `__apply_K` dispatcher for each element, not a function
   call. This is why reachability has to seed the apply function.
-- **List builtin intrinsics** — `List.get`, `List.len`, etc. inline
-  directly to SSA instructions instead of going through a call.
+- **List builtin intrinsics** — `List.get`, `List.len`,
+  `List.sublist`, etc. inline directly to SSA instructions instead of
+  going through a call.
 - **`__num_to_str`** — numeric-to-string conversions route through a
-  5-entry builtin table rather than a real function.
+  builtin table rather than a real function.
+- **`compare` builtin** — emits `Lt`/`Eq` comparisons and branches to
+  construct the `Order` tag union (`Lt`/`Eq`/`Gt`).
+- **Record update** — `{ base & field: val }` copies unchanged fields
+  from the base record, substitutes updated ones.
+- **Zero-param value bindings** — `Name` references to known
+  zero-arity functions emit a zero-arg `call` instruction.
 
 Reads `func_schemes` from `InferResult` directly (for return-type
 lookups) rather than from `decl_info`. Variable environment is
