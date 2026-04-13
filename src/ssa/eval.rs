@@ -383,6 +383,40 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(list, 2, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
+        "__str_concat" => {
+            // args: [str_a, str_b] → str_ptr (List(U8))
+            let Scalar::Ptr(a_idx) = args[0] else {
+                panic!("__str_concat: expected Ptr");
+            };
+            let Scalar::Ptr(b_idx) = args[1] else {
+                panic!("__str_concat: expected Ptr");
+            };
+            let Scalar::U64(a_len) = heap.load(a_idx, 0) else {
+                panic!("__str_concat: expected U64 len");
+            };
+            let Scalar::U64(b_len) = heap.load(b_idx, 0) else {
+                panic!("__str_concat: expected U64 len");
+            };
+            let Scalar::Ptr(a_data) = heap.load(a_idx, 2) else {
+                panic!("__str_concat: expected Ptr data");
+            };
+            let Scalar::Ptr(b_data) = heap.load(b_idx, 2) else {
+                panic!("__str_concat: expected Ptr data");
+            };
+            let total = a_len + b_len;
+            let data = heap.alloc(total as usize);
+            for i in 0..a_len as usize {
+                heap.store(data, i, heap.load(a_data, i));
+            }
+            for i in 0..b_len as usize {
+                heap.store(data, a_len as usize + i, heap.load(b_data, i));
+            }
+            let list = heap.alloc(3);
+            heap.store(list, 0, Scalar::U64(total));
+            heap.store(list, 1, Scalar::U64(total));
+            heap.store(list, 2, Scalar::Ptr(data));
+            Some(Scalar::Ptr(list))
+        }
         "__u64_from_u8" => {
             // args: [u8] → u64 (widening conversion)
             let Scalar::U8(n) = args[0] else {

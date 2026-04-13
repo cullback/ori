@@ -1259,6 +1259,27 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
         }
 
+        // Record types: compiler-generated equals and to_str.
+        if let Type::Record { .. } = &resolved {
+            match method {
+                "equals" => {
+                    let bool_ty = Type::Con("Bool".to_owned());
+                    self.unify_at(&ret, &bool_ty, span)?;
+                    self.method_resolutions
+                        .insert(span, "__record_equals".to_owned());
+                    return Ok(ret);
+                }
+                "to_str" => {
+                    let str_ty = Type::Con("Str".to_owned());
+                    self.unify_at(&ret, &str_ty, span)?;
+                    self.method_resolutions
+                        .insert(span, "__record_to_str".to_owned());
+                    return Ok(ret);
+                }
+                _ => {}
+            }
+        }
+
         if let Type::Var(tv) = resolved {
             let mut param_types = vec![Type::Var(tv)];
             param_types.extend(arg_types);
@@ -1658,36 +1679,47 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             for i in remaining {
                 let c = self.engine.constraints[i].clone();
                 let resolved = self.engine.resolve(&Type::Var(c.type_var));
+                let maybe_span = self.constraint_spans.get(i).copied();
+
+                // Record types: compiler-generated equals/to_str.
+                if let Type::Record { .. } = &resolved
+                    && matches!(c.method_name.as_str(), "equals" | "to_str")
+                {
+                    if let Some(s) = maybe_span {
+                        self.method_resolutions
+                            .insert(s, format!("__record_{}", c.method_name));
+                    }
+                    progress = true;
+                    continue;
+                }
+
                 let (Type::Con(type_name) | Type::App(type_name, _)) = &resolved else {
                     still_remaining.push(i);
                     continue;
                 };
-            let maybe_span = self.constraint_spans.get(i).copied();
-            let mangled = format!("{type_name}.{}", c.method_name);
-            if let Some(scheme) = self.env.get(&mangled).cloned() {
-                // Unify the constraint's method type with the actual method signature
-                // so that arg types (e.g. index literals) resolve correctly.
-                let actual_ty = self.engine.instantiate(&scheme);
-                drop(self.engine.unify(&c.method_type, &actual_ty));
-                if let Some(s) = maybe_span {
-                    let resolution = if super::post_infer::is_numeric_builtin(type_name, &c.method_name) {
-                        format!("__builtin.{}", c.method_name)
-                    } else {
-                        mangled
-                    };
-                    self.method_resolutions.insert(s, resolution);
+                let mangled = format!("{type_name}.{}", c.method_name);
+                if let Some(scheme) = self.env.get(&mangled).cloned() {
+                    let actual_ty = self.engine.instantiate(&scheme);
+                    drop(self.engine.unify(&c.method_type, &actual_ty));
+                    if let Some(s) = maybe_span {
+                        let resolution = if super::post_infer::is_numeric_builtin(type_name, &c.method_name) {
+                            format!("__builtin.{}", c.method_name)
+                        } else {
+                            mangled
+                        };
+                        self.method_resolutions.insert(s, resolution);
+                    }
+                } else if let Some(s) = maybe_span {
+                    return Err(CompileError::at(
+                        s,
+                        format!("no method '{0}' on type {type_name}", c.method_name),
+                    ));
+                } else {
+                    return Err(CompileError::new(format!(
+                        "no method '{0}' on type {type_name}",
+                        c.method_name
+                    )));
                 }
-            } else if let Some(s) = maybe_span {
-                return Err(CompileError::at(
-                    s,
-                    format!("no method '{0}' on type {type_name}", c.method_name),
-                ));
-            } else {
-                return Err(CompileError::new(format!(
-                    "no method '{0}' on type {type_name}",
-                    c.method_name
-                )));
-            }
                 progress = true;
             }
             remaining = still_remaining;

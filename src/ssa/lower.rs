@@ -233,8 +233,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     BinOp::Mul => self.builder.binop(BinaryOp::Mul, l, r, ty),
                     BinOp::Div => self.builder.binop(BinaryOp::Div, l, r, ty),
                     BinOp::Rem => self.builder.binop(BinaryOp::Rem, l, r, ty),
-                    BinOp::Eq => self.lower_eq(l, r, false),
-                    BinOp::Neq => self.lower_eq(l, r, true),
+                    BinOp::Eq | BinOp::Neq => {
+                        let negate = matches!(op, BinOp::Neq);
+                        if let Type::Record { .. } = &lhs.ty {
+                            self.lower_record_eq(l, r, &lhs.ty, negate)
+                        } else {
+                            self.lower_eq(l, r, negate)
+                        }
+                    }
                     BinOp::Lt => self.lower_cmp(l, r, BinaryOp::Lt),
                     BinOp::Gt => self.lower_cmp(l, r, BinaryOp::Gt),
                     BinOp::Le => self.lower_cmp(l, r, BinaryOp::Le),
@@ -545,6 +551,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             panic!("no method resolution for .{method}() at {:?}", outer.span);
         };
         let recv_val = self.lower_expr(receiver);
+        if mangled == "__record_equals" {
+            let rhs = self.lower_expr(&args[0]);
+            return self.lower_record_eq(recv_val, rhs, &receiver.ty, false);
+        }
+        if mangled == "__record_to_str" {
+            return self.lower_record_to_str(recv_val, &receiver.ty);
+        }
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
             if op_name == "to_str" {
                 return self
@@ -778,6 +791,119 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     fn lower_eq(&mut self, lhs: Value, rhs: Value, negate: bool) -> Value {
         let cmp = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::Bool);
         self.lower_bool_from_cmp_neg(cmp, negate)
+    }
+
+    /// Field-by-field record equality with short-circuit branching.
+    /// Each field comparison branches: if not equal, jump to the
+    /// "false" merge; otherwise check the next field.
+    fn lower_record_eq(&mut self, lhs: Value, rhs: Value, ty: &Type, negate: bool) -> Value {
+        let Type::Record { fields, .. } = ty else {
+            panic!("lower_record_eq called on non-record type");
+        };
+        let mut sorted: Vec<(&str, &Type)> = fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        sorted.sort_by_key(|(n, _)| *n);
+
+        if sorted.is_empty() {
+            // Empty records are always equal.
+            let cmp = self.builder.const_bool(true);
+            return self.lower_bool_from_cmp_neg(cmp, negate);
+        }
+
+        let false_block = self.builder.create_block();
+        let true_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::Bool);
+
+        for (slot, (_name, field_ty)) in sorted.iter().enumerate() {
+            let l = self.builder.load(lhs, slot, type_to_scalar(field_ty));
+            let r = self.builder.load(rhs, slot, type_to_scalar(field_ty));
+            let field_eq = if let Type::Record { .. } = field_ty {
+                // Nested record: recurse, extract raw Bool tag.
+                let bool_val = self.lower_record_eq(l, r, field_ty, false);
+                let tag = self.builder.load(bool_val, 0, ScalarType::U64);
+                let true_tag = self.builder.const_u64(self.decls.constructors["True"].tag_index);
+                self.builder.binop(BinaryOp::Eq, tag, true_tag, ScalarType::Bool)
+            } else {
+                self.builder.binop(BinaryOp::Eq, l, r, ScalarType::Bool)
+            };
+            let next = if slot + 1 < sorted.len() {
+                self.builder.create_block()
+            } else {
+                true_block
+            };
+            self.builder.branch(field_eq, next, vec![], false_block, vec![]);
+            if slot + 1 < sorted.len() {
+                self.builder.switch_to(next);
+            }
+        }
+
+        self.builder.switch_to(true_block);
+        let t = self.builder.const_bool(true);
+        self.builder.jump(merge, vec![t]);
+
+        self.builder.switch_to(false_block);
+        let f = self.builder.const_bool(false);
+        self.builder.jump(merge, vec![f]);
+
+        self.builder.switch_to(merge);
+        self.lower_bool_from_cmp_neg(merge_param, negate)
+    }
+
+    /// Record to_str: produces `"{ field1: val1, field2: val2 }"`.
+    fn lower_record_to_str(&mut self, recv: Value, ty: &Type) -> Value {
+        let Type::Record { fields, .. } = ty else {
+            panic!("lower_record_to_str called on non-record type");
+        };
+        let mut sorted: Vec<(String, Type)> = fields
+            .iter()
+            .map(|(n, t)| (n.clone(), t.clone()))
+            .collect();
+        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        // Start with "{ "
+        let mut acc = self.lower_str_literal(b"{ ");
+        for (i, (name, field_ty)) in sorted.iter().enumerate() {
+            if i > 0 {
+                let sep = self.lower_str_literal(b", ");
+                acc = self.lower_str_concat(acc, sep);
+            }
+            // "fieldname: "
+            let label = format!("{name}: ");
+            let label_val = self.lower_str_literal(label.as_bytes());
+            acc = self.lower_str_concat(acc, label_val);
+            // value.to_str()
+            let field_val = self.builder.load(recv, i, type_to_scalar(&field_ty));
+            let val_str = if let Type::Record { .. } = &field_ty {
+                self.lower_record_to_str(field_val, &field_ty)
+            } else {
+                self.builder.call("__num_to_str", vec![field_val], ScalarType::Ptr)
+            };
+            acc = self.lower_str_concat(acc, val_str);
+        }
+        // " }"
+        let close = self.lower_str_literal(b" }");
+        self.lower_str_concat(acc, close)
+    }
+
+    /// Helper: emit a string literal as a List(U8) header.
+    fn lower_str_literal(&mut self, bytes: &[u8]) -> Value {
+        let len = bytes.len();
+        let data = self.builder.alloc(len);
+        for (i, &b) in bytes.iter().enumerate() {
+            let val = self.builder.const_u8(b);
+            self.builder.store(data, i, val);
+        }
+        let header = self.builder.alloc(3);
+        let len_val = self.builder.const_u64(len as u64);
+        self.builder.store(header, 0, len_val);
+        self.builder.store(header, 1, len_val);
+        self.builder.store(header, 2, data);
+        header
+    }
+
+    /// Helper: emit string concatenation via builtin.
+    fn lower_str_concat(&mut self, a: Value, b: Value) -> Value {
+        self.builder.call("__str_concat", vec![a, b], ScalarType::Ptr)
     }
 
     fn lower_cmp(&mut self, lhs: Value, rhs: Value, op: BinaryOp) -> Value {
