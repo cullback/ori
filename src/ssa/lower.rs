@@ -198,8 +198,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 if name == "crash" {
                     return self.builder.const_i64(0);
                 }
-                // Zero-param top-level value binding: compiled as a
-                // zero-arg function, call it to get the value.
+                // Top-level value binding: call as zero-arg function.
                 if self.decls.funcs.contains(name) {
                     let ret_ty = self.func_ret_type(name);
                     return self.builder.call(name, vec![], ret_ty);

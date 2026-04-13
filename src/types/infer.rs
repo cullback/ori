@@ -1530,7 +1530,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         // wrapped in Arrow). If there's a type annotation, unify with it.
         if params.is_empty() {
             let body_ty = self.infer_expr(body)?;
-            // Check annotation if present
             if let Some(anno) = self.type_annos.get(name).cloned() {
                 let anno_ty = self.resolve_type_expr(&anno)?;
                 self.unify_expected(

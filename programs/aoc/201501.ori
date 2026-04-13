@@ -1,4 +1,3 @@
-
 # Advent of Code 2015, Day 1: Not Quite Lisp
 
 parse : Str -> List(I32)
@@ -7,7 +6,7 @@ parse = |input|
           |c| if c
             : '(' then 1
             : ')' then -1
-            else crash("bad '${c}'")
+            else 0
         )
 
 part1 : Str -> I32
@@ -15,13 +14,10 @@ part1 = |input| parse(input).sum()
 
 part2 : Str -> U64
 part2 = |input| parse(input)
-            .trail(0, I32.add)
-            .find_index(.equals(-1))
-            .unwrap()
-            .add(1)
+          .trail(0, I32.add)
+          .find_index(.equals(-1))
+          .unwrap()
+          .add(1)
 
 main : List(Str), Str -> Result(Str, Str)
-main = |args, input| (
-    # Ok(input)
-    Ok(part2(input).to_str())
-)
+main = |args, input| Ok(part2(input).to_str())

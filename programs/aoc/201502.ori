@@ -1,0 +1,6 @@
+
+part1 = |input|
+	input
+		.to_utf8()
+		.split_on('\n')
+		.split_on('*')

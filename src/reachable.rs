@@ -28,10 +28,20 @@ pub fn prune<'src>(
 
     let mut new_decls: Vec<Decl<'src>> = Vec::new();
     for decl in module.decls {
+        // Borrow before the match so the FuncDef arm can inspect
+        // fields without moving out of `decl`.
+        let keep_func = matches!(
+            &decl,
+            Decl::FuncDef { name, params, .. }
+                if reachable_set.contains(symbols.display(*name))
+                    || params.is_empty()
+        );
         match decl {
-            Decl::FuncDef { name, .. } => {
-                let name_str = symbols.display(name).to_owned();
-                if reachable_set.contains(&name_str) {
+            Decl::FuncDef { .. } => {
+                // Keep zero-param value bindings even if reachability
+                // doesn't trace them — they're referenced via Name
+                // which defunc may rewrite, breaking the trace.
+                if keep_func {
                     new_decls.push(decl);
                 }
             }

@@ -1,0 +1,22 @@
+merge_sorted = |accum, left,  right| (
+	if left
+		: [] then  accum.concat(right)
+		: [left_first, ..rest] then
+			if right
+				: [] then accum.concat(left)
+				: [right_first, ..rest] then
+					if left_first < right_first then
+						merge_sort
+)
+
+mergeSorted = \accum, left, right ->
+    when left is
+        [] -> List.concat accum right
+        [leftFirst, .. as leftRest] ->
+            when right is
+                [] -> List.concat accum left
+                [rightFirst, .. as rightRest] ->
+                    if leftFirst <= rightFirst then
+                        mergeSorted (List.append accum leftFirst) leftRest right
+                    else
+                        mergeSorted (List.append accum rightFirst) left rightRest
