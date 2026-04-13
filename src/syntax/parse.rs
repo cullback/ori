@@ -6,6 +6,12 @@ use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest_derive::Parser;
 
 use crate::error::CompileError;
+
+/// Leak a `String` to produce a `&'static str`. Used for synthesized
+/// names (like `__expect_0`) that don't exist in the source text.
+fn leak_string(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
 use crate::source::FileId;
 use crate::syntax::raw::{
     BinOp, ConstraintDecl, Decl, Expr, ExprKind, Import, ListPatternElem, MatchArm, Module,
@@ -21,6 +27,8 @@ struct ParseCtx {
     /// Maps byte offset of the first non-comment token after a comment block
     /// to the accumulated doc string.
     doc_comments: HashMap<usize, String>,
+    /// Counter for generating unique `__expect_N` names.
+    expect_counter: std::cell::Cell<usize>,
 }
 
 pub fn parse(source: &str, file: FileId) -> Result<Module<'_>, CompileError> {
@@ -28,7 +36,11 @@ pub fn parse(source: &str, file: FileId) -> Result<Module<'_>, CompileError> {
         OriParser::parse(Rule::module, source).map_err(|e| CompileError::new(e.to_string()))?;
     let module_pair = pairs.into_iter().next().unwrap();
     let doc_comments = extract_doc_comments(source);
-    let ctx = ParseCtx { file, doc_comments };
+    let ctx = ParseCtx {
+        file,
+        doc_comments,
+        expect_counter: std::cell::Cell::new(0),
+    };
     Ok(ctx.parse_module(module_pair))
 }
 
@@ -100,6 +112,39 @@ impl ParseCtx {
                 _ => {}
             }
         }
+        // If there are `expect` declarations but no user-defined `main`,
+        // generate a synthetic main that evaluates all expects.
+        let expect_count = self.expect_counter.get();
+        let has_main = decls.iter().any(|d| matches!(d, Decl::FuncDef { name: "main", .. }));
+        if expect_count > 0 && !has_main {
+            let span = Span::default();
+            // Build: ( __expect_0; __expect_1; ...; Ok("N expects passed") )
+            let stmts: Vec<Stmt<'_>> = (0..expect_count)
+                .map(|i| {
+                    let name: &str = leak_string(format!("__expect_{i}"));
+                    Stmt::Let {
+                        name: "_",
+                        val: Expr::new(ExprKind::Call { func: name, args: vec![] }, span),
+                    }
+                })
+                .collect();
+            let msg = format!("{expect_count} expects passed");
+            let ok_result = Expr::new(
+                ExprKind::Call {
+                    func: "Ok",
+                    args: vec![Expr::new(ExprKind::StrLit(msg.into_bytes()), span)],
+                },
+                span,
+            );
+            let body = Expr::new(ExprKind::Block(stmts, Box::new(ok_result)), span);
+            decls.push(Decl::FuncDef {
+                span,
+                name: "main",
+                params: vec!["_"],
+                body,
+                doc: None,
+            });
+        }
         Module {
             exports,
             imports,
@@ -111,8 +156,59 @@ impl ParseCtx {
         let inner = pair.into_inner().next().unwrap();
         match inner.as_rule() {
             Rule::type_anno => self.parse_type_anno(inner),
+            Rule::expect_decl => self.parse_expect_decl(inner),
             Rule::assignment => self.parse_assignment_as_decl(inner),
             other => panic!("unexpected decl rule: {other:?}"),
+        }
+    }
+
+    fn parse_expect_decl<'src>(&self, pair: Pair<'src, Rule>) -> Decl<'src> {
+        let span = self.span_of(&pair);
+        let mut inner = pair.into_inner();
+        let _keyword = inner.next().unwrap(); // expect_keyword
+        let body_expr = self.parse_expr(inner.next().unwrap());
+
+        // Allocate a unique name for this expect.
+        let idx = self.expect_counter.get();
+        self.expect_counter.set(idx + 1);
+        let name: &'src str = leak_string(format!("__expect_{idx}"));
+
+        // Desugar: __expect_N = if expr : True then {} : False then crash("...")
+        let msg = format!("assertion failed (expect #{}, line {})", idx, span.start);
+        let crash_call = Expr::new(
+            ExprKind::Call {
+                func: "crash",
+                args: vec![Expr::new(ExprKind::StrLit(msg.into_bytes()), span)],
+            },
+            span,
+        );
+        let desugared = Expr::new(
+            ExprKind::If {
+                expr: Box::new(body_expr),
+                arms: vec![
+                    MatchArm {
+                        pattern: Pattern::Constructor { name: "True", fields: vec![] },
+                        guards: vec![],
+                        body: Expr::new(ExprKind::Record { fields: vec![] }, span),
+                        is_return: false,
+                    },
+                    MatchArm {
+                        pattern: Pattern::Constructor { name: "False", fields: vec![] },
+                        guards: vec![],
+                        body: crash_call,
+                        is_return: false,
+                    },
+                ],
+                else_body: None,
+            },
+            span,
+        );
+        Decl::FuncDef {
+            span,
+            name,
+            params: vec![],
+            body: desugared,
+            doc: None,
         }
     }
 

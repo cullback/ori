@@ -16,7 +16,10 @@ exposing_clause = { "exposing" ~ name_list }
 
 name_list = { "[" ~ name ~ ("," ~ name)* ~ "]" }
 
-decl = { type_anno | assignment }
+decl = { type_anno | expect_decl | assignment }
+
+expect_decl = { expect_keyword ~ expr }
+expect_keyword = @{ "expect" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // Atomic: no space before "(" in type params (e.g. List(a), not List (a))
 type_head = @{ name ~ "(" }
