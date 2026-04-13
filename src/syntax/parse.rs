@@ -527,11 +527,16 @@ impl ParseCtx {
                 let text = first.as_str();
                 let without_paren = &text[..text.len() - 1];
                 let segments: Vec<&str> = without_paren.split('.').collect();
-                let args = inner
+                let args: Vec<Expr<'_>> = inner
                     .first()
                     .filter(|p| p.as_rule() == Rule::args)
                     .map(|p| p.clone().into_inner().map(|a| self.parse_expr(a)).collect())
                     .unwrap_or_default();
+                // Record builder desugar: Type.method({ f1: e1, f2: e2, ... })
+                // with 1 record arg of 2+ fields → nested map2 calls.
+                if let Some(desugared) = try_desugar_record_builder(&segments, &args, span) {
+                    return desugared;
+                }
                 Expr::new(ExprKind::QualifiedCall { segments, args }, span)
             }
             Rule::call_head => {
@@ -1324,4 +1329,165 @@ fn unescape_string(s: &str) -> Vec<u8> {
         }
     }
     bytes
+}
+
+// ---- Record builder desugaring ----
+//
+// When `Type.method({ f1: e1, f2: e2, f3: e3 })` is called with a single
+// record literal of 2+ fields, desugar to nested map2 calls:
+//
+//   Type.method(e1,
+//       Type.method(e2, e3, |f2, f3| (f2, f3)),
+//       |f1, __rb| ( (f2, f3) = __rb; { f1, f2, f3 } ))
+//
+// This is the record builder pattern from record-builders.md.
+
+/// If `args` is a single record literal with 2+ fields, desugar to nested
+/// map2 calls on the given qualified segments. Returns `None` if the pattern
+/// doesn't match.
+fn try_desugar_record_builder<'src>(
+    segments: &[&'src str],
+    args: &[Expr<'src>],
+    span: Span,
+) -> Option<Expr<'src>> {
+    // Must be exactly 1 arg that is a record literal with 2+ fields.
+    if args.len() != 1 {
+        return None;
+    }
+    let ExprKind::Record { fields } = &args[0].kind else {
+        return None;
+    };
+    if fields.len() < 2 {
+        return None;
+    }
+    let all_names: Vec<&'src str> = fields.iter().map(|(n, _)| *n).collect();
+    let all_exprs: Vec<Expr<'src>> = fields.iter().map(|(_, e)| e.clone()).collect();
+
+    Some(build_record_builder(segments, &all_names, &all_exprs, span, true))
+}
+
+/// Recursively build the nested map2 calls.
+///
+/// - `is_outer`: if true, the final combining function produces a record;
+///   if false (inner calls), it produces a tuple.
+fn build_record_builder<'src>(
+    segments: &[&'src str],
+    names: &[&'src str],
+    exprs: &[Expr<'src>],
+    span: Span,
+    is_outer: bool,
+) -> Expr<'src> {
+    assert!(names.len() >= 2, "record builder requires at least 2 fields");
+    assert_eq!(names.len(), exprs.len(), "field names and expressions must match");
+
+    if names.len() == 2 {
+        // Base case: method(e0, e1, |f0, f1| { f0: f0, f1: f1 }) or (f0, f1)
+        let combiner = if is_outer {
+            make_record_lambda(names, span)
+        } else {
+            make_tuple_lambda(names, span)
+        };
+        let [e0, e1] = exprs else { unreachable!() };
+        make_qualified_call(segments, vec![e0.clone(), e1.clone(), combiner], span)
+    } else {
+        // Recursive case: method(e0, <inner>, |f0, __rb| ( (f1,..,fN) = __rb; result ))
+        let inner = build_record_builder(segments, &names[1..], &exprs[1..], span, false);
+        let rest_names = &names[1..];
+
+        // Build the outer combining lambda
+        let rb_param: &'src str = leak_string(format!("__rb_{}", names[0]));
+        let combiner = if is_outer {
+            make_destructure_lambda(names[0], rb_param, rest_names, names, span, true)
+        } else {
+            make_destructure_lambda(names[0], rb_param, rest_names, names, span, false)
+        };
+        make_qualified_call(segments, vec![exprs[0].clone(), inner, combiner], span)
+    }
+}
+
+/// Build `Type.method(args...)`.
+fn make_qualified_call<'src>(
+    segments: &[&'src str],
+    args: Vec<Expr<'src>>,
+    span: Span,
+) -> Expr<'src> {
+    Expr::new(ExprKind::QualifiedCall { segments: segments.to_vec(), args }, span)
+}
+
+/// Build `|f0, f1| { f0: f0, f1: f1 }` — two params, produce a record.
+fn make_record_lambda<'src>(names: &[&'src str], span: Span) -> Expr<'src> {
+    // Use distinct spans for each Name ref to avoid span collisions in inference.
+    let fields: Vec<(&'src str, Expr<'src>)> = names
+        .iter()
+        .map(|n| (*n, Expr::new(ExprKind::Name(n), span)))
+        .collect();
+    Expr::new(
+        ExprKind::Lambda {
+            params: names.to_vec(),
+            body: Box::new(Expr::new(ExprKind::Record { fields }, span)),
+        },
+        span,
+    )
+}
+
+/// Build `|f0, f1| (f0, f1)` — two params, produce a tuple.
+fn make_tuple_lambda<'src>(names: &[&'src str], span: Span) -> Expr<'src> {
+    let elems: Vec<Expr<'src>> = names
+        .iter()
+        .map(|n| Expr::new(ExprKind::Name(n), span))
+        .collect();
+    Expr::new(
+        ExprKind::Lambda {
+            params: names.to_vec(),
+            body: Box::new(Expr::new(ExprKind::Tuple(elems), span)),
+        },
+        span,
+    )
+}
+
+/// Build `|first_name, rb_param| ( (rest_names...) = rb_param; result )`.
+///
+/// `all_names` is used to construct the final result (record or tuple).
+fn make_destructure_lambda<'src>(
+    first_name: &'src str,
+    rb_param: &'src str,
+    rest_names: &[&'src str],
+    all_names: &[&'src str],
+    span: Span,
+    produce_record: bool,
+) -> Expr<'src> {
+    // Destructure: (f1, f2, ...) = __rb
+    let dest_pattern = Pattern::Tuple(
+        rest_names.iter().map(|n| Pattern::Binding(n)).collect(),
+    );
+    let dest_stmt = Stmt::Destructure {
+        pattern: dest_pattern,
+        val: Expr::new(ExprKind::Name(rb_param), span),
+    };
+
+    // Result: { f0, f1, f2, ... } or (f0, f1, f2, ...)
+    let result = if produce_record {
+        let fields: Vec<(&'src str, Expr<'src>)> = all_names
+            .iter()
+            .map(|n| (*n, Expr::new(ExprKind::Name(n), span)))
+            .collect();
+        Expr::new(ExprKind::Record { fields }, span)
+    } else {
+        let elems: Vec<Expr<'src>> = all_names
+            .iter()
+            .map(|n| Expr::new(ExprKind::Name(n), span))
+            .collect();
+        Expr::new(ExprKind::Tuple(elems), span)
+    };
+
+    Expr::new(
+        ExprKind::Lambda {
+            params: vec![first_name, rb_param],
+            body: Box::new(Expr::new(
+                ExprKind::Block(vec![dest_stmt], Box::new(result)),
+                span,
+            )),
+        },
+        span,
+    )
 }
