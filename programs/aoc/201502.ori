@@ -1,6 +1,15 @@
+import parser
 
-part1 = |input|
-	input
-		.to_utf8()
-		.split_on('\n')
-		.split_on('*')
+parse_box : List(U8) -> Result(({ l: U64, w: U64, h: U64 }, List(U8)), Str)
+parse_box = |input| Parser.sequence({
+    l: u64.and_drop_right(symbol('x')),
+    w: u64.and_drop_right(symbol('x')),
+    h: u64,
+}).run(input)
+
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| (
+    (result, rest) = parse_box(Str.to_utf8(input))?
+    Ok("${U64.to_str(result.l)}x${U64.to_str(result.w)}x${U64.to_str(result.h)}")
+)
+

@@ -8,9 +8,9 @@
 #
 #     # Parse "2x3x4" into { l: 3, w: 3, h: 4 }
 #     box = Parser.sequence({
-#         l: natural.and_drop_right(symbol('x')),
-#         w: natural.and_drop_right(symbol('x')),
-#         h: natural,
+#         l: u64.and_drop_right(symbol('x')),
+#         w: u64.and_drop_right(symbol('x')),
+#         h: u64,
 #     })
 #
 #     box.run("2x3x4")
@@ -18,7 +18,7 @@
 
 lib {}
 
-exports [Parser, symbol, in_range, digit, natural]
+exports [Parser, symbol, in_range, digit, u64]
 
 # A parser function from input bytes to a parse result.
 #
@@ -32,7 +32,7 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     # Run a parser against a `Str`, returning the parsed value
     # and the unconsumed suffix.
     #
-    #     natural.run("42rest")
+    #     u64.run("42rest")
     #     # Ok((42, "rest"))
     run : Parser(a), Str -> Result((a, Str), Str)
     run = |p, input| (
@@ -60,9 +60,9 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     # Since parsers consume input, field order IS parse order.
     #
     #     Parser.sequence({
-    #         l: natural.and_drop_right(symbol('x')),
-    #         w: natural.and_drop_right(symbol('x')),
-    #         h: natural,
+    #         l: u64.and_drop_right(symbol('x')),
+    #         w: u64.and_drop_right(symbol('x')),
+    #         h: u64,
     #     })
     sequence : Parser(a), Parser(b), (a, b -> c) -> Parser(c)
     sequence = |pa, pb, f|
@@ -75,7 +75,7 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     # Sequence two parsers, keeping only the left result.
     # Useful for consuming delimiters after a value.
     #
-    #     natural.and_drop_right(symbol('x')).run("42x")
+    #     u64.and_drop_right(symbol('x')).run("42x")
     #     # Ok((42, ""))
     and_drop_right : Parser(a), Parser(b) -> Parser(a)
     and_drop_right = |pa, pb| pa.sequence(pb, |a, _| a)
@@ -83,7 +83,7 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     # Sequence two parsers, keeping only the right result.
     # Useful for skipping delimiters before a value.
     #
-    #     symbol('x').and_drop_left(natural).run("x42")
+    #     symbol('x').and_drop_left(u64).run("x42")
     #     # Ok((42, ""))
     and_drop_left : Parser(a), Parser(b) -> Parser(b)
     and_drop_left = |pa, pb| pa.sequence(pb, |_, b| b)
@@ -128,7 +128,7 @@ Parser(a) :: (List(U8) -> Result({ value: a, rest: List(U8) }, Str)).(
     # Parse values separated by a delimiter. Matches zero or more;
     # always succeeds.
     #
-    #     natural.separated_by(symbol(',')).run("1,2,3end")
+    #     u64.separated_by(symbol(',')).run("1,2,3end")
     #     # Ok(([1, 2, 3], "end"))
     separated_by : Parser(a), Parser(b) -> Parser(List(a))
     separated_by = |element, delim| (
@@ -194,12 +194,12 @@ in_range = |lo, hi|
 digit : Parser(U8)
 digit = in_range('0', '9')
 
-# Match a natural number (one or more digits) as U64.
+# Parse one or more digits as a U64.
 #
-#     natural.run("42rest")
+#     u64.run("42rest")
 #     # Ok((42, "rest"))
-natural : Parser(U64)
-natural =
+u64 : Parser(U64)
+u64 =
     digit.one_or_more().map(|digits|
         digits.walk(0, |acc, d| acc * 10 + U64.from_u8(d - '0')))
 
@@ -210,9 +210,9 @@ natural =
 
 box : Parser({ l: U64, w: U64, h: U64 })
 box = Parser.sequence({
-    l: natural.and_drop_right(symbol('x')),
-    w: natural.and_drop_right(symbol('x')),
-    h: natural,
+    l: u64.and_drop_right(symbol('x')),
+    w: u64.and_drop_right(symbol('x')),
+    h: u64,
 })
 
 boxes : Parser(List({ l: U64, w: U64, h: U64 }))
@@ -236,16 +236,16 @@ expect symbol('x').run("abc") is Err(_)
 expect digit.run("7xy") == Ok(('7', "xy"))
 expect digit.run("xy") is Err(_)
 
-expect natural.run("42rest") == Ok((42, "rest"))
-expect natural.run("0end") == Ok((0, "end"))
-expect natural.run("abc") is Err(_)
+expect u64.run("42rest") == Ok((42, "rest"))
+expect u64.run("0end") == Ok((0, "end"))
+expect u64.run("abc") is Err(_)
 
-expect natural.and_drop_right(symbol('x')).run("42x")
+expect u64.and_drop_right(symbol('x')).run("42x")
     == Ok((42, ""))
 
-expect natural.separated_by(symbol(',')).run("1,2,3end")
+expect u64.separated_by(symbol(',')).run("1,2,3end")
     == Ok(([1, 2, 3], "end"))
-expect natural.separated_by(symbol(',')).run("")
+expect u64.separated_by(symbol(',')).run("")
     == Ok(([], ""))
 
 expect box.run("2x3x4") == Ok(({ l: 2, w: 3, h: 4 }, ""))
