@@ -37,35 +37,7 @@ pub struct InferResult {
 
 // ---- Inference context ----
 
-/// Information a post-inference rewrite needs to turn a bare
-/// callable reference into an explicit lambda. Two shapes:
-///
-/// - `Constructor` — a bare constructor name (declared or
-///   structural) used where a function is expected, like
-///   `List.map(xs, Ok)`. The rewrite produces `|a| Ok(a)`.
-/// - `Method` — a qualified method name like `I64.add` used as
-///   a value, like `xs.scan(0, I64.add)`. The rewrite produces
-///   `|a, b| I64.add(a, b)` via a `QualifiedCall`.
-///
-/// In both cases the arrow type is read from `expr.ty` at rewrite
-/// time (populated by `write_types_back`), so the stored info only
-/// needs the kind-specific bits. This way any further unification
-/// between inference-populate time and end-of-inference resolve
-/// flows through to the rewrite automatically.
-enum EtaInfo {
-    /// Constructor eta-expansion. Carries the constructor's
-    /// `SymbolId` so the rewrite can emit `Call { target }`.
-    Constructor { con_sym: SymbolId },
-    /// Method-reference eta-expansion. Carries the type and
-    /// method names so the rewrite can emit the `QualifiedCall`
-    /// that the method dispatch pipeline expects. Stored as
-    /// `String` (rather than `&'src str`) so the rewrite can
-    /// leak them to `'static` without lifetime gymnastics.
-    Method {
-        type_name: String,
-        method_name: String,
-    },
-}
+use super::post_infer::EtaInfo;
 
 struct InferCtx<'a, 'src> {
     engine: TypeEngine,
@@ -364,6 +336,69 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     ty: con_type,
                 },
             );
+        }
+        Ok(())
+    }
+
+    // ---- Method registration (shared between tag-union and non-tag-union TypeAnno) ----
+
+    /// Register method signatures and annotations for a type's methods.
+    /// For each `FuncDef` method: registers a fresh arrow scheme (unless
+    /// a preceding `TypeAnno` already resolved an annotation). For each
+    /// `TypeAnno` method: eagerly resolves the annotation to a scheme so
+    /// callers see the intended type, and registers it in `type_annos`.
+    fn register_methods(
+        &mut self,
+        type_name: &str,
+        methods: &[Decl<'src>],
+        scope: &crate::resolve::ModuleScope,
+    ) -> Result<(), CompileError> {
+        for method in methods {
+            match method {
+                Decl::FuncDef {
+                    name: method_name,
+                    params,
+                    ..
+                } => {
+                    let method_name = self.symbols.display(*method_name);
+                    let mangled = method_key(type_name, method_name);
+                    if !self.env.contains_key(&mangled) {
+                        let param_types: Vec<Type> =
+                            params.iter().map(|_| self.engine.fresh()).collect();
+                        let ret = self.engine.fresh();
+                        let func_ty = Type::Arrow(param_types, Box::new(ret));
+                        self.env.insert(mangled.clone(), Scheme::mono(func_ty));
+                    }
+                    if let Some(mod_name) = scope.qualified_types.get(type_name) {
+                        let qual = format!("{mod_name}.{mangled}");
+                        if let Some(scheme) = self.env.get(&mangled).cloned() {
+                            self.env.insert(qual, scheme);
+                        }
+                    }
+                }
+                Decl::TypeAnno {
+                    name: method_name,
+                    ty,
+                    ..
+                } => {
+                    let method_name = self.symbols.display(*method_name);
+                    let mangled = method_key(type_name, method_name);
+                    if let Some(mod_name) = scope.qualified_types.get(type_name) {
+                        let qual = format!("{mod_name}.{mangled}");
+                        self.type_annos.insert(qual, ty.clone());
+                    }
+                    self.type_annos.insert(mangled.clone(), ty.clone());
+                    let mut tvar_env = HashMap::new();
+                    let anno_ty = self.type_expr_to_type(ty, &mut tvar_env)?;
+                    let tvars: Vec<_> = tvar_env.into_values().collect();
+                    let scheme = Scheme {
+                        vars: tvars,
+                        constraints: vec![],
+                        ty: anno_ty,
+                    };
+                    self.env.insert(mangled, scheme);
+                }
+            }
         }
         Ok(())
     }
@@ -1076,46 +1111,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             });
         }
 
-        // Method call on a type variable: x.method(args) → generate constraint
+        // Dotted call: x.method(args) → dispatch through resolve_method
         if let Some(dot_pos) = func.find('.') {
             let var_name = &func[..dot_pos];
             let method_name = &func[dot_pos + 1..];
             if let Some(scheme) = self.env.get(var_name).cloned() {
                 let var_ty = self.engine.instantiate(&scheme);
-                let resolved = self.engine.resolve(&var_ty);
-                if let Type::Var(tv) = resolved {
-                    // Generate constraint: tv.method_name : (tv, args...) -> ret
-                    let mut param_types = vec![Type::Var(tv)];
-                    param_types.extend(arg_types);
-                    let method_type = Type::Arrow(param_types, Box::new(ret.clone()));
-                    self.push_constraint(
-                        Constraint {
-                            type_var: tv,
-                            method_name: method_name.to_owned(),
-                            method_type,
-                        },
-                        span,
-                    );
-                    return Ok(ret);
-                }
-                // Resolved to a concrete type: look up Type.method
-                if let Type::Con(concrete_name) | Type::App(concrete_name, _) = &resolved {
-                    let mangled = format!("{concrete_name}.{method_name}");
-                    if let Some(scheme) = self.env.get(&mangled).cloned() {
-                        let func_ty = self.engine.instantiate(&scheme);
-                        let mut full_args = vec![var_ty];
-                        full_args.extend(arg_types);
-                        let expected = Type::Arrow(full_args, Box::new(ret.clone()));
-                        self.unify_at(&func_ty, &expected, span)?;
-                        let resolution = if Self::is_numeric_builtin(concrete_name, method_name) {
-                            format!("__builtin.{method_name}")
-                        } else {
-                            mangled
-                        };
-                        self.method_resolutions.insert(span, resolution);
-                        return Ok(ret);
-                    }
-                }
+                return self.resolve_method(var_ty, method_name, arg_types, span);
             }
         }
 
@@ -1221,11 +1223,24 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         for a in args {
             arg_types.push(self.infer_expr(a)?);
         }
+        self.resolve_method(recv_ty, method, arg_types, span)
+    }
+
+    /// Shared method dispatch: given a receiver type, method name, and
+    /// already-inferred argument types, look up the method on the
+    /// receiver's concrete type or generate a constraint for type
+    /// variables. Used by both `infer_method_call` and the dotted-call
+    /// path in `infer_call`.
+    fn resolve_method(
+        &mut self,
+        recv_ty: Type,
+        method: &str,
+        arg_types: Vec<Type>,
+        span: Span,
+    ) -> Result<Type, CompileError> {
         let ret = self.engine.fresh();
         let resolved = self.engine.resolve(&recv_ty);
-        // Concrete type: look up Type.method in env. For numeric
-        // builtins, write `__builtin.<method>` so the lowerer emits
-        // an SSA op instead of a function call.
+
         if let Type::Con(name) | Type::App(name, _) = &resolved {
             let mangled = format!("{name}.{method}");
             if let Some(scheme) = self.env.get(&mangled).cloned() {
@@ -1234,7 +1249,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 full_args.extend(arg_types);
                 let expected = Type::Arrow(full_args, Box::new(ret.clone()));
                 self.unify_at(&func_ty, &expected, span)?;
-                let resolution = if Self::is_numeric_builtin(name, method) {
+                let resolution = if super::post_infer::is_numeric_builtin(name, method) {
                     format!("__builtin.{method}")
                 } else {
                     mangled
@@ -1244,7 +1259,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
         }
 
-        // Type variable: generate constraint
         if let Type::Var(tv) = resolved {
             let mut param_types = vec![Type::Var(tv)];
             param_types.extend(arg_types);
@@ -1252,7 +1266,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             self.push_constraint(
                 Constraint {
                     type_var: tv,
-                    method_name: (*method).to_owned(),
+                    method_name: method.to_owned(),
                     method_type,
                 },
                 span,
@@ -1616,14 +1630,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         Ok(())
     }
 
-    /// True if `type_name.method` is a compiler-intrinsic numeric
-    /// method that should resolve to `__builtin.<method>` instead of
-    /// the env-provided scheme name.
-    fn is_numeric_builtin(type_name: &str, method: &str) -> bool {
-        crate::numeric::NumericType::from_name(type_name)
-            .is_some_and(|num| num.has_builtin_method(method))
-    }
-
     /// If `func` is a dotted `Type.method` that matches a numeric
     /// builtin, insert the `__builtin.<method>` marker into
     /// `method_resolutions` at `span`. Called after `infer_call` /
@@ -1633,7 +1639,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         if let Some(dot) = func.find('.') {
             let type_name = &func[..dot];
             let method = &func[dot + 1..];
-            if Self::is_numeric_builtin(type_name, method) {
+            if super::post_infer::is_numeric_builtin(type_name, method) {
                 self.method_resolutions
                     .insert(span, format!("__builtin.{method}"));
             }
@@ -1664,7 +1670,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 let actual_ty = self.engine.instantiate(&scheme);
                 drop(self.engine.unify(&c.method_type, &actual_ty));
                 if let Some(s) = maybe_span {
-                    let resolution = if Self::is_numeric_builtin(type_name, &c.method_name) {
+                    let resolution = if super::post_infer::is_numeric_builtin(type_name, &c.method_name) {
                         format!("__builtin.{}", c.method_name)
                     } else {
                         mangled
@@ -1841,69 +1847,7 @@ pub fn check<'src>(
             } => {
                 let name = symbols.display(*name);
                 ctx.register_type_decl(name, type_params, tags)?;
-                // Register method signatures and collect method annotations
-                for method in methods {
-                    match method {
-                        Decl::FuncDef {
-                            name: method_name,
-                            params,
-                            ..
-                        } => {
-                            let method_name = symbols.display(*method_name);
-                            let mangled = method_key(name, method_name);
-                            // Only register a fresh arrow if the
-                            // preceding `TypeAnno` arm didn't already
-                            // resolve an annotation to a proper scheme —
-                            // otherwise we'd overwrite the user's
-                            // declared type with a fresh unconstrained
-                            // arrow and lose the annotation.
-                            if !ctx.env.contains_key(&mangled) {
-                                let param_types: Vec<Type> =
-                                    params.iter().map(|_| ctx.engine.fresh()).collect();
-                                let ret = ctx.engine.fresh();
-                                let func_ty = Type::Arrow(param_types, Box::new(ret));
-                                ctx.env.insert(mangled.clone(), Scheme::mono(func_ty));
-                            }
-                            // Dual-register: module-qualified alias
-                            if let Some(mod_name) = scope.qualified_types.get(name) {
-                                let qual = format!("{mod_name}.{mangled}");
-                                if let Some(scheme) = ctx.env.get(&mangled).cloned() {
-                                    ctx.env.insert(qual, scheme);
-                                }
-                            }
-                        }
-                        Decl::TypeAnno {
-                            name: method_name,
-                            ty,
-                            ..
-                        } => {
-                            let method_name = symbols.display(*method_name);
-                            let mangled = method_key(name, method_name);
-                            if let Some(mod_name) = scope.qualified_types.get(name) {
-                                let qual = format!("{mod_name}.{mangled}");
-                                ctx.type_annos.insert(qual, ty.clone());
-                            }
-                            ctx.type_annos.insert(mangled.clone(), ty.clone());
-                            // Eagerly resolve the annotation to a concrete
-                            // scheme so callers see the intended type,
-                            // not a fresh arrow that later unifications
-                            // might pollute. This used to only happen
-                            // for stdlib methods; post-Step 5, free
-                            // functions are inferred before methods, so
-                            // user methods need the same early resolution
-                            // to avoid call-site contamination.
-                            let mut tvar_env = HashMap::new();
-                            let anno_ty = ctx.type_expr_to_type(ty, &mut tvar_env)?;
-                            let tvars: Vec<_> = tvar_env.into_values().collect();
-                            let scheme = Scheme {
-                                vars: tvars,
-                                constraints: vec![],
-                                ty: anno_ty,
-                            };
-                            ctx.env.insert(mangled, scheme);
-                        }
-                    }
-                }
+                ctx.register_methods(name, methods, scope)?;
             }
             Decl::TypeAnno {
                 name,
@@ -1919,49 +1863,7 @@ pub fn check<'src>(
                 {
                     // Nominal type (:= or ::) — distinct type, not an alias
                     ctx.known_types.insert(name.to_owned());
-                    // Register methods
-                    for method in methods {
-                        match method {
-                            Decl::FuncDef {
-                                name: method_name,
-                                params,
-                                ..
-                            } => {
-                                let method_name = symbols.display(*method_name);
-                                let mangled = method_key(name, method_name);
-                                // See the tag-union branch above: don't
-                                // overwrite a scheme already inserted
-                                // from the method's TypeAnno annotation.
-                                if !ctx.env.contains_key(&mangled) {
-                                    let param_types: Vec<Type> =
-                                        params.iter().map(|_| ctx.engine.fresh()).collect();
-                                    let ret = ctx.engine.fresh();
-                                    let func_ty = Type::Arrow(param_types, Box::new(ret));
-                                    ctx.env.insert(mangled, Scheme::mono(func_ty));
-                                }
-                            }
-                            Decl::TypeAnno {
-                                name: method_name,
-                                ty: method_ty,
-                                ..
-                            } => {
-                                let method_name = symbols.display(*method_name);
-                                let mangled = method_key(name, method_name);
-                                ctx.type_annos.insert(mangled.clone(), method_ty.clone());
-                                // Eagerly resolve the annotation (see the
-                                // tag-union branch above for the rationale).
-                                let mut tvar_env = HashMap::new();
-                                let anno_ty = ctx.type_expr_to_type(method_ty, &mut tvar_env)?;
-                                let tvars: Vec<_> = tvar_env.into_values().collect();
-                                let scheme = Scheme {
-                                    vars: tvars,
-                                    constraints: vec![],
-                                    ty: anno_ty,
-                                };
-                                ctx.env.insert(mangled, scheme);
-                            }
-                        }
-                    }
+                    ctx.register_methods(name, methods, scope)?;
                 } else if name.starts_with(|c: char| c.is_ascii_uppercase()) {
                     // CamelCase alias (:) — type alias (e.g. Point : { x: I64, y: I64 })
                     let mut tvar_env: HashMap<String, TypeVar> = type_params
@@ -2148,8 +2050,6 @@ pub fn check<'src>(
     ctx.verify_constraints()?;
 
     // Resolve all expression types now that inference is complete.
-    // This map is consumed by `write_types_back` below and is not part of
-    // the public `InferResult`.
     let expr_types: HashMap<Span, Type> = ctx
         .expr_types
         .iter()
@@ -2190,21 +2090,16 @@ pub fn check<'src>(
         })
         .collect();
 
-    // Write resolved types back onto Expr::ty so downstream passes can
-    // read types directly from the AST.
-    write_types_back(module, &expr_types);
-    // Write method resolutions onto MethodCall / QualifiedCall nodes.
-    write_resolutions_back(module, &ctx.method_resolutions);
-
-    // Eta-expand constructor references that were checked against an
-    // arrow type. `check_expr` marked the spans; this rewrite walks
-    // the module and replaces each marked `Name` with an explicit
-    // `Lambda` wrapping a `Call` to the constructor. Allocates fresh
-    // lambda parameter symbols from `symbols`, which is why `check`
-    // takes `&mut SymbolTable`.
-    if !ctx.eta_expansions.is_empty() {
-        eta_expand_con_refs(module, &ctx.eta_expansions, symbols);
-    }
+    // Single combined post-inference walk: write resolved types onto
+    // Expr::ty, write method resolutions onto MethodCall/QualifiedCall
+    // nodes, and eta-expand constructor/method references.
+    super::post_infer::rewrite(
+        module,
+        &expr_types,
+        &ctx.method_resolutions,
+        &ctx.eta_expansions,
+        symbols,
+    );
 
     Ok(InferResult {
         func_schemes,
@@ -2212,489 +2107,6 @@ pub fn check<'src>(
     })
 }
 
-// ---- Eta-expansion of constructor references ----
-
-/// Rewrite `Name(con_sym)` expressions marked by `check_expr` into
-/// explicit `Lambda` wrappers. See `EtaInfo` and `check_expr` for the
-/// inference-side bookkeeping; this is the mutation side.
-///
-/// For an expression at span `S` marked with `EtaInfo { con_sym,
-/// arrow_ty: Arrow([T1, T2, ..., Tn], ret) }`, rewrite to
-///
-/// ```ignore
-/// Lambda {
-///     params: [p1, p2, ..., pn],
-///     body: Call { target: con_sym, args: [Name(p1), Name(p2), ...] }
-/// }
-/// ```
-///
-/// Types on the synthesized nodes come from the stored arrow: the
-/// lambda itself has type `arrow_ty`, each param Name has the
-/// corresponding `T_i`, and the inner Call has type `ret`.
-fn eta_expand_con_refs(
-    module: &mut Module<'_>,
-    eta: &HashMap<Span, EtaInfo>,
-    symbols: &mut SymbolTable,
-) {
-    for decl in &mut module.decls {
-        eta_expand_decl(decl, eta, symbols);
-    }
-}
-
-fn eta_expand_decl(
-    decl: &mut Decl<'_>,
-    eta: &HashMap<Span, EtaInfo>,
-    symbols: &mut SymbolTable,
-) {
-    match decl {
-        Decl::FuncDef { body, .. } => eta_expand_expr(body, eta, symbols),
-        Decl::TypeAnno { methods, .. } => {
-            for m in methods {
-                eta_expand_decl(m, eta, symbols);
-            }
-        }
-    }
-}
-
-fn eta_expand_expr(
-    expr: &mut Expr<'_>,
-    eta: &HashMap<Span, EtaInfo>,
-    symbols: &mut SymbolTable,
-) {
-    // First recurse into children so inner constructor references
-    // are rewritten before we consider the current node.
-    match &mut expr.kind {
-        ExprKind::IntLit(_)
-        | ExprKind::FloatLit(_)
-        | ExprKind::StrLit(_)
-        | ExprKind::Name(_) => {}
-        ExprKind::BinOp { lhs, rhs, .. } => {
-            eta_expand_expr(lhs, eta, symbols);
-            eta_expand_expr(rhs, eta, symbols);
-        }
-        ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
-            for a in args {
-                eta_expand_expr(a, eta, symbols);
-            }
-        }
-        ExprKind::Block(stmts, result) => {
-            for stmt in stmts {
-                match stmt {
-                    Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
-                        eta_expand_expr(val, eta, symbols);
-                    }
-                    Stmt::Guard {
-                        condition,
-                        return_val,
-                    } => {
-                        eta_expand_expr(condition, eta, symbols);
-                        eta_expand_expr(return_val, eta, symbols);
-                    }
-                    Stmt::TypeHint { .. } => {}
-                }
-            }
-            eta_expand_expr(result, eta, symbols);
-        }
-        ExprKind::If {
-            expr: scrutinee,
-            arms,
-            else_body,
-        } => {
-            eta_expand_expr(scrutinee, eta, symbols);
-            for arm in arms {
-                for g in &mut arm.guards {
-                    eta_expand_expr(g, eta, symbols);
-                }
-                eta_expand_expr(&mut arm.body, eta, symbols);
-            }
-            if let Some(eb) = else_body {
-                eta_expand_expr(eb, eta, symbols);
-            }
-        }
-        ExprKind::Fold {
-            expr: scrutinee,
-            arms,
-        } => {
-            eta_expand_expr(scrutinee, eta, symbols);
-            for arm in arms {
-                for g in &mut arm.guards {
-                    eta_expand_expr(g, eta, symbols);
-                }
-                eta_expand_expr(&mut arm.body, eta, symbols);
-            }
-        }
-        ExprKind::Lambda { body, .. } => eta_expand_expr(body, eta, symbols),
-        ExprKind::Record { fields } => {
-            for (_, e) in fields {
-                eta_expand_expr(e, eta, symbols);
-            }
-        }
-        ExprKind::FieldAccess { record, .. } => eta_expand_expr(record, eta, symbols),
-        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
-            for e in elems {
-                eta_expand_expr(e, eta, symbols);
-            }
-        }
-        ExprKind::MethodCall { receiver, args, .. } => {
-            eta_expand_expr(receiver, eta, symbols);
-            for a in args {
-                eta_expand_expr(a, eta, symbols);
-            }
-        }
-        ExprKind::Is { expr: inner, .. } => {
-            eta_expand_expr(inner, eta, symbols);
-        }
-        ExprKind::RecordUpdate { base, updates } => {
-            eta_expand_expr(base, eta, symbols);
-            for (_, e) in updates {
-                eta_expand_expr(e, eta, symbols);
-            }
-        }
-    }
-
-    // Post-order rewrite: replace marked callable references
-    // (Name → constructor, FieldAccess → method) with synthesized
-    // Lambdas. The arrow type comes from `expr.ty` which was
-    // resolved by `write_types_back` immediately before this pass
-    // runs, so any post-creation unification on the reference's
-    // type flows through automatically.
-    if let Some(info) = eta.get(&expr.span)
-        && matches!(
-            &expr.kind,
-            ExprKind::Name(_) | ExprKind::FieldAccess { .. }
-        )
-        && matches!(&expr.ty, Type::Arrow(_, _))
-    {
-        rewrite_callable_ref_to_lambda(expr, info, symbols);
-    }
-}
-
-/// Replace a marked callable reference (either a bare constructor
-/// `Name` or a `Type.method` `FieldAccess`) with an explicit Lambda
-/// that forwards its arguments to the underlying call.
-///
-/// Assumes the caller has verified that `expr.ty` is an `Arrow`
-/// and that `expr.kind` is one of the two supported reference
-/// shapes. The arrow's parameter count determines the lambda's
-/// arity; fresh `SymbolId`s are allocated for each parameter.
-fn rewrite_callable_ref_to_lambda(
-    expr: &mut Expr<'_>,
-    info: &EtaInfo,
-    symbols: &mut SymbolTable,
-) {
-    let Type::Arrow(param_types, ret_ty) = expr.ty.clone() else {
-        unreachable!("caller checked expr.ty is Arrow");
-    };
-    let span = expr.span;
-    let param_syms: Vec<SymbolId> = (0..param_types.len())
-        .map(|i| {
-            let name = format!("__eta_{i}");
-            symbols.fresh(name, span, SymbolKind::Local)
-        })
-        .collect();
-    let call_args: Vec<Expr<'_>> = param_syms
-        .iter()
-        .zip(param_types.iter())
-        .map(|(sym, ty)| {
-            let mut name_expr = Expr::new(ExprKind::Name(*sym), span);
-            name_expr.ty = ty.clone();
-            name_expr
-        })
-        .collect();
-
-    // Build the inner call based on which kind of reference we
-    // have. Constructors emit `Call { target, args }`; methods
-    // emit `QualifiedCall { segments, args, resolved }` so the
-    // existing method dispatch pipeline in mono and lowering
-    // picks them up the same way a hand-written call would.
-    let inner_kind = match info {
-        EtaInfo::Constructor { con_sym } => ExprKind::Call {
-            target: *con_sym,
-            args: call_args,
-        },
-        EtaInfo::Method {
-            type_name,
-            method_name,
-        } => {
-            // Leak segment strings to 'static so they satisfy the
-            // 'src lifetime of the AST. Parse-time synthesized
-            // names already follow this pattern (fold_lift,
-            // desugar_try). Leak cost is O(methods-passed-as-args).
-            let type_seg: &'static str =
-                Box::leak(type_name.clone().into_boxed_str());
-            let method_seg: &'static str =
-                Box::leak(method_name.clone().into_boxed_str());
-            // Numeric builtin methods (`I64.add` etc.) are dispatched
-            // via the `__builtin.<op>` marker that `resolve_numeric_builtin`
-            // and the method-call path already use; populating it here
-            // lets the lowerer's existing `strip_prefix("__builtin.")`
-            // handle the eta-expanded call uniformly with hand-written
-            // `x.add(y)` method calls. Non-numeric method references
-            // leave `resolved` at `None` so normal function-call
-            // dispatch handles them.
-            let resolved =
-                InferCtx::is_numeric_builtin(type_name, method_name)
-                    .then(|| format!("__builtin.{method_name}"));
-            ExprKind::QualifiedCall {
-                segments: vec![type_seg, method_seg],
-                args: call_args,
-                resolved,
-            }
-        }
-    };
-    let mut inner_expr = Expr::new(inner_kind, span);
-    inner_expr.ty = *ret_ty;
-
-    expr.kind = ExprKind::Lambda {
-        params: param_syms,
-        body: Box::new(inner_expr),
-    };
-    // `expr.ty` is already the correct arrow type — set when
-    // inference populated expr_types and copied back.
-}
-
-// ---- Write-back of resolved types onto AST nodes ----
-
-/// Walk `module` and copy each expression's resolved type from `expr_types`
-/// into its `Expr::ty` field. `expr_types` already contains fully-resolved
-/// types (including defaulted numeric literals), so this is a simple
-/// span-keyed lookup on every `Expr` node we encounter.
-fn write_types_back(module: &mut Module<'_>, expr_types: &HashMap<Span, Type>) {
-    for decl in &mut module.decls {
-        write_back_decl(decl, expr_types);
-    }
-}
-
-fn write_back_decl(decl: &mut Decl<'_>, expr_types: &HashMap<Span, Type>) {
-    match decl {
-        Decl::FuncDef { body, .. } => write_back_expr(body, expr_types),
-        Decl::TypeAnno { methods, .. } => {
-            for m in methods {
-                write_back_decl(m, expr_types);
-            }
-        }
-    }
-}
-
-fn write_back_expr(expr: &mut Expr<'_>, expr_types: &HashMap<Span, Type>) {
-    if let Some(ty) = expr_types.get(&expr.span) {
-        expr.ty = ty.clone();
-    }
-    match &mut expr.kind {
-        ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) | ExprKind::Name(_) => {}
-        ExprKind::BinOp { lhs, rhs, .. } => {
-            write_back_expr(lhs, expr_types);
-            write_back_expr(rhs, expr_types);
-        }
-        ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
-            for a in args {
-                write_back_expr(a, expr_types);
-            }
-        }
-        ExprKind::Block(stmts, result) => {
-            for s in stmts {
-                write_back_stmt(s, expr_types);
-            }
-            write_back_expr(result, expr_types);
-        }
-        ExprKind::If {
-            expr: scrutinee,
-            arms,
-            else_body,
-        } => {
-            write_back_expr(scrutinee, expr_types);
-            for arm in arms {
-                write_back_arm(arm, expr_types);
-            }
-            if let Some(eb) = else_body {
-                write_back_expr(eb, expr_types);
-            }
-        }
-        ExprKind::Fold {
-            expr: scrutinee,
-            arms,
-        } => {
-            write_back_expr(scrutinee, expr_types);
-            for arm in arms {
-                write_back_arm(arm, expr_types);
-            }
-        }
-        ExprKind::Lambda { body, .. } => write_back_expr(body, expr_types),
-        ExprKind::Record { fields } => {
-            for (_, e) in fields {
-                write_back_expr(e, expr_types);
-            }
-        }
-        ExprKind::FieldAccess { record, .. } => write_back_expr(record, expr_types),
-        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
-            for e in elems {
-                write_back_expr(e, expr_types);
-            }
-        }
-        ExprKind::MethodCall { receiver, args, .. } => {
-            write_back_expr(receiver, expr_types);
-            for a in args {
-                write_back_expr(a, expr_types);
-            }
-        }
-        ExprKind::Is { expr: inner, .. } => write_back_expr(inner, expr_types),
-        ExprKind::RecordUpdate { base, updates } => {
-            write_back_expr(base, expr_types);
-            for (_, e) in updates {
-                write_back_expr(e, expr_types);
-            }
-        }
-    }
-}
-
-fn write_back_arm(arm: &mut ast::MatchArm<'_>, expr_types: &HashMap<Span, Type>) {
-    for g in &mut arm.guards {
-        write_back_expr(g, expr_types);
-    }
-    write_back_expr(&mut arm.body, expr_types);
-}
-
-fn write_back_stmt(stmt: &mut Stmt<'_>, expr_types: &HashMap<Span, Type>) {
-    match stmt {
-        Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
-            write_back_expr(val, expr_types);
-        }
-        Stmt::Guard {
-            condition,
-            return_val,
-        } => {
-            write_back_expr(condition, expr_types);
-            write_back_expr(return_val, expr_types);
-        }
-        Stmt::TypeHint { .. } => {}
-    }
-}
-
-// ---- Write-back of method resolutions onto AST nodes ----
-
-/// Walk `module` and copy each `MethodCall`/`QualifiedCall` resolution
-/// from the side table onto the node's `resolved` field.
-fn write_resolutions_back(module: &mut Module<'_>, resolutions: &HashMap<Span, String>) {
-    for decl in &mut module.decls {
-        write_res_decl(decl, resolutions);
-    }
-}
-
-fn write_res_decl(decl: &mut Decl<'_>, resolutions: &HashMap<Span, String>) {
-    match decl {
-        Decl::FuncDef { body, .. } => write_res_expr(body, resolutions),
-        Decl::TypeAnno { methods, .. } => {
-            for m in methods {
-                write_res_decl(m, resolutions);
-            }
-        }
-    }
-}
-
-fn write_res_expr(expr: &mut Expr<'_>, resolutions: &HashMap<Span, String>) {
-    let span = expr.span;
-    match &mut expr.kind {
-        ExprKind::QualifiedCall { args, resolved, .. } => {
-            if let Some(r) = resolutions.get(&span) {
-                *resolved = Some(r.clone());
-            }
-            for a in args {
-                write_res_expr(a, resolutions);
-            }
-        }
-        ExprKind::MethodCall {
-            receiver,
-            args,
-            resolved,
-            ..
-        } => {
-            if let Some(r) = resolutions.get(&span) {
-                *resolved = Some(r.clone());
-            }
-            write_res_expr(receiver, resolutions);
-            for a in args {
-                write_res_expr(a, resolutions);
-            }
-        }
-        ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) | ExprKind::Name(_) => {}
-        ExprKind::BinOp { lhs, rhs, .. } => {
-            write_res_expr(lhs, resolutions);
-            write_res_expr(rhs, resolutions);
-        }
-        ExprKind::Call { args, .. } => {
-            for a in args {
-                write_res_expr(a, resolutions);
-            }
-        }
-        ExprKind::Block(stmts, result) => {
-            for s in stmts {
-                write_res_stmt(s, resolutions);
-            }
-            write_res_expr(result, resolutions);
-        }
-        ExprKind::If {
-            expr: scrutinee,
-            arms,
-            else_body,
-        } => {
-            write_res_expr(scrutinee, resolutions);
-            for arm in arms {
-                write_res_arm(arm, resolutions);
-            }
-            if let Some(eb) = else_body {
-                write_res_expr(eb, resolutions);
-            }
-        }
-        ExprKind::Fold {
-            expr: scrutinee,
-            arms,
-        } => {
-            write_res_expr(scrutinee, resolutions);
-            for arm in arms {
-                write_res_arm(arm, resolutions);
-            }
-        }
-        ExprKind::Lambda { body, .. } => write_res_expr(body, resolutions),
-        ExprKind::Record { fields } => {
-            for (_, e) in fields {
-                write_res_expr(e, resolutions);
-            }
-        }
-        ExprKind::FieldAccess { record, .. } => write_res_expr(record, resolutions),
-        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
-            for e in elems {
-                write_res_expr(e, resolutions);
-            }
-        }
-        ExprKind::Is { expr: inner, .. } => write_res_expr(inner, resolutions),
-        ExprKind::RecordUpdate { base, updates } => {
-            write_res_expr(base, resolutions);
-            for (_, e) in updates {
-                write_res_expr(e, resolutions);
-            }
-        }
-    }
-}
-
-fn write_res_arm(arm: &mut ast::MatchArm<'_>, resolutions: &HashMap<Span, String>) {
-    for g in &mut arm.guards {
-        write_res_expr(g, resolutions);
-    }
-    write_res_expr(&mut arm.body, resolutions);
-}
-
-fn write_res_stmt(stmt: &mut Stmt<'_>, resolutions: &HashMap<Span, String>) {
-    match stmt {
-        Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
-            write_res_expr(val, resolutions);
-        }
-        Stmt::Guard {
-            condition,
-            return_val,
-        } => {
-            write_res_expr(condition, resolutions);
-            write_res_expr(return_val, resolutions);
-        }
-        Stmt::TypeHint { .. } => {}
-    }
-}
+// Post-inference write-back and eta-expansion moved to
+// `src/types/post_infer.rs` — single combined walk replaces three
+// separate traversals.
