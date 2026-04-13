@@ -232,6 +232,8 @@ fn scan_module<'src>(
         ho_param_sets: HashMap::new(),
         ho_vars: HashMap::new(),
         lambda_counter: 0,
+        current_func: None,
+        current_params: HashMap::new(),
     };
     collect_lambdas(&mut ctx, &module.decls, reachable_set);
     // Post-mono, every call-site target is the canonical mangled
@@ -250,6 +252,10 @@ struct ScanCtx<'a, 'src> {
     ho_param_sets: HashMap<(String, usize), usize>,
     ho_vars: HashMap<SymbolId, usize>,
     lambda_counter: usize,
+    /// Current enclosing function name (for detecting HO calls to params).
+    current_func: Option<String>,
+    /// Parameters of the current function: sym → (func_name, param_index).
+    current_params: HashMap<SymbolId, (String, usize)>,
 }
 
 impl ScanCtx<'_, '_> {
@@ -296,7 +302,10 @@ fn scan_free_functions<'src>(
         {
             let name_str = ctx.symbols.display(*name).to_owned();
             if reachable_set.contains(&name_str) {
+                ctx.current_func = Some(name_str.clone());
+                ctx.current_params.clear();
                 for (i, p) in params.iter().enumerate() {
+                    ctx.current_params.insert(*p, (name_str.clone(), i));
                     let key = (name_str.clone(), i);
                     if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
                         ctx.ho_vars.insert(*p, ls_idx);
@@ -306,6 +315,8 @@ fn scan_free_functions<'src>(
                 for p in params {
                     ctx.ho_vars.remove(p);
                 }
+                ctx.current_func = None;
+                ctx.current_params.clear();
             }
         }
     }
@@ -335,7 +346,10 @@ fn scan_methods<'src>(
                     let method_name_str = ctx.symbols.display(*method_name);
                     let mangled = method_key(&type_name_str, method_name_str);
                     if reachable_set.contains(&mangled) {
+                        ctx.current_func = Some(mangled.clone());
+                        ctx.current_params.clear();
                         for (i, p) in params.iter().enumerate() {
+                            ctx.current_params.insert(*p, (mangled.clone(), i));
                             let key = (mangled.clone(), i);
                             if let Some(&ls_idx) = ctx.ho_param_sets.get(&key) {
                                 ctx.ho_vars.insert(*p, ls_idx);
@@ -345,6 +359,8 @@ fn scan_methods<'src>(
                         for p in params {
                             ctx.ho_vars.remove(p);
                         }
+                        ctx.current_func = None;
+                        ctx.current_params.clear();
                     }
                 }
             }
@@ -358,7 +374,36 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
             let name = ctx.symbols.display(*target).to_owned();
             scan_call_args(ctx, &name, args);
         }
-        ExprKind::Call { args, .. } => {
+        ExprKind::Call { target, args, .. } => {
+            // Call to a non-global target — check if it's a parameter
+            // being called as a function (e.g. `p(input)` where p has
+            // opaque type transparent to Arrow). If so, mark it as
+            // higher-order so defunc generates an apply dispatcher.
+            if !ctx.is_constructor(*target) {
+                if let Some((func_name, param_idx)) = ctx.current_params.get(target).cloned() {
+                    let key = (func_name, param_idx);
+                    if !ctx.ho_param_sets.contains_key(&key) {
+                        // Determine arity from the call site.
+                        let arity = args.len();
+                        let apply_name = format!("__apply_{}_{}", key.0, key.1);
+                        let closure_type_name = format!("__Closure_{}_{}", key.0, key.1);
+                        let idx = ctx.lambda_sets.len();
+                        ctx.lambda_sets.push(LambdaSet {
+                            apply_name,
+                            apply_sym: None,
+                            closure_type_name,
+                            closure_type_sym: None,
+                            entries: Vec::new(),
+                            arity,
+                        });
+                        ctx.ho_param_sets.insert(key.clone(), idx);
+                        ctx.ho_vars.insert(*target, idx);
+                    } else if !ctx.ho_vars.contains_key(target) {
+                        let idx = ctx.ho_param_sets[&key];
+                        ctx.ho_vars.insert(*target, idx);
+                    }
+                }
+            }
             for arg in args {
                 scan_expr(ctx, arg);
             }
@@ -1029,30 +1074,34 @@ impl<'src> Rewriter<'_, 'src> {
                 };
             }
             ExprKind::Name(sym) => {
-                // Two cases:
-                // - Global function ref: emit the nullary func_ref
-                //   constructor.
+                // Three cases:
                 // - Pass-through local HO var: leave as-is (the
                 //   inner value is already a closure).
+                // - Global function ref: emit the nullary func_ref
+                //   constructor.
+                // - Local variable holding a closure (e.g. let-bound
+                //   result of a constructor): leave as-is.
                 if self.ho_vars.contains_key(sym) {
-                    // Pass-through — no rewrite.
+                    // Pass-through HO param — no rewrite.
                 } else {
-                    // Global function ref: find its entry.
                     let target_display = self.symbols.display(*sym).to_owned();
-                    let entry_idx = self
+                    let maybe_entry = self
                         .lambda_sets[ls_idx]
                         .entries
                         .iter()
-                        .position(|e| e.func_ref.as_deref() == Some(target_display.as_str()))
-                        .expect("global func ref must correspond to a scanned entry");
-                    let entry = &self.lambda_sets[ls_idx].entries[entry_idx];
-                    let tag_sym = entry
-                        .tag_sym
-                        .expect("tag_sym must be allocated before rewrite");
-                    arg.kind = ExprKind::Call {
-                        target: tag_sym,
-                        args: Vec::new(),
-                    };
+                        .position(|e| e.func_ref.as_deref() == Some(target_display.as_str()));
+                    if let Some(entry_idx) = maybe_entry {
+                        // Global function ref: find its entry.
+                        let entry = &self.lambda_sets[ls_idx].entries[entry_idx];
+                        let tag_sym = entry
+                            .tag_sym
+                            .expect("tag_sym must be allocated before rewrite");
+                        arg.kind = ExprKind::Call {
+                            target: tag_sym,
+                            args: Vec::new(),
+                        };
+                    }
+                    // else: local variable already holding a closure — leave as-is.
                 }
             }
             _ => {
