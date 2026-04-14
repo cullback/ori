@@ -7,8 +7,8 @@ fn run(source: &str, input: i64) -> Scalar {
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::fold_lift::lift(&mut resolved);
+    crate::passes::flatten_patterns::flatten(&mut resolved);
     crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let mut mono =
@@ -59,8 +59,8 @@ fn infer_func_type(source: &str, func: &str) -> String {
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::fold_lift::lift(&mut resolved);
+    crate::passes::flatten_patterns::flatten(&mut resolved);
     crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved)
         .unwrap_or_else(|e| panic!("infer failed: {}", e.format(&arena)));
@@ -128,8 +128,8 @@ fn infer_err(source: &str) -> String {
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::fold_lift::lift(&mut resolved);
+    crate::passes::flatten_patterns::flatten(&mut resolved);
     crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     match crate::types::infer::check(&mut resolved) {
         Ok(_) => panic!("expected inference to fail, but it succeeded"),
@@ -2695,7 +2695,7 @@ main = |arg| f(arg)";
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    crate::passes::fold_lift::lift(&mut resolved);
     let err = crate::passes::topo::compute(&mut resolved.module, &resolved.symbols)
         .expect_err("expected cycle detection error");
     let msg = err.format(&arena);
@@ -2777,8 +2777,8 @@ fn compile_to_ssa(source: &str) -> crate::ssa::Module {
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::fold_lift::lift(&mut resolved);
+    crate::passes::flatten_patterns::flatten(&mut resolved);
     crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let mut mono =
@@ -2960,8 +2960,8 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, arena, None).unwrap();
-    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::fold_lift::lift(&mut resolved);
+    crate::passes::flatten_patterns::flatten(&mut resolved);
     crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let mut mono =
@@ -3129,8 +3129,8 @@ mod ast_snapshots {
             .unwrap_or_else(|e| panic!("parse failed for {source_path}: {e:?}"));
         let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None)
             .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
-        resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
-        resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+        crate::passes::fold_lift::lift(&mut resolved);
+        crate::passes::flatten_patterns::flatten(&mut resolved);
         crate::passes::topo::compute(&mut resolved.module, &resolved.symbols)
             .unwrap_or_else(|e| panic!("topo failed for {source_path}: {e:?}"));
         crate::types::infer::check(&mut resolved)

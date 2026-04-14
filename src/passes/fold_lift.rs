@@ -18,12 +18,17 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast;
+use crate::passes::resolve::Resolved;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 
 /// Lift every `Fold` expression in `module` to a top-level `__fold_N`
-/// helper function. Returns the rewritten module. `symbols` is used to
-/// allocate fresh `SymbolId`s for each synthesized helper.
-pub fn lift<'src>(mut module: ast::Module<'src>, symbols: &mut SymbolTable) -> ast::Module<'src> {
+/// helper function.
+pub fn lift(resolved: &mut Resolved<'_>) {
+    let module = std::mem::take(&mut resolved.module);
+    resolved.module = lift_module(module, &mut resolved.symbols);
+}
+
+fn lift_module<'src>(mut module: ast::Module<'src>, symbols: &mut SymbolTable) -> ast::Module<'src> {
     let recursive_fields = collect_recursive_fields(&module, symbols);
 
     let mut ctx = LiftCtx {

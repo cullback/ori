@@ -90,10 +90,16 @@
 use crate::ast::{
     BinOp, Decl, Expr, ExprKind, ListPatternElem, MatchArm, Module, Pattern, Span, Stmt,
 };
+use crate::passes::resolve::Resolved;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 
-/// Run the pass. Mutates the module in place and returns it.
-pub fn flatten<'src>(mut module: Module<'src>, symbols: &mut SymbolTable) -> Module<'src> {
+/// Flatten nested patterns into shallow match chains.
+pub fn flatten(resolved: &mut Resolved<'_>) {
+    let module = std::mem::take(&mut resolved.module);
+    resolved.module = flatten_module(module, &mut resolved.symbols);
+}
+
+fn flatten_module<'src>(mut module: Module<'src>, symbols: &mut SymbolTable) -> Module<'src> {
     let mut ctx = FlattenCtx {
         temp_counter: 0,
         synth_span_offset: SPAN_OFFSET_BASE,

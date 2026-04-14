@@ -39,8 +39,8 @@ fn resolve(
 fn compile(
     mut resolved: passes::resolve::Resolved<'static>,
 ) -> Result<(crate::ssa::Module, Vec<crate::ssa::Value>), CompileError> {
-    resolved.module = passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    passes::fold_lift::lift(&mut resolved);
+    passes::flatten_patterns::flatten(&mut resolved);
     passes::topo::compute(&mut resolved.module, &resolved.symbols)?;
     let infer_result = types::infer::check(&mut resolved)?;
     let mut mono = passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
