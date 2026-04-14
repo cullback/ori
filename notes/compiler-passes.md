@@ -1,4 +1,4 @@
-# Compiler phases
+# Compiler passes
 
 Pipeline in `src/main.rs::compile`. Every phase between `resolve` and
 `ssa::lower` is a pure `Module -> Module` rewrite on a single AST
@@ -28,6 +28,7 @@ PEG parser (pest) with Pratt operator precedence. Produces
 `&'src str`. No scoping, no types.
 
 Parse-time desugars:
+
 - **Char literals** — `'x'` → `IntLit(code_point)`
 - **String interpolation** — `"${e}"` → `MethodCall` concat chain
 - **Dot-lambdas** — `.method(args)` → `|x| x.method(args)`
@@ -42,6 +43,7 @@ Walks `import` statements, recursively parses imported files, and
 converts the raw tree into `ast::Module<'src>` via `ast::from_raw`.
 
 `from_raw` does the real work:
+
 - Allocates a `SymbolId` for every binding site (top-level, params,
   locals, pattern bindings) through `SymbolTable`.
 - Runs a scope-stack name resolver that rewrites every `Name`, call
@@ -110,6 +112,7 @@ Hindley-Milner with row polymorphism, driven through `types/engine.rs`
 place.
 
 Three sub-passes:
+
 - **2a** — transparency setup (`Str := List(U8)`), body-less
   validation of user method annotations. Parameterized transparent
   types store `(Vec<TypeVar>, Type)` in the transparent map so App
@@ -148,6 +151,7 @@ Worklist monomorphization. Starts from `main` (already concrete) and
 drains `(SymbolId, Vec<Type>)` specialization requests.
 
 For each request:
+
 1. Normalize the type vector (resolve vars, collapse `Str ↔ List(U8)`,
    canonicalize record rows and field order).
 2. If already specialized, reuse.

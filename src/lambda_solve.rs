@@ -113,6 +113,12 @@ pub fn solve(
         }
     }
 
+    // Completion: ensure every Closure in the module has its func in
+    // at least one lambda set. Closures the flow analysis missed (deep
+    // method-return chains, etc.) get singleton fallback sets so the
+    // specialize pass can rewrite them to constructor calls.
+    ensure_all_closures_registered(&mut ctx, &module.decls);
+
     LambdaSolution {
         sets: ctx.sets,
         param_to_set: ctx.param_to_set,
@@ -800,6 +806,114 @@ fn register_func_ref(
         captures: Vec::new(),
         func_ref: Some(display),
     });
+}
+
+/// Ensure every Closure node's func is registered in at least one
+/// lambda set. Creates singleton fallback sets for any missed.
+fn ensure_all_closures_registered(ctx: &mut SolveCtx<'_>, decls: &[Decl<'_>]) {
+    let mut missing: Vec<(SymbolId, Vec<SymbolId>)> = Vec::new();
+    collect_missing_closures(ctx, decls, &mut missing);
+    for (func_sym, captures) in missing {
+        let func_name = ctx.symbols.display(func_sym).to_owned();
+        let total_params = ctx.func_arities.get(&func_name).copied().unwrap_or(0);
+        let arity = total_params.saturating_sub(captures.len());
+        let key_name = format!("__fallback_{func_name}");
+        let ls_idx = new_lambda_set(ctx, &key_name, 0, arity);
+        register_closure(ctx, ls_idx, func_sym, captures);
+    }
+}
+
+fn collect_missing_closures(
+    ctx: &SolveCtx<'_>,
+    decls: &[Decl<'_>],
+    out: &mut Vec<(SymbolId, Vec<SymbolId>)>,
+) {
+    for decl in decls {
+        match decl {
+            Decl::FuncDef { body, .. } => collect_missing_in_expr(ctx, body, out),
+            Decl::TypeAnno { methods, .. } => {
+                for m in methods {
+                    if let Decl::FuncDef { body, .. } = m {
+                        collect_missing_in_expr(ctx, body, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_missing_in_expr(
+    ctx: &SolveCtx<'_>,
+    expr: &Expr<'_>,
+    out: &mut Vec<(SymbolId, Vec<SymbolId>)>,
+) {
+    match &expr.kind {
+        ExprKind::Closure { func, captures } => {
+            let in_any_set = ctx.sets.iter()
+                .any(|s| s.entries.iter().any(|e| e.lifted_func == *func));
+            if !in_any_set {
+                out.push((*func, collect_capture_syms(captures)));
+            }
+            for c in captures {
+                collect_missing_in_expr(ctx, c, out);
+            }
+        }
+        ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
+            for a in args { collect_missing_in_expr(ctx, a, out); }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_missing_in_expr(ctx, receiver, out);
+            for a in args { collect_missing_in_expr(ctx, a, out); }
+        }
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_missing_in_expr(ctx, lhs, out);
+            collect_missing_in_expr(ctx, rhs, out);
+        }
+        ExprKind::Block(stmts, result) => {
+            for s in stmts {
+                match s {
+                    Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
+                        collect_missing_in_expr(ctx, val, out);
+                    }
+                    Stmt::Guard { condition, return_val } => {
+                        collect_missing_in_expr(ctx, condition, out);
+                        collect_missing_in_expr(ctx, return_val, out);
+                    }
+                    Stmt::TypeHint { .. } => {}
+                }
+            }
+            collect_missing_in_expr(ctx, result, out);
+        }
+        ExprKind::If { expr: s, arms, else_body } => {
+            collect_missing_in_expr(ctx, s, out);
+            for arm in arms {
+                for g in &arm.guards { collect_missing_in_expr(ctx, g, out); }
+                collect_missing_in_expr(ctx, &arm.body, out);
+            }
+            if let Some(eb) = else_body { collect_missing_in_expr(ctx, eb, out); }
+        }
+        ExprKind::Fold { expr: s, arms } => {
+            collect_missing_in_expr(ctx, s, out);
+            for arm in arms {
+                for g in &arm.guards { collect_missing_in_expr(ctx, g, out); }
+                collect_missing_in_expr(ctx, &arm.body, out);
+            }
+        }
+        ExprKind::Lambda { body, .. } => collect_missing_in_expr(ctx, body, out),
+        ExprKind::Record { fields } => {
+            for (_, e) in fields { collect_missing_in_expr(ctx, e, out); }
+        }
+        ExprKind::RecordUpdate { base, updates } => {
+            collect_missing_in_expr(ctx, base, out);
+            for (_, e) in updates { collect_missing_in_expr(ctx, e, out); }
+        }
+        ExprKind::FieldAccess { record, .. } => collect_missing_in_expr(ctx, record, out),
+        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
+            for e in elems { collect_missing_in_expr(ctx, e, out); }
+        }
+        ExprKind::Is { expr: inner, .. } => collect_missing_in_expr(ctx, inner, out),
+        ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) | ExprKind::Name(_) => {}
+    }
 }
 
 fn is_list_walk(name: &str) -> bool {
