@@ -10,6 +10,6 @@ parse_box = |input| Parser.sequence({
 main : List(Str), Str -> Result(Str, Str)
 main = |args, input| (
     (result, rest) = parse_box(Str.to_utf8(input))?
-    Ok("${U64.to_str(result.l)}x${U64.to_str(result.w)}x${U64.to_str(result.h)}")
+    Ok("${result}")
 )
 

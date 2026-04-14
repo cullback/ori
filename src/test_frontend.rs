@@ -3047,11 +3047,17 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     .unwrap();
     let (mono_module, mono_infer) =
         crate::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let defunc_module = crate::defunc::rewrite(
-        mono_module,
+    let lifted_module = crate::lambda_lift::lift(mono_module, &mut resolved.symbols);
+    let lambda_solution = crate::lambda_solve::solve(
+        &lifted_module,
         arena,
         &resolved.scope,
         &mono_infer,
+        &resolved.symbols,
+    );
+    let defunc_module = crate::lambda_specialize::specialize(
+        lifted_module,
+        &lambda_solution,
         &mut resolved.symbols,
     );
     let pre_prune_decls = crate::decl_info::build(

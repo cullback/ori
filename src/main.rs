@@ -1,7 +1,6 @@
 mod ast;
 mod ast_display;
 mod decl_info;
-mod defunc;
 mod error;
 mod flatten_patterns;
 mod fold_lift;
