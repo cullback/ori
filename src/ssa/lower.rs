@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};
 use crate::passes::decl_info::{self, DeclInfo, method_key, type_to_scalar};
+use crate::passes::mono::Monomorphized;
 use crate::error::CompileError;
 use crate::ssa::Module;
 use crate::ssa::builder::Builder;
@@ -10,18 +11,13 @@ use crate::symbol::{FieldInterner, SymbolId, SymbolTable};
 use crate::types::engine::Type;
 use crate::types::infer::InferResult;
 
-/// Lower a parsed AST module directly to SSA IR.
-///
-/// Returns the SSA module and a list of SSA values representing main's parameters
-/// (that the runtime must bind before evaluation).
-pub fn lower<'src>(
-    module: &ast::Module<'src>,
-    infer_result: &InferResult,
-    symbols: &crate::symbol::SymbolTable,
+/// Lower a monomorphized AST module to SSA IR.
+pub fn lower(
+    mono: &Monomorphized<'_>,
     fields: &FieldInterner,
 ) -> Result<(Module, Vec<Value>), CompileError> {
-    let decls = decl_info::build(module, infer_result, symbols);
-    lower_to_ssa(module, infer_result, &decls, symbols, fields)
+    let decls = decl_info::build(mono);
+    lower_to_ssa(&mono.module, &mono.infer, &decls, &mono.symbols, fields)
 }
 
 // ---- SSA lowering context ----

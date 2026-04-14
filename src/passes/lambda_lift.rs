@@ -16,10 +16,16 @@
 use std::collections::HashSet;
 
 use crate::ast::{self, Decl, Expr, ExprKind, Module, Span, Stmt};
+use crate::passes::mono::Monomorphized;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 
 /// Lift all lambdas in the module to top-level FuncDefs.
-pub fn lift<'src>(module: Module<'src>, symbols: &mut SymbolTable) -> Module<'src> {
+pub fn lift(mono: &mut Monomorphized<'_>) {
+    let module = std::mem::take(&mut mono.module);
+    mono.module = lift_module(module, &mut mono.symbols);
+}
+
+fn lift_module<'src>(module: Module<'src>, symbols: &mut SymbolTable) -> Module<'src> {
     let mut ctx = LiftCtx {
         symbols,
         lifted: Vec::new(),

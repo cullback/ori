@@ -67,14 +67,21 @@ use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 use crate::types::engine::{Scheme, Type, TypeVar};
 use crate::types::infer::InferResult;
 
+/// Post-monomorphization state: fully concrete module, specialized
+/// inference results, and the symbol table (which gains new entries
+/// for specialized function copies).
+pub struct Monomorphized<'src> {
+    pub module: Module<'src>,
+    pub infer: InferResult,
+    pub symbols: SymbolTable,
+}
+
 /// Specialize every polymorphic function reachable from `main`.
-/// Returns the rewritten module and a new `InferResult` reflecting
-/// the specialized schemes.
 pub fn specialize<'src>(
     module: Module<'src>,
     infer_result: InferResult,
-    symbols: &mut SymbolTable,
-) -> (Module<'src>, InferResult) {
+    mut symbols: SymbolTable,
+) -> Monomorphized<'src> {
     // The module lives for this function. We destructure it into
     // its parts so we can borrow from `input_decls` while the
     // worklist processes bodies (Phase 1–3) and then consume
@@ -88,7 +95,7 @@ pub fn specialize<'src>(
     } = module;
 
     let (specialized, specialized_schemes) = {
-        let mut ctx = MonoCtx::new(&infer_result, symbols);
+        let mut ctx = MonoCtx::new(&infer_result, &mut symbols);
 
         // Pass 1: index every `FuncDef` (free or method) by its
         // fully mangled name so the worklist can look up bodies.
@@ -172,14 +179,15 @@ pub fn specialize<'src>(
 
     let new_infer = build_new_infer_result(&infer_result, &specialized_schemes);
 
-    (
-        Module {
+    Monomorphized {
+        module: Module {
             exports,
             imports,
             decls: out_decls,
         },
-        new_infer,
-    )
+        infer: new_infer,
+        symbols,
+    }
 }
 
 // ---- Mono context ----

@@ -27,7 +27,7 @@ use crate::types::engine::{Type, TypeVar};
 
 // ---- Module ----
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Module<'src> {
     pub exports: Vec<&'src str>,
     pub imports: Vec<Import<'src>>,

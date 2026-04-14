@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Decl, TypeExpr};
+use crate::passes::mono::Monomorphized;
 use crate::ssa::ScalarType;
 use crate::symbol::SymbolTable;
 use crate::types::engine::{Scheme, Type};
@@ -79,11 +80,8 @@ pub struct DeclInfo {
 }
 
 /// Build `DeclInfo` from the resolved module declarations.
-pub fn build<'src>(
-    module: &ast::Module<'src>,
-    infer_result: &InferResult,
-    symbols: &SymbolTable,
-) -> DeclInfo {
+pub fn build(mono: &Monomorphized<'_>) -> DeclInfo {
+    let (module, infer_result, symbols) = (&mono.module, &mono.infer, &mono.symbols);
     let mut info = DeclInfo {
         funcs: HashSet::new(),
         func_arities: HashMap::new(),

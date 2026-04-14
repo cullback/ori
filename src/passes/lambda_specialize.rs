@@ -29,11 +29,17 @@ use crate::ast::{
     TypeExpr,
 };
 use crate::passes::lambda_solve::{LambdaEntry, LambdaSet, LambdaSolution};
+use crate::passes::mono::Monomorphized;
 use crate::source::SourceArena;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 
 /// Specialize the module using the lambda set solution.
-pub fn specialize<'src>(
+pub fn specialize(mono: &mut Monomorphized<'_>, solution: &LambdaSolution) {
+    let module = std::mem::take(&mut mono.module);
+    mono.module = specialize_module(module, solution, &mut mono.symbols);
+}
+
+fn specialize_module<'src>(
     module: Module<'src>,
     solution: &LambdaSolution,
     symbols: &mut SymbolTable,

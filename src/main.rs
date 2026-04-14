@@ -43,31 +43,13 @@ fn compile(
     resolved.module = passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
     passes::topo::compute(&mut resolved.module, &resolved.symbols)?;
     let infer_result = types::infer::check(&mut resolved)?;
-    let (mono_module, mono_infer) =
-        passes::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let lifted_module = passes::lambda_lift::lift(mono_module, &mut resolved.symbols);
-    let lambda_solution = passes::lambda_solve::solve(
-        &lifted_module,
-        &mono_infer,
-        &resolved.symbols,
-    );
-    let defunc_module = passes::lambda_specialize::specialize(
-        lifted_module,
-        &lambda_solution,
-        &mut resolved.symbols,
-    );
-    let pre_prune_decls = passes::decl_info::build(
-        &defunc_module,
-        &mono_infer,
-        &resolved.symbols,
-    );
-    resolved.module = passes::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
-    ssa::lower::lower(
-        &resolved.module,
-        &mono_infer,
-        &resolved.symbols,
-        &resolved.fields,
-    )
+    let mut mono = passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
+    passes::lambda_lift::lift(&mut mono);
+    let lambda_solution = passes::lambda_solve::solve(&mono);
+    passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
+    let pre_prune_decls = passes::decl_info::build(&mono);
+    passes::reachable::prune(&mut mono, &pre_prune_decls);
+    ssa::lower::lower(&mono, &resolved.fields)
 }
 
 fn bytes_to_scalar(bytes: &[u8], heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {

@@ -13,13 +13,16 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Decl, Expr, ExprKind, Module, Stmt};
 use crate::passes::decl_info::{DeclInfo, method_key};
+use crate::passes::mono::Monomorphized;
 use crate::symbol::SymbolTable;
 
-/// Rewrite `module` so that every remaining `FuncDef` (free function
-/// or method) is reachable from `main`. `TypeAnno` decls are kept
-/// unconditionally — their constructors might be referenced from
-/// match arms, and `decl_info` needs them for tag-index bookkeeping.
-pub fn prune<'src>(
+/// Drop unreachable decls from the module.
+pub fn prune(mono: &mut Monomorphized<'_>, decls: &DeclInfo) {
+    let module = std::mem::take(&mut mono.module);
+    mono.module = prune_module(module, decls, &mono.symbols);
+}
+
+fn prune_module<'src>(
     module: Module<'src>,
     decls: &DeclInfo,
     symbols: &SymbolTable,

@@ -19,11 +19,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Decl, Expr, ExprKind, Module, Stmt};
+use crate::ast::{Decl, Expr, ExprKind, Stmt};
 use crate::passes::decl_info::{self, method_key};
+use crate::passes::mono::Monomorphized;
 use crate::passes::reachable;
 use crate::symbol::{SymbolId, SymbolTable};
-use crate::types::infer::InferResult;
 
 // ---- Public types ----
 
@@ -159,12 +159,9 @@ fn snapshot(ctx: &Ctx<'_>) -> usize {
 
 // ---- Entry point ----
 
-pub fn solve(
-    module: &Module<'_>,
-    infer_result: &InferResult,
-    symbols: &SymbolTable,
-) -> LambdaSolution {
-    let decls = decl_info::build(module, infer_result, symbols);
+pub fn solve(mono: &Monomorphized<'_>) -> LambdaSolution {
+    let (module, symbols) = (&mono.module, &mono.symbols);
+    let decls = decl_info::build(mono);
     let reachable = reachable::compute(&decls, module, symbols);
 
     let mut ctx = Ctx {

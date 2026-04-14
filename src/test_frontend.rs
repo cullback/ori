@@ -11,32 +11,14 @@ fn run(source: &str, input: i64) -> Scalar {
     resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
     crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
-    let (mono_module, mono_infer) =
-        crate::passes::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let lifted_module = crate::passes::lambda_lift::lift(mono_module, &mut resolved.symbols);
-    let lambda_solution = crate::passes::lambda_solve::solve(
-        &lifted_module,
-        &mono_infer,
-        &resolved.symbols,
-    );
-    let defunc_module = crate::passes::lambda_specialize::specialize(
-        lifted_module,
-        &lambda_solution,
-        &mut resolved.symbols,
-    );
-    let pre_prune_decls = crate::passes::decl_info::build(
-        &defunc_module,
-        &mono_infer,
-        &resolved.symbols,
-    );
-    resolved.module = crate::passes::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
-    let (ssa_module, input_vals) = crate::ssa::lower::lower(
-        &resolved.module,
-        &mono_infer,
-        &resolved.symbols,
-        &resolved.fields,
-    )
-    .unwrap();
+    let mut mono =
+        crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
+    crate::passes::lambda_lift::lift(&mut mono);
+    let lambda_solution = crate::passes::lambda_solve::solve(&mono);
+    crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
+    let pre_prune_decls = crate::passes::decl_info::build(&mono);
+    crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
+    let (ssa_module, input_vals) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
 
     let mut heap = crate::ssa::eval::new_heap();
     let ssa_args: Vec<Scalar> = input_vals
@@ -2799,32 +2781,14 @@ fn compile_to_ssa(source: &str) -> crate::ssa::Module {
     resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
     crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
-    let (mono_module, mono_infer) =
-        crate::passes::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let lifted_module = crate::passes::lambda_lift::lift(mono_module, &mut resolved.symbols);
-    let lambda_solution = crate::passes::lambda_solve::solve(
-        &lifted_module,
-        &mono_infer,
-        &resolved.symbols,
-    );
-    let defunc_module = crate::passes::lambda_specialize::specialize(
-        lifted_module,
-        &lambda_solution,
-        &mut resolved.symbols,
-    );
-    let pre_prune_decls = crate::passes::decl_info::build(
-        &defunc_module,
-        &mono_infer,
-        &resolved.symbols,
-    );
-    resolved.module = crate::passes::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
-    let (ssa, _) = crate::ssa::lower::lower(
-        &resolved.module,
-        &mono_infer,
-        &resolved.symbols,
-        &resolved.fields,
-    )
-    .unwrap();
+    let mut mono =
+        crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
+    crate::passes::lambda_lift::lift(&mut mono);
+    let lambda_solution = crate::passes::lambda_solve::solve(&mono);
+    crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
+    let pre_prune_decls = crate::passes::decl_info::build(&mono);
+    crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
+    let (ssa, _) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
     ssa
 }
 
@@ -3000,26 +2964,14 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
     crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
-    let (mono_module, mono_infer) =
-        crate::passes::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let lifted_module = crate::passes::lambda_lift::lift(mono_module, &mut resolved.symbols);
-    let lambda_solution = crate::passes::lambda_solve::solve(
-        &lifted_module,
-        &mono_infer,
-        &resolved.symbols,
-    );
-    let defunc_module = crate::passes::lambda_specialize::specialize(
-        lifted_module,
-        &lambda_solution,
-        &mut resolved.symbols,
-    );
-    let pre_prune_decls = crate::passes::decl_info::build(
-        &defunc_module,
-        &mono_infer,
-        &resolved.symbols,
-    );
-    let pruned = crate::passes::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
-    (pruned, resolved.symbols)
+    let mut mono =
+        crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
+    crate::passes::lambda_lift::lift(&mut mono);
+    let lambda_solution = crate::passes::lambda_solve::solve(&mono);
+    crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
+    let pre_prune_decls = crate::passes::decl_info::build(&mono);
+    crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
+    (mono.module, mono.symbols)
 }
 
 #[test]
