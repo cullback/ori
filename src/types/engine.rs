@@ -129,6 +129,9 @@ pub struct Constraint {
     pub type_var: TypeVar,
     pub method_name: String,
     pub method_type: Type,
+    /// Source span of the expression that generated this constraint.
+    /// `None` for constraints generated during scheme instantiation.
+    pub span: Option<crate::ast::Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -694,6 +697,7 @@ impl TypeEngine {
                 type_var: new_tv,
                 method_name: c.method_name.clone(),
                 method_type: Self::apply_mapping(&c.method_type, &mapping),
+                span: None,
             });
         }
         Self::apply_mapping(&scheme.ty, &mapping)

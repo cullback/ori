@@ -51,8 +51,6 @@ struct InferCtx<'a, 'src> {
     /// Declared type annotations for checking against inferred types.
     type_annos: HashMap<String, TypeExpr<'src>>,
     known_types: std::collections::HashSet<String>,
-    /// Span for each constraint (parallel to engine.constraints).
-    constraint_spans: Vec<Span>,
     /// Return type of each enclosing function/lambda, innermost on
     /// top. `return` statements unify against the top. Depth is
     /// bounded by lambda nesting (System T forbids recursion, so
@@ -98,7 +96,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             type_aliases: HashMap::new(),
             type_annos: HashMap::new(),
             known_types: std::collections::HashSet::new(),
-            constraint_spans: Vec::new(),
             ret_ty_stack: Vec::new(),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
@@ -111,9 +108,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
     }
 
-    fn push_constraint(&mut self, constraint: Constraint, span: Span) {
+    fn push_constraint(&mut self, mut constraint: Constraint, span: Span) {
+        constraint.span = Some(span);
         self.engine.constraints.push(constraint);
-        self.constraint_spans.push(span);
     }
 
     fn type_error(span: Span, msg: &str) -> CompileError {
@@ -1184,6 +1181,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     type_var: tv,
                     method_name: method_name.to_owned(),
                     method_type,
+                    span: None,
                 },
                 span,
             );
@@ -1276,6 +1274,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     type_var: tv,
                     method_name: method.to_owned(),
                     method_type,
+                    span: None,
                 },
                 span,
             );
@@ -1654,7 +1653,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             for i in remaining {
                 let c = self.engine.constraints[i].clone();
                 let resolved = self.engine.resolve(&Type::Var(c.type_var));
-                let maybe_span = self.constraint_spans.get(i).copied();
+                let maybe_span = c.span;
 
                 // Record types: compiler-generated equals/to_str.
                 if let Type::Record { .. } = &resolved

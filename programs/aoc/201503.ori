@@ -1,0 +1,24 @@
+# Advent of Code 2015, Day 3: Perfectly Spherical Houses in a Vacuum
+
+step = |pos, ch|
+    if ch
+      : '>' then { x: pos.x + 1, y: pos.y }
+      : '<' then { x: pos.x - 1, y: pos.y }
+      : '^' then { x: pos.x, y: pos.y + 1 }
+      : 'v' then { x: pos.x, y: pos.y - 1 }
+      else pos
+
+part1 : Str -> U64
+part1 = |input| (
+    start = { x: 0, y: 0 }
+    state = input.to_utf8().walk({ pos: start, visited: [start] }, |acc, ch| (
+        next = step(acc.pos, ch)
+        if acc.visited.contains(next)
+            then { pos: next, visited: acc.visited }
+            else { pos: next, visited: List.append(acc.visited, next) }
+    ))
+    List.len(state.visited)
+)
+
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| Ok(part1(input).to_str())
