@@ -39,7 +39,8 @@ use crate::symbol::SymbolTable;
 /// Reorder `module.decls` so free-function `FuncDef`s appear in
 /// dependency order. Returns `Err` with a "System T violation" message
 /// if any non-self cycle is detected.
-pub fn compute(module: &mut ast::Module<'_>, symbols: &SymbolTable) -> Result<(), CompileError> {
+pub fn compute(resolved: &mut crate::passes::resolve::Resolved<'_>) -> Result<(), CompileError> {
+    let (module, symbols) = (&mut resolved.module, &resolved.symbols);
     let (free_fn_indices, free_fn_names) = collect_free_fns(&module.decls, symbols);
     let graph = build_call_graph(&module.decls, &free_fn_names, symbols);
     detect_cycles(&graph, &free_fn_names)?;

@@ -9,7 +9,7 @@ fn run(source: &str, input: i64) -> Scalar {
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     crate::passes::fold_lift::lift(&mut resolved);
     crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    crate::passes::topo::compute(&mut resolved).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let mut mono =
         crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
@@ -61,7 +61,7 @@ fn infer_func_type(source: &str, func: &str) -> String {
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     crate::passes::fold_lift::lift(&mut resolved);
     crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    crate::passes::topo::compute(&mut resolved).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved)
         .unwrap_or_else(|e| panic!("infer failed: {}", e.format(&arena)));
     let scheme = infer_result
@@ -130,7 +130,7 @@ fn infer_err(source: &str) -> String {
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     crate::passes::fold_lift::lift(&mut resolved);
     crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    crate::passes::topo::compute(&mut resolved).unwrap();
     match crate::types::infer::check(&mut resolved) {
         Ok(_) => panic!("expected inference to fail, but it succeeded"),
         Err(e) => e.format(&arena),
@@ -2696,7 +2696,7 @@ main = |arg| f(arg)";
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     crate::passes::fold_lift::lift(&mut resolved);
-    let err = crate::passes::topo::compute(&mut resolved.module, &resolved.symbols)
+    let err = crate::passes::topo::compute(&mut resolved)
         .expect_err("expected cycle detection error");
     let msg = err.format(&arena);
     assert!(
@@ -2779,7 +2779,7 @@ fn compile_to_ssa(source: &str) -> crate::ssa::Module {
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
     crate::passes::fold_lift::lift(&mut resolved);
     crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    crate::passes::topo::compute(&mut resolved).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let mut mono =
         crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
@@ -2962,7 +2962,7 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     let mut resolved = crate::passes::resolve::resolve_imports(parsed, arena, None).unwrap();
     crate::passes::fold_lift::lift(&mut resolved);
     crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    crate::passes::topo::compute(&mut resolved).unwrap();
     let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let mut mono =
         crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
@@ -3131,7 +3131,7 @@ mod ast_snapshots {
             .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
         crate::passes::fold_lift::lift(&mut resolved);
         crate::passes::flatten_patterns::flatten(&mut resolved);
-        crate::passes::topo::compute(&mut resolved.module, &resolved.symbols)
+        crate::passes::topo::compute(&mut resolved)
             .unwrap_or_else(|e| panic!("topo failed for {source_path}: {e:?}"));
         crate::types::infer::check(&mut resolved)
         .unwrap_or_else(|e| panic!("infer failed for {source_path}: {e:?}"));
