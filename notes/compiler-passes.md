@@ -14,7 +14,9 @@ source
   ↓ topo                 ast::Module (decls in call-graph order)
   ↓ infer                ast::Module with Expr.ty filled in, InferResult
   ↓ mono                 ast::Module (monomorphic only)
-  ↓ defunc               ast::Module (no Lambda nodes)
+  ↓ lambda_lift          ast::Module (Lambdas → Closure nodes + lifted FuncDefs)
+  ↓ lambda_solve         LambdaSolution (which closures flow where)
+  ↓ lambda_specialize    ast::Module (no Lambda/Closure nodes, apply dispatch)
   ↓ decl_info            side tables for lowering
   ↓ reachable::prune     ast::Module (only reachable decls)
   ↓ ssa::lower           ssa::Module
@@ -170,31 +172,60 @@ Outputs a module with only monomorphic `FuncDef`s, plus a new
 `InferResult` whose `func_schemes` are all `Type::Arrow`. Non-
 termination is impossible because System T forbids user recursion.
 
-## defunc — `src/defunc.rs`
+## lambda_lift — `src/lambda_lift.rs`
 
-Lambda elimination via standard defunctionalization.
+Converts every `Lambda` expression into a top-level `FuncDef` with
+captures as extra leading parameters, replacing the Lambda node with
+a `Closure { func, captures }` value. The lifted FuncDefs are
+prepended before the function whose body references their Closure
+(inner lambdas before outer), giving a topo-compatible ordering for
+the solve pass.
 
-1. **Scan** every reachable function body for lambda sites and
-   higher-order parameters. Group lambdas by the HO parameter slot
-   they flow into (a "lambda set").
-2. **Synthesize** per set:
-   - A `TagDecl` closure type, one variant per lambda, each carrying
-     the lambda's captured values as fields.
-   - An `__apply_K` `FuncDef` that takes the closure plus the original
-     arguments and dispatches on tag.
-3. **Rewrite** call sites: each lambda argument becomes a constructor
-   call building the closure from captures; each HO call becomes
-   `__apply_K(closure, args...)`.
+After this pass, no `Lambda` nodes survive. Every former lambda is a
+named function `__lifted_N(cap0, cap1, ..., param0, param1, ...)`.
 
-Uses `std::mem::take` on the body `Option<Expr>` slot to rewrite each
-entry in place without `unsafe` borrow splits.
+## lambda_solve — `src/lambda_solve.rs`
 
-After this phase there are no `Lambda` nodes and no higher-order
-parameters — every call has a known, first-order target.
+0-CFA flow analysis: determines which lifted functions can flow into
+each higher-order parameter position. Iterates to fixpoint over the
+module (typically 2–4 passes). Each iteration:
+
+1. Scans each function body for HO call sites (local variables or
+   parameters called as functions).
+2. Traces `Closure` values through call arguments, let bindings,
+   method receivers, and function return values.
+3. Propagates HO status through capture chains: if `__lifted_N`'s
+   capture parameter `i` is called, the enclosing function's
+   corresponding parameter is also HO.
+4. Merges lambda sets bidirectionally when the same closures flow
+   through multiple paths.
+
+Outputs `LambdaSolution`: a list of lambda sets (each with entries
+mapping lifted functions to tag names + captures) and a map from
+`(func_name, param_index)` to lambda set index.
+
+A completion sweep ensures every `Closure` in the module is in at
+least one lambda set, creating fallback singletons for any the flow
+analysis missed.
+
+## lambda_specialize — `src/lambda_specialize.rs`
+
+Consumes the `LambdaSolution` and rewrites the module:
+
+1. **Synthesize** per lambda set:
+   - A `TagDecl` closure type, one variant per lambda, carrying
+     captures as fields.
+   - An `__apply_K` `FuncDef` that dispatches on the closure tag.
+2. **Rewrite** `Closure` nodes → constructor calls packing captures.
+3. **Rewrite** HO calls (`f(x)` where `f` is a closure-carrying
+   variable) → `__apply_K(f, x)`.
+
+After this pass there are no `Lambda` or `Closure` nodes — every
+call has a known, first-order target.
 
 ## decl_info — `src/decl_info.rs`
 
-Not a pass; a lookup-table build. Reads the defunc'd module and
+Not a pass; a lookup-table build. Reads the specialized module and
 produces `DeclInfo`:
 
 - `funcs` — set of all callable display names
@@ -202,7 +233,7 @@ produces `DeclInfo`:
 - `func_return_types` — concrete `ScalarType` per callable
 - `constructors` — tag index, field count, recursive-field flags, and
   per-field `ScalarType` for each tag union variant (including
-  defunc-synthesized closure tags)
+  lambda_specialize-synthesized closure tags)
 - `constructor_schemes` — raw schemes from inference, used for layout
 
 Used by `reachable::prune` (for `__apply_{walk}_2` aliasing) and by
@@ -214,7 +245,7 @@ DFS from `main` over `Call.target` / `MethodCall.resolved` /
 `QualifiedCall` segments / `Name` references. Drops unreachable
 `FuncDef`s at both the top level and inside `TypeAnno.methods`.
 `TypeAnno` decls themselves stay so `decl_info` keeps constructor
-bookkeeping. Zero-param value bindings are always kept (defunc may
+bookkeeping. Zero-param value bindings are always kept (lambda_specialize may
 rewrite their Name references in ways that break the trace).
 
 Special case: `List.walk` and its variants are lowered with an
@@ -261,6 +292,10 @@ an `ssa::Builder`. Notable bits:
   from the base record, substitutes updated ones.
 - **Zero-param value bindings** — `Name` references to known
   zero-arity functions emit a zero-arg `call` instruction.
+- **Record equality** — `==` on record types emits field-by-field
+  comparison with short-circuit branching. Recurses for nested records.
+- **Record `to_str`** — `.to_str()` on records emits inline string
+  building: `"{ field: val, ... }"`. Uses `__str_concat` builtin.
 
 Reads `func_schemes` from `InferResult` directly (for return-type
 lookups) rather than from `decl_info`. Variable environment is
@@ -283,7 +318,7 @@ Outputs `ssa::Module`. From here `ssa::eval` runs the program, or
 - **Reserved `__` prefix** for compiler-synthesized names (`__fold_N`,
   `__apply_K`, `__main`, specialized mangled names). No user program
   uses the prefix.
-- **Zero `unsafe`** in `src/`. Earlier drafts of defunc and mono used
+- **Zero `unsafe`** in `src/`. Earlier drafts of lambda_specialize and mono used
   raw-pointer splits and `transmute` to work around borrow checker
   issues with in-place body rewrites; both were replaced by
   `std::mem::take` and borrowed `StoredBody` respectively.
