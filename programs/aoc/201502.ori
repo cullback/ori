@@ -6,7 +6,7 @@ box = Parser.sequence({
     h: u64,
 })
 
-boxes = box.separated_by(symbol(10))
+boxes = box.separated_by(symbol('\n'))
 
 paper : { l: U64, w: U64, h: U64 } -> U64
 paper = |b| (
