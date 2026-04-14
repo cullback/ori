@@ -23,5 +23,5 @@ part2 = |bs| bs.walk(0, |acc, { l, w, h }| (
 main : List(Str), Str -> Result(Str, Str)
 main = |args, input| (
     (parsed, rest) = boxes.run(input)?
-    Ok("part1: ${U64.to_str(part1(parsed))} part2: ${U64.to_str(part2(parsed))}")
+    Ok("part1: ${part1(parsed)} part2: ${part2(parsed)}")
 )
