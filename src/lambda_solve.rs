@@ -64,6 +64,9 @@ pub struct LambdaSolution {
     pub sets: Vec<LambdaSet>,
     /// Maps (func_display_name, param_index) → lambda set index.
     pub param_to_set: HashMap<(String, usize), usize>,
+    /// Local variables that hold closure values and are called as
+    /// functions. Maps SymbolId → lambda set index.
+    pub local_ho_vars: HashMap<SymbolId, usize>,
 }
 
 /// Analyze the post-lambda_lift module to build lambda sets.
@@ -89,6 +92,9 @@ pub fn solve(
         current_func: None,
         current_params: HashMap::new(),
         ho_func_params: HashSet::new(),
+        return_closures: HashMap::new(),
+        local_closures: HashMap::new(),
+        local_ho_vars: HashMap::new(),
     };
 
     // Iterate to fixpoint: each pass may discover new HO positions
@@ -97,11 +103,12 @@ pub fn solve(
     // param i is HO, then wherever Closure { func: __lifted_N,
     // captures } appears, captures[i] is also HO.
     loop {
-        let before = ctx.param_to_set.len();
+        let before = ctx.param_to_set.len() + ctx.local_closures.len() + ctx.return_closures.len();
         solve_free_functions(&mut ctx, &module.decls, &reachable_set);
         solve_methods(&mut ctx, &module.decls, &reachable_set);
         propagate_captures(&mut ctx, &module.decls, &reachable_set);
-        if ctx.param_to_set.len() == before {
+        let after = ctx.param_to_set.len() + ctx.local_closures.len() + ctx.return_closures.len();
+        if after == before {
             break;
         }
     }
@@ -109,6 +116,7 @@ pub fn solve(
     LambdaSolution {
         sets: ctx.sets,
         param_to_set: ctx.param_to_set,
+        local_ho_vars: ctx.local_ho_vars,
     }
 }
 
@@ -126,6 +134,13 @@ struct SolveCtx<'a> {
     /// Tracks which (lifted_func_name, param_index) are HO call targets.
     /// Used to propagate HO status through captures.
     ho_func_params: HashSet<(String, usize)>,
+    /// Per function: which (lifted_func, captures) can be returned.
+    return_closures: HashMap<String, Vec<(SymbolId, Vec<SymbolId>)>>,
+    /// Per local variable: which (lifted_func, captures) it can hold.
+    local_closures: HashMap<SymbolId, Vec<(SymbolId, Vec<SymbolId>)>>,
+    /// Local variables (let-bound) that are called as functions.
+    /// Collected during solve, included in the output.
+    local_ho_vars: HashMap<SymbolId, usize>,
 }
 
 impl SolveCtx<'_> {
@@ -167,6 +182,10 @@ fn solve_free_functions(
                     }
                 }
                 solve_expr(ctx, body);
+                let ret = expr_closures(ctx, body);
+                if !ret.is_empty() {
+                    ctx.return_closures.insert(name_str, ret);
+                }
                 for p in params {
                     ctx.ho_vars.remove(p);
                 }
@@ -211,6 +230,10 @@ fn solve_methods(
                             }
                         }
                         solve_expr(ctx, body);
+                        let ret = expr_closures(ctx, body);
+                        if !ret.is_empty() {
+                            ctx.return_closures.insert(mangled, ret);
+                        }
                         for p in params {
                             ctx.ho_vars.remove(p);
                         }
@@ -403,6 +426,45 @@ fn propagate_in_expr(
     }
 }
 
+/// What (lifted_func, captures) can this expression evaluate to?
+fn expr_closures(ctx: &SolveCtx<'_>, expr: &Expr<'_>) -> Vec<(SymbolId, Vec<SymbolId>)> {
+    match &expr.kind {
+        ExprKind::Closure { func, captures } => {
+            vec![(*func, collect_capture_syms(captures))]
+        }
+        ExprKind::Name(sym) => {
+            ctx.local_closures.get(sym).cloned().unwrap_or_default()
+        }
+        ExprKind::Call { target, .. } => {
+            let name = ctx.symbols.display(*target).to_owned();
+            ctx.return_closures.get(&name).cloned().unwrap_or_default()
+        }
+        ExprKind::QualifiedCall { segments, .. } => {
+            let name = segments.join(".");
+            ctx.return_closures.get(&name).cloned().unwrap_or_default()
+        }
+        ExprKind::MethodCall { resolved, .. } => {
+            if let Some(name) = resolved {
+                ctx.return_closures.get(name).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        ExprKind::Block(_, result) => expr_closures(ctx, result),
+        ExprKind::If { arms, else_body, .. } => {
+            let mut all = Vec::new();
+            for arm in arms {
+                all.extend(expr_closures(ctx, &arm.body));
+            }
+            if let Some(eb) = else_body {
+                all.extend(expr_closures(ctx, eb));
+            }
+            all
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn solve_expr(ctx: &mut SolveCtx<'_>, expr: &Expr<'_>) {
     match &expr.kind {
         // Call to a known function: check args for closures/HO values.
@@ -410,10 +472,10 @@ fn solve_expr(ctx: &mut SolveCtx<'_>, expr: &Expr<'_>) {
             let name = ctx.symbols.display(*target).to_owned();
             solve_call_args(ctx, &name, args, 0);
         }
-        // Call to a local variable: this is an HO call site. Mark the
-        // variable as HO and discover which closures flow into it.
+        // Call to a local variable: this is an HO call site.
         ExprKind::Call { target, args, .. } => {
             if !ctx.is_constructor(*target) {
+                // Check if target is a function parameter.
                 if let Some((func_name, param_idx)) = ctx.current_params.get(target).cloned() {
                     let key = (func_name.clone(), param_idx);
                     ctx.ho_func_params.insert(key.clone());
@@ -424,6 +486,21 @@ fn solve_expr(ctx: &mut SolveCtx<'_>, expr: &Expr<'_>) {
                     } else if !ctx.ho_vars.contains_key(target) {
                         let idx = ctx.param_to_set[&key];
                         ctx.ho_vars.insert(*target, idx);
+                    }
+                }
+                // Check if target is a local variable holding closures.
+                if let Some(closures) = ctx.local_closures.get(target).cloned() {
+                    if !ctx.ho_vars.contains_key(target) {
+                        let arity = args.len();
+                        let caller = ctx.current_func.clone().unwrap_or_default().replace('.', "_");
+                        let local_name = ctx.symbols.display(*target);
+                        let key_name = format!("{caller}__local_{local_name}");
+                        let ls_idx = new_lambda_set(ctx, &key_name, 0, arity);
+                        for (func_sym, captures) in &closures {
+                            register_closure(ctx, ls_idx, *func_sym, captures.clone());
+                        }
+                        ctx.ho_vars.insert(*target, ls_idx);
+                        ctx.local_ho_vars.insert(*target, ls_idx);
                     }
                 }
             }
@@ -530,7 +607,14 @@ fn solve_expr(ctx: &mut SolveCtx<'_>, expr: &Expr<'_>) {
 
 fn solve_stmt(ctx: &mut SolveCtx<'_>, stmt: &Stmt<'_>) {
     match stmt {
-        Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => solve_expr(ctx, val),
+        Stmt::Let { name, val } => {
+            solve_expr(ctx, val);
+            let closures = expr_closures(ctx, val);
+            if !closures.is_empty() {
+                ctx.local_closures.insert(*name, closures);
+            }
+        }
+        Stmt::Destructure { val, .. } => solve_expr(ctx, val),
         Stmt::Guard {
             condition,
             return_val,

@@ -47,7 +47,7 @@ pub fn specialize<'src>(
         sets: &solution.sets,
         alloc: &alloc,
         symbols,
-        ho_vars: HashMap::new(),
+        ho_vars: solution.local_ho_vars.clone(),
     };
 
     // Rewrite module decls.
@@ -284,6 +284,18 @@ impl<'src> Rewriter<'_> {
         }
     }
 
+    /// Find which (lambda_set_index, entry_index) a lifted func belongs to.
+    fn find_entry_for_func(&self, func: SymbolId) -> Option<(usize, usize)> {
+        for (ls_idx, ls) in self.sets.iter().enumerate() {
+            for (entry_idx, entry) in ls.entries.iter().enumerate() {
+                if entry.lifted_func == func {
+                    return Some((ls_idx, entry_idx));
+                }
+            }
+        }
+        None
+    }
+
     fn enter_scope(&mut self, func_name: &str, params: &[SymbolId]) -> Vec<SymbolId> {
         let mut added = Vec::new();
         for (i, p) in params.iter().enumerate() {
@@ -393,9 +405,23 @@ impl<'src> Rewriter<'_> {
                 }
             }
             ExprKind::Is { expr: inner, .. } => self.rewrite_expr(inner),
-            ExprKind::Closure { captures, .. } => {
+            ExprKind::Closure { func, captures } => {
                 for c in captures.iter_mut() {
                     self.rewrite_expr(c);
+                }
+                // Stray Closure (return value, let-binding, etc.) —
+                // find which lambda set contains this func and rewrite
+                // to a constructor call.
+                let func = *func;
+                if let Some((ls_idx, entry_idx)) = self.find_entry_for_func(func) {
+                    let tag_sym = self.alloc.tag_syms[&(ls_idx, entry_idx)];
+                    let capture_args: Vec<Expr<'src>> = std::mem::take(captures)
+                        .into_iter()
+                        .collect();
+                    expr.kind = ExprKind::Call {
+                        target: tag_sym,
+                        args: capture_args,
+                    };
                 }
             }
             ExprKind::Lambda { .. } => {}
