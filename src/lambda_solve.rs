@@ -103,11 +103,11 @@ pub fn solve(
     // param i is HO, then wherever Closure { func: __lifted_N,
     // captures } appears, captures[i] is also HO.
     loop {
-        let before = ctx.param_to_set.len() + ctx.local_closures.len() + ctx.return_closures.len();
+        let before = snapshot_size(&ctx);
         solve_free_functions(&mut ctx, &module.decls, &reachable_set);
         solve_methods(&mut ctx, &module.decls, &reachable_set);
         propagate_captures(&mut ctx, &module.decls, &reachable_set);
-        let after = ctx.param_to_set.len() + ctx.local_closures.len() + ctx.return_closures.len();
+        let after = snapshot_size(&ctx);
         if after == before {
             break;
         }
@@ -141,6 +141,15 @@ struct SolveCtx<'a> {
     /// Local variables (let-bound) that are called as functions.
     /// Collected during solve, included in the output.
     local_ho_vars: HashMap<SymbolId, usize>,
+}
+
+fn snapshot_size(ctx: &SolveCtx<'_>) -> usize {
+    ctx.param_to_set.len()
+        + ctx.local_closures.values().map(Vec::len).sum::<usize>()
+        + ctx.return_closures.values().map(Vec::len).sum::<usize>()
+        + ctx.sets.iter().map(|s| s.entries.len()).sum::<usize>()
+        + ctx.ho_vars.len()
+        + ctx.local_ho_vars.len()
 }
 
 impl SolveCtx<'_> {
@@ -184,7 +193,7 @@ fn solve_free_functions(
                 solve_expr(ctx, body);
                 let ret = expr_closures(ctx, body);
                 if !ret.is_empty() {
-                    ctx.return_closures.insert(name_str, ret);
+                    ctx.return_closures.insert(name_str.clone(), ret);
                 }
                 for p in params {
                     ctx.ho_vars.remove(p);
@@ -433,7 +442,19 @@ fn expr_closures(ctx: &SolveCtx<'_>, expr: &Expr<'_>) -> Vec<(SymbolId, Vec<Symb
             vec![(*func, collect_capture_syms(captures))]
         }
         ExprKind::Name(sym) => {
-            ctx.local_closures.get(sym).cloned().unwrap_or_default()
+            if let Some(closures) = ctx.local_closures.get(sym) {
+                return closures.clone();
+            }
+            // Check if sym is a function parameter with a known lambda set.
+            if let Some((func_name, param_idx)) = ctx.current_params.get(sym) {
+                let key = (func_name.clone(), *param_idx);
+                if let Some(&ls_idx) = ctx.param_to_set.get(&key) {
+                    return ctx.sets[ls_idx].entries.iter()
+                        .map(|e| (e.lifted_func, e.captures.clone()))
+                        .collect();
+                }
+            }
+            Vec::new()
         }
         ExprKind::Call { target, .. } => {
             let name = ctx.symbols.display(*target).to_owned();
@@ -648,6 +669,28 @@ fn solve_call_args(ctx: &mut SolveCtx<'_>, callee: &str, args: &[Expr<'_>], offs
                     // Pass-through: HO var flows into this position.
                     let key = (callee.to_owned(), idx);
                     ctx.param_to_set.entry(key).or_insert(ls_idx);
+                } else if let Some(closures) = ctx.local_closures.get(sym).cloned() {
+                    // Local variable holding closures passed to HO position.
+                    let ls_idx = ensure_lambda_set(ctx, callee, idx);
+                    for (func_sym, captures) in closures {
+                        register_closure(ctx, ls_idx, func_sym, captures);
+                    }
+                }
+                // If this arg position is HO, and sym is a parameter
+                // of the current function, propagate: the current
+                // function's param is also HO (it flows into an HO
+                // callee position).
+                let callee_key = (callee.to_owned(), idx);
+                if ctx.param_to_set.contains_key(&callee_key) {
+                    if let Some((func_name, param_idx)) = ctx.current_params.get(sym).cloned() {
+                        let my_key = (func_name, param_idx);
+                        if !ctx.param_to_set.contains_key(&my_key) {
+                            let callee_ls = ctx.param_to_set[&callee_key];
+                            ctx.param_to_set.insert(my_key.clone(), callee_ls);
+                            ctx.ho_func_params.insert(my_key);
+                            ctx.ho_vars.insert(*sym, callee_ls);
+                        }
+                    }
                 }
             }
             _ => {}
