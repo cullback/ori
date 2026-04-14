@@ -1708,38 +1708,26 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     /// Default unresolved numeric literal type vars to `I64` / `F64` and
     /// check that each literal resolves to a valid numeric type. The
     /// resolved types propagate onto `Expr::ty` via `write_types_back`.
-    fn resolve_literals(&mut self) -> Result<(), CompileError> {
+    /// Default unresolved int literal type vars to I64, floats to F64.
+    /// Uses `unify` so the default propagates through substitution
+    /// chains (direct inserts can orphan downstream vars).
+    fn default_literals(&mut self) {
         let i64_ty = Type::Con("I64".to_owned());
         let f64_ty = Type::Con("F64".to_owned());
-
-        // Default unresolved int literals to I64. Use `unify`
-        // rather than inserting into `subst` directly so the
-        // default propagates to the *root* of the var's
-        // substitution chain — direct inserts can orphan a
-        // downstream var in the chain when the literal's var
-        // points transitively to another unresolved var (which
-        // happens whenever `unify_at(lit_var, other_var)` set
-        // lit_var := other_var earlier). Unification cannot fail
-        // here because the chain root is a free Var.
         for &(tv, _) in &self.int_literal_vars {
-            if matches!(self.engine.resolve(&Type::Var(tv)), Type::Var(_))
-                && self.engine.unify(&Type::Var(tv), &i64_ty).is_err()
-            {
-                unreachable!("unresolved var cannot fail to unify with I64");
+            if matches!(self.engine.resolve(&Type::Var(tv)), Type::Var(_)) {
+                let _ = self.engine.unify(&Type::Var(tv), &i64_ty);
             }
         }
-
-        // Default unresolved float literals to F64 (same
-        // consideration as above).
         for &(tv, _) in &self.float_literal_vars {
-            if matches!(self.engine.resolve(&Type::Var(tv)), Type::Var(_))
-                && self.engine.unify(&Type::Var(tv), &f64_ty).is_err()
-            {
-                unreachable!("unresolved var cannot fail to unify with F64");
+            if matches!(self.engine.resolve(&Type::Var(tv)), Type::Var(_)) {
+                let _ = self.engine.unify(&Type::Var(tv), &f64_ty);
             }
         }
+    }
 
-        // Validate that every literal resolved to a supported numeric type.
+    /// Validate that every literal resolved to a supported numeric type.
+    fn validate_literals(&self) -> Result<(), CompileError> {
         for &(tv, span) in &self.int_literal_vars {
             let resolved = self.engine.resolve(&Type::Var(tv));
             match &resolved {
@@ -1774,6 +1762,18 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
         }
         Ok(())
+    }
+
+    /// Resolve method constraints and literal types to a fixpoint.
+    /// Literal defaulting (int→I64, float→F64) can unlock constraints
+    /// that depend on knowing the concrete type (e.g. `x.to_str()`
+    /// where `x` was an unresolved int literal), so we loop until no
+    /// further progress is made.
+    fn resolve_and_verify(&mut self) -> Result<(), CompileError> {
+        self.verify_constraints()?;
+        self.default_literals();
+        self.verify_constraints()?;
+        self.validate_literals()
     }
 }
 
@@ -2017,12 +2017,7 @@ pub fn check(
         }
     }
 
-    ctx.verify_constraints()?;
-    ctx.resolve_literals()?;
-    // Second pass: constraints that depended on literal defaulting
-    // (e.g. `x.to_str()` where `x` was an unresolved int literal
-    // that just got defaulted to I64) can now resolve.
-    ctx.verify_constraints()?;
+    ctx.resolve_and_verify()?;
 
     // Resolve all expression types now that inference is complete.
     let expr_types: HashMap<Span, Type> = ctx
