@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};
-use crate::decl_info::{self, DeclInfo, method_key, type_to_scalar};
+use crate::passes::decl_info::{self, DeclInfo, method_key, type_to_scalar};
 use crate::error::CompileError;
-use crate::source::SourceArena;
 use crate::ssa::Module;
 use crate::ssa::builder::Builder;
 use crate::ssa::instruction::{BinaryOp, BlockId, ScalarType, Value};
@@ -16,18 +15,12 @@ use crate::types::infer::InferResult;
 /// Returns the SSA module and a list of SSA values representing main's parameters
 /// (that the runtime must bind before evaluation).
 pub fn lower<'src>(
-    arena: &'src SourceArena,
     module: &ast::Module<'src>,
-    scope: &crate::resolve::ModuleScope,
     infer_result: &InferResult,
     symbols: &crate::symbol::SymbolTable,
     fields: &FieldInterner,
 ) -> Result<(Module, Vec<Value>), CompileError> {
-    // Post-Step 9, the module was already pruned by
-    // `reachable::prune`, so every `Decl::FuncDef` here is reachable
-    // from `main` and must be lowered. The reachability side-table
-    // that the lowerer used to maintain is gone.
-    let decls = decl_info::build(arena, module, scope, infer_result, symbols);
+    let decls = decl_info::build(module, infer_result, symbols);
     lower_to_ssa(module, infer_result, &decls, symbols, fields)
 }
 

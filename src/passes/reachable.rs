@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Decl, Expr, ExprKind, Module, Stmt};
-use crate::decl_info::{DeclInfo, method_key};
+use crate::passes::decl_info::{DeclInfo, method_key};
 use crate::symbol::SymbolTable;
 
 /// Rewrite `module` so that every remaining `FuncDef` (free function

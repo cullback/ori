@@ -6,45 +6,32 @@ fn run(source: &str, input: i64) -> Scalar {
     let mut arena = SourceArena::new();
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
-    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
-    let infer_result = crate::types::infer::check(
-        &arena,
-        &mut resolved.module,
-        &resolved.scope,
-        &mut resolved.symbols,
-        &resolved.fields,
-    )
-    .unwrap();
+    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let (mono_module, mono_infer) =
-        crate::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let lifted_module = crate::lambda_lift::lift(mono_module, &mut resolved.symbols);
-    let lambda_solution = crate::lambda_solve::solve(
+        crate::passes::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
+    let lifted_module = crate::passes::lambda_lift::lift(mono_module, &mut resolved.symbols);
+    let lambda_solution = crate::passes::lambda_solve::solve(
         &lifted_module,
-        &arena,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
     );
-    let defunc_module = crate::lambda_specialize::specialize(
+    let defunc_module = crate::passes::lambda_specialize::specialize(
         lifted_module,
         &lambda_solution,
         &mut resolved.symbols,
     );
-    let pre_prune_decls = crate::decl_info::build(
-        &arena,
+    let pre_prune_decls = crate::passes::decl_info::build(
         &defunc_module,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
     );
-    resolved.module = crate::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
+    resolved.module = crate::passes::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
     let (ssa_module, input_vals) = crate::ssa::lower::lower(
-        &arena,
         &resolved.module,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
         &resolved.fields,
@@ -89,18 +76,12 @@ fn infer_func_type(source: &str, func: &str) -> String {
     let mut arena = SourceArena::new();
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
-    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
-    let infer_result = crate::types::infer::check(
-        &arena,
-        &mut resolved.module,
-        &resolved.scope,
-        &mut resolved.symbols,
-        &resolved.fields,
-    )
-    .unwrap_or_else(|e| panic!("infer failed: {}", e.format(&arena)));
+    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    let infer_result = crate::types::infer::check(&mut resolved)
+        .unwrap_or_else(|e| panic!("infer failed: {}", e.format(&arena)));
     let scheme = infer_result
         .func_schemes
         .get(func)
@@ -164,17 +145,11 @@ fn infer_err(source: &str) -> String {
     let mut arena = SourceArena::new();
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
-    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
-    match crate::types::infer::check(
-        &arena,
-        &mut resolved.module,
-        &resolved.scope,
-        &mut resolved.symbols,
-        &resolved.fields,
-    ) {
+    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    match crate::types::infer::check(&mut resolved) {
         Ok(_) => panic!("expected inference to fail, but it succeeded"),
         Err(e) => e.format(&arena),
     }
@@ -2737,9 +2712,9 @@ main = |arg| f(arg)";
     let mut arena = crate::source::SourceArena::new();
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    let err = crate::topo::compute(&mut resolved.module, &resolved.symbols)
+    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    let err = crate::passes::topo::compute(&mut resolved.module, &resolved.symbols)
         .expect_err("expected cycle detection error");
     let msg = err.format(&arena);
     assert!(
@@ -2819,45 +2794,32 @@ fn compile_to_ssa(source: &str) -> crate::ssa::Module {
     let mut arena = SourceArena::new();
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
-    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
-    let infer_result = crate::types::infer::check(
-        &arena,
-        &mut resolved.module,
-        &resolved.scope,
-        &mut resolved.symbols,
-        &resolved.fields,
-    )
-    .unwrap();
+    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let (mono_module, mono_infer) =
-        crate::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let lifted_module = crate::lambda_lift::lift(mono_module, &mut resolved.symbols);
-    let lambda_solution = crate::lambda_solve::solve(
+        crate::passes::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
+    let lifted_module = crate::passes::lambda_lift::lift(mono_module, &mut resolved.symbols);
+    let lambda_solution = crate::passes::lambda_solve::solve(
         &lifted_module,
-        &arena,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
     );
-    let defunc_module = crate::lambda_specialize::specialize(
+    let defunc_module = crate::passes::lambda_specialize::specialize(
         lifted_module,
         &lambda_solution,
         &mut resolved.symbols,
     );
-    let pre_prune_decls = crate::decl_info::build(
-        &arena,
+    let pre_prune_decls = crate::passes::decl_info::build(
         &defunc_module,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
     );
-    resolved.module = crate::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
+    resolved.module = crate::passes::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
     let (ssa, _) = crate::ssa::lower::lower(
-        &arena,
         &resolved.module,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
         &resolved.fields,
@@ -3033,41 +2995,30 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     let arena = Box::leak(Box::new(SourceArena::new()));
     let file_id = arena.add("<test>".to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::resolve::resolve_imports(parsed, arena, None).unwrap();
-    resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
-    crate::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
-    let infer_result = crate::types::infer::check(
-        arena,
-        &mut resolved.module,
-        &resolved.scope,
-        &mut resolved.symbols,
-        &resolved.fields,
-    )
-    .unwrap();
+    let mut resolved = crate::passes::resolve::resolve_imports(parsed, arena, None).unwrap();
+    resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    crate::passes::topo::compute(&mut resolved.module, &resolved.symbols).unwrap();
+    let infer_result = crate::types::infer::check(&mut resolved).unwrap();
     let (mono_module, mono_infer) =
-        crate::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let lifted_module = crate::lambda_lift::lift(mono_module, &mut resolved.symbols);
-    let lambda_solution = crate::lambda_solve::solve(
+        crate::passes::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
+    let lifted_module = crate::passes::lambda_lift::lift(mono_module, &mut resolved.symbols);
+    let lambda_solution = crate::passes::lambda_solve::solve(
         &lifted_module,
-        arena,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
     );
-    let defunc_module = crate::lambda_specialize::specialize(
+    let defunc_module = crate::passes::lambda_specialize::specialize(
         lifted_module,
         &lambda_solution,
         &mut resolved.symbols,
     );
-    let pre_prune_decls = crate::decl_info::build(
-        arena,
+    let pre_prune_decls = crate::passes::decl_info::build(
         &defunc_module,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
     );
-    let pruned = crate::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
+    let pruned = crate::passes::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
     (pruned, resolved.symbols)
 }
 
@@ -3224,19 +3175,13 @@ mod ast_snapshots {
         let file_id = arena.add(source_path.to_owned(), source.to_owned());
         let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id)
             .unwrap_or_else(|e| panic!("parse failed for {source_path}: {e:?}"));
-        let mut resolved = crate::resolve::resolve_imports(parsed, &mut arena, None)
+        let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None)
             .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
-        resolved.module = crate::fold_lift::lift(resolved.module, &mut resolved.symbols);
-        resolved.module = crate::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
-        crate::topo::compute(&mut resolved.module, &resolved.symbols)
+        resolved.module = crate::passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+        resolved.module = crate::passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+        crate::passes::topo::compute(&mut resolved.module, &resolved.symbols)
             .unwrap_or_else(|e| panic!("topo failed for {source_path}: {e:?}"));
-        crate::types::infer::check(
-            &arena,
-            &mut resolved.module,
-            &resolved.scope,
-            &mut resolved.symbols,
-            &resolved.fields,
-        )
+        crate::types::infer::check(&mut resolved)
         .unwrap_or_else(|e| panic!("infer failed for {source_path}: {e:?}"));
 
         // Filter to user-file decls only to keep snapshots compact. The
@@ -3267,7 +3212,7 @@ mod ast_snapshots {
         let file_id = arena.add(source_path.to_owned(), source.to_owned());
         let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id)
             .unwrap_or_else(|e| panic!("parse failed for {source_path}: {e:?}"));
-        let resolved = crate::resolve::resolve_imports(parsed, &mut arena, None)
+        let resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None)
             .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
 
         let mut out = String::from("resolved:\n");

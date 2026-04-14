@@ -13,7 +13,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Decl, TypeExpr};
-use crate::source::SourceArena;
 use crate::ssa::ScalarType;
 use crate::symbol::SymbolTable;
 use crate::types::engine::{Scheme, Type};
@@ -81,9 +80,7 @@ pub struct DeclInfo {
 
 /// Build `DeclInfo` from the resolved module declarations.
 pub fn build<'src>(
-    _arena: &'src SourceArena,
     module: &ast::Module<'src>,
-    _scope: &crate::resolve::ModuleScope,
     infer_result: &InferResult,
     symbols: &SymbolTable,
 ) -> DeclInfo {

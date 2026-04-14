@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
-use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Module, Span, Stmt, TypeDeclKind, TypeExpr};
+use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Span, Stmt, TypeDeclKind, TypeExpr};
 use crate::error::CompileError;
-use crate::source::SourceArena;
 use crate::symbol::{FieldInterner, SymbolId, SymbolKind, SymbolTable};
 use crate::types::engine::{Constraint, Scheme, Type, TypeEngine, TypeVar};
 
@@ -351,7 +350,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         &mut self,
         type_name: &str,
         methods: &[Decl<'src>],
-        scope: &crate::resolve::ModuleScope,
+        scope: &crate::passes::resolve::ModuleScope,
     ) -> Result<(), CompileError> {
         for method in methods {
             match method {
@@ -1812,17 +1811,15 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     clippy::too_many_lines,
     reason = "multi-pass type checking orchestration"
 )]
-pub fn check<'src>(
-    arena: &'src SourceArena,
-    module: &mut Module<'src>,
-    scope: &crate::resolve::ModuleScope,
-    symbols: &mut crate::symbol::SymbolTable,
-    fields: &FieldInterner,
+pub fn check(
+    resolved: &mut crate::passes::resolve::Resolved<'_>,
 ) -> Result<InferResult, CompileError> {
-    // Inference itself only needs an immutable view of the symbol
-    // table. The post-pass that eta-expands constructor references
-    // allocates fresh lambda parameter syms, which is why `check`
-    // takes `&mut`.
+    let (module, scope, symbols, fields) = (
+        &mut resolved.module,
+        &resolved.scope,
+        &mut resolved.symbols,
+        &resolved.fields,
+    );
     let mut ctx = InferCtx::new(&*symbols, fields);
 
     // Register to_str for all numeric types (not as full modules — their
@@ -1956,7 +1953,6 @@ pub fn check<'src>(
             type_params,
             ty,
             kind,
-            methods,
             ..
         } = decl
         {
@@ -1972,35 +1968,6 @@ pub fn check<'src>(
                     ctx.engine
                         .transparent
                         .insert(name.to_owned(), (param_vars, underlying));
-                }
-            }
-            let func_names: std::collections::HashSet<&str> = methods
-                .iter()
-                .filter_map(|m| {
-                    if let Decl::FuncDef { name, .. } = m {
-                        Some(symbols.display(*name))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for method in methods {
-                if let Decl::TypeAnno {
-                    span: method_span,
-                    name: method_name,
-                    ..
-                } = method
-                {
-                    let method_name = symbols.display(*method_name);
-                    if !func_names.contains(method_name) {
-                        let is_stdlib = arena.path(method_span.file).starts_with("<stdlib:");
-                        if !is_stdlib {
-                            return Err(CompileError::at(
-                                *method_span,
-                                format!("method '{name}.{method_name}' declared but not defined"),
-                            ));
-                        }
-                    }
                 }
             }
         }

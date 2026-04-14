@@ -97,34 +97,7 @@ pub fn resolve_imports<'src>(
         // Check for body-less method declarations in user modules
         let is_stdlib = stdlib::get(import.module).is_some();
         if !is_stdlib {
-            for decl in &imported.decls {
-                if let Decl::TypeAnno { methods, name, .. } = decl {
-                    let func_names: std::collections::HashSet<&str> = methods
-                        .iter()
-                        .filter_map(|m| {
-                            if let Decl::FuncDef { name, .. } = m {
-                                Some(*name)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    for method in methods {
-                        if let Decl::TypeAnno {
-                            span,
-                            name: method_name,
-                            ..
-                        } = method
-                            && !func_names.contains(method_name)
-                        {
-                            return Err(CompileError::at(
-                                *span,
-                                format!("method '{name}.{method_name}' declared but not defined"),
-                            ));
-                        }
-                    }
-                }
-            }
+            check_bodyless_methods(&imported.decls)?;
         }
 
         // No exports = fully private (nothing importable)
@@ -188,6 +161,7 @@ pub fn resolve_imports<'src>(
 
         all_decls.extend(included_decls);
     }
+    check_bodyless_methods(&module.decls)?;
     all_decls.extend(module.decls);
 
     let resolved = Module {
@@ -204,6 +178,39 @@ pub fn resolve_imports<'src>(
         symbols,
         fields,
     })
+}
+
+/// Reject type declarations with method signatures but no corresponding body.
+fn check_bodyless_methods(decls: &[Decl<'_>]) -> Result<(), CompileError> {
+    for decl in decls {
+        if let Decl::TypeAnno { methods, name, .. } = decl {
+            let func_names: std::collections::HashSet<&str> = methods
+                .iter()
+                .filter_map(|m| {
+                    if let Decl::FuncDef { name, .. } = m {
+                        Some(*name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for method in methods {
+                if let Decl::TypeAnno {
+                    span,
+                    name: method_name,
+                    ..
+                } = method
+                    && !func_names.contains(method_name)
+                {
+                    return Err(CompileError::at(
+                        *span,
+                        format!("method '{name}.{method_name}' declared but not defined"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---- Transitive dependency computation for imports ----

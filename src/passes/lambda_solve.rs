@@ -20,10 +20,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Decl, Expr, ExprKind, Module, Stmt};
-use crate::decl_info::{self, method_key};
-use crate::reachable;
-use crate::resolve::ModuleScope;
-use crate::source::SourceArena;
+use crate::passes::decl_info::{self, method_key};
+use crate::passes::reachable;
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::infer::InferResult;
 
@@ -163,12 +161,10 @@ fn snapshot(ctx: &Ctx<'_>) -> usize {
 
 pub fn solve(
     module: &Module<'_>,
-    arena: &SourceArena,
-    scope: &ModuleScope,
     infer_result: &InferResult,
     symbols: &SymbolTable,
 ) -> LambdaSolution {
-    let decls = decl_info::build(arena, module, scope, infer_result, symbols);
+    let decls = decl_info::build(module, infer_result, symbols);
     let reachable = reachable::compute(&decls, module, symbols);
 
     let mut ctx = Ctx {

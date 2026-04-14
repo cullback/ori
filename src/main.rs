@@ -1,16 +1,8 @@
 mod ast;
 mod ast_display;
-mod decl_info;
 mod error;
-mod flatten_patterns;
-mod fold_lift;
-mod lambda_lift;
-mod lambda_solve;
-mod lambda_specialize;
-mod mono;
 mod numeric;
-mod reachable;
-mod resolve;
+mod passes;
 mod source;
 #[allow(
     clippy::pedantic,
@@ -25,7 +17,6 @@ mod symbol;
 mod syntax;
 #[cfg(test)]
 mod test_frontend;
-mod topo;
 mod types;
 
 use std::io::IsTerminal as _;
@@ -36,53 +27,43 @@ use std::process;
 use error::CompileError;
 use source::SourceArena;
 
-fn compile(
+fn resolve(
     arena: &mut SourceArena,
     main_file: source::FileId,
     source_dir: Option<&std::path::Path>,
-) -> Result<(crate::ssa::Module, Vec<crate::ssa::Value>), CompileError> {
+) -> Result<passes::resolve::Resolved<'static>, CompileError> {
     let parsed = syntax::parse::parse(arena.content(main_file), main_file)?;
-    let mut resolved = resolve::resolve_imports(parsed, arena, source_dir)?;
-    resolved.module = fold_lift::lift(resolved.module, &mut resolved.symbols);
-    resolved.module = flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
-    topo::compute(&mut resolved.module, &resolved.symbols)?;
-    let infer_result = types::infer::check(
-        arena,
-        &mut resolved.module,
-        &resolved.scope,
-        &mut resolved.symbols,
-        &resolved.fields,
-    )?;
+    passes::resolve::resolve_imports(parsed, arena, source_dir)
+}
+
+fn compile(
+    mut resolved: passes::resolve::Resolved<'static>,
+) -> Result<(crate::ssa::Module, Vec<crate::ssa::Value>), CompileError> {
+    resolved.module = passes::fold_lift::lift(resolved.module, &mut resolved.symbols);
+    resolved.module = passes::flatten_patterns::flatten(resolved.module, &mut resolved.symbols);
+    passes::topo::compute(&mut resolved.module, &resolved.symbols)?;
+    let infer_result = types::infer::check(&mut resolved)?;
     let (mono_module, mono_infer) =
-        mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let lifted_module = lambda_lift::lift(mono_module, &mut resolved.symbols);
-    let lambda_solution = lambda_solve::solve(
+        passes::mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
+    let lifted_module = passes::lambda_lift::lift(mono_module, &mut resolved.symbols);
+    let lambda_solution = passes::lambda_solve::solve(
         &lifted_module,
-        arena,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
     );
-    let defunc_module = lambda_specialize::specialize(
+    let defunc_module = passes::lambda_specialize::specialize(
         lifted_module,
         &lambda_solution,
         &mut resolved.symbols,
     );
-    // Pruning: drop unreachable decls. Build decl_info on the
-    // defunc'd module so reachable::prune can trace aliases, then
-    // feed the pruned module to ssa::lower.
-    let pre_prune_decls = decl_info::build(
-        arena,
+    let pre_prune_decls = passes::decl_info::build(
         &defunc_module,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
     );
-    resolved.module = reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
+    resolved.module = passes::reachable::prune(defunc_module, &pre_prune_decls, &resolved.symbols);
     ssa::lower::lower(
-        arena,
         &resolved.module,
-        &resolved.scope,
         &mono_infer,
         &resolved.symbols,
         &resolved.fields,
@@ -153,7 +134,14 @@ fn main() {
     let main_file = arena.add(source_path.clone(), content);
 
     let source_dir = std::path::Path::new(source_path).parent();
-    let (ssa_module, input_vals) = match compile(&mut arena, main_file, source_dir) {
+    let resolved = match resolve(&mut arena, main_file, source_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}", e.format(&arena));
+            process::exit(1);
+        }
+    };
+    let (ssa_module, input_vals) = match compile(resolved) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("{}", e.format(&arena));
