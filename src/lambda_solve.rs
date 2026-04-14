@@ -554,6 +554,9 @@ fn solve_expr(ctx: &mut SolveCtx<'_>, expr: &Expr<'_>) {
             solve_expr(ctx, receiver);
             if let Some(target) = resolved.as_deref() {
                 if is_list_walk(target) || ctx.funcs.contains(target) {
+                    // Check receiver at position 0 for closures.
+                    let recv_as_slice = std::slice::from_ref(receiver.as_ref());
+                    solve_call_args(ctx, target, recv_as_slice, 0);
                     solve_call_args(ctx, target, args, 1);
                 } else {
                     for a in args {
@@ -668,9 +671,24 @@ fn solve_call_args(ctx: &mut SolveCtx<'_>, callee: &str, args: &[Expr<'_>], offs
             ExprKind::Name(sym) => {
                 if ctx.is_known_func(*sym) && !ctx.is_constructor(*sym) {
                     let display = ctx.symbols.display(*sym).to_owned();
-                    let arity = ctx.func_arity(*sym);
-                    let ls_idx = ensure_lambda_set_with_arity(ctx, callee, idx, arity);
-                    register_func_ref(ctx, ls_idx, *sym, display);
+                    // Check if this function returns closures. If so,
+                    // register the returned closures (not a func_ref).
+                    if let Some(ret_closures) = ctx.return_closures.get(&display).cloned() {
+                        let ls_idx = ensure_lambda_set(ctx, callee, idx);
+                        for (func_sym, captures) in ret_closures {
+                            register_closure(ctx, ls_idx, func_sym, captures);
+                        }
+                    } else {
+                        // Only register as func_ref if the function
+                        // genuinely IS a callable value (not a factory
+                        // that returns closures — those get caught on
+                        // a later fixpoint iteration).
+                        let arity = ctx.func_arity(*sym);
+                        if arity > 0 {
+                            let ls_idx = ensure_lambda_set_with_arity(ctx, callee, idx, arity);
+                            register_func_ref(ctx, ls_idx, *sym, display);
+                        }
+                    }
                 } else if let Some(&ls_idx) = ctx.ho_vars.get(sym) {
                     // Pass-through: HO var flows into this position.
                     let key = (callee.to_owned(), idx);
@@ -687,19 +705,43 @@ fn solve_call_args(ctx: &mut SolveCtx<'_>, callee: &str, args: &[Expr<'_>], offs
                 // function's param is also HO (it flows into an HO
                 // callee position).
                 let callee_key = (callee.to_owned(), idx);
-                if ctx.param_to_set.contains_key(&callee_key) {
+                if let Some(&callee_ls) = ctx.param_to_set.get(&callee_key) {
                     if let Some((func_name, param_idx)) = ctx.current_params.get(sym).cloned() {
                         let my_key = (func_name, param_idx);
-                        if !ctx.param_to_set.contains_key(&my_key) {
-                            let callee_ls = ctx.param_to_set[&callee_key];
+                        if let Some(&my_ls) = ctx.param_to_set.get(&my_key) {
+                            // Both exist — merge entries from my_ls into callee_ls.
+                            if my_ls != callee_ls {
+                                let to_add: Vec<_> = ctx.sets[my_ls].entries.clone();
+                                for entry in to_add {
+                                    let already = ctx.sets[callee_ls]
+                                        .entries.iter()
+                                        .any(|e| e.lifted_func == entry.lifted_func);
+                                    if !already {
+                                        ctx.sets[callee_ls].entries.push(entry);
+                                    }
+                                }
+                                // Redirect my_key to callee_ls.
+                                ctx.param_to_set.insert(my_key.clone(), callee_ls);
+                            }
+                        } else {
                             ctx.param_to_set.insert(my_key.clone(), callee_ls);
-                            ctx.ho_func_params.insert(my_key);
-                            ctx.ho_vars.insert(*sym, callee_ls);
                         }
+                        ctx.ho_func_params.insert(my_key);
+                        ctx.ho_vars.insert(*sym, callee_ls);
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // Any other expression (Call, MethodCall, Block, etc.)
+                // might evaluate to a closure via return_closures.
+                let closures = expr_closures(ctx, arg);
+                if !closures.is_empty() {
+                    let ls_idx = ensure_lambda_set(ctx, callee, idx);
+                    for (func_sym, captures) in closures {
+                        register_closure(ctx, ls_idx, func_sym, captures);
+                    }
+                }
+            }
         }
         solve_expr(ctx, arg);
     }
