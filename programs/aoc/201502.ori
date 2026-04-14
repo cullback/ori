@@ -1,15 +1,25 @@
 import parser
 
-parse_box : List(U8) -> Result(({ l: U64, w: U64, h: U64 }, List(U8)), Str)
-parse_box = |input| Parser.sequence({
+box = Parser.sequence({
     l: u64.and_drop_right(symbol('x')),
     w: u64.and_drop_right(symbol('x')),
     h: u64,
-}).run(input)
+})
+
+boxes = box.separated_by(symbol(10))
+
+paper : { l: U64, w: U64, h: U64 } -> U64
+paper = |b| (
+    lw = b.l * b.w
+    wh = b.w * b.h
+    hl = b.h * b.l
+    smallest = U64.min(lw, U64.min(wh, hl))
+    2 * lw + 2 * wh + 2 * hl + smallest
+)
 
 main : List(Str), Str -> Result(Str, Str)
 main = |args, input| (
-    (result, rest) = parse_box(Str.to_utf8(input))?
-    Ok("${result}")
+    (parsed, rest) = boxes.run(input)?
+    total = parsed.walk(0, |acc, b| acc + paper(b))
+    Ok(U64.to_str(total))
 )
-
