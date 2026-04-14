@@ -726,15 +726,47 @@ impl ParseCtx {
     fn parse_lambda<'src>(&self, pair: Pair<'src, Rule>, span: Span) -> Expr<'src> {
         let mut inner: Vec<Pair<'src, Rule>> = pair.into_inner().collect();
         let body = self.parse_expr(inner.pop().unwrap());
-        let params: Vec<&str> = inner
+        let param_pairs: Vec<Pair<'src, Rule>> = inner
             .into_iter()
             .filter(|p| p.as_rule() == Rule::lambda_param)
-            .map(|p| p.as_str())
             .collect();
+
+        // Desugar pattern params: simple names stay as params,
+        // destructuring patterns become a fresh param + a Destructure
+        // statement prepended to the body.
+        let mut params: Vec<&'src str> = Vec::new();
+        let mut destructures: Vec<Stmt<'src>> = Vec::new();
+        for (i, p) in param_pairs.into_iter().enumerate() {
+            let pat_pair = p.into_inner().next().unwrap();
+            let pattern = parse_pattern(pat_pair);
+            match &pattern {
+                Pattern::Binding(name) => params.push(name),
+                Pattern::Wildcard => {
+                    let name: &'static str = Box::leak(format!("__pat_{i}").into_boxed_str());
+                    params.push(name);
+                }
+                _ => {
+                    // Destructuring: generate a fresh name and desugar.
+                    let name: &'static str = Box::leak(format!("__pat_{i}").into_boxed_str());
+                    params.push(name);
+                    destructures.push(Stmt::Destructure {
+                        pattern,
+                        val: Expr::new(ExprKind::Name(name), span),
+                    });
+                }
+            }
+        }
+
+        let final_body = if destructures.is_empty() {
+            body
+        } else {
+            Expr::new(ExprKind::Block(destructures, Box::new(body)), span)
+        };
+
         Expr::new(
             ExprKind::Lambda {
                 params,
-                body: Box::new(body),
+                body: Box::new(final_body),
             },
             span,
         )

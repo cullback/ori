@@ -7,19 +7,17 @@ boxes = Parser.sequence({
 }).separated_by(symbol('\n'))
 
 part1 : List({ l: U64, w: U64, h: U64 }) -> U64
-part1 = |bs| bs.walk(0, |acc, b| (
-    lw = b.l * b.w
-    wh = b.w * b.h
-    hl = b.h * b.l
+part1 = |bs| bs.walk(0, |acc, { l, w, h }| (
+    lw = l * w
+    wh = w * h
+    hl = h * l
     acc + 2 * lw + 2 * wh + 2 * hl + U64.min(lw, U64.min(wh, hl))
 ))
 
 part2 : List({ l: U64, w: U64, h: U64 }) -> U64
-part2 = |bs| bs.walk(0, |acc, b| (
-    smallest_perimeter = U64.min(
-        2 * b.l + 2 * b.w,
-        U64.min(2 * b.w + 2 * b.h, 2 * b.h + 2 * b.l))
-    acc + smallest_perimeter + b.l * b.w * b.h
+part2 = |bs| bs.walk(0, |acc, { l, w, h }| (
+    smallest_perimeter = U64.min(2 * l + 2 * w, U64.min(2 * w + 2 * h, 2 * h + 2 * l))
+    acc + smallest_perimeter + l * w * h
 ))
 
 main : List(Str), Str -> Result(Str, Str)
