@@ -95,6 +95,12 @@ List := {}.(
         List.append(state.chunks, state.current)
     )
 
+    # Returns True if the list contains an element equal to `target`.
+    contains : List(a), a -> Bool where [a.equals]
+    contains = |xs, target|
+        List.walk_until(xs, False, |_, x|
+            if x == target then Break(True) else Continue(False))
+
     # Returns the sum of all elements.
     sum : List(a) -> a where [a.add]
     sum = |xs| List.walk(xs, 0, |acc, x| acc + x)
