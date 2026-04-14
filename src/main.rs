@@ -5,6 +5,7 @@ mod defunc;
 mod error;
 mod flatten_patterns;
 mod fold_lift;
+mod lambda_lift;
 mod mono;
 mod numeric;
 mod reachable;

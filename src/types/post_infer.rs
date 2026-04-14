@@ -158,6 +158,11 @@ fn rewrite_expr(
                 rewrite_expr(e, expr_types, resolutions, eta, symbols);
             }
         }
+        ExprKind::Closure { captures, .. } => {
+            for c in captures {
+                rewrite_expr(c, expr_types, resolutions, eta, symbols);
+            }
+        }
     }
 
     // Step 3 (post-order): eta-expand marked callable references.

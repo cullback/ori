@@ -517,6 +517,11 @@ fn scan_expr<'src>(ctx: &mut ScanCtx<'_, 'src>, expr: &Expr<'src>) {
             }
         }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) | ExprKind::Name(_) => {}
+        ExprKind::Closure { captures, .. } => {
+            for c in captures {
+                scan_expr(ctx, c);
+            }
+        }
     }
 }
 
@@ -961,6 +966,11 @@ impl<'src> Rewriter<'_, 'src> {
             | ExprKind::FloatLit(_)
             | ExprKind::StrLit(_)
             | ExprKind::Name(_) => {}
+            ExprKind::Closure { captures, .. } => {
+                for c in captures.iter_mut() {
+                    self.rewrite_expr(c);
+                }
+            }
         }
     }
 

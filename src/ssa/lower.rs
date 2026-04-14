@@ -374,6 +374,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 self.builder.store(header, 2, data);
                 header
             }
+
+            ExprKind::Closure { .. } => {
+                panic!(
+                    "Closure should have been eliminated before SSA lowering (at {:?})",
+                    expr.span
+                )
+            }
         }
     }
 

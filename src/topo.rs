@@ -211,6 +211,12 @@ fn collect_callees(expr: &Expr<'_>, out: &mut HashSet<String>, symbols: &SymbolT
             }
         }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
+        ExprKind::Closure { func, captures } => {
+            out.insert(symbols.display(*func).to_owned());
+            for c in captures {
+                collect_callees(c, out, symbols);
+            }
+        }
     }
 }
 

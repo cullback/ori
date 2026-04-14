@@ -246,6 +246,7 @@ fn flatten_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) {
                 flatten_expr(ctx, e);
             }
         }
+        ExprKind::Closure { .. } => {}
     }
 }
 

@@ -229,6 +229,14 @@ pub enum ExprKind<'src> {
         expr: Box<Expr<'src>>,
         pattern: Pattern<'src>,
     },
+    /// Closure value produced by lambda_lift. `func` is the SymbolId
+    /// of the lifted top-level function. `captures` are expressions
+    /// for each captured variable (matching the capture-prefix
+    /// parameters of `func`). Eliminated by lambda_specialize.
+    Closure {
+        func: SymbolId,
+        captures: Vec<Expr<'src>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +512,12 @@ fn free_names_inner<F: Fn(SymbolId) -> bool>(
         }
         ExprKind::Is { expr: inner, .. } => {
             free_names_inner(inner, bound, seen, is_known, out);
+        }
+        ExprKind::Closure { func, captures } => {
+            check(*func, seen, out);
+            for c in captures {
+                free_names_inner(c, bound, seen, is_known, out);
+            }
         }
     }
 }

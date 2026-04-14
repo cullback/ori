@@ -2985,6 +2985,7 @@ fn any_lambda_in_module(module: &crate::ast::Module<'_>) -> bool {
             ExprKind::FieldAccess { record, .. } => in_expr(record),
             ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => elems.iter().any(in_expr),
             ExprKind::Is { expr, .. } => in_expr(expr),
+            ExprKind::Closure { captures, .. } => captures.iter().any(in_expr),
             ExprKind::Name(_)
             | ExprKind::IntLit(_)
             | ExprKind::FloatLit(_)

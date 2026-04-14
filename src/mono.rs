@@ -503,6 +503,19 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                 }
             }
             ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
+            ExprKind::Closure { func, captures } => {
+                // Specialize the closure's target if needed.
+                let name = self.symbols.display(*func).to_owned();
+                if let Some(new_sym) = self.specialize_target(*func, &Type::Con("_".to_owned())) {
+                    *func = new_sym;
+                } else {
+                    // Ensure identity specialization exists.
+                    let _ = &name;
+                }
+                for c in captures.iter_mut() {
+                    self.rewrite_calls_in_expr(c);
+                }
+            }
         }
     }
 
@@ -977,6 +990,11 @@ fn substitute_types_in_expr(expr: &mut Expr<'_>, mapping: &HashMap<TypeVar, Type
         | ExprKind::FloatLit(_)
         | ExprKind::StrLit(_)
         | ExprKind::Name(_) => {}
+        ExprKind::Closure { captures, .. } => {
+            for c in captures.iter_mut() {
+                substitute_types_in_expr(c, mapping);
+            }
+        }
     }
 }
 

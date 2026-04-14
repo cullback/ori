@@ -301,6 +301,21 @@ impl<W: Write> Printer<'_, W> {
                 }
                 Ok(())
             }
+            ExprKind::Closure { func, captures } => {
+                let func_name = self.symbols.display(*func);
+                let cap_names: Vec<String> = captures
+                    .iter()
+                    .map(|_| "_".to_owned())
+                    .collect();
+                self.line(
+                    level,
+                    format_args!("Closure({func_name}, [{}]) : {t}", cap_names.join(", ")),
+                )?;
+                for c in captures {
+                    self.write_expr(c, level + 1)?;
+                }
+                Ok(())
+            }
         }
     }
 

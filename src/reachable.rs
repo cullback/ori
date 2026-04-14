@@ -287,5 +287,11 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) 
             }
         }
         ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
+        ExprKind::Closure { func, captures } => {
+            refs.push(symbols.display(*func).to_owned());
+            for c in captures {
+                collect_refs(c, refs, symbols);
+            }
+        }
     }
 }

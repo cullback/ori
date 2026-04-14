@@ -215,6 +215,9 @@ fn lift_expr<'src>(ctx: &mut LiftCtx<'_, 'src>, expr: &mut ast::Expr<'src>) {
                 lift_expr(ctx, e);
             }
         }
+        ast::ExprKind::Closure { .. } => {
+            panic!("Closure should not exist before lambda_lift (fold_lift)")
+        }
     }
 
     // Post-order transform: if this is a Fold, replace it.
@@ -602,6 +605,9 @@ fn substitute_expr(expr: &mut ast::Expr<'_>, subst: &HashMap<SymbolId, SymbolId>
             }
         }
         ast::ExprKind::IntLit(_) | ast::ExprKind::FloatLit(_) | ast::ExprKind::StrLit(_) => {}
+        ast::ExprKind::Closure { .. } => {
+            panic!("Closure should not exist before lambda_lift (fold_lift substitute)")
+        }
     }
 }
 

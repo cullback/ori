@@ -737,6 +737,10 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 }
                 Ok(base_ty)
             }
+
+            ExprKind::Closure { .. } => {
+                panic!("Closure should not exist during type inference")
+            }
         }
     }
 
