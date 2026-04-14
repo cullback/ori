@@ -1,16 +1,36 @@
-use crate::source::SourceArena;
+use crate::passes::resolve::Resolved;
+use crate::source::{FileId, SourceArena};
 use crate::ssa::eval::Scalar;
 
-/// Compile and run an Ori program via SSA with the given I64 input.
-fn run(source: &str, input: i64) -> Scalar {
+// ---- Shared pipeline helpers ----
+
+/// Parse source and run resolve (the only IO pass).
+fn parse_and_resolve(source: &str) -> (SourceArena, FileId, Resolved<'static>) {
+    parse_and_resolve_named("<test>", source)
+}
+
+fn parse_and_resolve_named(path: &str, source: &str) -> (SourceArena, FileId, Resolved<'static>) {
     let mut arena = SourceArena::new();
-    let file_id = arena.add("<test>".to_owned(), source.to_owned());
+    let file_id = arena.add(path.to_owned(), source.to_owned());
     let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    crate::passes::fold_lift::lift(&mut resolved);
-    crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved).unwrap();
-    let infer_result = crate::types::infer::check(&mut resolved).unwrap();
+    let resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    (arena, file_id, resolved)
+}
+
+/// Run pre-mono passes (fold_lift, flatten, topo) + type inference.
+fn through_infer(
+    resolved: &mut Resolved<'_>,
+) -> crate::types::infer::InferResult {
+    crate::passes::fold_lift::lift(resolved);
+    crate::passes::flatten_patterns::flatten(resolved);
+    crate::passes::topo::compute(resolved).unwrap();
+    crate::types::infer::check(resolved).unwrap()
+}
+
+/// Full compile: through infer, then mono + lambda passes + lower → SSA.
+fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
+    let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
+    let infer_result = through_infer(&mut resolved);
     let mut mono =
         crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
     crate::passes::lambda_lift::lift(&mut mono);
@@ -18,8 +38,14 @@ fn run(source: &str, input: i64) -> Scalar {
     crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
-    let (ssa_module, input_vals) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
+    crate::ssa::lower::lower(&mono, &resolved.fields).unwrap()
+}
 
+// ---- Test runners ----
+
+/// Compile and run an Ori program via SSA with the given I64 input.
+fn run(source: &str, input: i64) -> Scalar {
+    let (ssa_module, input_vals) = compile(source);
     let mut heap = crate::ssa::eval::new_heap();
     let ssa_args: Vec<Scalar> = input_vals
         .iter()
@@ -48,22 +74,10 @@ fn run_i64(source: &str, input: i64) -> i64 {
     }
 }
 
-/// Run parse → resolve → fold_lift → flatten_patterns → topo → infer
-/// and return the inferred function scheme for the given function
-/// name as a rendered string. Used by tests that want to assert on
-/// inferred types without needing the full SSA pipeline — e.g. tests
-/// for structural tag unions where lowering support isn't landed yet.
 #[allow(dead_code, reason = "used by structural-tag inference tests")]
 fn infer_func_type(source: &str, func: &str) -> String {
-    let mut arena = SourceArena::new();
-    let file_id = arena.add("<test>".to_owned(), source.to_owned());
-    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    crate::passes::fold_lift::lift(&mut resolved);
-    crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved).unwrap();
-    let infer_result = crate::types::infer::check(&mut resolved)
-        .unwrap_or_else(|e| panic!("infer failed: {}", e.format(&arena)));
+    let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
+    let infer_result = through_infer(&mut resolved);
     let scheme = infer_result
         .func_schemes
         .get(func)
@@ -119,15 +133,9 @@ fn render_scheme(ty: &crate::types::engine::Type) -> String {
     }
 }
 
-/// Compile a program up through inference and return the type
-/// error message, or panic if inference succeeded. Used by tests
-/// that pin the shape of specific error messages.
 #[allow(dead_code, reason = "used by error-message tests")]
 fn infer_err(source: &str) -> String {
-    let mut arena = SourceArena::new();
-    let file_id = arena.add("<test>".to_owned(), source.to_owned());
-    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    let (arena, _file_id, mut resolved) = parse_and_resolve(source);
     crate::passes::fold_lift::lift(&mut resolved);
     crate::passes::flatten_patterns::flatten(&mut resolved);
     crate::passes::topo::compute(&mut resolved).unwrap();
@@ -2691,10 +2699,7 @@ g = |x| f(x)
 
 main : I64 -> I64
 main = |arg| f(arg)";
-    let mut arena = crate::source::SourceArena::new();
-    let file_id = arena.add("<test>".to_owned(), source.to_owned());
-    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
+    let (arena, _file_id, mut resolved) = parse_and_resolve(source);
     crate::passes::fold_lift::lift(&mut resolved);
     let err = crate::passes::topo::compute(&mut resolved)
         .expect_err("expected cycle detection error");
@@ -2773,23 +2778,7 @@ main = |arg| (
 /// SSA module. Use this helper to assert specific specialization
 /// names appear in the output.
 fn compile_to_ssa(source: &str) -> crate::ssa::Module {
-    let mut arena = SourceArena::new();
-    let file_id = arena.add("<test>".to_owned(), source.to_owned());
-    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None).unwrap();
-    crate::passes::fold_lift::lift(&mut resolved);
-    crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved).unwrap();
-    let infer_result = crate::types::infer::check(&mut resolved).unwrap();
-    let mut mono =
-        crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
-    crate::passes::lambda_lift::lift(&mut mono);
-    let lambda_solution = crate::passes::lambda_solve::solve(&mono);
-    crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
-    let pre_prune_decls = crate::passes::decl_info::build(&mono);
-    crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
-    let (ssa, _) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
-    ssa
+    compile(source).0
 }
 
 fn ssa_has_function(ssa: &crate::ssa::Module, name: &str) -> bool {
@@ -2952,18 +2941,9 @@ fn any_lambda_in_module(module: &crate::ast::Module<'_>) -> bool {
 }
 
 /// Run the frontend through defunc and return the rewritten module.
-#[allow(clippy::needless_pass_by_value, reason = "helper used by tests")]
 fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::symbol::SymbolTable) {
-    // Leak the arena so the returned module has a `'static` lifetime.
-    // This is a test-only helper; the real pipeline doesn't need this.
-    let arena = Box::leak(Box::new(SourceArena::new()));
-    let file_id = arena.add("<test>".to_owned(), source.to_owned());
-    let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id).unwrap();
-    let mut resolved = crate::passes::resolve::resolve_imports(parsed, arena, None).unwrap();
-    crate::passes::fold_lift::lift(&mut resolved);
-    crate::passes::flatten_patterns::flatten(&mut resolved);
-    crate::passes::topo::compute(&mut resolved).unwrap();
-    let infer_result = crate::types::infer::check(&mut resolved).unwrap();
+    let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
+    let infer_result = through_infer(&mut resolved);
     let mut mono =
         crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
     crate::passes::lambda_lift::lift(&mut mono);
@@ -3118,23 +3098,9 @@ mod ast_snapshots {
         format!("{parsed}")
     }
 
-    /// Render the fully-inferred AST for the user's source file only
-    /// (stdlib decls filtered out). Exercises ast_display with types
-    /// populated by inference. Runs fold-lift between resolve and infer,
-    /// so snapshots show the lifted form rather than the raw `Fold`.
     fn render_typed(source_path: &str, source: &str) -> String {
-        let mut arena = SourceArena::new();
-        let file_id = arena.add(source_path.to_owned(), source.to_owned());
-        let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id)
-            .unwrap_or_else(|e| panic!("parse failed for {source_path}: {e:?}"));
-        let mut resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None)
-            .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
-        crate::passes::fold_lift::lift(&mut resolved);
-        crate::passes::flatten_patterns::flatten(&mut resolved);
-        crate::passes::topo::compute(&mut resolved)
-            .unwrap_or_else(|e| panic!("topo failed for {source_path}: {e:?}"));
-        crate::types::infer::check(&mut resolved)
-        .unwrap_or_else(|e| panic!("infer failed for {source_path}: {e:?}"));
+        let (_arena, file_id, mut resolved) = super::parse_and_resolve_named(source_path, source);
+        super::through_infer(&mut resolved);
 
         // Filter to user-file decls only to keep snapshots compact. The
         // `file.start == 0` condition catches synthesized `__fold_N`
@@ -3160,12 +3126,7 @@ mod ast_snapshots {
     /// a missing stdlib import) without bloating snapshots with the full
     /// stdlib AST on every program.
     fn render_resolved(source_path: &str, source: &str) -> String {
-        let mut arena = SourceArena::new();
-        let file_id = arena.add(source_path.to_owned(), source.to_owned());
-        let parsed = crate::syntax::parse::parse(arena.content(file_id), file_id)
-            .unwrap_or_else(|e| panic!("parse failed for {source_path}: {e:?}"));
-        let resolved = crate::passes::resolve::resolve_imports(parsed, &mut arena, None)
-            .unwrap_or_else(|e| panic!("resolve failed for {source_path}: {e:?}"));
+        let (arena, _file_id, resolved) = super::parse_and_resolve_named(source_path, source);
 
         let mut out = String::from("resolved:\n");
         if resolved.module.imports.is_empty() {
