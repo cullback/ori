@@ -10,11 +10,13 @@ fn method_key(type_name: &str, method: &str) -> String {
     format!("{type_name}.{method}")
 }
 
-/// Value restriction helper: is this expression a syntactic value
-/// safe to let-generalize? Functions (lambdas) are always safe.
-/// Everything else — calls, matches, records, tag values — is not,
-/// because generalizing a non-function let-binding can freeze row
-/// variables prematurely and break structural tag row propagation.
+
+/// Value restriction: only generalize let bindings whose value is a
+/// syntactic function (lambda). Non-function bindings like records or
+/// tag values can carry open row variables — generalizing those would
+/// give each use site a fresh row, breaking structural field/tag
+/// propagation. This is a row-polymorphism concern, not a mutation
+/// concern (System T's lack of mutation doesn't help here).
 const fn is_syntactic_value(expr: &Expr<'_>) -> bool {
     matches!(expr.kind, ExprKind::Lambda { .. })
 }
@@ -39,57 +41,55 @@ pub struct InferResult {
 use super::post_infer::EtaInfo;
 
 struct InferCtx<'a, 'src> {
+    // -- Core inference state --
     engine: TypeEngine,
-    /// Names to schemes. Keyed by display name (string).
-    ///
-    /// Locals (`let`, function params, lambda params, pattern bindings)
-    /// are inserted under `symbols.display(sym)`. Globals (free
-    /// functions, methods, stdlib) are inserted under their mangled
-    /// names (e.g. `"List.map"`). Shadowing is implemented via the
-    /// usual save/restore of `env` around scope exits.
+    /// Names → schemes. Locals keyed by display name, globals by
+    /// mangled name (e.g. `"List.map"`). Scoped via `self.scoped()`.
     env: HashMap<String, Scheme>,
     constructors: HashMap<String, Scheme>,
-    /// Type aliases: Name -> Scheme (e.g. Point -> { x: I64, y: I64 })
     type_aliases: HashMap<String, Scheme>,
     /// Declared type annotations for checking against inferred types.
     type_annos: HashMap<String, TypeExpr<'src>>,
-    /// Known type names (I64, Bool, List, user-defined types).
     known_types: std::collections::HashSet<String>,
-    /// Track integer literal type vars for defaulting and side table.
+    /// Span for each constraint (parallel to engine.constraints).
+    constraint_spans: Vec<Span>,
+    /// Return type of each enclosing function/lambda, innermost on
+    /// top. `return` statements unify against the top. Depth is
+    /// bounded by lambda nesting (System T forbids recursion, so
+    /// `infer_func_body` never re-enters for the same function).
+    ret_ty_stack: Vec<Type>,
+
+    // -- Literal defaulting --
     int_literal_vars: Vec<(TypeVar, Span)>,
-    /// Track float literal type vars for defaulting and side table.
     float_literal_vars: Vec<(TypeVar, Span)>,
+
+    // -- Output side tables (consumed by post_infer::rewrite) --
+    /// Per-expression types, resolved to concrete types at end of inference.
+    expr_types: HashMap<Span, Type>,
     /// Bindings from `is` expressions, indexed by the Is expression's span.
     is_bindings: HashMap<Span, Vec<(String, Type)>>,
     /// Resolved method calls: span → mangled method name.
     method_resolutions: HashMap<Span, String>,
-    /// Span for each constraint (parallel to engine.constraints).
-    constraint_spans: Vec<Span>,
-    /// Raw (possibly unresolved) types for each expression, keyed by span.
-    /// Resolved to concrete types at the end of inference.
-    expr_types: HashMap<Span, Type>,
-    /// Constructor references that should be eta-expanded by the
-    /// post-inference rewrite. Populated by `check_expr` when a bare
-    /// `Name(con_sym)` is checked against an arrow type and the
-    /// constructor needs to be upgraded from a nullary value to a
-    /// function. Keyed by the `Name` expression's span so the rewrite
-    /// can find and replace it later.
+    /// Constructor references to eta-expand in post-inference rewrite.
     eta_expansions: HashMap<Span, EtaInfo>,
-    /// Stack of enclosing function / lambda return types. The top of
-    /// the stack is the return type of the innermost enclosing
-    /// function body currently being inferred; `return` statements
-    /// (arm-level `is_return` and `Stmt::Guard::return_val`) unify
-    /// their value against it. Push in `infer_func_body` and
-    /// `ExprKind::Lambda`; pop on exit.
-    ret_ty_stack: Vec<Type>,
-    /// Borrowed symbol table for display-name lookups.
+
+    // -- Borrowed context --
     symbols: &'a SymbolTable,
-    /// Borrowed field interner for recovering source names at the
-    /// engine boundary (engine stores record fields as `String`).
     fields: &'a FieldInterner,
 }
 
 impl<'a, 'src> InferCtx<'a, 'src> {
+    fn lookup(&self, name: &str) -> Option<&Scheme> {
+        self.env.get(name).or_else(|| self.constructors.get(name))
+    }
+
+    fn scoped<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.env.clone();
+        let result = f(self);
+        self.env = saved;
+        result
+    }
+
     fn new(symbols: &'a SymbolTable, fields: &'a FieldInterner) -> Self {
         Self {
             engine: TypeEngine::new(),
@@ -98,14 +98,14 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             type_aliases: HashMap::new(),
             type_annos: HashMap::new(),
             known_types: std::collections::HashSet::new(),
+            constraint_spans: Vec::new(),
+            ret_ty_stack: Vec::new(),
             int_literal_vars: Vec::new(),
             float_literal_vars: Vec::new(),
+            expr_types: HashMap::new(),
             is_bindings: HashMap::new(),
             method_resolutions: HashMap::new(),
-            constraint_spans: Vec::new(),
-            expr_types: HashMap::new(),
             eta_expansions: HashMap::new(),
-            ret_ty_stack: Vec::new(),
             symbols,
             fields,
         }
@@ -446,11 +446,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         if args.is_empty() {
             return Ok(None);
         }
-        let scheme = self
-            .constructors
-            .get(func)
-            .cloned()
-            .or_else(|| self.env.get(func).cloned());
+        let scheme = self.lookup(func).cloned();
         let Some(scheme) = scheme else {
             return Ok(None);
         };
@@ -750,73 +746,71 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         stmts: &[Stmt<'src>],
         result: &Expr<'src>,
     ) -> Result<Type, CompileError> {
-        let saved_env = self.env.clone();
-        let mut pending_hints: HashMap<String, TypeExpr<'src>> = HashMap::new();
-        for stmt in stmts {
-            match stmt {
-                Stmt::TypeHint { name, ty } => {
-                    pending_hints.insert((*name).to_owned(), ty.clone());
-                }
-                Stmt::Let { name, val } => {
-                    let name_str = self.symbols.display(*name).to_owned();
-                    let val_ty = self.infer_expr(val)?;
-                    if let Some(hint) = pending_hints.remove(&name_str) {
-                        let hint_ty = self.resolve_type_expr(&hint)?;
-                        self.unify_expected(
-                            &val_ty,
-                            &hint_ty,
-                            val.span,
-                            &format!("let binding `{name_str}`"),
-                        )?;
+        self.scoped(|ctx| {
+            let mut pending_hints: HashMap<String, TypeExpr<'src>> = HashMap::new();
+            for stmt in stmts {
+                match stmt {
+                    Stmt::TypeHint { name, ty } => {
+                        pending_hints.insert((*name).to_owned(), ty.clone());
                     }
-                    // Value restriction: only generalize let bindings
-                    // whose value is syntactically a function.
-                    let scheme = if is_syntactic_value(val) {
-                        self.engine.generalize(&val_ty, &self.env)
-                    } else {
-                        Scheme::mono(val_ty)
-                    };
-                    self.env.insert(name_str, scheme);
-                }
-                Stmt::Destructure { pattern, val } => {
-                    let val_ty = self.infer_expr(val)?;
-                    let bindings = self.infer_pattern(pattern, &val_ty, val.span, None)?;
-                    let is_value = is_syntactic_value(val);
-                    for (sym, ty) in bindings {
-                        let name = self.symbols.display(sym).to_owned();
-                        let scheme = if is_value {
-                            self.engine.generalize(&ty, &self.env)
+                    Stmt::Let { name, val } => {
+                        let name_str = ctx.symbols.display(*name).to_owned();
+                        let val_ty = ctx.infer_expr(val)?;
+                        if let Some(hint) = pending_hints.remove(&name_str) {
+                            let hint_ty = ctx.resolve_type_expr(&hint)?;
+                            ctx.unify_expected(
+                                &val_ty,
+                                &hint_ty,
+                                val.span,
+                                &format!("let binding `{name_str}`"),
+                            )?;
+                        }
+                        let scheme = if is_syntactic_value(val) {
+                            ctx.engine.generalize(&val_ty, &ctx.env)
                         } else {
-                            Scheme::mono(ty)
+                            Scheme::mono(val_ty)
                         };
-                        self.env.insert(name, scheme);
+                        ctx.env.insert(name_str, scheme);
                     }
-                }
-                Stmt::Guard {
-                    condition,
-                    return_val,
-                } => {
-                    let cond_ty = self.infer_expr(condition)?;
-                    let bool_ty = Type::Con("Bool".to_owned());
-                    self.unify_at(&cond_ty, &bool_ty, condition.span)?;
-                    let guard_saved_env = self.env.clone();
-                    self.collect_is_bindings(condition);
-                    let ret_val_ty = self.infer_expr(return_val)?;
-                    if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
-                        self.unify_expected(
-                            &ret_val_ty,
-                            &fn_ret,
-                            return_val.span,
-                            "`return` value of guard clause",
-                        )?;
+                    Stmt::Destructure { pattern, val } => {
+                        let val_ty = ctx.infer_expr(val)?;
+                        let bindings = ctx.infer_pattern(pattern, &val_ty, val.span, None)?;
+                        let is_value = is_syntactic_value(val);
+                        for (sym, ty) in bindings {
+                            let name = ctx.symbols.display(sym).to_owned();
+                            let scheme = if is_value {
+                                ctx.engine.generalize(&ty, &ctx.env)
+                            } else {
+                                Scheme::mono(ty)
+                            };
+                            ctx.env.insert(name, scheme);
+                        }
                     }
-                    self.env = guard_saved_env;
+                    Stmt::Guard {
+                        condition,
+                        return_val,
+                    } => {
+                        let cond_ty = ctx.infer_expr(condition)?;
+                        let bool_ty = Type::Con("Bool".to_owned());
+                        ctx.unify_at(&cond_ty, &bool_ty, condition.span)?;
+                        ctx.scoped(|ctx| {
+                            ctx.collect_is_bindings(condition);
+                            let ret_val_ty = ctx.infer_expr(return_val)?;
+                            if let Some(fn_ret) = ctx.ret_ty_stack.last().cloned() {
+                                ctx.unify_expected(
+                                    &ret_val_ty,
+                                    &fn_ret,
+                                    return_val.span,
+                                    "`return` value of guard clause",
+                                )?;
+                            }
+                            Ok(())
+                        })?;
+                    }
                 }
             }
-        }
-        let result_ty = self.infer_expr(result)?;
-        self.env = saved_env;
-        Ok(result_ty)
+            ctx.infer_expr(result)
+        })
     }
 
     fn infer_if(
@@ -831,33 +825,34 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         let bool_ty = Type::Con("Bool".to_owned());
         for arm in arms {
             let bindings = self.infer_pattern(&arm.pattern, &scrutinee_ty, span, None)?;
-            let saved_env = self.env.clone();
-            for (sym, ty) in bindings {
-                let name = self.symbols.display(sym).to_owned();
-                self.env.insert(name, Scheme::mono(ty));
-            }
-            if let ast::Pattern::Constructor { name: "True", .. } = &arm.pattern {
-                self.collect_is_bindings(scrutinee);
-            }
-            for guard_expr in &arm.guards {
-                let guard_ty = self.infer_expr(guard_expr)?;
-                self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
-                self.collect_is_bindings(guard_expr);
-            }
-            let body_ty = self.infer_expr(&arm.body)?;
-            if arm.is_return {
-                if let Some(fn_ret) = self.ret_ty_stack.last().cloned() {
-                    self.unify_expected(
-                        &body_ty,
-                        &fn_ret,
-                        arm.body.span,
-                        "`return` value of match arm",
-                    )?;
+            self.scoped(|ctx| {
+                for (sym, ty) in bindings {
+                    let name = ctx.symbols.display(sym).to_owned();
+                    ctx.env.insert(name, Scheme::mono(ty));
                 }
-            } else {
-                self.unify_expected(&body_ty, &result_ty, arm.body.span, "match arm body")?;
-            }
-            self.env = saved_env;
+                if let ast::Pattern::Constructor { name: "True", .. } = &arm.pattern {
+                    ctx.collect_is_bindings(scrutinee);
+                }
+                for guard_expr in &arm.guards {
+                    let guard_ty = ctx.infer_expr(guard_expr)?;
+                    ctx.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
+                    ctx.collect_is_bindings(guard_expr);
+                }
+                let body_ty = ctx.infer_expr(&arm.body)?;
+                if arm.is_return {
+                    if let Some(fn_ret) = ctx.ret_ty_stack.last().cloned() {
+                        ctx.unify_expected(
+                            &body_ty,
+                            &fn_ret,
+                            arm.body.span,
+                            "`return` value of match arm",
+                        )?;
+                    }
+                } else {
+                    ctx.unify_expected(&body_ty, &result_ty, arm.body.span, "match arm body")?;
+                }
+                Ok(())
+            })?;
         }
         if let Some(eb) = else_body {
             let eb_ty = self.infer_expr(eb)?;
@@ -894,19 +889,19 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 span,
                 Some(&result_ty),
             )?;
-            let saved_env = self.env.clone();
-            for (sym, ty) in bindings {
-                let name = self.symbols.display(sym).to_owned();
-                self.env.insert(name, Scheme::mono(ty));
-            }
-            for guard_expr in &arm.guards {
-                let guard_ty = self.infer_expr(guard_expr)?;
-                self.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
-                self.collect_is_bindings(guard_expr);
-            }
-            let body_ty = self.infer_expr(&arm.body)?;
-            self.unify_expected(&body_ty, &result_ty, arm.body.span, "fold arm body")?;
-            self.env = saved_env;
+            self.scoped(|ctx| {
+                for (sym, ty) in bindings {
+                    let name = ctx.symbols.display(sym).to_owned();
+                    ctx.env.insert(name, Scheme::mono(ty));
+                }
+                for guard_expr in &arm.guards {
+                    let guard_ty = ctx.infer_expr(guard_expr)?;
+                    ctx.unify_at(&guard_ty, &bool_ty, guard_expr.span)?;
+                    ctx.collect_is_bindings(guard_expr);
+                }
+                let body_ty = ctx.infer_expr(&arm.body)?;
+                ctx.unify_expected(&body_ty, &result_ty, arm.body.span, "fold arm body")
+            })?;
         }
         self.close_open_tag_row(&scrutinee_ty);
         Ok(result_ty)
@@ -923,25 +918,22 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         let lhs_ty = self.infer_expr(lhs)?;
         let bool_ty = Type::Con("Bool".to_owned());
         self.unify_at(&lhs_ty, &bool_ty, lhs.span)?;
-        let saved_env = flow_is_bindings.then(|| {
-            let saved = self.env.clone();
-            self.collect_is_bindings(lhs);
-            saved
-        });
-        let rhs_ty = self.infer_expr(rhs)?;
-        self.unify_at(&rhs_ty, &bool_ty, rhs.span)?;
-        if let Some(saved) = saved_env {
-            self.env = saved;
+        if flow_is_bindings {
+            self.scoped(|ctx| {
+                ctx.collect_is_bindings(lhs);
+                let rhs_ty = ctx.infer_expr(rhs)?;
+                ctx.unify_at(&rhs_ty, &bool_ty, rhs.span)
+            })?;
+        } else {
+            let rhs_ty = self.infer_expr(rhs)?;
+            self.unify_at(&rhs_ty, &bool_ty, rhs.span)?;
         }
         Ok(bool_ty)
     }
 
     fn infer_name(&mut self, sym: SymbolId, span: Span) -> Result<Type, CompileError> {
         let name = self.symbols.display(sym);
-        if let Some(scheme) = self.env.get(name).cloned() {
-            return Ok(self.engine.instantiate(&scheme));
-        }
-        if let Some(scheme) = self.constructors.get(name).cloned() {
+        if let Some(scheme) = self.lookup(name).cloned() {
             return Ok(self.engine.instantiate(&scheme));
         }
         // Structural constructor: uppercase name not in any declaration
@@ -1011,24 +1003,24 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         expected_ret: &Type,
         span: Span,
     ) -> Result<Type, CompileError> {
-        let saved_env = self.env.clone();
-        let param_types: Vec<Type> = params
-            .iter()
-            .zip(expected_params.iter())
-            .map(|(p, expected_ty)| {
-                let name = self.symbols.display(*p).to_owned();
-                self.env.insert(name, Scheme::mono(expected_ty.clone()));
-                expected_ty.clone()
-            })
-            .collect();
-        let ret = self.engine.fresh();
-        self.ret_ty_stack.push(ret.clone());
-        let body_ty = self.infer_expr(body)?;
-        self.ret_ty_stack.pop();
-        self.unify_at(&ret, &body_ty, body.span)?;
-        self.unify_at(&ret, expected_ret, span)?;
-        self.env = saved_env;
-        Ok(Type::Arrow(param_types, Box::new(ret)))
+        self.scoped(|ctx| {
+            let param_types: Vec<Type> = params
+                .iter()
+                .zip(expected_params.iter())
+                .map(|(p, expected_ty)| {
+                    let name = ctx.symbols.display(*p).to_owned();
+                    ctx.env.insert(name, Scheme::mono(expected_ty.clone()));
+                    expected_ty.clone()
+                })
+                .collect();
+            let ret = ctx.engine.fresh();
+            ctx.ret_ty_stack.push(ret.clone());
+            let body_ty = ctx.infer_expr(body)?;
+            ctx.ret_ty_stack.pop();
+            ctx.unify_at(&ret, &body_ty, body.span)?;
+            ctx.unify_at(&ret, expected_ret, span)?;
+            Ok(Type::Arrow(param_types, Box::new(ret)))
+        })
     }
 
     fn infer_lambda(
@@ -1036,23 +1028,23 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         params: &[SymbolId],
         body: &Expr<'src>,
     ) -> Result<Type, CompileError> {
-        let saved_env = self.env.clone();
-        let param_types: Vec<Type> = params
-            .iter()
-            .map(|p| {
-                let ty = self.engine.fresh();
-                let name = self.symbols.display(*p).to_owned();
-                self.env.insert(name, Scheme::mono(ty.clone()));
-                ty
-            })
-            .collect();
-        let ret = self.engine.fresh();
-        self.ret_ty_stack.push(ret.clone());
-        let body_ty = self.infer_expr(body)?;
-        self.ret_ty_stack.pop();
-        self.unify_at(&ret, &body_ty, body.span)?;
-        self.env = saved_env;
-        Ok(Type::Arrow(param_types, Box::new(ret)))
+        self.scoped(|ctx| {
+            let param_types: Vec<Type> = params
+                .iter()
+                .map(|p| {
+                    let ty = ctx.engine.fresh();
+                    let name = ctx.symbols.display(*p).to_owned();
+                    ctx.env.insert(name, Scheme::mono(ty.clone()));
+                    ty
+                })
+                .collect();
+            let ret = ctx.engine.fresh();
+            ctx.ret_ty_stack.push(ret.clone());
+            let body_ty = ctx.infer_expr(body)?;
+            ctx.ret_ty_stack.pop();
+            ctx.unify_at(&ret, &body_ty, body.span)?;
+            Ok(Type::Arrow(param_types, Box::new(ret)))
+        })
     }
 
     // ---- Call inference ----
@@ -1084,19 +1076,11 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
         let ret = self.engine.fresh();
 
-        if let Some(scheme) = self.constructors.get(func).cloned() {
-            let con_ty = self.engine.instantiate(&scheme);
-            if arg_types.is_empty() {
-                // Nullary constructor called with parens
-                return Ok(con_ty);
-            }
-            let expected = Type::Arrow(arg_types, Box::new(ret.clone()));
-            self.unify_at(&con_ty, &expected, span)?;
-            return Ok(ret);
-        }
-
-        if let Some(scheme) = self.env.get(func).cloned() {
+        if let Some(scheme) = self.lookup(func).cloned() {
             let func_ty = self.engine.instantiate(&scheme);
+            if arg_types.is_empty() && self.constructors.contains_key(func) {
+                return Ok(func_ty);
+            }
             let expected = Type::Arrow(arg_types, Box::new(ret.clone()));
             self.unify_at(&func_ty, &expected, span)?;
             self.maybe_mark_numeric_builtin(func, span);
@@ -1561,23 +1545,21 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         params: &[SymbolId],
         body: &Expr<'src>,
     ) -> Result<(), CompileError> {
-        let saved_env = self.env.clone();
-
         // Zero-param bindings are value bindings, not zero-arg functions.
-        // Infer the body directly and register the result type (not
-        // wrapped in Arrow). If there's a type annotation, unify with it.
         if params.is_empty() {
-            let body_ty = self.infer_expr(body)?;
-            if let Some(anno) = self.type_annos.get(name).cloned() {
-                let anno_ty = self.resolve_type_expr(&anno)?;
-                self.unify_expected(
-                    &body_ty,
-                    &anno_ty,
-                    body.span,
-                    &format!("value `{name}`"),
-                )?;
-            }
-            self.env = saved_env;
+            let body_ty = self.scoped(|ctx| {
+                let body_ty = ctx.infer_expr(body)?;
+                if let Some(anno) = ctx.type_annos.get(name).cloned() {
+                    let anno_ty = ctx.resolve_type_expr(&anno)?;
+                    ctx.unify_expected(
+                        &body_ty,
+                        &anno_ty,
+                        body.span,
+                        &format!("value `{name}`"),
+                    )?;
+                }
+                Ok(body_ty)
+            })?;
             self.env.remove(name);
             let generalized = self.engine.generalize(&body_ty, &self.env);
             self.env.insert(name.to_owned(), generalized);
@@ -1593,62 +1575,52 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         // similar synthesized recursive helpers resolve calls to
         // themselves; it's restored/generalized at the end of this
         // function so no spurious mono scheme leaks into later callers.
-        let func_ty = if let Some(pre_scheme) = self.env.get(name).cloned() {
-            self.engine.instantiate(&pre_scheme)
-        } else {
-            let param_types: Vec<Type> = params.iter().map(|_| self.engine.fresh()).collect();
-            let ret = self.engine.fresh();
-            let func_ty = Type::Arrow(param_types, Box::new(ret));
-            self.env
-                .insert(name.to_owned(), Scheme::mono(func_ty.clone()));
-            func_ty
-        };
+        let external_ty = self.scoped(|ctx| {
+            let func_ty = if let Some(pre_scheme) = ctx.env.get(name).cloned() {
+                ctx.engine.instantiate(&pre_scheme)
+            } else {
+                let param_types: Vec<Type> = params.iter().map(|_| ctx.engine.fresh()).collect();
+                let ret = ctx.engine.fresh();
+                let func_ty = Type::Arrow(param_types, Box::new(ret));
+                ctx.env
+                    .insert(name.to_owned(), Scheme::mono(func_ty.clone()));
+                func_ty
+            };
 
-        let param_types: Vec<Type> = params.iter().map(|_| self.engine.fresh()).collect();
-        let ret = self.engine.fresh();
-        let expected = Type::Arrow(param_types.clone(), Box::new(ret.clone()));
-        self.unify_at(&func_ty, &expected, body.span)?;
+            let param_types: Vec<Type> = params.iter().map(|_| ctx.engine.fresh()).collect();
+            let ret = ctx.engine.fresh();
+            let expected = Type::Arrow(param_types.clone(), Box::new(ret.clone()));
+            ctx.unify_at(&func_ty, &expected, body.span)?;
 
-        for (p, ty) in params.iter().zip(param_types.iter()) {
-            let pname = self.symbols.display(*p).to_owned();
-            self.env.insert(pname, Scheme::mono(ty.clone()));
-        }
-        // Push the return type so any `return` statement inside the
-        // body can flow its value here. Use check_expr to push the
-        // expected return type into lambdas bidirectionally — this
-        // enables opaque type transparency (e.g. Parser(a) → Arrow)
-        // to flow into nested lambda param types.
-        self.ret_ty_stack.push(ret.clone());
-        let body_ty = self.check_expr(body, &ret, Some((name, 0)))?;
-        self.ret_ty_stack.pop();
-        self.unify_expected(
-            &body_ty,
-            &ret,
-            body.span,
-            &format!("body of function `{name}`"),
-        )?;
-
-        // If there's an annotation, unify with it and use it as
-        // the external type. A mismatch here is the classic
-        // "function body doesn't match its signature" error —
-        // attribute it to the function name so the user knows
-        // which definition is wrong, not just that a unify failed.
-        let external_ty = if let Some(anno) = self.type_annos.get(name).cloned() {
-            let anno_ty = self.resolve_type_expr(&anno)?;
-            self.unify_expected(
-                &func_ty,
-                &anno_ty,
+            for (p, ty) in params.iter().zip(param_types.iter()) {
+                let pname = ctx.symbols.display(*p).to_owned();
+                ctx.env.insert(pname, Scheme::mono(ty.clone()));
+            }
+            ctx.ret_ty_stack.push(ret.clone());
+            let body_ty = ctx.check_expr(body, &ret, Some((name, 0)))?;
+            ctx.ret_ty_stack.pop();
+            ctx.unify_expected(
+                &body_ty,
+                &ret,
                 body.span,
-                &format!("function `{name}`"),
+                &format!("body of function `{name}`"),
             )?;
-            anno_ty
-        } else {
-            self.engine.resolve(&func_ty)
-        };
 
-        self.env = saved_env;
+            if let Some(anno) = ctx.type_annos.get(name).cloned() {
+                let anno_ty = ctx.resolve_type_expr(&anno)?;
+                ctx.unify_expected(
+                    &func_ty,
+                    &anno_ty,
+                    body.span,
+                    &format!("function `{name}`"),
+                )?;
+                Ok(anno_ty)
+            } else {
+                Ok(ctx.engine.resolve(&func_ty))
+            }
+        })?;
+
         self.env.remove(name);
-
         let generalized = self.engine.generalize(&external_ty, &self.env);
         self.env.insert(name.to_owned(), generalized);
         Ok(())
