@@ -1,12 +1,10 @@
 import parser
 
-box = Parser.sequence({
+boxes = Parser.sequence({
     l: u64.and_drop_right(symbol('x')),
     w: u64.and_drop_right(symbol('x')),
     h: u64,
-})
-
-boxes = box.separated_by(symbol('\n'))
+}).separated_by(symbol('\n'))
 
 paper : { l: U64, w: U64, h: U64 } -> U64
 paper = |b| (
