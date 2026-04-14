@@ -6,18 +6,24 @@ boxes = Parser.sequence({
     h: u64,
 }).separated_by(symbol('\n'))
 
-paper : { l: U64, w: U64, h: U64 } -> U64
-paper = |b| (
+part1 : List({ l: U64, w: U64, h: U64 }) -> U64
+part1 = |bs| bs.walk(0, |acc, b| (
     lw = b.l * b.w
     wh = b.w * b.h
     hl = b.h * b.l
-    smallest = U64.min(lw, U64.min(wh, hl))
-    2 * lw + 2 * wh + 2 * hl + smallest
-)
+    acc + 2 * lw + 2 * wh + 2 * hl + U64.min(lw, U64.min(wh, hl))
+))
+
+part2 : List({ l: U64, w: U64, h: U64 }) -> U64
+part2 = |bs| bs.walk(0, |acc, b| (
+    smallest_perimeter = U64.min(
+        2 * b.l + 2 * b.w,
+        U64.min(2 * b.w + 2 * b.h, 2 * b.h + 2 * b.l))
+    acc + smallest_perimeter + b.l * b.w * b.h
+))
 
 main : List(Str), Str -> Result(Str, Str)
 main = |args, input| (
     (parsed, rest) = boxes.run(input)?
-    total = parsed.walk(0, |acc, b| acc + paper(b))
-    Ok(U64.to_str(total))
+    Ok("part1: ${U64.to_str(part1(parsed))} part2: ${U64.to_str(part2(parsed))}")
 )
