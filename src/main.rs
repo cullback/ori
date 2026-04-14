@@ -6,6 +6,8 @@ mod error;
 mod flatten_patterns;
 mod fold_lift;
 mod lambda_lift;
+mod lambda_solve;
+mod lambda_specialize;
 mod mono;
 mod numeric;
 mod reachable;
@@ -54,11 +56,17 @@ fn compile(
     )?;
     let (mono_module, mono_infer) =
         mono::specialize(resolved.module, infer_result, &mut resolved.symbols);
-    let defunc_module = defunc::rewrite(
-        mono_module,
+    let lifted_module = lambda_lift::lift(mono_module, &mut resolved.symbols);
+    let lambda_solution = lambda_solve::solve(
+        &lifted_module,
         arena,
         &resolved.scope,
         &mono_infer,
+        &resolved.symbols,
+    );
+    let defunc_module = lambda_specialize::specialize(
+        lifted_module,
+        &lambda_solution,
         &mut resolved.symbols,
     );
     // Pruning: drop unreachable decls. Build decl_info on the

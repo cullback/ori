@@ -1,3 +1,10 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::needless_pass_by_value,
+    reason = "lambda lift is an AST walker"
+)]
+
 //! Lambda lifting — convert every `Lambda` into a top-level `FuncDef`
 //! with captures as extra leading parameters, replacing the Lambda node
 //! with a `Closure { func, captures }` value.

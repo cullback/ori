@@ -44,7 +44,9 @@
     clippy::match_same_arms,
     clippy::explicit_iter_loop,
     clippy::if_not_else,
-    reason = "defunc is a multi-phase AST walker with many variants"
+    dead_code,
+    unused_imports,
+    reason = "defunc is replaced by lambda_lift + lambda_solve + lambda_specialize"
 )]
 
 use std::collections::{HashMap, HashSet};

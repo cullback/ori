@@ -229,10 +229,10 @@ pub enum ExprKind<'src> {
         expr: Box<Expr<'src>>,
         pattern: Pattern<'src>,
     },
-    /// Closure value produced by lambda_lift. `func` is the SymbolId
+    /// Closure value produced by `lambda_lift`. `func` is the `SymbolId`
     /// of the lifted top-level function. `captures` are expressions
     /// for each captured variable (matching the capture-prefix
-    /// parameters of `func`). Eliminated by lambda_specialize.
+    /// parameters of `func`). Eliminated by `lambda_specialize`.
     Closure {
         func: SymbolId,
         captures: Vec<Expr<'src>>,
