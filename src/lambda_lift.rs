@@ -26,14 +26,17 @@ pub fn lift<'src>(module: Module<'src>, symbols: &mut SymbolTable) -> Module<'sr
         counter: 0,
     };
 
-    let mut new_decls: Vec<Decl<'src>> = module
-        .decls
-        .into_iter()
-        .map(|d| ctx.lift_decl(d))
-        .collect();
-
-    // Append all lifted FuncDefs.
-    new_decls.extend(ctx.lifted);
+    // Process each decl. Lifted functions created during a decl's
+    // processing are prepended before it so they appear earlier in
+    // topo order — inner lambdas before outer, all before the
+    // function whose body references their Closure nodes.
+    let mut new_decls: Vec<Decl<'src>> = Vec::new();
+    for d in module.decls {
+        let before = ctx.lifted.len();
+        let d = ctx.lift_decl(d);
+        new_decls.extend(ctx.lifted.drain(before..));
+        new_decls.push(d);
+    }
 
     Module {
         exports: module.exports,
