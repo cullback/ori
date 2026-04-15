@@ -749,11 +749,14 @@ impl ParseCtx {
                 }
                 _ => {
                     // Destructuring: generate a fresh name and desugar.
+                    // Use a unique span so expr_types doesn't collide
+                    // with the lambda's own span (which gets the Arrow type).
                     let name: &'static str = Box::leak(format!("__pat_{i}").into_boxed_str());
                     params.push(name);
+                    let pat_span = Span { start: span.start + i + 1, ..span };
                     destructures.push(Stmt::Destructure {
                         pattern,
-                        val: Expr::new(ExprKind::Name(name), span),
+                        val: Expr::new(ExprKind::Name(name), pat_span),
                     });
                 }
             }

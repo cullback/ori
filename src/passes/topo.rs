@@ -9,13 +9,10 @@
 //! ## Cycle policy
 //!
 //! System T forbids user recursion — every loop must come from `fold`
-//! or `List.walk*`. The cycle check errors on any cycle with two or
-//! more distinct nodes. **Self-cycles** (a function calling itself)
-//! are deliberately *not* reported, because `fold_lift` synthesizes
-//! recursive helpers like `__fold_N` that call themselves by
-//! construction. Detecting user self-recursion cleanly would require
-//! distinguishing synthesized helpers from user code, which is a
-//! bigger concern for a later step.
+//! or `List.walk*`. The cycle check errors on any multi-node cycle
+//! and on self-recursive functions. The only exception is synthesized
+//! `__fold_N` helpers from `fold_lift`, which are self-recursive by
+//! construction.
 //!
 //! ## Scope
 //!
@@ -276,8 +273,14 @@ fn detect_cycles(
             let node_name = *node;
             if let Some(next) = successors.pop() {
                 if next == node_name {
-                    // Self-loop: skip silently.
-                    continue;
+                    // Self-loop from a synthesized fold helper — skip.
+                    // User-written self-recursion is a System T violation.
+                    if node_name.starts_with("__fold_") {
+                        continue;
+                    }
+                    return Err(CompileError::new(format!(
+                        "System T violation: recursive function `{node_name}`"
+                    )));
                 }
                 match color.get(next).copied().unwrap_or(Color::Black) {
                     Color::White => {

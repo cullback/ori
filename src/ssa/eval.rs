@@ -513,11 +513,15 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
         "__num_to_str" => {
             // args: [number] → str_ptr (List(U8))
             let s = match args[0] {
+                Scalar::I8(n) => n.to_string(),
+                Scalar::U8(n) => n.to_string(),
+                Scalar::I16(n) => n.to_string(),
+                Scalar::U16(n) => n.to_string(),
+                Scalar::I32(n) => n.to_string(),
+                Scalar::U32(n) => n.to_string(),
                 Scalar::I64(n) => n.to_string(),
                 Scalar::U64(n) => n.to_string(),
                 Scalar::F64(n) => n.to_string(),
-                Scalar::U8(n) => n.to_string(),
-                Scalar::I8(n) => n.to_string(),
                 _ => panic!("__num_to_str: expected number"),
             };
             let bytes = s.into_bytes();

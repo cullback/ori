@@ -53,19 +53,17 @@ unpack_le = |w| [
 pad : List(U8) -> List(U8)
 pad = |msg| (
     orig_len = msg.len()
-    # Append 0x80 byte
     padded = msg.append(128)
-    # Append zeros until length mod 64 == 56
     padded2 = pad_zeros(padded)
-    # Append original length in bits as 64-bit little-endian
     bit_len = orig_len * 8
     append_length(padded2, bit_len)
 )
 
 pad_zeros : List(U8) -> List(U8)
 pad_zeros = |msg|
-    if msg.len() % 64 == 56 then msg
-    else pad_zeros(msg.append(0))
+    List.repeat(0, 64).walk_until(msg, |m, x|
+        if m.len() % 64 == 56 then Break(m)
+        else Continue(m.append(0)))
 
 append_length : List(U8), U64 -> List(U8)
 append_length = |msg, n|
@@ -81,12 +79,8 @@ append_length = |msg, n|
 # Parse a 64-byte chunk into 16 U32 words (little-endian).
 chunk_to_words : List(U8), U64 -> List(U32)
 chunk_to_words = |bytes, offset|
-    build_words(bytes, offset, 0, [])
-
-build_words : List(U8), U64, U64, List(U32) -> List(U32)
-build_words = |bytes, offset, i, acc|
-    if i == 16 then acc
-    else (
+    List.repeat(0, 16).walk([], |acc, x| (
+        i = acc.len()
         j = offset + i * 4
         w = pack_le(
             bytes.get(j).unwrap(),
@@ -94,25 +88,23 @@ build_words = |bytes, offset, i, acc|
             bytes.get(j + 2).unwrap(),
             bytes.get(j + 3).unwrap()
         )
-        build_words(bytes, offset, i + 1, acc.append(w))
-    )
+        acc.append(w)
+    ))
 
 # Process one 64-byte block.
 process_block : (U32, U32, U32, U32), List(U32) -> (U32, U32, U32, U32)
 process_block = |(a0, b0, c0, d0), m| (
-    (a_final, b_final, c_final, d_final) = round_loop(a0, b0, c0, d0, m, 0)
-    (a0 + a_final, b0 + b_final, c0 + c_final, d0 + d_final)
+    result = round_loop(a0, b0, c0, d0, m)
+    (a0 + result.a, b0 + result.b, c0 + result.c, d0 + result.d)
 )
 
-round_loop : U32, U32, U32, U32, List(U32), U64 -> (U32, U32, U32, U32)
-round_loop = |a, b, c, d, m, i|
-    if i == 64 then (a, b, c, d)
-    else (
-        (f, g) = round_fg(b, c, d, i)
-        temp = a + f + k_table.get(i).unwrap() + m.get(g).unwrap()
-        new_b = b + temp.rotate_left(s_table.get(i).unwrap())
-        round_loop(d, new_b, b, c, m, i + 1)
-    )
+round_loop = |a, b, c, d, m|
+    List.repeat(0, 64).walk({ i: 0, a: a, b: b, c: c, d: d }, |state, x| (
+        (f, g) = round_fg(state.b, state.c, state.d, state.i)
+        temp = state.a + f + k_table.get(state.i).unwrap() + m.get(g).unwrap()
+        new_b = state.b + temp.rotate_left(s_table.get(state.i).unwrap())
+        { i: state.i + 1, a: state.d, b: new_b, c: state.b, d: state.c }
+    ))
 
 round_fg : U32, U32, U32, U64 -> (U32, U64)
 round_fg = |b, c, d, i|
@@ -133,17 +125,16 @@ Md5 := {}.(
         num_blocks = padded.len() / 64
         state : (U32, U32, U32, U32)
         state = (1732584193, 4023233417, 2562383102, 271733878)
-        final_state = process_blocks(padded, state, 0, num_blocks)
+        final_state = process_blocks(padded, state, num_blocks)
         (a, b, c, d) = final_state
         unpack_le(a).concat(unpack_le(b)).concat(unpack_le(c)).concat(unpack_le(d))
     )
 )
 
-process_blocks : List(U8), (U32, U32, U32, U32), U64, U64 -> (U32, U32, U32, U32)
-process_blocks = |padded, state, block_idx, num_blocks|
-    if block_idx == num_blocks then state
-    else (
-        words = chunk_to_words(padded, block_idx * 64)
-        new_state = process_block(state, words)
-        process_blocks(padded, new_state, block_idx + 1, num_blocks)
-    )
+process_blocks : List(U8), (U32, U32, U32, U32), U64 -> (U32, U32, U32, U32)
+process_blocks = |padded, state, num_blocks|
+    List.repeat(0, num_blocks).walk({ idx: 0, st: state }, |acc, x| (
+        words = chunk_to_words(padded, acc.idx * 64)
+        new_state = process_block(acc.st, words)
+        { idx: acc.idx + 1, st: new_state }
+    )).st
