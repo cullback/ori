@@ -37,6 +37,36 @@ pub fn insert_rc(module: &mut Module) {
     }
 }
 
+/// Remove RcInc/RcDec on values defined by StaticRef, since
+/// static objects have a sentinel refcount and RC is a no-op.
+pub fn elide_static_rc(module: &mut Module) {
+    for func in module.functions.values_mut() {
+        let statics: HashSet<Value> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|inst| {
+                if let Inst::StaticRef(dest, _) = inst {
+                    Some(*dest)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if statics.is_empty() {
+            continue;
+        }
+        for block in &mut func.blocks {
+            block.insts.retain(|inst| {
+                !matches!(
+                    inst,
+                    Inst::RcInc(v) | Inst::RcDec(v) if statics.contains(v)
+                )
+            });
+        }
+    }
+}
+
 /// Replace RcDec+Alloc pairs with Reset+Reuse when the allocation
 /// sizes match, enabling in-place mutation of unique values.
 pub fn insert_reuse(module: &mut Module) {

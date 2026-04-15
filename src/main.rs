@@ -53,7 +53,9 @@ fn compile(
     ssa::static_promote::promote(&mut ssa_module);
     ssa::opt::optimize(&mut ssa_module);
     ssa::rc::insert_rc(&mut ssa_module);
+    ssa::rc::elide_static_rc(&mut ssa_module);
     ssa::rc::insert_reuse(&mut ssa_module);
+    ssa::opt::optimize(&mut ssa_module);
     Ok((ssa_module, input_vals))
 }
 

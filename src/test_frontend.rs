@@ -42,7 +42,9 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     crate::ssa::static_promote::promote(&mut ssa_module);
     crate::ssa::opt::optimize(&mut ssa_module);
     crate::ssa::rc::insert_rc(&mut ssa_module);
+    crate::ssa::rc::elide_static_rc(&mut ssa_module);
     crate::ssa::rc::insert_reuse(&mut ssa_module);
+    crate::ssa::opt::optimize(&mut ssa_module);
     (ssa_module, input_vals)
 }
 

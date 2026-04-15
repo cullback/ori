@@ -160,7 +160,6 @@ fn is_side_effect(inst: &Inst) -> bool {
             | Inst::RcDec(..)
             | Inst::Reset(..)
             | Inst::Reuse(..)
-            | Inst::StaticRef(..)
     )
 }
 
