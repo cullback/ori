@@ -11,26 +11,17 @@ step = |(x, y), ch|
       else (x, y)
 
 part1 : Str -> U64
-part1 = |input| (
-    start = (0, 0)
-    input.to_utf8().trail(start, step)
-        .walk(Set.single(start), |s, pos| s.insert(pos))
-        .len()
-)
+part1 = |input|
+    Set.from_list(input.to_utf8().trail((0, 0), step)).len()
 
 part2 : Str -> U64
 part2 = |input| (
     start = (0, 0)
     (santa_moves, robo_moves) = input.to_utf8().enumerate()
         .partition(|(i, _)| i % 2 == 0)
-    santa_visited = santa_moves.map(|(_, ch)| ch)
-        .trail(start, step)
-        .walk(Set.single(start), |s, pos| s.insert(pos))
-    robo_moves.map(|(_, ch)| ch)
-        .trail(start, step)
-        .walk(Set.single(start), |s, pos| s.insert(pos))
-        .walk(santa_visited, |s, pos| s.insert(pos))
-        .len()
+    santa_trail = santa_moves.map(|(_, ch)| ch).trail(start, step)
+    robo_trail = robo_moves.map(|(_, ch)| ch).trail(start, step)
+    Set.from_list(santa_trail.concat(robo_trail)).len()
 )
 
 main : List(Str), Str -> Result(Str, Str)
