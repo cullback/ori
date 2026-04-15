@@ -2,20 +2,33 @@ use super::{Block, Function, Module};
 use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 use std::collections::{BTreeMap, HashMap};
 
-/// Block under construction — terminator is set later.
-pub struct BuilderBlock {
-    params: Vec<Value>,
-    insts: Vec<Inst>,
-    terminator: Option<Terminator>,
+/// Block under construction — no terminator yet.
+pub struct PendingBlock {
+    pub params: Vec<Value>,
+    pub insts: Vec<Inst>,
+}
+
+/// Accumulated state for one function being built.
+pub struct FuncBuilder {
+    pub pending: BTreeMap<BlockId, PendingBlock>,
+    pub finished: BTreeMap<BlockId, Block>,
+    pub next_block: usize,
+}
+
+impl FuncBuilder {
+    pub fn new() -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            finished: BTreeMap::new(),
+            next_block: 0,
+        }
+    }
 }
 
 /// Builds SSA functions and modules incrementally.
-///
-/// Blocks are accumulated in a Vec during construction (for fast
-/// append) and converted to a BTreeMap when `finish_function` is called.
 pub struct Builder {
     next_value: usize,
-    pub blocks: Vec<BuilderBlock>,
+    pub func: FuncBuilder,
     pub current_block: Option<BlockId>,
     functions: HashMap<String, Function>,
     pub value_types: HashMap<Value, ScalarType>,
@@ -25,7 +38,7 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             next_value: 0,
-            blocks: Vec::new(),
+            func: FuncBuilder::new(),
             current_block: None,
             functions: HashMap::new(),
             value_types: HashMap::new(),
@@ -43,11 +56,11 @@ impl Builder {
     }
 
     pub fn create_block(&mut self) -> BlockId {
-        let id = BlockId(self.blocks.len());
-        self.blocks.push(BuilderBlock {
+        let id = BlockId(self.func.next_block);
+        self.func.next_block += 1;
+        self.func.pending.insert(id, PendingBlock {
             params: Vec::new(),
             insts: Vec::new(),
-            terminator: None,
         });
         id
     }
@@ -58,7 +71,9 @@ impl Builder {
 
     pub fn add_block_param(&mut self, block: BlockId, ty: ScalarType) -> Value {
         let v = self.fresh_value();
-        self.blocks[block.0].params.push(v);
+        self.func.pending.get_mut(&block)
+            .expect("add_block_param on non-pending block")
+            .params.push(v);
         self.set_type(v, ty);
         v
     }
@@ -200,13 +215,17 @@ impl Builder {
     }
 
     // ---- Terminators ----
+    //
+    // Each terminator method finalizes the current block: it takes the
+    // pending block, combines it with the terminator to produce a
+    // complete Block, and moves it into the finished map.
 
     pub fn ret(&mut self, value: Value) {
-        self.set_terminator(Terminator::Return(value));
+        self.seal(Terminator::Return(value));
     }
 
     pub fn jump(&mut self, target: BlockId, args: Vec<Value>) {
-        self.set_terminator(Terminator::Jump(target, args));
+        self.seal(Terminator::Jump(target, args));
     }
 
     pub fn branch(
@@ -217,7 +236,7 @@ impl Builder {
         else_block: BlockId,
         else_args: Vec<Value>,
     ) {
-        self.set_terminator(Terminator::Branch {
+        self.seal(Terminator::Branch {
             cond,
             then_block,
             then_args,
@@ -232,7 +251,7 @@ impl Builder {
         arms: Vec<(u64, BlockId, Vec<Value>)>,
         default: Option<(BlockId, Vec<Value>)>,
     ) {
-        self.set_terminator(Terminator::SwitchInt {
+        self.seal(Terminator::SwitchInt {
             scrutinee,
             arms,
             default,
@@ -248,34 +267,24 @@ impl Builder {
         param_types: Vec<ScalarType>,
         return_type: ScalarType,
     ) {
-        let builder_blocks = std::mem::take(&mut self.blocks);
-        let next_block = builder_blocks.len();
-        let blocks: BTreeMap<BlockId, Block> = builder_blocks
-            .into_iter()
-            .enumerate()
-            .map(|(i, bb)| {
-                let block = Block {
-                    params: bb.params,
-                    insts: bb.insts,
-                    terminator: bb.terminator.unwrap_or_else(|| {
-                        panic!("block b{i} in {name} has no terminator")
-                    }),
-                };
-                (BlockId(i), block)
-            })
-            .collect();
+        assert!(
+            self.func.pending.is_empty(),
+            "finish_function({name}): {} blocks still pending terminators",
+            self.func.pending.len(),
+        );
+        let fb = std::mem::replace(&mut self.func, FuncBuilder::new());
         let value_types = std::mem::take(&mut self.value_types);
         self.functions.insert(
             name.to_owned(),
             Function {
                 name: name.to_owned(),
                 params,
-                blocks,
+                blocks: fb.finished,
                 param_types,
                 return_type,
                 value_types,
                 entry: BlockId(0),
-                next_block,
+                next_block: fb.next_block,
             },
         );
         self.current_block = None;
@@ -292,12 +301,20 @@ impl Builder {
     // ---- Internal ----
 
     fn push(&mut self, inst: Inst) {
-        let block = self.current_block.expect("no current block");
-        self.blocks[block.0].insts.push(inst);
+        let bid = self.current_block.expect("no current block");
+        self.func.pending.get_mut(&bid)
+            .expect("push to non-pending block")
+            .insts.push(inst);
     }
 
-    fn set_terminator(&mut self, term: Terminator) {
-        let block = self.current_block.expect("no current block");
-        self.blocks[block.0].terminator = Some(term);
+    fn seal(&mut self, terminator: Terminator) {
+        let bid = self.current_block.expect("no current block");
+        let pending = self.func.pending.remove(&bid)
+            .expect("seal on non-pending block");
+        self.func.finished.insert(bid, Block {
+            params: pending.params,
+            insts: pending.insts,
+            terminator,
+        });
     }
 }

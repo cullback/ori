@@ -187,7 +187,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     fn lower_function(&mut self, name: &str, param_syms: &[SymbolId], body: &Expr<'src>) {
         let saved_vars = self.vars.clone();
-        let saved_blocks = std::mem::take(&mut self.builder.blocks);
+        let saved_func = std::mem::replace(&mut self.builder.func, crate::ssa::builder::FuncBuilder::new());
         let saved_current = self.builder.current_block.take();
 
         let ssa_params: Vec<Value> = param_syms
@@ -224,7 +224,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder
             .finish_function(name, ssa_params, param_types, return_type);
 
-        self.builder.blocks = saved_blocks;
+        self.builder.func = saved_func;
         self.builder.current_block = saved_current;
         self.vars = saved_vars;
     }
