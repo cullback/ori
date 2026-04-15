@@ -54,6 +54,8 @@ fn compile(
     ssa::opt::optimize(&mut ssa_module);
     ssa::inline::inline(&mut ssa_module);
     ssa::opt::optimize(&mut ssa_module);
+    ssa::const_eval::evaluate(&mut ssa_module);
+    ssa::opt::optimize(&mut ssa_module);
     ssa::rc::insert_rc(&mut ssa_module);
     ssa::rc::elide_static_rc(&mut ssa_module);
     ssa::rc::insert_reuse(&mut ssa_module);

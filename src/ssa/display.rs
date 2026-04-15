@@ -16,6 +16,7 @@ impl fmt::Display for Module {
                     }
                     match slot {
                         StaticSlot::U8(b) => write!(f, "{b}_u8")?,
+                        StaticSlot::U32(n) => write!(f, "{n}_u32")?,
                         StaticSlot::U64(n) => write!(f, "{n}_u64")?,
                         StaticSlot::I64(n) => write!(f, "{n}_i64")?,
                         StaticSlot::StaticPtr(id) => write!(f, "@{id}")?,

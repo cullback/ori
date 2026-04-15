@@ -80,6 +80,7 @@ fn promote_block(block: &mut super::Block, statics: &mut Vec<StaticObject>) {
             if let Some((ty, bits)) = const_vals.get(stored_val) {
                 match ty {
                     ScalarType::U8 => slots.push(StaticSlot::U8(*bits as u8)),
+                    ScalarType::U32 => slots.push(StaticSlot::U32(*bits as u32)),
                     ScalarType::U64 => slots.push(StaticSlot::U64(*bits)),
                     ScalarType::I64 => slots.push(StaticSlot::I64(*bits as i64)),
                     _ => {

@@ -165,6 +165,7 @@ fn init_statics(module: &Module, heap: &mut Heap) {
         for (si, slot) in obj.slots.iter().enumerate() {
             let scalar = match slot {
                 StaticSlot::U8(b) => Scalar::U8(*b),
+                StaticSlot::U32(n) => Scalar::U32(*n),
                 StaticSlot::U64(n) => Scalar::U64(*n),
                 StaticSlot::I64(n) => Scalar::I64(*n),
                 StaticSlot::StaticPtr(id) => Scalar::Ptr(base + id),
@@ -179,7 +180,7 @@ pub fn new_heap() -> Heap {
     Heap::new()
 }
 
-fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) -> Scalar {
+pub fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) -> Scalar {
     // Check for runtime intrinsics
     if let Some(result) = eval_intrinsic(name, heap, args) {
         return result;

@@ -1,4 +1,5 @@
 mod builder;
+pub mod const_eval;
 mod display;
 pub mod eval;
 pub mod inline;
@@ -49,6 +50,7 @@ pub struct StaticObject {
 #[derive(Debug, Clone)]
 pub enum StaticSlot {
     U8(u8),
+    U32(u32),
     U64(u64),
     I64(i64),
     /// Reference to another static object by index.
