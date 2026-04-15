@@ -49,7 +49,9 @@ fn compile(
     passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
-    ssa::lower::lower(&mono, &resolved.fields)
+    let (mut ssa_module, input_vals) = ssa::lower::lower(&mono, &resolved.fields)?;
+    ssa::rc::insert_rc(&mut ssa_module);
+    Ok((ssa_module, input_vals))
 }
 
 fn bytes_to_scalar(bytes: &[u8], heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {

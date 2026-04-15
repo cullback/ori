@@ -3,6 +3,7 @@ mod display;
 pub mod eval;
 mod instruction;
 pub mod lower;
+pub mod rc;
 
 #[allow(unused_imports)]
 pub use builder::Builder;

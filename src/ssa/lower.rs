@@ -337,12 +337,23 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .iter()
                     .map(|(sym, e)| (self.fields.get(*sym).to_owned(), e))
                     .collect();
+                // Get sorted field types from the base record type.
+                let field_types: Vec<ScalarType> = match &base.ty {
+                    Type::Record { fields, .. } => {
+                        let mut sorted: Vec<(&str, &Type)> =
+                            fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                        sorted.sort_unstable_by_key(|(n, _)| *n);
+                        sorted.iter().map(|(_, t)| type_to_scalar(t)).collect()
+                    }
+                    _ => vec![],
+                };
                 // For each field slot, either use the update value or copy from base.
                 for (slot, field_name) in all_fields.iter().enumerate() {
                     let val = if let Some(upd_expr) = update_map.get(field_name) {
                         self.lower_expr(upd_expr)
                     } else {
-                        self.builder.load(base_val, slot, ScalarType::Ptr)
+                        let ty = field_types.get(slot).copied().unwrap_or(ScalarType::Ptr);
+                        self.builder.load(base_val, slot, ty)
                     };
                     self.builder.store(ptr, slot, val);
                 }
@@ -1455,8 +1466,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     ) {
         match pattern {
             ast::Pattern::Tuple(elems) => {
+                let elem_types = match val_ty {
+                    Type::Tuple(tys) => tys.as_slice(),
+                    _ => &[],
+                };
                 for (i, elem) in elems.iter().enumerate() {
-                    let field_val = self.builder.load(val, i, ScalarType::Ptr);
+                    let ty = elem_types
+                        .get(i)
+                        .map(type_to_scalar)
+                        .unwrap_or(ScalarType::Ptr);
+                    let field_val = self.builder.load(val, i, ty);
                     self.lower_destructure_elem(elem, field_val);
                 }
             }
@@ -1484,10 +1503,23 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         names
                     }
                 };
+                let type_fields: Vec<(&str, &Type)> = match val_ty {
+                    Type::Record { fields: tf, .. } => {
+                        let mut sorted: Vec<(&str, &Type)> =
+                            tf.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                        sorted.sort_unstable_by_key(|(n, _)| *n);
+                        sorted
+                    }
+                    _ => vec![],
+                };
                 for (field_sym, elem) in fields {
                     let name = self.fields.get(*field_sym);
                     let slot = all_names.iter().position(|n| *n == name).unwrap();
-                    let field_val = self.builder.load(val, slot, ScalarType::Ptr);
+                    let ty = type_fields
+                        .get(slot)
+                        .map(|(_, t)| type_to_scalar(t))
+                        .unwrap_or(ScalarType::Ptr);
+                    let field_val = self.builder.load(val, slot, ty);
                     self.lower_destructure_elem(elem, field_val);
                 }
             }

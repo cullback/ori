@@ -38,7 +38,9 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
-    crate::ssa::lower::lower(&mono, &resolved.fields).unwrap()
+    let (mut ssa_module, input_vals) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
+    crate::ssa::rc::insert_rc(&mut ssa_module);
+    (ssa_module, input_vals)
 }
 
 // ---- Test runners ----

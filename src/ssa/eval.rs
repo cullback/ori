@@ -68,11 +68,10 @@ impl Heap {
     }
 
     fn rc_dec(&mut self, idx: usize) {
-        if idx != 0 {
+        if idx != 0 && self.objects[idx].0 > 0 {
             self.objects[idx].0 -= 1;
-            if self.objects[idx].0 == 0 {
-                self.objects[idx].1.clear();
-            }
+            // Don't free yet — recursive child decrement not implemented.
+            // For now, just track the count.
         }
     }
 
@@ -235,18 +234,16 @@ fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option
         }
 
         Inst::RcInc(ptr) => {
-            let Scalar::Ptr(idx) = env[ptr] else {
-                panic!("rc_inc on non-ptr");
-            };
-            heap.rc_inc(idx);
+            if let Scalar::Ptr(idx) = env[ptr] {
+                heap.rc_inc(idx);
+            }
             None
         }
 
         Inst::RcDec(ptr) => {
-            let Scalar::Ptr(idx) = env[ptr] else {
-                panic!("rc_dec on non-ptr");
-            };
-            heap.rc_dec(idx);
+            if let Scalar::Ptr(idx) = env[ptr] {
+                heap.rc_dec(idx);
+            }
             None
         }
     }

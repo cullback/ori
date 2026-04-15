@@ -94,6 +94,79 @@ impl Inst {
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
         }
     }
+
+    /// All values used as operands (not the destination).
+    pub fn operands(&self) -> Vec<Value> {
+        match self {
+            Self::Const(..) | Self::Alloc(..) => vec![],
+            Self::BinOp(_, _, lhs, rhs) => vec![*lhs, *rhs],
+            Self::Call(_, _, args) => args.clone(),
+            Self::Load(_, ptr, _) => vec![*ptr],
+            Self::Store(ptr, _, val) => vec![*ptr, *val],
+            Self::LoadDyn(_, ptr, idx) => vec![*ptr, *idx],
+            Self::StoreDyn(ptr, idx, val) => vec![*ptr, *idx, *val],
+            Self::RcInc(v) | Self::RcDec(v) => vec![*v],
+        }
+    }
+}
+
+impl Terminator {
+    /// All values used as operands in the terminator.
+    pub fn operands(&self) -> Vec<Value> {
+        match self {
+            Self::None => vec![],
+            Self::Return(v) => vec![*v],
+            Self::Jump(_, args) => args.clone(),
+            Self::Branch {
+                cond,
+                then_args,
+                else_args,
+                ..
+            } => {
+                let mut vals = vec![*cond];
+                vals.extend(then_args);
+                vals.extend(else_args);
+                vals
+            }
+            Self::SwitchInt {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                let mut vals = vec![*scrutinee];
+                for (_, _, args) in arms {
+                    vals.extend(args);
+                }
+                if let Some((_, args)) = default {
+                    vals.extend(args);
+                }
+                vals
+            }
+        }
+    }
+
+    /// Successor blocks and the values passed to each.
+    pub fn successors(&self) -> Vec<(BlockId, &[Value])> {
+        match self {
+            Self::None | Self::Return(_) => vec![],
+            Self::Jump(target, args) => vec![(*target, args)],
+            Self::Branch {
+                then_block,
+                then_args,
+                else_block,
+                else_args,
+                ..
+            } => vec![(*then_block, then_args), (*else_block, else_args)],
+            Self::SwitchInt { arms, default, .. } => {
+                let mut succs: Vec<(BlockId, &[Value])> =
+                    arms.iter().map(|(_, b, args)| (*b, args.as_slice())).collect();
+                if let Some((b, args)) = default {
+                    succs.push((*b, args));
+                }
+                succs
+            }
+        }
+    }
 }
 
 /// How a basic block ends.
