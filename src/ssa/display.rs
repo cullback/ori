@@ -1,7 +1,7 @@
 use std::fmt;
 
 use super::{Function, Module, StaticSlot};
-use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
+use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 use std::collections::HashMap;
 
 impl fmt::Display for Module {
@@ -47,8 +47,38 @@ impl fmt::Display for Module {
     }
 }
 
+/// Format a constant literal for inline display.
+fn fmt_const(ty: ScalarType, bits: u64) -> String {
+    match ty {
+        ScalarType::F64 => format!("{}_f64", f64::from_bits(bits)),
+        ScalarType::Bool => format!("{}", bits != 0),
+        ScalarType::Ptr => format!("0x{bits:x}_ptr"),
+        _ => format!("{bits}_{ty}"),
+    }
+}
+
+/// Display a value, inlining constants.
+fn fmt_val(v: Value, consts: &HashMap<Value, (ScalarType, u64)>) -> String {
+    if let Some(&(ty, bits)) = consts.get(&v) {
+        fmt_const(ty, bits)
+    } else {
+        format!("{v}")
+    }
+}
+
+/// Display a comma-separated arg list, inlining constants.
+fn fmt_args(args: &[Value], consts: &HashMap<Value, (ScalarType, u64)>) -> String {
+    args.iter()
+        .map(|v| fmt_val(*v, consts))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Collect all constants for inline display.
+        let consts = collect_consts(self);
+
         write!(f, "fn {}(", self.name)?;
         for (i, p) in self.params.iter().enumerate() {
             if i > 0 {
@@ -74,46 +104,47 @@ impl fmt::Display for Function {
             }
             writeln!(f, ":")?;
             for inst in &block.insts {
-                writeln!(f, "    {}", InstDisplay(inst, &self.value_types))?;
+                // Skip Const instructions — they're shown inline at use sites.
+                if matches!(inst, Inst::Const(..)) {
+                    continue;
+                }
+                writeln!(f, "    {}", FmtInst(inst, &self.value_types, &consts))?;
             }
-            writeln!(f, "    {}", block.terminator)?;
+            writeln!(f, "    {}", FmtTerm(&block.terminator, &consts))?;
         }
         Ok(())
     }
 }
 
-/// Helper to display an instruction with type annotations from value_types.
-struct InstDisplay<'a>(&'a Inst, &'a HashMap<Value, ScalarType>);
+/// Collect all Const instructions in a function.
+fn collect_consts(func: &Function) -> HashMap<Value, (ScalarType, u64)> {
+    let mut consts = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Const(dest, ty, bits) = inst {
+                consts.insert(*dest, (*ty, *bits));
+            }
+        }
+    }
+    consts
+}
 
-impl fmt::Display for InstDisplay<'_> {
+/// Display an instruction with constants inlined.
+struct FmtInst<'a>(&'a Inst, &'a HashMap<Value, ScalarType>, &'a HashMap<Value, (ScalarType, u64)>);
+
+impl fmt::Display for FmtInst<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let types = self.1;
+        let consts = self.2;
         match self.0 {
-            Inst::Const(d, ty, bits) => {
-                let dt = types.get(d).copied().unwrap_or(*ty);
-                match ty {
-                    ScalarType::F64 => {
-                        write!(f, "{d}: {dt} = const {}_f64", f64::from_bits(*bits))
-                    }
-                    ScalarType::Bool => write!(f, "{d}: {dt} = const {}", *bits != 0),
-                    ScalarType::Ptr => write!(f, "{d}: {dt} = const 0x{bits:x}_ptr"),
-                    _ => write!(f, "{d}: {dt} = const {bits}_{ty}"),
-                }
-            }
+            Inst::Const(..) => Ok(()), // suppressed
             Inst::BinOp(d, op, l, r) => {
                 let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
-                write!(f, "{d}: {dt} = {op} {l}, {r}")
+                write!(f, "{d}: {dt} = {op} {}, {}", fmt_val(*l, consts), fmt_val(*r, consts))
             }
             Inst::Call(d, name, args) => {
                 let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
-                write!(f, "{d}: {dt} = call {name}(")?;
-                for (i, a) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{a}")?;
-                }
-                write!(f, ")")
+                write!(f, "{d}: {dt} = call {name}({})", fmt_args(args, consts))
             }
             Inst::Alloc(d, size) => {
                 let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
@@ -121,19 +152,80 @@ impl fmt::Display for InstDisplay<'_> {
             }
             Inst::Load(d, ptr, off) => {
                 let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
-                write!(f, "{d}: {dt} = load {ptr}[{off}]")
+                write!(f, "{d}: {dt} = load {}[{off}]", fmt_val(*ptr, consts))
             }
-            Inst::Store(ptr, off, val) => write!(f, "store {val} -> {ptr}[{off}]"),
+            Inst::Store(ptr, off, val) => {
+                write!(f, "store {} -> {}[{off}]", fmt_val(*val, consts), fmt_val(*ptr, consts))
+            }
             Inst::LoadDyn(d, ptr, idx) => {
                 let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
-                write!(f, "{d}: {dt} = load_dyn {ptr}[{idx}]")
+                write!(f, "{d}: {dt} = load_dyn {}[{}]", fmt_val(*ptr, consts), fmt_val(*idx, consts))
             }
-            Inst::StoreDyn(ptr, idx, val) => write!(f, "store_dyn {val} -> {ptr}[{idx}]"),
-            Inst::RcInc(ptr) => write!(f, "rc_inc {ptr}"),
-            Inst::RcDec(ptr) => write!(f, "rc_dec {ptr}"),
-            Inst::Reset(d, ptr, _) => write!(f, "{d}: ptr = reset {ptr}"),
-            Inst::Reuse(d, tok, n) => write!(f, "{d}: ptr = reuse {tok}, {n}"),
+            Inst::StoreDyn(ptr, idx, val) => {
+                write!(f, "store_dyn {} -> {}[{}]",
+                    fmt_val(*val, consts), fmt_val(*ptr, consts), fmt_val(*idx, consts))
+            }
+            Inst::RcInc(ptr) => write!(f, "rc_inc {}", fmt_val(*ptr, consts)),
+            Inst::RcDec(ptr) => write!(f, "rc_dec {}", fmt_val(*ptr, consts)),
+            Inst::Reset(d, ptr, _) => write!(f, "{d}: ptr = reset {}", fmt_val(*ptr, consts)),
+            Inst::Reuse(d, tok, n) => write!(f, "{d}: ptr = reuse {}, {n}", fmt_val(*tok, consts)),
             Inst::StaticRef(d, id) => write!(f, "{d}: ptr = static_ref @{id}"),
+        }
+    }
+}
+
+/// Display a terminator with constants inlined.
+struct FmtTerm<'a>(&'a Terminator, &'a HashMap<Value, (ScalarType, u64)>);
+
+impl fmt::Display for FmtTerm<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let consts = self.1;
+        match self.0 {
+            Terminator::Return(v) => write!(f, "ret {}", fmt_val(*v, consts)),
+            Terminator::Jump(target, args) => {
+                write!(f, "jump {target}")?;
+                if !args.is_empty() {
+                    write!(f, "({})", fmt_args(args, consts))?;
+                }
+                Ok(())
+            }
+            Terminator::Branch {
+                cond,
+                then_block,
+                then_args,
+                else_block,
+                else_args,
+            } => {
+                write!(f, "branch {} ? {then_block}", fmt_val(*cond, consts))?;
+                if !then_args.is_empty() {
+                    write!(f, "({})", fmt_args(then_args, consts))?;
+                }
+                write!(f, " : {else_block}")?;
+                if !else_args.is_empty() {
+                    write!(f, "({})", fmt_args(else_args, consts))?;
+                }
+                Ok(())
+            }
+            Terminator::SwitchInt {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                write!(f, "switch {}", fmt_val(*scrutinee, consts))?;
+                for (val, block, args) in arms {
+                    write!(f, "\n      {val} -> {block}")?;
+                    if !args.is_empty() {
+                        write!(f, "({})", fmt_args(args, consts))?;
+                    }
+                }
+                if let Some((block, args)) = default {
+                    write!(f, "\n      _ -> {block}")?;
+                    if !args.is_empty() {
+                        write!(f, "({})", fmt_args(args, consts))?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -176,89 +268,4 @@ impl fmt::Display for BinaryOp {
     }
 }
 
-impl fmt::Display for Terminator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Return(v) => write!(f, "ret {v}"),
-            Self::Jump(target, args) => {
-                write!(f, "jump {target}")?;
-                if !args.is_empty() {
-                    write!(f, "(")?;
-                    for (i, a) in args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{a}")?;
-                    }
-                    write!(f, ")")?;
-                }
-                Ok(())
-            }
-            Self::Branch {
-                cond,
-                then_block,
-                then_args,
-                else_block,
-                else_args,
-            } => {
-                write!(f, "branch {cond} ? {then_block}")?;
-                if !then_args.is_empty() {
-                    write!(f, "(")?;
-                    for (i, a) in then_args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{a}")?;
-                    }
-                    write!(f, ")")?;
-                }
-                write!(f, " : {else_block}")?;
-                if !else_args.is_empty() {
-                    write!(f, "(")?;
-                    for (i, a) in else_args.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{a}")?;
-                    }
-                    write!(f, ")")?;
-                }
-                Ok(())
-            }
-            Self::SwitchInt {
-                scrutinee,
-                arms,
-                default,
-            } => {
-                write!(f, "switch {scrutinee}")?;
-                for (val, block, args) in arms {
-                    write!(f, "\n      {val} -> {block}")?;
-                    if !args.is_empty() {
-                        write!(f, "(")?;
-                        for (i, a) in args.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, ", ")?;
-                            }
-                            write!(f, "{a}")?;
-                        }
-                        write!(f, ")")?;
-                    }
-                }
-                if let Some((block, args)) = default {
-                    write!(f, "\n      _ -> {block}")?;
-                    if !args.is_empty() {
-                        write!(f, "(")?;
-                        for (i, a) in args.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, ", ")?;
-                            }
-                            write!(f, "{a}")?;
-                        }
-                        write!(f, ")")?;
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
-}
+// BlockId and Value Display impls live in instruction.rs.
