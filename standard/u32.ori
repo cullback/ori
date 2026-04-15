@@ -6,9 +6,22 @@ U32 := {}.(
     mul : U32, U32 -> U32
     div : U32, U32 -> U32
     mod : U32, U32 -> U32
+    bit_and : U32, U32 -> U32
+    bit_or : U32, U32 -> U32
+    bit_xor : U32, U32 -> U32
+    shl : U32, U32 -> U32
+    shr : U32, U32 -> U32
     equals : U32, U32 -> Bool
     compare : U32, U32 -> Order
     to_str : U32 -> Str
+    from_u8 : U8 -> U32
+    to_u8 : U32 -> U8
+
+    bit_not : U32 -> U32
+    bit_not = |x| x.bit_xor(4294967295)
+
+    rotate_left : U32, U32 -> U32
+    rotate_left = |x, n| x.shl(n).bit_or(x.shr(32 - n))
 
     min : U32, U32 -> U32
     min = |a, b| if a <= b then a else b

@@ -3328,3 +3328,181 @@ main = |_| Set.from_list([(0, 0), (1, 0), (2, 0), (1, 0)]).len()";
     // 4 elements, 3 unique
     assert_eq!(run_u64(source, 0), 3);
 }
+
+#[test]
+fn bitwise_operations_u32() {
+    // bit_and
+    let source = "\
+main : I64 -> U64
+main = |_| (
+    a : U32
+    a = 255
+    b : U32
+    b = 15
+    result : U32
+    result = a.bit_and(b)
+    if result == 15 then 1 else 0
+)";
+    assert_eq!(run_u64(source, 0), 1);
+
+    // bit_or, bit_xor, shl, shr
+    let source2 = "\
+main : I64 -> U64
+main = |_| (
+    a : U32
+    a = 240
+    b : U32
+    b = 15
+    or_ok = (a | b) == 255
+    xor_ok = (a ^ b) == 255
+    shl_ok = b.shl(4) == 240
+    shr_ok = a.shr(4) == 15
+    rot_ok = a.rotate_left(28) == 15
+    not_ok = b.bit_not() == 4294967280
+    if or_ok and xor_ok and shl_ok and shr_ok and rot_ok and not_ok then 1 else 0
+)";
+    assert_eq!(run_u64(source2, 0), 1);
+}
+
+#[test]
+fn md5_empty_string() {
+    // Full inline MD5 test - tests bitwise ops, U32 from_u8/to_u8, and the algorithm
+    let source = r#"
+s_table : List(U32)
+s_table = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+]
+
+k_table : List(U32)
+k_table = [
+    3614090360, 3905402710, 606105819, 3250441966,
+    4118548399, 1200080426, 2821735955, 4249261313,
+    1770035416, 2336552879, 4294925233, 2304563134,
+    1804603682, 4254626195, 2792965006, 1236535329,
+    4129170786, 3225465664, 643717713, 3921069994,
+    3593408605, 38016083, 3634488961, 3889429448,
+    568446438, 3275163606, 4107603335, 1163531501,
+    2850285829, 4243563512, 1735328473, 2368359562,
+    4294588738, 2272392833, 1839030562, 4259657740,
+    2763975236, 1272893353, 4139469664, 3200236656,
+    681279174, 3936430074, 3572445317, 76029189,
+    3654602809, 3873151461, 530742520, 3299628645,
+    4096336452, 1126891415, 2878612391, 4237533241,
+    1700485571, 2399980690, 4293915773, 2240044497,
+    1873313359, 4264355552, 2734768916, 1309151649,
+    4149444226, 3174756917, 718787259, 3951481745
+]
+
+pack_le : U8, U8, U8, U8 -> U32
+pack_le = |b0, b1, b2, b3|
+    U32.from_u8(b0)
+        .bit_or(U32.from_u8(b1).shl(8))
+        .bit_or(U32.from_u8(b2).shl(16))
+        .bit_or(U32.from_u8(b3).shl(24))
+
+build_words : List(U8), U64, U64, List(U32) -> List(U32)
+build_words = |bytes, offset, i, acc|
+    if i == 16 then acc
+    else (
+        j = offset + i * 4
+        w = pack_le(
+            bytes.get(j).unwrap(),
+            bytes.get(j + 1).unwrap(),
+            bytes.get(j + 2).unwrap(),
+            bytes.get(j + 3).unwrap()
+        )
+        build_words(bytes, offset, i + 1, acc.append(w))
+    )
+
+round_fg : U32, U32, U32, U64 -> (U32, U64)
+round_fg = |b, c, d, i|
+    if i < 16 then
+        (b.bit_and(c).bit_or(b.bit_not().bit_and(d)), i)
+    else if i < 32 then
+        (d.bit_and(b).bit_or(d.bit_not().bit_and(c)), (5 * i + 1) % 16)
+    else if i < 48 then
+        (b.bit_xor(c).bit_xor(d), (3 * i + 5) % 16)
+    else
+        (c.bit_xor(b.bit_or(d.bit_not())), (7 * i) % 16)
+
+round_loop : U32, U32, U32, U32, List(U32), U64 -> (U32, U32, U32, U32)
+round_loop = |a, b, c, d, m, i|
+    if i == 64 then (a, b, c, d)
+    else (
+        (f, g) = round_fg(b, c, d, i)
+        temp = a + f + k_table.get(i).unwrap() + m.get(g).unwrap()
+        new_b = b + temp.rotate_left(s_table.get(i).unwrap())
+        round_loop(d, new_b, b, c, m, i + 1)
+    )
+
+pad_zeros : List(U8) -> List(U8)
+pad_zeros = |msg|
+    if msg.len() % 64 == 56 then msg
+    else pad_zeros(msg.append(0))
+
+append_length : List(U8), U64 -> List(U8)
+append_length = |msg, bit_len|
+    msg.append(bit_len.bit_and(255).to_u8())
+       .append(bit_len.shr(8).bit_and(255).to_u8())
+       .append(bit_len.shr(16).bit_and(255).to_u8())
+       .append(bit_len.shr(24).bit_and(255).to_u8())
+       .append(bit_len.shr(32).bit_and(255).to_u8())
+       .append(bit_len.shr(40).bit_and(255).to_u8())
+       .append(bit_len.shr(48).bit_and(255).to_u8())
+       .append(bit_len.shr(56).bit_and(255).to_u8())
+
+pad : List(U8) -> List(U8)
+pad = |msg| (
+    orig_len = msg.len()
+    padded = pad_zeros(msg.append(128))
+    append_length(padded, orig_len * 8)
+)
+
+unpack_le : U32 -> List(U8)
+unpack_le = |w| [
+    w.to_u8(),
+    w.shr(8).to_u8(),
+    w.shr(16).to_u8(),
+    w.shr(24).to_u8()
+]
+
+main : I64 -> U64
+main = |_| (
+    padded = pad([])
+    words : List(U32)
+    words = build_words(padded, 0, 0, [])
+    a0 : U32
+    a0 = 1732584193
+    b0 : U32
+    b0 = 4023233417
+    c0 : U32
+    c0 = 2562383102
+    d0 : U32
+    d0 = 271733878
+    (a, b, c, d) = round_loop(a0, b0, c0, d0, words, 0)
+    result_a = a0 + a
+    # MD5("") first word should be 0xd98c1dd4 = 3652501972
+    # Actually: d41d8cd9 -> first 4 bytes are d4, 1d, 8c, d9
+    # little-endian U32: 0xd98c1dd4 = 3652501972
+    result = unpack_le(result_a)
+    # First byte of MD5("") should be 0xd4 = 212
+    if result.get(0).unwrap() == 212 then 1 else 0
+)
+"#;
+    assert_eq!(run_u64(source, 0), 1);
+}
+
+#[test]
+fn u32_from_u8() {
+    let source = "\
+main : I64 -> U64
+main = |_| (
+    x : U32
+    x = U32.from_u8(42)
+    if x == 42 then 1 else 0
+)";
+    assert_eq!(run_u64(source, 0), 1);
+}

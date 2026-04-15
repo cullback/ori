@@ -42,12 +42,25 @@ fn find_candidates(module: &Module) -> HashSet<String> {
         if name == &module.entry {
             continue;
         }
+        // Skip recursive functions — inlining them would produce an
+        // infinite expansion since the recursive call would immediately
+        // become a new inline site.
+        if calls_self(func) {
+            continue;
+        }
         let inst_count: usize = func.blocks.values().map(|b| b.insts.len()).sum();
         if inst_count <= MAX_INLINE_INSTS {
             candidates.insert(name.clone());
         }
     }
     candidates
+}
+
+/// True if the function contains any `Call` to itself.
+fn calls_self(func: &Function) -> bool {
+    func.blocks.values().any(|block| {
+        block.insts.iter().any(|inst| matches!(inst, Inst::Call(_, name, _) if name == &func.name))
+    })
 }
 
 /// Inline all eligible calls within a single function.

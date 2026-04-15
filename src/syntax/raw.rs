@@ -241,6 +241,8 @@ pub enum BinOp {
     Mul,
     Div,
     Rem,
+    BitOr,
+    BitXor,
     Eq,
     Neq,
     Lt,

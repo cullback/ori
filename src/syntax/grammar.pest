@@ -212,9 +212,10 @@ field_pattern = {
 
 // ---- Operators ----
 
-binop  = _{ or_op | and_op | ord_op | cmp_op | add_op | mul_op }
+binop  = _{ or_op | and_op | bit_op | ord_op | cmp_op | add_op | mul_op }
 or_op  =  { "or" }
 and_op =  { "and" }
+bit_op =  { "|" | "^" }
 ord_op =  { "<=" | ">=" | "<" | ">" }
 cmp_op =  { "==" | "!=" }
 add_op =  { "+" | "-" }

@@ -1,0 +1,149 @@
+exports [Md5]
+
+# MD5 message-digest algorithm (RFC 1321).
+
+# Per-round shift amounts.
+s_table : List(U32)
+s_table = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+]
+
+# Precomputed T[i] = floor(2^32 * abs(sin(i+1))).
+k_table : List(U32)
+k_table = [
+    3614090360, 3905402710, 606105819, 3250441966,
+    4118548399, 1200080426, 2821735955, 4249261313,
+    1770035416, 2336552879, 4294925233, 2304563134,
+    1804603682, 4254626195, 2792965006, 1236535329,
+    4129170786, 3225465664, 643717713, 3921069994,
+    3593408605, 38016083, 3634488961, 3889429448,
+    568446438, 3275163606, 4107603335, 1163531501,
+    2850285829, 4243563512, 1735328473, 2368359562,
+    4294588738, 2272392833, 1839030562, 4259657740,
+    2763975236, 1272893353, 4139469664, 3200236656,
+    681279174, 3936430074, 3572445317, 76029189,
+    3654602809, 3873151461, 530742520, 3299628645,
+    4096336452, 1126891415, 2878612391, 4237533241,
+    1700485571, 2399980690, 4293915773, 2240044497,
+    1873313359, 4264355552, 2734768916, 1309151649,
+    4149444226, 3174756917, 718787259, 3951481745
+]
+
+# Pack 4 bytes (little-endian) into a U32.
+pack_le : U8, U8, U8, U8 -> U32
+pack_le = |b0, b1, b2, b3|
+    U32.from_u8(b0)
+        .bit_or(U32.from_u8(b1).shl(8))
+        .bit_or(U32.from_u8(b2).shl(16))
+        .bit_or(U32.from_u8(b3).shl(24))
+
+# Unpack a U32 into 4 bytes (little-endian).
+unpack_le : U32 -> List(U8)
+unpack_le = |w| [
+    w.to_u8(),
+    w.shr(8).to_u8(),
+    w.shr(16).to_u8(),
+    w.shr(24).to_u8()
+]
+
+# Pad message to a multiple of 64 bytes per MD5 spec.
+pad : List(U8) -> List(U8)
+pad = |msg| (
+    orig_len = msg.len()
+    # Append 0x80 byte
+    padded = msg.append(128)
+    # Append zeros until length mod 64 == 56
+    padded2 = pad_zeros(padded)
+    # Append original length in bits as 64-bit little-endian
+    bit_len = orig_len * 8
+    append_length(padded2, bit_len)
+)
+
+pad_zeros : List(U8) -> List(U8)
+pad_zeros = |msg|
+    if msg.len() % 64 == 56 then msg
+    else pad_zeros(msg.append(0))
+
+append_length : List(U8), U64 -> List(U8)
+append_length = |msg, n|
+    msg.append(n.to_u8())
+       .append(n.shr(8).to_u8())
+       .append(n.shr(16).to_u8())
+       .append(n.shr(24).to_u8())
+       .append(n.shr(32).to_u8())
+       .append(n.shr(40).to_u8())
+       .append(n.shr(48).to_u8())
+       .append(n.shr(56).to_u8())
+
+# Parse a 64-byte chunk into 16 U32 words (little-endian).
+chunk_to_words : List(U8), U64 -> List(U32)
+chunk_to_words = |bytes, offset|
+    build_words(bytes, offset, 0, [])
+
+build_words : List(U8), U64, U64, List(U32) -> List(U32)
+build_words = |bytes, offset, i, acc|
+    if i == 16 then acc
+    else (
+        j = offset + i * 4
+        w = pack_le(
+            bytes.get(j).unwrap(),
+            bytes.get(j + 1).unwrap(),
+            bytes.get(j + 2).unwrap(),
+            bytes.get(j + 3).unwrap()
+        )
+        build_words(bytes, offset, i + 1, acc.append(w))
+    )
+
+# Process one 64-byte block.
+process_block : (U32, U32, U32, U32), List(U32) -> (U32, U32, U32, U32)
+process_block = |(a0, b0, c0, d0), m| (
+    (a_final, b_final, c_final, d_final) = round_loop(a0, b0, c0, d0, m, 0)
+    (a0 + a_final, b0 + b_final, c0 + c_final, d0 + d_final)
+)
+
+round_loop : U32, U32, U32, U32, List(U32), U64 -> (U32, U32, U32, U32)
+round_loop = |a, b, c, d, m, i|
+    if i == 64 then (a, b, c, d)
+    else (
+        (f, g) = round_fg(b, c, d, i)
+        temp = a + f + k_table.get(i).unwrap() + m.get(g).unwrap()
+        new_b = b + temp.rotate_left(s_table.get(i).unwrap())
+        round_loop(d, new_b, b, c, m, i + 1)
+    )
+
+round_fg : U32, U32, U32, U64 -> (U32, U64)
+round_fg = |b, c, d, i|
+    if i < 16 then
+        (b.bit_and(c).bit_or(b.bit_not().bit_and(d)), i)
+    else if i < 32 then
+        (d.bit_and(b).bit_or(d.bit_not().bit_and(c)), (5 * i + 1) % 16)
+    else if i < 48 then
+        (b.bit_xor(c).bit_xor(d), (3 * i + 5) % 16)
+    else
+        (c.bit_xor(b.bit_or(d.bit_not())), (7 * i) % 16)
+
+Md5 := {}.(
+    # Compute the MD5 digest of a byte list, returning 16 bytes.
+    hash : List(U8) -> List(U8)
+    hash = |input| (
+        padded = pad(input)
+        num_blocks = padded.len() / 64
+        state : (U32, U32, U32, U32)
+        state = (1732584193, 4023233417, 2562383102, 271733878)
+        final_state = process_blocks(padded, state, 0, num_blocks)
+        (a, b, c, d) = final_state
+        unpack_le(a).concat(unpack_le(b)).concat(unpack_le(c)).concat(unpack_le(d))
+    )
+)
+
+process_blocks : List(U8), (U32, U32, U32, U32), U64, U64 -> (U32, U32, U32, U32)
+process_blocks = |padded, state, block_idx, num_blocks|
+    if block_idx == num_blocks then state
+    else (
+        words = chunk_to_words(padded, block_idx * 64)
+        new_state = process_block(state, words)
+        process_blocks(padded, new_state, block_idx + 1, num_blocks)
+    )

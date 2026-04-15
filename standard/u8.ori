@@ -6,6 +6,11 @@ U8 := {}.(
     mul : U8, U8 -> U8
     div : U8, U8 -> U8
     mod : U8, U8 -> U8
+    bit_and : U8, U8 -> U8
+    bit_or : U8, U8 -> U8
+    bit_xor : U8, U8 -> U8
+    shl : U8, U8 -> U8
+    shr : U8, U8 -> U8
     equals : U8, U8 -> Bool
     compare : U8, U8 -> Order
     to_str : U8 -> Str

@@ -436,6 +436,8 @@ const fn bin_op(op: BinOp) -> &'static str {
         BinOp::Mul => "Mul",
         BinOp::Div => "Div",
         BinOp::Rem => "Rem",
+        BinOp::BitOr => "BitOr",
+        BinOp::BitXor => "BitXor",
         BinOp::Eq => "Eq",
         BinOp::Neq => "Neq",
         BinOp::Lt => "Lt",

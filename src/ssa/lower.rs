@@ -345,6 +345,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     BinOp::Mul => self.builder.binop(BinaryOp::Mul, l, r, ty),
                     BinOp::Div => self.builder.binop(BinaryOp::Div, l, r, ty),
                     BinOp::Rem => self.builder.binop(BinaryOp::Rem, l, r, ty),
+                    BinOp::BitOr => self.builder.binop(BinaryOp::Or, l, r, ty),
+                    BinOp::BitXor => self.builder.binop(BinaryOp::Xor, l, r, ty),
                     BinOp::Eq | BinOp::Neq => {
                         let negate = matches!(op, BinOp::Neq);
                         if let Type::Record { .. } = &lhs.ty {
@@ -623,11 +625,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .call("__num_to_str", vec![arg], ScalarType::Ptr);
             }
             if op_name == "from_u8" {
-                // Unary widening conversion: `U64.from_u8(x)`
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
-                return self
-                    .builder
-                    .call("__u64_from_u8", vec![arg], ScalarType::U64);
+                let (rt_fn, ret_ty) = match segments[0] {
+                    "U32" => ("__u32_from_u8", ScalarType::U32),
+                    _ => ("__u64_from_u8", ScalarType::U64),
+                };
+                return self.builder.call(rt_fn, vec![arg], ret_ty);
+            }
+            if op_name == "to_u8" {
+                let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
+                return self.builder.call("__to_u8", vec![arg], ScalarType::U8);
             }
             // Binary arithmetic op
             let (lhs, rhs) = if let Some(local_val) = local_val {
@@ -720,9 +727,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .call("__num_hash", vec![recv_val], ScalarType::U64);
             }
             if op_name == "from_u8" {
-                return self
-                    .builder
-                    .call("__u64_from_u8", vec![recv_val], ScalarType::U64);
+                let ret_ty = self.expr_scalar_type(outer);
+                let rt_fn = if ret_ty == ScalarType::U32 { "__u32_from_u8" } else { "__u64_from_u8" };
+                return self.builder.call(rt_fn, vec![recv_val], ret_ty);
+            }
+            if op_name == "to_u8" {
+                return self.builder.call("__to_u8", vec![recv_val], ScalarType::U8);
             }
             let rhs = self.lower_expr(&args[0]);
             let ty = self.expr_scalar_type(receiver);
@@ -840,6 +850,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             "mul" => self.builder.binop(BinaryOp::Mul, lhs, rhs, ty),
             "div" => self.builder.binop(BinaryOp::Div, lhs, rhs, ty),
             "mod" => self.builder.binop(BinaryOp::Rem, lhs, rhs, ty),
+            "bit_and" => self.builder.binop(BinaryOp::And, lhs, rhs, ty),
+            "bit_or" => self.builder.binop(BinaryOp::Or, lhs, rhs, ty),
+            "bit_xor" => self.builder.binop(BinaryOp::Xor, lhs, rhs, ty),
+            "shl" => self.builder.binop(BinaryOp::Shl, lhs, rhs, ty),
+            "shr" => self.builder.binop(BinaryOp::Shr, lhs, rhs, ty),
             "equals" => self.lower_eq(lhs, rhs, false),
             "compare" => self.lower_compare(lhs, rhs, ty),
             _ => panic!("unknown builtin: {name}"),

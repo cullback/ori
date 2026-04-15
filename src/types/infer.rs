@@ -1129,13 +1129,15 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             BinOp::Mul => "*",
             BinOp::Div => "/",
             BinOp::Rem => "%",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
             BinOp::Eq => "==",
             BinOp::Neq => "!=",
             BinOp::Lt => "<",
             BinOp::Gt => ">",
             BinOp::Le => "<=",
             BinOp::Ge => ">=",
-            BinOp::And | BinOp::Or => unreachable!(),
+            BinOp::And | BinOp::Or => unreachable!("logical ops handled separately"),
         };
         if self.unify_at(&lt, &rt, span).is_err() {
             // Binop sides are symmetric — neither is "expected" —
@@ -1164,9 +1166,11 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             BinOp::Mul => "mul",
             BinOp::Div => "div",
             BinOp::Rem => "mod",
+            BinOp::BitOr => "bit_or",
+            BinOp::BitXor => "bit_xor",
             BinOp::Eq | BinOp::Neq => "equals",
             BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => "compare",
-            BinOp::And | BinOp::Or => unreachable!(),
+            BinOp::And | BinOp::Or => unreachable!("logical ops handled separately"),
         };
 
         let resolved = self.engine.resolve(&lt);

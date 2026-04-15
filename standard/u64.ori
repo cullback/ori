@@ -6,10 +6,16 @@ U64 := {}.(
     mul : U64, U64 -> U64
     div : U64, U64 -> U64
     mod : U64, U64 -> U64
+    bit_and : U64, U64 -> U64
+    bit_or : U64, U64 -> U64
+    bit_xor : U64, U64 -> U64
+    shl : U64, U64 -> U64
+    shr : U64, U64 -> U64
     equals : U64, U64 -> Bool
     compare : U64, U64 -> Order
     to_str : U64 -> Str
     from_u8 : U8 -> U64
+    to_u8 : U64 -> U8
 
     min : U64, U64 -> U64
     min = |a, b| if a <= b then a else b

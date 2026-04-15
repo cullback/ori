@@ -90,8 +90,9 @@ impl NumericType {
     pub fn has_builtin_method(self, method: &str) -> bool {
         match method {
             "add" | "sub" | "mul" | "div" | "equals" | "compare" | "to_str" | "hash" => true,
-            "mod" => self.is_integer(),
-            "from_u8" => matches!(self, Self::U64),
+            "mod" | "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr" => self.is_integer(),
+            "from_u8" => matches!(self, Self::U64 | Self::U32),
+            "to_u8" => matches!(self, Self::U32 | Self::U64),
             _ => false,
         }
     }
