@@ -1273,14 +1273,24 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
         }
 
-        // Tuple types: compiler-generated hash.
+        // Tuple types: compiler-generated equals, hash.
         if let Type::Tuple(_) = &resolved {
-            if method == "hash" {
-                let u64_ty = Type::Con("U64".to_owned());
-                self.unify_at(&ret, &u64_ty, span)?;
-                self.method_resolutions
-                    .insert(span, "__tuple_hash".to_owned());
-                return Ok(ret);
+            match method {
+                "equals" => {
+                    let bool_ty = Type::Con("Bool".to_owned());
+                    self.unify_at(&ret, &bool_ty, span)?;
+                    self.method_resolutions
+                        .insert(span, "__tuple_equals".to_owned());
+                    return Ok(ret);
+                }
+                "hash" => {
+                    let u64_ty = Type::Con("U64".to_owned());
+                    self.unify_at(&ret, &u64_ty, span)?;
+                    self.method_resolutions
+                        .insert(span, "__tuple_hash".to_owned());
+                    return Ok(ret);
+                }
+                _ => {}
             }
         }
 
@@ -1697,13 +1707,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     continue;
                 }
 
-                // Tuple types: compiler-generated hash.
+                // Tuple types: compiler-generated equals, hash.
                 if let Type::Tuple(_) = &resolved
-                    && c.method_name == "hash"
+                    && matches!(c.method_name.as_str(), "equals" | "hash")
                 {
                     if let Some(s) = maybe_span {
                         self.method_resolutions
-                            .insert(s, "__tuple_hash".to_owned());
+                            .insert(s, format!("__tuple_{}", c.method_name));
                     }
                     progress = true;
                     continue;

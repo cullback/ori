@@ -2,17 +2,17 @@ import set
 
 # Advent of Code 2015, Day 3: Perfectly Spherical Houses in a Vacuum
 
-step = |pos, ch|
+step = |(x, y), ch|
     if ch
-      : '>' then { x: pos.x + 1, y: pos.y }
-      : '<' then { x: pos.x - 1, y: pos.y }
-      : '^' then { x: pos.x, y: pos.y + 1 }
-      : 'v' then { x: pos.x, y: pos.y - 1 }
-      else pos
+      : '>' then (x + 1, y)
+      : '<' then (x - 1, y)
+      : '^' then (x, y + 1)
+      : 'v' then (x, y - 1)
+      else (x, y)
 
 part1 : Str -> U64
 part1 = |input| (
-    start = { x: 0, y: 0 }
+    start = (0, 0)
     input.to_utf8().trail(start, |pos, ch| step(pos, ch))
         .walk(Set.single(start), |s, pos| s.insert(pos))
         .len()
@@ -20,7 +20,7 @@ part1 = |input| (
 
 part2 : Str -> U64
 part2 = |input| (
-    start = { x: 0, y: 0 }
+    start = (0, 0)
     (santa_moves, robo_moves) = input.to_utf8().enumerate()
         .partition(|(i, _)| i % 2 == 0)
     santa_visited = santa_moves.map(|(_, ch)| ch)

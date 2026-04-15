@@ -349,6 +349,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         let negate = matches!(op, BinOp::Neq);
                         if let Type::Record { .. } = &lhs.ty {
                             self.lower_record_eq(l, r, &lhs.ty, negate)
+                        } else if let Type::Tuple(_) = &lhs.ty {
+                            self.lower_tuple_eq(l, r, &lhs.ty, negate)
                         } else {
                             self.lower_eq(l, r, negate)
                         }
@@ -696,6 +698,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         if mangled == "__record_hash" {
             return self.lower_record_hash(recv_val, &receiver.ty);
         }
+        if mangled == "__tuple_equals" {
+            let rhs = self.lower_expr(&args[0]);
+            return self.lower_tuple_eq(recv_val, rhs, &receiver.ty, false);
+        }
         if mangled == "__tuple_hash" {
             return self.lower_tuple_hash(recv_val, &receiver.ty);
         }
@@ -995,6 +1001,63 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             };
             self.builder.branch(field_eq, next, vec![], false_block, vec![]);
             if slot + 1 < sorted.len() {
+                self.builder.switch_to(next);
+            }
+        }
+
+        self.builder.switch_to(true_block);
+        let t = self.builder.const_u8(1);
+        self.builder.jump(merge, vec![t]);
+
+        self.builder.switch_to(false_block);
+        let f = self.builder.const_u8(0);
+        self.builder.jump(merge, vec![f]);
+
+        self.builder.switch_to(merge);
+        self.lower_bool_from_cmp_neg(merge_param, negate)
+    }
+
+    /// Tuple structural equality: short-circuit AND of element comparisons.
+    fn lower_tuple_eq(&mut self, lhs: Value, rhs: Value, ty: &Type, negate: bool) -> Value {
+        let Type::Tuple(elem_types) = ty else {
+            panic!("lower_tuple_eq called on non-tuple type");
+        };
+
+        if elem_types.is_empty() {
+            let cmp = self.builder.const_u8(1);
+            return self.lower_bool_from_cmp_neg(cmp, negate);
+        }
+
+        let false_block = self.builder.create_block();
+        let true_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
+
+        for (slot, elem_ty) in elem_types.iter().enumerate() {
+            let l = self.builder.load(lhs, slot, self.scalar_type(elem_ty));
+            let r = self.builder.load(rhs, slot, self.scalar_type(elem_ty));
+            let elem_eq = if let Type::Record { .. } = elem_ty {
+                let bool_val = self.lower_record_eq(l, r, elem_ty, false);
+                let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
+                let true_tag = self.decls.constructors["True"].tag_index;
+                let true_val = self.const_tag(true_tag, disc_ty);
+                self.builder.binop(BinaryOp::Eq, bool_val, true_val, ScalarType::U8)
+            } else if let Type::Tuple(_) = elem_ty {
+                let bool_val = self.lower_tuple_eq(l, r, elem_ty, false);
+                let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
+                let true_tag = self.decls.constructors["True"].tag_index;
+                let true_val = self.const_tag(true_tag, disc_ty);
+                self.builder.binop(BinaryOp::Eq, bool_val, true_val, ScalarType::U8)
+            } else {
+                self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8)
+            };
+            let next = if slot + 1 < elem_types.len() {
+                self.builder.create_block()
+            } else {
+                true_block
+            };
+            self.builder.branch(elem_eq, next, vec![], false_block, vec![]);
+            if slot + 1 < elem_types.len() {
                 self.builder.switch_to(next);
             }
         }
