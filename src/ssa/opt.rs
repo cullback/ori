@@ -16,9 +16,27 @@ pub fn optimize(module: &mut Module) {
         branch_switch_fold(func);
         jump_threading(func);
         branch_switch_fold(func);
-        // merge_blocks(func); // TODO: fix value scoping bug on 201503
+        // merge_blocks(func); // TODO: fix value scoping bug
+
         dce(func);
     }
+    dead_functions(module);
+}
+
+/// Remove functions that are never called by any other function.
+fn dead_functions(module: &mut Module) {
+    let mut called: HashSet<String> = HashSet::new();
+    called.insert(module.entry.clone());
+    for func in module.functions.values() {
+        for block in func.blocks.values() {
+            for inst in &block.insts {
+                if let Inst::Call(_, name, _) = inst {
+                    called.insert(name.clone());
+                }
+            }
+        }
+    }
+    module.functions.retain(|name, _| called.contains(name));
 }
 
 /// Dead code elimination: remove instructions whose destination
@@ -586,6 +604,38 @@ fn fold_binop(op: BinaryOp, ty: ScalarType, lbits: u64, rbits: u64) -> Option<(S
                 _ => return None,
             };
             Some((ScalarType::U64, result))
+        }
+        ScalarType::I32 => {
+            let l = lbits as i32;
+            let r = rbits as i32;
+            let result = match op {
+                BinaryOp::Add => l.checked_add(r)? as u64,
+                BinaryOp::Sub => l.checked_sub(r)? as u64,
+                BinaryOp::Mul => l.checked_mul(r)? as u64,
+                BinaryOp::Div if r != 0 => l.checked_div(r)? as u64,
+                BinaryOp::Rem if r != 0 => l.checked_rem(r)? as u64,
+                BinaryOp::Eq => return Some((ScalarType::U8, u64::from(l == r))),
+                BinaryOp::Neq => return Some((ScalarType::U8, u64::from(l != r))),
+                BinaryOp::Lt => return Some((ScalarType::U8, u64::from(l < r))),
+                BinaryOp::Le => return Some((ScalarType::U8, u64::from(l <= r))),
+                BinaryOp::Gt => return Some((ScalarType::U8, u64::from(l > r))),
+                BinaryOp::Ge => return Some((ScalarType::U8, u64::from(l >= r))),
+                _ => return None,
+            };
+            Some((ScalarType::I32, result))
+        }
+        ScalarType::U8 => {
+            let l = lbits as u8;
+            let r = rbits as u8;
+            let result = match op {
+                BinaryOp::Add => u64::from(l.wrapping_add(r)),
+                BinaryOp::Sub => u64::from(l.wrapping_sub(r)),
+                BinaryOp::Xor => u64::from(l ^ r),
+                BinaryOp::Eq => return Some((ScalarType::U8, u64::from(l == r))),
+                BinaryOp::Neq => return Some((ScalarType::U8, u64::from(l != r))),
+                _ => return None,
+            };
+            Some((ScalarType::U8, result))
         }
         _ => None,
     }
