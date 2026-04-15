@@ -74,6 +74,10 @@ pub struct Monomorphized<'src> {
     pub module: Module<'src>,
     pub infer: InferResult,
     pub symbols: SymbolTable,
+    /// Maps apply function names to direct call targets for singleton lambda sets.
+    pub singletons: std::collections::HashMap<String, crate::passes::lambda_specialize::SingletonTarget>,
+    /// Maps closure tag constructor names to direct call targets (all entries, not just singletons).
+    pub tag_targets: std::collections::HashMap<String, crate::passes::lambda_specialize::SingletonTarget>,
 }
 
 /// Specialize every polymorphic function reachable from `main`.
@@ -187,6 +191,8 @@ pub fn specialize<'src>(
         },
         infer: new_infer,
         symbols,
+        singletons: std::collections::HashMap::new(),
+        tag_targets: std::collections::HashMap::new(),
     }
 }
 

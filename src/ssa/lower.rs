@@ -17,10 +17,12 @@ pub fn lower(
     fields: &FieldInterner,
 ) -> Result<(Module, Vec<Value>), CompileError> {
     let decls = decl_info::build(mono);
-    lower_to_ssa(&mono.module, &mono.infer, &decls, &mono.symbols, fields)
+    lower_to_ssa(&mono.module, &mono.infer, &decls, &mono.symbols, fields, &mono.singletons, &mono.tag_targets)
 }
 
 // ---- SSA lowering context ----
+
+use crate::passes::lambda_specialize::SingletonTarget;
 
 struct LowerCtx<'a, 'src> {
     builder: Builder,
@@ -33,6 +35,8 @@ struct LowerCtx<'a, 'src> {
     infer: &'a InferResult,
     symbols: &'a SymbolTable,
     fields: &'a FieldInterner,
+    singletons: &'a HashMap<String, SingletonTarget>,
+    tag_targets: &'a HashMap<String, SingletonTarget>,
     _phantom: std::marker::PhantomData<&'src ()>,
 }
 
@@ -42,6 +46,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         infer: &'a InferResult,
         symbols: &'a SymbolTable,
         fields: &'a FieldInterner,
+        singletons: &'a HashMap<String, SingletonTarget>,
+        tag_targets: &'a HashMap<String, SingletonTarget>,
     ) -> Self {
         Self {
             builder: Builder::new(),
@@ -50,7 +56,20 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             infer,
             symbols,
             fields,
+            singletons,
+            tag_targets,
             _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// If the closure expression is a known tag constructor, return
+    /// the direct call target.
+    fn resolve_closure_target(&self, closure_expr: &Expr<'_>) -> Option<&'a SingletonTarget> {
+        if let ExprKind::Call { target, .. } = &closure_expr.kind {
+            let name = self.symbols.display(*target);
+            self.tag_targets.get(name)
+        } else {
+            None
         }
     }
 }
@@ -657,6 +676,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             assert!(args.len() == 2, "List.walk* method form takes 2 args");
             let init_val = self.lower_expr(&args[0]);
             let acc_ty = self.expr_scalar_type(&args[0]);
+            let direct = self.resolve_closure_target(&args[1]);
             let closure_val = self.lower_expr(&args[1]);
             let apply_name = format!("__apply_{mangled}_2");
             return self.lower_list_walk(
@@ -666,6 +686,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 &apply_name,
                 walk.until,
                 acc_ty,
+                direct,
             );
         }
         let mut arg_vals = Vec::with_capacity(args.len() + 1);
@@ -697,6 +718,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let list_val = self.lower_expr(&args[0]);
             let init_val = self.lower_expr(&args[1]);
             let acc_ty = self.expr_scalar_type(&args[1]);
+            let direct = self.resolve_closure_target(&args[2]);
             let closure_val = self.lower_expr(&args[2]);
             let apply_name = format!("__apply_{func}_2");
             return self.lower_list_walk(
@@ -706,6 +728,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 &apply_name,
                 walk.until,
                 acc_ty,
+                direct,
             );
         }
         if func == "crash" {
@@ -1579,6 +1602,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         apply_name: &str,
         until: bool,
         acc_ty: ScalarType,
+        direct: Option<&SingletonTarget>,
     ) -> Value {
         let len_val = self.builder.load(list_val, 0, ScalarType::U64);
         let data_ptr = self.builder.load(list_val, 2, ScalarType::Ptr);
@@ -1602,9 +1626,20 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         self.builder.switch_to(body_block);
         let elem = self.builder.load_dyn(data_ptr, i_param, ScalarType::Ptr);
-        let result =
+        // Resolve direct call target: per-call-site tag > singleton > apply dispatch.
+        let resolved = direct.or_else(|| self.singletons.get(apply_name));
+        let result = if let Some(st) = resolved {
+            let mut call_args = Vec::with_capacity(st.num_captures + 2);
+            for i in 0..st.num_captures {
+                call_args.push(self.builder.load(step_val, i + 1, ScalarType::Ptr));
+            }
+            call_args.push(acc_param);
+            call_args.push(elem);
+            self.builder.call(&st.target_func, call_args, ScalarType::Ptr)
+        } else {
             self.builder
-                .call(apply_name, vec![step_val, acc_param, elem], ScalarType::Ptr);
+                .call(apply_name, vec![step_val, acc_param, elem], ScalarType::Ptr)
+        };
 
         let one = self.builder.const_u64(1);
         let next_i = self
@@ -1728,8 +1763,10 @@ fn lower_to_ssa<'src>(
     decls: &DeclInfo,
     symbols: &SymbolTable,
     fields: &FieldInterner,
+    singletons: &HashMap<String, SingletonTarget>,
+    tag_targets: &HashMap<String, SingletonTarget>,
 ) -> Result<(Module, Vec<Value>), CompileError> {
-    let mut ctx = LowerCtx::new(decls, infer_result, symbols, fields);
+    let mut ctx = LowerCtx::new(decls, infer_result, symbols, fields, singletons, tag_targets);
 
     let mut main_params: Option<Vec<SymbolId>> = None;
     let mut main_body: Option<Expr<'src>> = None;

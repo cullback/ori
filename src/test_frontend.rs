@@ -3065,14 +3065,15 @@ main = |arg| a(5)";
 
 #[test]
 fn defunc_emits_apply_function() {
-    // The `__apply_K` function for a user-defined HO callable
-    // should exist after defunc.
+    // The `__apply_K` function for a multi-entry lambda set
+    // should exist after defunc. Two lambdas flow into the same
+    // HO parameter, so the apply dispatch is needed.
     let source = "\
 apply : I64, (I64 -> I64) -> I64
 apply = |x, f| f(x)
 
-main : I64 -> I64
-main = |arg| apply(5, |y| y * 2)";
+main : I64, Bool -> I64
+main = |arg, b| if b then apply(5, |y| y * 2) else apply(5, |y| y + 1)";
     let (module, symbols) = compile_through_defunc(source);
     let has_apply = module.decls.iter().any(|d| {
         if let crate::ast::Decl::FuncDef { name, .. } = d {

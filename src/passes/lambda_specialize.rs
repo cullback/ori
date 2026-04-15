@@ -33,17 +33,28 @@ use crate::passes::mono::Monomorphized;
 use crate::source::SourceArena;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 
+/// Direct-call info for a singleton lambda set.
+pub struct SingletonTarget {
+    /// Display name of the target function.
+    pub target_func: String,
+    /// Number of captures stored in the closure (after the tag slot).
+    pub num_captures: usize,
+}
+
 /// Specialize the module using the lambda set solution.
 pub fn specialize(mono: &mut Monomorphized<'_>, solution: &LambdaSolution) {
     let module = std::mem::take(&mut mono.module);
-    mono.module = specialize_module(module, solution, &mut mono.symbols);
+    let (new_module, singletons, tag_targets) = specialize_module(module, solution, &mut mono.symbols);
+    mono.module = new_module;
+    mono.singletons = singletons;
+    mono.tag_targets = tag_targets;
 }
 
 fn specialize_module<'src>(
     module: Module<'src>,
     solution: &LambdaSolution,
     symbols: &mut SymbolTable,
-) -> Module<'src> {
+) -> (Module<'src>, HashMap<String, SingletonTarget>, HashMap<String, SingletonTarget>) {
     // Allocate SymbolIds for all synthesized names.
     let alloc = allocate_symbols(solution, symbols);
 
@@ -64,16 +75,39 @@ fn specialize_module<'src>(
         .collect();
 
     // Synthesize closure types and apply functions.
+    // Singletons still get apply functions (to keep lifted funcs
+    // reachable) but call sites use direct calls instead.
+    let mut singletons = HashMap::new();
+    let mut tag_targets = HashMap::new();
     for (ls_idx, ls) in solution.sets.iter().enumerate() {
         new_decls.push(build_closure_type(ls, &alloc, ls_idx));
         new_decls.push(build_apply_function(ls, &alloc, ls_idx, symbols));
+        for entry in &ls.entries {
+            let target_func = entry.func_ref.clone().unwrap_or_else(|| {
+                symbols.display(entry.lifted_func).to_owned()
+            });
+            tag_targets.insert(entry.tag_name.clone(), SingletonTarget {
+                target_func,
+                num_captures: entry.captures.len(),
+            });
+        }
+        if ls.entries.len() == 1 {
+            let entry = &ls.entries[0];
+            let target_func = entry.func_ref.clone().unwrap_or_else(|| {
+                symbols.display(entry.lifted_func).to_owned()
+            });
+            singletons.insert(ls.apply_name.clone(), SingletonTarget {
+                target_func,
+                num_captures: entry.captures.len(),
+            });
+        }
     }
 
-    Module {
+    (Module {
         exports: module.exports,
         imports: module.imports,
         decls: new_decls,
-    }
+    }, singletons, tag_targets)
 }
 
 // ---- Symbol allocation ----
@@ -83,12 +117,15 @@ struct AllocatedSymbols {
     set_syms: Vec<(SymbolId, SymbolId)>,
     /// Per entry across all sets: tag constructor sym.
     tag_syms: HashMap<(usize, usize), SymbolId>,
+    /// Pre-allocated capture bindings for singleton inline destructures.
+    singleton_captures: HashMap<usize, Vec<SymbolId>>,
 }
 
 fn allocate_symbols(solution: &LambdaSolution, symbols: &mut SymbolTable) -> AllocatedSymbols {
     let span = synth_span();
     let mut set_syms = Vec::new();
     let mut tag_syms = HashMap::new();
+    let mut singleton_captures = HashMap::new();
 
     for (ls_idx, ls) in solution.sets.iter().enumerate() {
         let apply_sym = symbols.fresh(&ls.apply_name, span, SymbolKind::Func);
@@ -99,9 +136,22 @@ fn allocate_symbols(solution: &LambdaSolution, symbols: &mut SymbolTable) -> All
             let tag_sym = symbols.fresh(&entry.tag_name, span, SymbolKind::Func);
             tag_syms.insert((ls_idx, entry_idx), tag_sym);
         }
+
+        // Pre-allocate capture bindings for singleton sets with captures.
+        if ls.entries.len() == 1 && !ls.entries[0].captures.is_empty() {
+            let bindings: Vec<SymbolId> = ls.entries[0]
+                .captures
+                .iter()
+                .map(|&cap| {
+                    let name = symbols.display(cap).to_owned();
+                    symbols.fresh(format!("__sc_{name}"), span, SymbolKind::Local)
+                })
+                .collect();
+            singleton_captures.insert(ls_idx, bindings);
+        }
     }
 
-    AllocatedSymbols { set_syms, tag_syms }
+    AllocatedSymbols { set_syms, tag_syms, singleton_captures }
 }
 
 // ---- Closure type synthesis ----
@@ -325,6 +375,52 @@ impl<'src> Rewriter<'_> {
             ExprKind::Call { target, args } => {
                 // Call to a local HO variable → apply dispatch.
                 if let Some(&ls_idx) = self.ho_vars.get(target) {
+                    let ls = &self.sets[ls_idx];
+                    if ls.entries.len() == 1 {
+                        // Singleton: emit direct call, skip apply dispatch.
+                        let entry = &ls.entries[0];
+                        let direct_target = entry.lifted_func;
+                        for arg in args.iter_mut() {
+                            self.rewrite_expr(arg);
+                        }
+                        if entry.captures.is_empty() {
+                            // Zero captures: call target directly.
+                            expr.kind = ExprKind::Call {
+                                target: direct_target,
+                                args: std::mem::take(args),
+                            };
+                        } else {
+                            // With captures: destructure closure inline.
+                            let span = expr.span;
+                            let closure_expr = Box::new(Expr::new(ExprKind::Name(*target), span));
+                            let tag_name = leak_str(&entry.tag_name);
+                            let caps = &self.alloc.singleton_captures[&ls_idx];
+                            let pattern = Pattern::Constructor {
+                                name: tag_name,
+                                fields: caps.iter().map(|s| Pattern::Binding(*s)).collect(),
+                            };
+                            let mut call_args: Vec<Expr<'src>> = caps.iter()
+                                .map(|s| Expr::new(ExprKind::Name(*s), span))
+                                .collect();
+                            call_args.append(args);
+                            let call = Expr::new(ExprKind::Call {
+                                target: direct_target,
+                                args: call_args,
+                            }, span);
+                            expr.kind = ExprKind::If {
+                                expr: closure_expr,
+                                arms: vec![MatchArm {
+                                    pattern,
+                                    guards: vec![],
+                                    body: call,
+                                    is_return: false,
+                                }],
+                                else_body: None,
+                            };
+                        }
+                        return;
+                    }
+                    // Multi-entry: use apply dispatch.
                     let apply_sym = self.alloc.set_syms[ls_idx].0;
                     let closure_expr = Expr::new(ExprKind::Name(*target), expr.span);
                     for arg in args.iter_mut() {
