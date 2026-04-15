@@ -1831,7 +1831,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ast::Pattern::Tuple(elems) => {
                 let elem_types = match val_ty {
                     Type::Tuple(tys) => tys.as_slice(),
-                    _ => &[],
+                    other => {
+                        eprintln!("BUG: tuple destructure got val_ty={other:?}");
+                        &[]
+                    }
                 };
                 for (i, elem) in elems.iter().enumerate() {
                     let ty = elem_types

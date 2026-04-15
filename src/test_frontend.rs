@@ -3365,7 +3365,6 @@ main = |_| (
 }
 
 #[test]
-#[ignore = "MD5 library produces shifted output; needs investigation"]
 fn md5_empty_string() {
     // Full inline MD5 test - tests bitwise ops, U32 from_u8/to_u8, and the algorithm
     let source = r#"

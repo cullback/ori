@@ -88,12 +88,10 @@ impl Heap {
     }
 
     fn rc_dec(&mut self, idx: usize) {
-        if idx == 0 || self.objects[idx].0 == RC_STATIC {
+        if idx == 0 || self.objects[idx].0 == RC_STATIC || self.objects[idx].0 == 0 {
             return;
         }
-        if self.objects[idx].0 > 0 {
-            self.objects[idx].0 -= 1;
-        }
+        self.objects[idx].0 -= 1;
         if self.objects[idx].0 == 0 {
             // Collect Ptr children before adding to free list.
             let children: Vec<usize> = self.objects[idx]
