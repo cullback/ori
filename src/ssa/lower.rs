@@ -8,7 +8,7 @@ use crate::ssa::Module;
 use crate::ssa::builder::Builder;
 use crate::ssa::instruction::{BinaryOp, BlockId, ScalarType, Value};
 use crate::symbol::{FieldInterner, SymbolId, SymbolTable};
-use crate::types::engine::Type;
+use crate::types::engine::{Type, TypeVar};
 use crate::types::infer::InferResult;
 
 /// Lower a monomorphized AST module to SSA IR.
@@ -76,8 +76,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     // ---- Field slot computation ----
 
-    fn field_slot(ty: &Type, field: &str) -> usize {
-        match ty {
+    fn field_slot(&self, ty: &Type, field: &str) -> usize {
+        // Unwrap transparent types to their underlying representation.
+        let resolved = self.resolve_transparent(ty);
+        match &resolved {
             Type::Record { fields, .. } => {
                 let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
                 names.sort_unstable();
@@ -94,7 +96,57 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .position(|n| n == field)
                     .unwrap_or_else(|| panic!("field '{field}' not found in tuple type"))
             }
-            _ => panic!("field access on non-record type: {ty:?}"),
+            _ => panic!("field access on non-record type: {resolved:?} (original: {ty:?})"),
+        }
+    }
+
+    /// Resolve a method on a concrete type at lowering time. Used when
+    /// inference left the resolution as None (polymorphic body).
+    fn resolve_method_at_lower_time(&self, method: &str, recv_ty: &Type) -> String {
+        let resolved = self.resolve_transparent(recv_ty);
+        match &resolved {
+            Type::Record { .. } => format!("__record_{method}"),
+            Type::Tuple(_) => format!("__tuple_{method}"),
+            Type::TagUnion { .. } => format!("__tag_{method}"),
+            Type::Con(name) | Type::App(name, _) => {
+                if crate::numeric::NumericType::from_name(name).is_some()
+                    && crate::numeric::NumericType::from_name(name)
+                        .unwrap()
+                        .has_builtin_method(method)
+                {
+                    format!("__builtin.{method}")
+                } else {
+                    format!("{name}.{method}")
+                }
+            }
+            _ => panic!(
+                "cannot resolve method '{method}' on type {recv_ty:?} at lowering time"
+            ),
+        }
+    }
+
+    /// Resolve a type through transparent type aliases.
+    fn resolve_transparent(&self, ty: &Type) -> Type {
+        match ty {
+            Type::App(name, args) => {
+                if let Some((param_vars, underlying)) = self.infer.transparent.get(name) {
+                    let mut result = underlying.clone();
+                    for (var, arg) in param_vars.iter().zip(args) {
+                        result = substitute_type_var(&result, *var, arg);
+                    }
+                    self.resolve_transparent(&result)
+                } else {
+                    ty.clone()
+                }
+            }
+            Type::Con(name) => {
+                if let Some((_, underlying)) = self.infer.transparent.get(name) {
+                    self.resolve_transparent(underlying)
+                } else {
+                    ty.clone()
+                }
+            }
+            _ => ty.clone(),
         }
     }
 
@@ -293,7 +345,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ExprKind::FieldAccess { record, field } => {
                 let ptr = self.lower_expr(record);
                 let field_name = self.fields.get(*field);
-                let slot = Self::field_slot(&record.ty, field_name);
+                let slot = self.field_slot(&record.ty, field_name);
                 let ty = self.expr_scalar_type(expr);
                 self.builder.load(ptr, slot, ty)
             }
@@ -554,8 +606,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let ExprKind::MethodCall { resolved, .. } = &outer.kind else {
             unreachable!("lower_method_call called on non-MethodCall");
         };
-        let Some(mangled) = resolved.clone() else {
-            panic!("no method resolution for .{method}() at {:?}", outer.span);
+        let mangled = if let Some(r) = resolved.clone() {
+            r
+        } else {
+            // No resolution from inference — resolve based on the
+            // concrete receiver type (happens for polymorphic methods
+            // after monomorphization).
+            self.resolve_method_at_lower_time(method, &receiver.ty)
         };
         let recv_val = self.lower_expr(receiver);
         if mangled == "__record_equals" {
@@ -1861,4 +1918,57 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
         panic!("unknown list builtin: {name}");
     };
     builder.call(intrinsic, args, ret_ty)
+}
+
+/// Replace all occurrences of `var` in `ty` with `replacement`.
+fn substitute_type_var(ty: &Type, var: TypeVar, replacement: &Type) -> Type {
+    match ty {
+        Type::Var(v) if *v == var => replacement.clone(),
+        Type::Var(_) | Type::Con(_) => ty.clone(),
+        Type::App(name, args) => Type::App(
+            name.clone(),
+            args.iter()
+                .map(|a| substitute_type_var(a, var, replacement))
+                .collect(),
+        ),
+        Type::Arrow(params, ret) => Type::Arrow(
+            params
+                .iter()
+                .map(|p| substitute_type_var(p, var, replacement))
+                .collect(),
+            Box::new(substitute_type_var(ret, var, replacement)),
+        ),
+        Type::Record { fields, rest } => Type::Record {
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), substitute_type_var(t, var, replacement)))
+                .collect(),
+            rest: rest
+                .as_ref()
+                .map(|r| Box::new(substitute_type_var(r, var, replacement))),
+        },
+        Type::Tuple(elems) => Type::Tuple(
+            elems
+                .iter()
+                .map(|e| substitute_type_var(e, var, replacement))
+                .collect(),
+        ),
+        Type::TagUnion { tags, rest } => Type::TagUnion {
+            tags: tags
+                .iter()
+                .map(|(n, payloads)| {
+                    (
+                        n.clone(),
+                        payloads
+                            .iter()
+                            .map(|p| substitute_type_var(p, var, replacement))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            rest: rest
+                .as_ref()
+                .map(|r| Box::new(substitute_type_var(r, var, replacement))),
+        },
+    }
 }

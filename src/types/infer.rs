@@ -29,11 +29,12 @@ const fn is_syntactic_value(expr: &Expr<'_>) -> bool {
 /// and `is` bindings all live on the AST nodes themselves.
 pub struct InferResult {
     /// Resolved type schemes for all functions/methods.
-    /// Used by the lowerer to compute type parameter mappings for specialization.
     pub func_schemes: HashMap<String, Scheme>,
     /// Constructor type schemes (e.g., Ok: forall ok err. ok -> Result(ok, err)).
-    /// Used by the lowerer to compute concrete field types from instantiations.
     pub constructor_schemes: HashMap<String, Scheme>,
+    /// Transparent type definitions: name → (type param vars, underlying type).
+    /// Used by the lowerer to unwrap nominal types to their underlying representation.
+    pub transparent: HashMap<String, (Vec<TypeVar>, Type)>,
 }
 
 // ---- Inference context ----
@@ -2117,6 +2118,8 @@ pub fn check(
         })
         .collect();
 
+    let transparent = ctx.engine.transparent.clone();
+
     // Single combined post-inference walk: write resolved types onto
     // Expr::ty, write method resolutions onto MethodCall/QualifiedCall
     // nodes, and eta-expand constructor/method references.
@@ -2131,6 +2134,7 @@ pub fn check(
     Ok(InferResult {
         func_schemes,
         constructor_schemes,
+        transparent,
     })
 }
 

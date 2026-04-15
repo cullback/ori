@@ -665,6 +665,7 @@ fn build_new_infer_result(
     InferResult {
         func_schemes,
         constructor_schemes: old.constructor_schemes.clone(),
+        transparent: old.transparent.clone(),
     }
 }
 
