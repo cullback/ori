@@ -39,19 +39,19 @@ List := {}.(
 
     # Returns True if the list has no elements.
     is_empty : List(a) -> Bool
-    is_empty = |xs| List.len(xs) == 0
+    is_empty = |xs| xs.len() == 0
 
     # Returns the first element, or Err(Empty) if the list is empty.
     first : List(a) -> Result(a, [Empty])
-    first = |xs| if List.is_empty(xs) then Err(Empty) else Ok(List.get(xs, 0))
+    first = |xs| if xs.is_empty() then Err(Empty) else Ok(xs.get(0))
 
     # Returns a new list with the element added to the front.
     prepend : List(a), a -> List(a)
-    prepend = |xs, x| List.walk(xs, [x], |acc, elem| List.append(acc, elem))
+    prepend = |xs, x| xs.walk([x], |acc, elem| acc.append(elem))
 
     # Applies a function to every element, returning a new list.
     map : List(a), (a -> b) -> List(b)
-    map = |xs, f| List.walk(xs, [], |acc, x| List.append(acc, f(x)))
+    map = |xs, f| xs.walk([], |acc, x| acc.append(f(x)))
 
     # Like walk, but yields every intermediate accumulator value as
     # a list. Output length equals input length — the initial value
@@ -64,20 +64,18 @@ List := {}.(
     # naturally as plain running aggregates.
     trail : List(a), b, (b, a -> b) -> List(b)
     trail = |xs, init, f| (
-        final = List.walk(xs, { acc: init, out: [] }, |state, x| (
+        final = xs.walk({ acc: init, out: [] }, |state, x| (
             new_acc = f(state.acc, x)
-            { acc: new_acc, out: List.append(state.out, new_acc) }
+            { acc: new_acc, out: state.out.append(new_acc) }
         ))
         final.out
     )
 
     # Returns the index of the first element satisfying the predicate,
     # or `Err(NotFound)` if no element matches.
-    # Returns the index of the first element satisfying the predicate,
-    # or `Err(NotFound)` if no element matches.
     find_index : List(a), (a -> Bool) -> Result(U64, [NotFound])
     find_index = |xs, pred| (
-        result = List.walk_until(xs, { i: 0, found: Err(NotFound) }, |state, x|
+        result = xs.walk_until({ i: 0, found: Err(NotFound) }, |state, x|
             if pred(x) then Break({ i: state.i, found: Ok(state.i) })
             else Continue({ i: state.i + 1, found: state.found })
         )
@@ -90,18 +88,18 @@ List := {}.(
     # `[1, 2, 3, 2, 4].split_on(2)` produces `[[1], [3], [4]]`.
     split_on : List(a), a -> List(List(a)) where [a.equals]
     split_on = |xs, delim| (
-        state = List.walk(xs, { chunks: [], current: [] }, |s, x|
+        state = xs.walk({ chunks: [], current: [] }, |s, x|
             if x == delim
-                then { chunks: List.append(s.chunks, s.current), current: [] }
-                else { chunks: s.chunks, current: List.append(s.current, x) }
+                then { chunks: s.chunks.append(s.current), current: [] }
+                else { chunks: s.chunks, current: s.current.append(x) }
         )
-        List.append(state.chunks, state.current)
+        state.chunks.append(state.current)
     )
 
     # Returns True if the list contains an element equal to `target`.
     contains : List(a), a -> Bool where [a.equals]
     contains = |xs, target|
-        List.walk_until(xs, False, |_, x|
+        xs.walk_until(False, |_, x|
             if x == target then Break(True) else Continue(False))
 
     # Splits the list into chunks of the given size. The last chunk
@@ -112,14 +110,14 @@ List := {}.(
     chunks_of = |xs, chunk_size| (
         if chunk_size == 0 then []
         else (
-            total = List.len(xs)
-            result = List.walk_until(xs, { i: 0, out: [] }, |state, _|
+            total = xs.len()
+            result = xs.walk_until({ i: 0, out: [] }, |state, _|
                 if state.i >= total then Break(state)
                 else (
                     remaining = total - state.i
                     size = if remaining < chunk_size then remaining else chunk_size
-                    chunk = List.sublist(xs, state.i, size)
-                    Continue({ i: state.i + size, out: List.append(state.out, chunk) })
+                    chunk = xs.sublist(state.i, size)
+                    Continue({ i: state.i + size, out: state.out.append(chunk) })
                 )
             )
             result.out
@@ -128,5 +126,5 @@ List := {}.(
 
     # Returns the sum of all elements.
     sum : List(a) -> a where [a.add]
-    sum = |xs| List.walk(xs, 0, |acc, x| acc + x)
+    sum = |xs| xs.walk(0, |acc, x| acc + x)
 )
