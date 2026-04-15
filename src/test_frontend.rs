@@ -1036,7 +1036,7 @@ main = |arg| List.len([1, 2, 3])";
 fn builtin_list_get() {
     let source = "\
 main : I64 -> I64
-main = |arg| List.get([10, 20, 30], 1)";
+main = |arg| List.get([10, 20, 30], 1).unwrap()";
 
     assert_eq!(run_i64(source, 0), 20);
 }
@@ -1063,7 +1063,7 @@ main = |arg| List.walk([1, 2, 3, 4, 5], 0, |acc, x| acc + x)";
 fn builtin_list_reverse() {
     let source = "\
 main : I64 -> I64
-main = |arg| List.get(List.reverse([10, 20, 30]), 0)";
+main = |arg| List.get(List.reverse([10, 20, 30]), 0).unwrap()";
 
     // reversed = [30, 20, 10], first element is 30
     assert_eq!(run_i64(source, 0), 30);
@@ -1073,7 +1073,7 @@ main = |arg| List.get(List.reverse([10, 20, 30]), 0)";
 fn builtin_list_set() {
     let source = "\
 main : I64 -> I64
-main = |arg| List.get(List.set([10, 20, 30], 1, 99), 1)";
+main = |arg| List.get(List.set([10, 20, 30], 1, 99), 1).unwrap()";
 
     assert_eq!(run_i64(source, 0), 99);
 }
@@ -1095,7 +1095,7 @@ fn builtin_list_reverse_standalone() {
     // are actually reordered (by indexing into the reversed list).
     let source = "\
 main : I64 -> I64
-main = |arg| List.get(List.reverse([10, 20, 30]), 0)";
+main = |arg| List.get(List.reverse([10, 20, 30]), 0).unwrap()";
 
     assert_eq!(run_i64(source, 0), 30);
 }
@@ -1126,7 +1126,7 @@ fn builtin_list_trail_running_sum() {
 main : I64 -> I64
 main = |arg| (
     sums = List.trail([1, 2, 3, 4], 0, |acc, x| acc + x)
-    List.get(sums, 3)
+    List.get(sums, 3).unwrap()
 )";
     assert_eq!(run_i64(source, 0), 10);
 }
@@ -1140,7 +1140,7 @@ fn builtin_list_trail_middle_element() {
 main : I64 -> I64
 main = |arg| (
     sums = List.trail([1, 2, 3, 4], 0, |acc, x| acc + x)
-    List.get(sums, 1)
+    List.get(sums, 1).unwrap()
 )";
     assert_eq!(run_i64(source, 0), 3);
 }
@@ -1155,7 +1155,7 @@ fn builtin_list_trail_running_product() {
 main : I64 -> I64
 main = |arg| (
     ps = List.trail([2, 3, 4], 1, |acc, x| acc * x)
-    List.get(ps, 2)
+    List.get(ps, 2).unwrap()
 )";
     assert_eq!(run_i64(source, 0), 24);
 }
@@ -1245,7 +1245,7 @@ main = |arg| \"hi\".concat(\"!\").count_bytes()";
 fn dot_method_on_list() {
     let source = "\
 main : I64 -> I64
-main = |arg| [10, 20, 30].get(1)";
+main = |arg| [10, 20, 30].get(1).unwrap()";
 
     assert_eq!(run_i64(source, 0), 20);
 }
@@ -1273,7 +1273,7 @@ fn str_get_byte() {
     // 'H' = 72 in ASCII/UTF-8
     let source = "\
 main : I64 -> U8
-main = |arg| Str.get(\"Hello\", 0)";
+main = |arg| Str.get(\"Hello\", 0).unwrap()";
 
     match run(source, 0) {
         Scalar::U8(n) => assert_eq!(n, 72),
@@ -1741,7 +1741,7 @@ fn method_ref_i64_add_in_trail() {
 main : I64 -> I64
 main = |arg| (
     sums = List.trail([1, 2, 3, 4], 0, I64.add)
-    List.get(sums, 3)
+    List.get(sums, 3).unwrap()
 )";
     assert_eq!(run_i64(source, 0), 10);
 }
@@ -1754,7 +1754,7 @@ fn method_ref_i64_mul_in_trail() {
 main : I64 -> I64
 main = |arg| (
     ps = List.trail([2, 3, 4], 1, I64.mul)
-    List.get(ps, 2)
+    List.get(ps, 2).unwrap()
 )";
     assert_eq!(run_i64(source, 0), 24);
 }
@@ -1851,7 +1851,7 @@ fn dot_lambda_method_call() {
 main : I64 -> I64
 main = |arg| (
     xs = List.map([1, 2, 3], .add(10))
-    List.get(xs, 1)
+    List.get(xs, 1).unwrap()
 )";
     assert_eq!(run_i64(source, 0), 12);
 }
@@ -1863,7 +1863,7 @@ fn dot_lambda_mul() {
 main : I64 -> I64
 main = |arg| (
     xs = List.map([2, 3, 4], .mul(3))
-    List.get(xs, 0)
+    List.get(xs, 0).unwrap()
 )";
     assert_eq!(run_i64(source, 0), 6);
 }

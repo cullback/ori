@@ -25,7 +25,11 @@ module:
         body:
           Call Ok:
             QualifiedCall Str.concat:
-              QualifiedCall List.get:
-                Name args
-                IntLit 0
+              MethodCall .unwrap:
+                receiver:
+                  MethodCall .get:
+                    receiver:
+                      Name args
+                    args:
+                      IntLit 0
               StrLit "\n"

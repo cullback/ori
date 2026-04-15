@@ -344,7 +344,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             Some(len)
         }
         "__list_get" => {
-            // args: [list_ptr, index_u64] → element
+            // args: [list_ptr, index_u64] → element (unchecked)
             let Scalar::Ptr(list_idx) = args[0] else {
                 panic!("__list_get: expected Ptr");
             };

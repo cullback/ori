@@ -781,7 +781,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         matches!(
             name,
             "List.len"
-                | "List.get"
+                | "List.get_unchecked"
                 | "List.set"
                 | "List.append"
                 | "List.reverse"
@@ -1988,7 +1988,7 @@ fn lower_int_const(builder: &mut Builder, n: i64, ty: &Type) -> Value {
 fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -> Value {
     let (intrinsic, ret_ty) = if name.ends_with(".len") || name == "List.len" {
         ("__list_len", ScalarType::U64)
-    } else if name.ends_with(".get") || name == "List.get" {
+    } else if name.ends_with(".get_unchecked") || name == "List.get_unchecked" {
         ("__list_get", ScalarType::Ptr)
     } else if name.ends_with(".set") || name == "List.set" {
         ("__list_set", ScalarType::Ptr)

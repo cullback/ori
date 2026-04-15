@@ -4,4 +4,4 @@ main : List(Str) -> Result(Str, Str)
 main = |args|
     if List.is_empty(args)
         then Ok("\n")
-        else Ok(Str.concat(List.get(args, 0), "\n"))
+        else Ok(Str.concat(args.get(0).unwrap(), "\n"))

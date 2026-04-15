@@ -25,7 +25,11 @@ module:
         body:
           Call Ok : Result(Str, Str):
             QualifiedCall Str.concat : Str:
-              QualifiedCall List.get : Str:
-                Name args : List(Str)
-                IntLit 0 : U64
+              MethodCall .unwrap => Result.unwrap : Str:
+                receiver:
+                  MethodCall .get => List.get : Result(Str, [OutOfBounds]):
+                    receiver:
+                      Name args : List(Str)
+                    args:
+                      IntLit 0 : U64
               StrLit "\n" : Str

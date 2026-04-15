@@ -6,8 +6,8 @@ Str := List(U8).(
     count_bytes : Str -> U64
     count_bytes = |s| List.len(s)
 
-    # Returns the byte at the given index.
-    get : Str, U64 -> U8
+    # Returns the byte at the given index, or Err(OutOfBounds).
+    get : Str, U64 -> Result(U8, [OutOfBounds])
     get = |s, i| List.get(s, i)
 
     # Returns True if the string has no bytes.
