@@ -816,7 +816,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         matches!(
             name,
             "List.len"
-                | "List.get_unchecked"
+                | "List.get"
                 | "List.set"
                 | "List.append"
                 | "List.reverse"
@@ -2023,8 +2023,8 @@ fn lower_int_const(builder: &mut Builder, n: i64, ty: &Type) -> Value {
 fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -> Value {
     let (intrinsic, ret_ty) = if name.ends_with(".len") || name == "List.len" {
         ("__list_len", ScalarType::U64)
-    } else if name.ends_with(".get_unchecked") || name == "List.get_unchecked" {
-        ("__list_get", ScalarType::Ptr)
+    } else if name.ends_with(".get") || name == "List.get" {
+        return emit_list_get_checked(builder, args);
     } else if name.ends_with(".set") || name == "List.set" {
         ("__list_set", ScalarType::Ptr)
     } else if name.ends_with(".append") || name == "List.append" {
@@ -2039,6 +2039,45 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
         panic!("unknown list builtin: {name}");
     };
     builder.call(intrinsic, args, ret_ty)
+}
+
+/// Emit a bounds-checked List.get that returns Result(a, [OutOfBounds]).
+/// SSA: load len, compare, branch to Ok(element) or Err(OutOfBounds).
+fn emit_list_get_checked(builder: &mut Builder, args: Vec<Value>) -> Value {
+    use crate::ssa::instruction::BinaryOp;
+    let list = args[0];
+    let idx = args[1];
+
+    let len = builder.call("__list_len", vec![list], ScalarType::U64);
+    let in_bounds = builder.binop(BinaryOp::Lt, idx, len, ScalarType::U8);
+
+    let ok_block = builder.create_block();
+    let err_block = builder.create_block();
+    let merge = builder.create_block();
+    let merge_param = builder.add_block_param(merge, ScalarType::Ptr);
+
+    builder.branch(in_bounds, ok_block, vec![], err_block, vec![]);
+
+    // Ok path: get element, wrap in Ok(elem) = [tag=0, elem]
+    builder.switch_to(ok_block);
+    let elem = builder.call("__list_get", vec![list, idx], ScalarType::Ptr);
+    let ok_result = builder.alloc(2);
+    let ok_tag = builder.const_u64(0);
+    builder.store(ok_result, 0, ok_tag);
+    builder.store(ok_result, 1, elem);
+    builder.jump(merge, vec![ok_result]);
+
+    // Err path: Err(OutOfBounds) = [tag=1, OutOfBounds=tag0]
+    builder.switch_to(err_block);
+    let err_result = builder.alloc(2);
+    let err_tag = builder.const_u64(1);
+    builder.store(err_result, 0, err_tag);
+    let oob_tag = builder.const_u64(0);
+    builder.store(err_result, 1, oob_tag);
+    builder.jump(merge, vec![err_result]);
+
+    builder.switch_to(merge);
+    merge_param
 }
 
 /// Replace all occurrences of `var` in `ty` with `replacement`.

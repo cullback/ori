@@ -9,13 +9,8 @@ List := {}.(
     # Returns the number of elements in the list.
     len : List(a) -> U64
 
-    # Returns the element at the given index without bounds checking.
-    # Prefer `get` which returns a Result.
-    get_unchecked : List(a), U64 -> a
-
     # Returns the element at the given index, or Err(OutOfBounds).
     get : List(a), U64 -> Result(a, [OutOfBounds])
-    get = |xs, i| if i < xs.len() then Ok(xs.get_unchecked(i)) else Err(OutOfBounds)
 
     # Returns a new list with the element at the given index replaced.
     set : List(a), U64, a -> List(a)
@@ -48,7 +43,7 @@ List := {}.(
 
     # Returns the first element, or Err(Empty) if the list is empty.
     first : List(a) -> Result(a, [Empty])
-    first = |xs| if xs.is_empty() then Err(Empty) else Ok(xs.get_unchecked(0))
+    first = |xs| if xs.is_empty() then Err(Empty) else Ok(xs.get(0).unwrap())
 
     # Returns a new list with the element added to the front.
     prepend : List(a), a -> List(a)

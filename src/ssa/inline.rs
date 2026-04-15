@@ -52,7 +52,6 @@ fn find_candidates(module: &Module) -> HashSet<String> {
 
 /// Inline all eligible calls within a single function.
 fn inline_calls_in_function(caller: &mut Function, snapshots: &HashMap<String, Function>) {
-    // Iterate until no more inlining happens (handles transitive inlining).
     loop {
         let Some((block_id, inst_idx, callee_name)) = find_inline_site(caller, snapshots) else {
             break;
@@ -95,6 +94,8 @@ fn perform_inline(
     // --- Step 1: compute remapping for Values and BlockIds ---
 
     // Find the max Value index in the caller to avoid collisions.
+    // Check blocks, params, AND value_types (which may contain values
+    // from previous inlines that aren't in any block yet).
     let mut max_val = 0_usize;
     for block in caller.blocks.values() {
         for &p in &block.params {
@@ -108,6 +109,9 @@ fn perform_inline(
     }
     for &p in &caller.params {
         max_val = max_val.max(p.0 + 1);
+    }
+    for &v in caller.value_types.keys() {
+        max_val = max_val.max(v.0 + 1);
     }
 
     // Build Value remap: callee params → call args, callee locals → fresh values.
@@ -242,6 +246,17 @@ fn perform_inline(
     // Map the original call destination to the continuation parameter
     // in remaining instructions and the original terminator.
     let dest_map: HashMap<Value, Value> = [(call_dest, cont_param)].into();
+
+    // Rewrite call_dest → cont_param in ALL existing caller blocks,
+    // not just the continuation. The call result may be used in blocks
+    // that were already present (e.g., blocks after the call's block
+    // in the original control flow).
+    for block in caller.blocks.values_mut() {
+        for inst in &mut block.insts {
+            rewrite_operands(inst, &dest_map);
+        }
+        rewrite_terminator_operands(&mut block.terminator, &dest_map);
+    }
 
     let cont_block = Block {
         params: vec![cont_param],
