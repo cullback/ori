@@ -1,7 +1,5 @@
-use std::collections::HashMap;
-
 use crate::ssa::Module;
-use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
+use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator};
 
 /// A scalar runtime value that fits in a register.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,7 +135,7 @@ impl Heap {
     }
 }
 
-type Env = HashMap<Value, Scalar>;
+type Env = Vec<Scalar>;
 
 /// Pre-allocate static objects on the heap. Must be called before
 /// any other heap allocations so that `StaticRef` indices are stable.
@@ -191,10 +189,18 @@ fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) 
         .functions
         .get(name)
         .unwrap_or_else(|| panic!("undefined SSA function: {name}"));
-    let mut env = Env::new();
+    let max_from_types = func.value_types.keys().map(|v| v.0 + 1).max().unwrap_or(0);
+    let max_from_params = func.params.iter().map(|v| v.0 + 1).max().unwrap_or(0);
+    let max_from_blocks = func.blocks.values()
+        .flat_map(|b| b.params.iter())
+        .map(|v| v.0 + 1)
+        .max()
+        .unwrap_or(0);
+    let num_values = max_from_types.max(max_from_params).max(max_from_blocks);
+    let mut env = vec![Scalar::I64(0); num_values];
 
     for (param, arg) in func.params.iter().zip(args) {
-        env.insert(*param, *arg);
+        env[param.0] = *arg;
     }
 
     let mut current = func.entry;
@@ -204,23 +210,23 @@ fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) 
         let block = &func.blocks[&current];
 
         for (param, arg) in block.params.iter().zip(&block_args) {
-            env.insert(*param, *arg);
+            env[param.0] = *arg;
         }
 
         for inst in &block.insts {
             let val = eval_inst(module, heap, &env, inst);
             if let Some(dest) = inst.dest() {
                 if let Some(v) = val {
-                    env.insert(dest, v);
+                    env[dest.0] = v;
                 }
             }
         }
 
         match &block.terminator {
-            Terminator::Return(v) => return env[v],
+            Terminator::Return(v) => return env[v.0],
 
             Terminator::Jump(target, args) => {
-                block_args = args.iter().map(|v| env[v]).collect();
+                block_args = args.iter().map(|v| env[v.0]).collect();
                 current = *target;
             }
 
@@ -231,11 +237,11 @@ fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) 
                 else_block,
                 else_args,
             } => {
-                if scalar_to_u64(env[cond]) != 0 {
-                    block_args = then_args.iter().map(|v| env[v]).collect();
+                if scalar_to_u64(env[cond.0]) != 0 {
+                    block_args = then_args.iter().map(|v| env[v.0]).collect();
                     current = *then_block;
                 } else {
-                    block_args = else_args.iter().map(|v| env[v]).collect();
+                    block_args = else_args.iter().map(|v| env[v.0]).collect();
                     current = *else_block;
                 }
             }
@@ -245,12 +251,12 @@ fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) 
                 arms,
                 default,
             } => {
-                let tag = scalar_to_u64(env[scrutinee]);
+                let tag = scalar_to_u64(env[scrutinee.0]);
                 if let Some((_, block, args)) = arms.iter().find(|(v, _, _)| *v == tag) {
-                    block_args = args.iter().map(|v| env[v]).collect();
+                    block_args = args.iter().map(|v| env[v.0]).collect();
                     current = *block;
                 } else if let Some((block, args)) = default {
-                    block_args = args.iter().map(|v| env[v]).collect();
+                    block_args = args.iter().map(|v| env[v.0]).collect();
                     current = *block;
                 } else {
                     panic!("no matching arm for tag {tag}");
@@ -265,10 +271,10 @@ fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option
     match inst {
         Inst::Const(_, ty, bits) => Some(bits_to_scalar(*ty, *bits)),
 
-        Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs], env[rhs])),
+        Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs.0], env[rhs.0])),
 
         Inst::Call(_, name, args) => {
-            let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v]).collect();
+            let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.0]).collect();
             Some(eval_function(module, heap, name, &arg_vals))
         }
 
@@ -278,46 +284,46 @@ fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option
         }
 
         Inst::Load(_, ptr, offset) => {
-            let Scalar::Ptr(idx) = env[ptr] else {
-                panic!("load from non-ptr: {:?}", env[ptr]);
+            let Scalar::Ptr(idx) = env[ptr.0] else {
+                panic!("load from non-ptr: {:?}", env[ptr.0]);
             };
             Some(heap.load(idx, *offset))
         }
 
         Inst::Store(ptr, offset, val) => {
-            let Scalar::Ptr(idx) = env[ptr] else {
-                panic!("store to non-ptr: {:?}", env[ptr]);
+            let Scalar::Ptr(idx) = env[ptr.0] else {
+                panic!("store to non-ptr: {:?}", env[ptr.0]);
             };
-            heap.store(idx, *offset, env[val]);
+            heap.store(idx, *offset, env[val.0]);
             None
         }
 
         Inst::LoadDyn(_, ptr, idx_val) => {
-            let Scalar::Ptr(heap_idx) = env[ptr] else {
-                panic!("load_dyn from non-ptr: {:?}", env[ptr]);
+            let Scalar::Ptr(heap_idx) = env[ptr.0] else {
+                panic!("load_dyn from non-ptr: {:?}", env[ptr.0]);
             };
-            let slot = scalar_to_usize(env[idx_val]);
+            let slot = scalar_to_usize(env[idx_val.0]);
             Some(heap.load_dyn(heap_idx, slot))
         }
 
         Inst::StoreDyn(ptr, idx_val, val) => {
-            let Scalar::Ptr(heap_idx) = env[ptr] else {
-                panic!("store_dyn to non-ptr: {:?}", env[ptr]);
+            let Scalar::Ptr(heap_idx) = env[ptr.0] else {
+                panic!("store_dyn to non-ptr: {:?}", env[ptr.0]);
             };
-            let slot = scalar_to_usize(env[idx_val]);
-            heap.store_dyn(heap_idx, slot, env[val]);
+            let slot = scalar_to_usize(env[idx_val.0]);
+            heap.store_dyn(heap_idx, slot, env[val.0]);
             None
         }
 
         Inst::RcInc(ptr) => {
-            if let Scalar::Ptr(idx) = env[ptr] {
+            if let Scalar::Ptr(idx) = env[ptr.0] {
                 heap.rc_inc(idx);
             }
             None
         }
 
         Inst::RcDec(ptr) => {
-            if let Scalar::Ptr(idx) = env[ptr] {
+            if let Scalar::Ptr(idx) = env[ptr.0] {
                 heap.rc_dec(idx);
             }
             None
@@ -330,7 +336,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option
         }
 
         Inst::Reset(_dest, ptr, slot_types) => {
-            if let Scalar::Ptr(idx) = env[ptr] {
+            if let Scalar::Ptr(idx) = env[ptr.0] {
                 if idx != 0 && heap.objects[idx].0 == 1 && heap.objects[idx].0 != RC_STATIC {
                     // Unique: dec pointer-typed fields, return address for reuse.
                     for (i, ty) in slot_types.iter().enumerate() {
@@ -353,7 +359,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option
         }
 
         Inst::Reuse(_dest, token, num_slots) => {
-            if let Scalar::Ptr(idx) = env[token] {
+            if let Scalar::Ptr(idx) = env[token.0] {
                 if idx != 0 {
                     // Reuse the existing allocation. Reset refcount to 1.
                     heap.objects[idx].0 = 1;
