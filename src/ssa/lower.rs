@@ -136,9 +136,44 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// Resolve a method on a concrete type at lowering time. Used when
     /// inference left the resolution as None (polymorphic body).
     fn resolve_method_at_lower_time(&self, method: &str, recv_ty: &Type) -> String {
+        // Check the original type first — if it's a named type (Con/App),
+        // use that name for method resolution even if it's transparent.
+        // This prevents Set.insert from becoming __record_insert when
+        // Set is a transparent alias for a record.
+        match recv_ty {
+            Type::Con(name) | Type::App(name, _) => {
+                if crate::numeric::NumericType::from_name(name).is_some()
+                    && crate::numeric::NumericType::from_name(name)
+                        .unwrap()
+                        .has_builtin_method(method)
+                {
+                    return format!("__builtin.{method}");
+                }
+                return format!("{name}.{method}");
+            }
+            _ => {}
+        }
         let resolved = self.resolve_transparent(recv_ty);
         match &resolved {
-            Type::Record { .. } => format!("__record_{method}"),
+            Type::Record { .. } => {
+                // The receiver is a bare record — check if a named type
+                // has this method registered (e.g., Set.insert when Set
+                // is a transparent alias for this record shape).
+                // Search registered functions for TypeName.method__suffix
+                // where TypeName is a transparent alias for this record.
+                let needle = format!(".{method}");
+                for func_name in &self.decls.funcs {
+                    if let Some(pos) = func_name.find(&needle) {
+                        // Check that what follows is either end-of-string
+                        // or a monomorphization suffix like "__..."
+                        let after = &func_name[pos + needle.len()..];
+                        if after.is_empty() || after.starts_with("__") {
+                            return func_name.clone();
+                        }
+                    }
+                }
+                format!("__record_{method}")
+            }
             Type::Tuple(_) => format!("__tuple_{method}"),
             Type::TagUnion { .. } => format!("__tag_{method}"),
             Type::Con(name) | Type::App(name, _) => {
