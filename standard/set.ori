@@ -1,0 +1,95 @@
+exports [Set, SetSlot]
+
+# Hash set using open addressing with linear probing.
+#
+# Backed by a flat List of SetSlots. Each slot is either Empty or
+# Full(key). Insert hashes the key to find a slot, probes linearly
+# on collision, and grows when load factor exceeds 75%.
+
+SetSlot(k) := [SetEmpty, SetFull(k)]
+
+Set(k) := { len: U64, entries: List(SetSlot(k)) }.(
+    # Creates a new empty Set with default initial capacity.
+    empty : {} -> Set(k)
+    empty = |_| { len: 0, entries: List.repeat(SetEmpty, 8) }
+
+    # Number of values in the Set.
+    len : Set(k) -> U64
+    len = |s| s.len
+
+    # Test if a value is in the Set.
+    contains : Set(k), k -> Bool where [k.equals, k.hash]
+    contains = |s, key| (
+        cap = List.len(s.entries)
+        start = key.hash() % cap
+        result = s.entries.walk_until({ i: 0, found: False }, |state, _|
+            if state.i >= cap then Break(state)
+            else (
+                idx = (start + state.i) % cap
+                if List.get(s.entries, idx)
+                  : SetFull(k) and k == key then Break({ i: state.i, found: True })
+                  : SetEmpty then Break(state)
+                  else Continue({ i: state.i + 1, found: False })
+            ))
+        result.found
+    )
+
+    # Insert a value into the Set. No-op if already present.
+    insert : Set(k), k -> Set(k) where [k.equals, k.hash]
+    insert = |s, key| (
+        grown = if s.len * 4 >= List.len(s.entries) * 3
+            then Set.grow(s)
+            else s
+        cap = List.len(grown.entries)
+        start = key.hash() % cap
+        probe = grown.entries.walk_until({ i: 0, slot: 0 }, |state, _|
+            if state.i >= cap then Break(state)
+            else (
+                idx = (start + state.i) % cap
+                if List.get(grown.entries, idx)
+                  : SetFull(k) and k == key then Break({ i: cap, slot: idx })
+                  : SetEmpty then Break({ i: cap, slot: idx })
+                  else Continue({ i: state.i + 1, slot: 0 })
+            ))
+        idx = probe.slot
+        if List.get(grown.entries, idx)
+          : SetFull(_) then grown
+          else {
+              len: grown.len + 1,
+              entries: List.set(grown.entries, idx, SetFull(key)),
+          }
+    )
+
+    # Create a Set from a List of values.
+    from_list : List(k) -> Set(k) where [k.equals, k.hash]
+    from_list = |xs| xs.walk(Set.empty({}), |s, x| Set.insert(s, x))
+
+    # Retrieve all values as a List (unspecified order).
+    to_list : Set(k) -> List(k)
+    to_list = |s| s.entries.walk([], |acc, slot|
+        if slot
+          : SetFull(k) then List.append(acc, k)
+          else acc)
+
+    # Iterate through values, building a result.
+    walk : Set(k), b, (b, k -> b) -> b
+    walk = |s, init, f| s.entries.walk(init, |acc, slot|
+        if slot
+          : SetFull(k) then f(acc, k)
+          else acc)
+
+    # Check if the set is empty.
+    is_empty : Set(k) -> Bool
+    is_empty = |s| s.len == 0
+
+    # Internal: double the capacity and re-insert all entries.
+    grow : Set(k) -> Set(k) where [k.equals, k.hash]
+    grow = |s| (
+        new_cap = List.len(s.entries) * 2
+        empty_set = { len: 0, entries: List.repeat(SetEmpty, new_cap) }
+        s.entries.walk(empty_set, |acc, slot|
+            if slot
+              : SetFull(k) then Set.insert(acc, k)
+              else acc)
+    )
+)

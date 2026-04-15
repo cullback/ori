@@ -4,7 +4,8 @@
 pub const MODULES: &[&str] = &[
     // Dependency order: Bool first (no deps), then Order (no deps),
     // then numeric types (reference Bool, Order), then Result,
-    // List (references U64), Str (references List, U8, U64, Bool).
+    // List (references U64), Str (references List, U8, U64, Bool),
+    // Set (references List, Bool, U64).
     "Bool", "Order",
     "I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64", "F64",
     "Result", "List", "Str",
@@ -16,6 +17,7 @@ pub fn get(name: &str) -> Option<&'static str> {
         "bool" | "Bool" => Some(include_str!("../standard/bool.ori")),
         "result" | "Result" => Some(include_str!("../standard/result.ori")),
         "str" | "Str" => Some(include_str!("../standard/str.ori")),
+        "set" | "Set" => Some(include_str!("../standard/set.ori")),
         "i8" | "I8" => Some(include_str!("../standard/i8.ori")),
         "u8" | "U8" => Some(include_str!("../standard/u8.ori")),
         "i16" | "I16" => Some(include_str!("../standard/i16.ori")),

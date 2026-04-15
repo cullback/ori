@@ -445,6 +445,24 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(new_list, 2, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
+        "__list_repeat" => {
+            // args: [val, count] → list_ptr
+            let val = args[0];
+            let Scalar::U64(count) = args[1] else {
+                panic!("__list_repeat: expected U64 count");
+            };
+            #[expect(clippy::cast_possible_truncation)]
+            let n = count as usize;
+            let data = heap.alloc(n);
+            for i in 0..n {
+                heap.store(data, i, val);
+            }
+            let list = heap.alloc(3);
+            heap.store(list, 0, Scalar::U64(count));
+            heap.store(list, 1, Scalar::U64(count));
+            heap.store(list, 2, Scalar::Ptr(data));
+            Some(Scalar::Ptr(list))
+        }
         "__num_to_str" => {
             // args: [number] → str_ptr (List(U8))
             let s = match args[0] {

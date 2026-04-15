@@ -689,6 +689,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 | "List.append"
                 | "List.reverse"
                 | "List.sublist"
+                | "List.repeat"
         )
     }
 
@@ -1854,6 +1855,8 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
         ("__list_reverse", ScalarType::Ptr)
     } else if name.ends_with(".sublist") || name == "List.sublist" {
         ("__list_sublist", ScalarType::Ptr)
+    } else if name.ends_with(".repeat") || name == "List.repeat" {
+        ("__list_repeat", ScalarType::Ptr)
     } else {
         panic!("unknown list builtin: {name}");
     };
