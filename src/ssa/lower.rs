@@ -2072,7 +2072,7 @@ fn emit_list_get_checked(builder: &mut Builder, args: Vec<Value>) -> Value {
     let err_result = builder.alloc(2);
     let err_tag = builder.const_u64(1);
     builder.store(err_result, 0, err_tag);
-    let oob_tag = builder.const_u64(0);
+    let oob_tag = builder.const_u8(0);
     builder.store(err_result, 1, oob_tag);
     builder.jump(merge, vec![err_result]);
 
