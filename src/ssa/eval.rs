@@ -113,7 +113,7 @@ pub fn eval(module: &Module, heap: &mut Heap, args: &[Scalar]) -> Scalar {
 /// indices 1..=N (0 is null). They use a sentinel refcount so
 /// RC operations are no-ops.
 fn init_statics(module: &Module, heap: &mut Heap) {
-    use super::{StaticSlot, StaticObject};
+    use super::StaticSlot;
     // First pass: allocate all static objects with placeholder slots
     // so they have stable indices for cross-references.
     let base = heap.objects.len();

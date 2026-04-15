@@ -217,7 +217,7 @@ fn check_bodyless_methods(decls: &[Decl<'_>]) -> Result<(), CompileError> {
 
 // ---- Transitive dependency computation for imports ----
 
-use crate::syntax::raw::{Expr, ExprKind, ListPatternElem, Pattern, Stmt, TypeExpr, TagDecl};
+use crate::syntax::raw::{Expr, ExprKind, ListPatternElem, Pattern, Stmt, TypeExpr};
 
 /// Compute the set of declaration names reachable from `roots` via
 /// references in function bodies. Returns all names that need to be

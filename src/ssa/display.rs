@@ -1,7 +1,7 @@
 use std::fmt;
 
 use super::{Function, Module, StaticSlot};
-use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
+use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
 use std::collections::HashMap;
 
 impl fmt::Display for Module {
