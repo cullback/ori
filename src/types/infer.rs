@@ -1244,7 +1244,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
         }
 
-        // Record types: compiler-generated equals and to_str.
+        // Record types: compiler-generated equals, to_str, hash.
         if let Type::Record { .. } = &resolved {
             match method {
                 "equals" => {
@@ -1269,6 +1269,28 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     return Ok(ret);
                 }
                 _ => {}
+            }
+        }
+
+        // Tuple types: compiler-generated hash.
+        if let Type::Tuple(_) = &resolved {
+            if method == "hash" {
+                let u64_ty = Type::Con("U64".to_owned());
+                self.unify_at(&ret, &u64_ty, span)?;
+                self.method_resolutions
+                    .insert(span, "__tuple_hash".to_owned());
+                return Ok(ret);
+            }
+        }
+
+        // Tag union types: compiler-generated hash.
+        if matches!(&resolved, Type::TagUnion { .. } | Type::App(_, _)) {
+            if method == "hash" {
+                let u64_ty = Type::Con("U64".to_owned());
+                self.unify_at(&ret, &u64_ty, span)?;
+                self.method_resolutions
+                    .insert(span, "__tag_hash".to_owned());
+                return Ok(ret);
             }
         }
 
@@ -1669,6 +1691,30 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     if let Some(s) = maybe_span {
                         self.method_resolutions
                             .insert(s, format!("__record_{}", c.method_name));
+                    }
+                    progress = true;
+                    continue;
+                }
+
+                // Tuple types: compiler-generated hash.
+                if let Type::Tuple(_) = &resolved
+                    && c.method_name == "hash"
+                {
+                    if let Some(s) = maybe_span {
+                        self.method_resolutions
+                            .insert(s, "__tuple_hash".to_owned());
+                    }
+                    progress = true;
+                    continue;
+                }
+
+                // Tag union types: compiler-generated hash.
+                if let Type::TagUnion { .. } = &resolved
+                    && c.method_name == "hash"
+                {
+                    if let Some(s) = maybe_span {
+                        self.method_resolutions
+                            .insert(s, "__tag_hash".to_owned());
                     }
                     progress = true;
                     continue;

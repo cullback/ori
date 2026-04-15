@@ -482,7 +482,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
                 Scalar::U8(n) => u64::from(n),
                 Scalar::F64(n) => n.to_bits(),
                 Scalar::Bool(b) => u64::from(b),
-                Scalar::Ptr(_) => panic!("__num_hash: unexpected Ptr"),
+                Scalar::Ptr(idx) => idx as u64,
             };
             // FNV-1a: hash one u64 value
             let hash = (14695981039346656037_u64 ^ bits).wrapping_mul(1099511628211);

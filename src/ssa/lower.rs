@@ -568,6 +568,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         if mangled == "__record_hash" {
             return self.lower_record_hash(recv_val, &receiver.ty);
         }
+        if mangled == "__tuple_hash" {
+            return self.lower_tuple_hash(recv_val, &receiver.ty);
+        }
+        if mangled == "__tag_hash" {
+            return self.lower_tag_hash(recv_val, &receiver.ty);
+        }
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
             if op_name == "to_str" {
                 return self
@@ -895,6 +901,75 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .binop(BinaryOp::Mul, hash, prime, ScalarType::U64);
         }
         hash
+    }
+
+    /// Tuple hash: FNV-1a over each element in order.
+    fn lower_tuple_hash(&mut self, recv: Value, ty: &Type) -> Value {
+        let Type::Tuple(elem_types) = ty else {
+            panic!("lower_tuple_hash called on non-tuple type");
+        };
+
+        #[expect(clippy::unreadable_literal)]
+        let mut hash = self.builder.const_u64(14695981039346656037);
+
+        for (slot, elem_ty) in elem_types.iter().enumerate() {
+            let elem_val = self.builder.load(recv, slot, type_to_scalar(elem_ty));
+            let elem_hash = if let Type::Record { .. } = elem_ty {
+                self.lower_record_hash(elem_val, elem_ty)
+            } else if let Type::Tuple(_) = elem_ty {
+                self.lower_tuple_hash(elem_val, elem_ty)
+            } else {
+                self.builder
+                    .call("__num_hash", vec![elem_val], ScalarType::U64)
+            };
+            hash = self
+                .builder
+                .binop(BinaryOp::Xor, hash, elem_hash, ScalarType::U64);
+            #[expect(clippy::unreadable_literal)]
+            let prime = self.builder.const_u64(1099511628211);
+            hash = self
+                .builder
+                .binop(BinaryOp::Mul, hash, prime, ScalarType::U64);
+        }
+        hash
+    }
+
+    /// Tag union hash: hash the tag index, then the payload fields.
+    fn lower_tag_hash(&mut self, recv: Value, _ty: &Type) -> Value {
+        // Hash the tag index (slot 0) plus the payload (slot 1).
+        // This is a simplified version — we treat the payload as
+        // an opaque Ptr and hash its address. For full structural
+        // hashing of payloads, we'd need to know the payload type
+        // per-tag at this point.
+        #[expect(clippy::unreadable_literal)]
+        let mut hash = self.builder.const_u64(14695981039346656037);
+
+        // Hash the tag index.
+        let tag = self.builder.load(recv, 0, ScalarType::U64);
+        let tag_hash = self
+            .builder
+            .call("__num_hash", vec![tag], ScalarType::U64);
+        hash = self
+            .builder
+            .binop(BinaryOp::Xor, hash, tag_hash, ScalarType::U64);
+        #[expect(clippy::unreadable_literal)]
+        let prime = self.builder.const_u64(1099511628211);
+        hash = self
+            .builder
+            .binop(BinaryOp::Mul, hash, prime, ScalarType::U64);
+
+        // Hash the payload (slot 1) — treat as raw value.
+        let payload = self.builder.load(recv, 1, ScalarType::Ptr);
+        let payload_hash = self
+            .builder
+            .call("__num_hash", vec![payload], ScalarType::U64);
+        hash = self
+            .builder
+            .binop(BinaryOp::Xor, hash, payload_hash, ScalarType::U64);
+        #[expect(clippy::unreadable_literal)]
+        let prime2 = self.builder.const_u64(1099511628211);
+        self.builder
+            .binop(BinaryOp::Mul, hash, prime2, ScalarType::U64)
     }
 
     /// Record to_str: produces `"{ field1: val1, field2: val2 }"`.
