@@ -27,16 +27,19 @@ part2 = |input| (
     start = { x: 0, y: 0 }
     state = input.to_utf8().chunks_of(2).walk(
         { santa: start, robo: start, visited: Set.single(start) },
-        |s, pair| (
-            santa_next = step(s.santa, pair.get(0).unwrap())
-            v = s.visited.insert(santa_next)
-            if pair.len() > 1
-                then (
-                    robo_next = step(s.robo, pair.get(1).unwrap())
-                    { santa: santa_next, robo: robo_next, visited: v.insert(robo_next) }
-                )
-                else { santa: santa_next, robo: s.robo, visited: v }
-        )
+        |s, chunk|
+            if chunk
+              : [santa_ch, robo_ch] then (
+                  santa_next = step(s.santa, santa_ch)
+                  robo_next = step(s.robo, robo_ch)
+                  { santa: santa_next, robo: robo_next,
+                    visited: s.visited.insert(santa_next).insert(robo_next) }
+              )
+              : [santa_ch] then (
+                  santa_next = step(s.santa, santa_ch)
+                  { santa: santa_next, robo: s.robo,
+                    visited: s.visited.insert(santa_next) }
+              )
     )
     state.visited.len()
 )

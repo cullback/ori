@@ -733,7 +733,18 @@ fn list_element_bindings<'src>(
                     )
                 };
                 let sp_get = ctx.fresh_span(span);
-                let get_call = list_call("get", vec![scr_ref, idx_expr], sp_get);
+                let get_result = list_call("get", vec![scr_ref, idx_expr], sp_get);
+                // List.get returns Result — unwrap since length was already checked.
+                let sp_unwrap = ctx.fresh_span(span);
+                let get_call = Expr::new(
+                    ExprKind::MethodCall {
+                        receiver: Box::new(get_result),
+                        method: "unwrap",
+                        args: vec![],
+                        resolved: None,
+                    },
+                    sp_unwrap,
+                );
 
                 // If the sub-pattern is just a Binding, create a Let directly.
                 // Otherwise create a Destructure.
