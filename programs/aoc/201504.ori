@@ -22,7 +22,7 @@ has_6_zeros = |hash|
 search5 : List(U8), U64 -> U64
 search5 = |key, start|
     List.repeat(0, 1000000).walk_until(start, |n, x| (
-        hsh = Md5.hash(key.concat(n.to_str().to_utf8()))
+        hsh = md5_hash(key.concat(n.to_str().to_utf8()))
         if has_5_zeros(hsh) then Break(n)
         else Continue(n + 1)
     ))
@@ -30,7 +30,7 @@ search5 = |key, start|
 search6 : List(U8), U64 -> U64
 search6 = |key, start|
     List.repeat(0, 10000000).walk_until(start, |n, x| (
-        hsh = Md5.hash(key.concat(n.to_str().to_utf8()))
+        hsh = md5_hash(key.concat(n.to_str().to_utf8()))
         if has_6_zeros(hsh) then Break(n)
         else Continue(n + 1)
     ))

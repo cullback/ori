@@ -1,4 +1,4 @@
-exports [Md5]
+exports [md5_hash]
 
 # MD5 message-digest algorithm (RFC 1321).
 
@@ -117,18 +117,16 @@ round_fg = |b, c, d, i|
     else
         (c.bit_xor(b.bit_or(d.bit_not())), (7 * i) % 16)
 
-Md5 := {}.(
-    # Compute the MD5 digest of a byte list, returning 16 bytes.
-    hash : List(U8) -> List(U8)
-    hash = |input| (
-        padded = pad(input)
-        num_blocks = padded.len() / 64
-        state : (U32, U32, U32, U32)
-        state = (1732584193, 4023233417, 2562383102, 271733878)
-        final_state = process_blocks(padded, state, num_blocks)
-        (a, b, c, d) = final_state
-        unpack_le(a).concat(unpack_le(b)).concat(unpack_le(c)).concat(unpack_le(d))
-    )
+# Compute the MD5 digest of a byte list, returning 16 bytes.
+md5_hash : List(U8) -> List(U8)
+md5_hash = |input| (
+    padded = pad(input)
+    num_blocks = padded.len() / 64
+    state : (U32, U32, U32, U32)
+    state = (1732584193, 4023233417, 2562383102, 271733878)
+    final_state = process_blocks(padded, state, num_blocks)
+    (a, b, c, d) = final_state
+    unpack_le(a).concat(unpack_le(b)).concat(unpack_le(c)).concat(unpack_le(d))
 )
 
 process_blocks : List(U8), (U32, U32, U32, U32), U64 -> (U32, U32, U32, U32)
