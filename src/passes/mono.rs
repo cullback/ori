@@ -490,13 +490,14 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                 }
             }
             ExprKind::Name(sym) => {
-                // Bare function reference (e.g. passing `add1` as a
+                // Bare function reference (e.g. passing `step` as a
                 // higher-order arg, or referencing a zero-param value
                 // binding). If `sym` points at a known global function,
-                // ensure its identity specialization is on the worklist.
+                // ensure a specialization is on the worklist.
                 let name = self.symbols.display(*sym).to_owned();
                 if let Some(stored) = self.decl_bodies.get(&name) {
                     if stored.scheme.vars.is_empty() && !stored.is_method {
+                        // Monomorphic: identity specialization.
                         let key = (name.clone(), Vec::new());
                         if let std::collections::hash_map::Entry::Vacant(e) =
                             self.spec_map.entry(key)
@@ -508,6 +509,12 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                                 substitution: Vec::new(),
                                 spec_sym: orig_sym,
                             });
+                        }
+                    } else if !stored.scheme.vars.is_empty() {
+                        // Polymorphic: specialize using the concrete type
+                        // from inference (carried on expr.ty).
+                        if let Some(new_sym) = self.specialize_by_sym(&name, &expr.ty) {
+                            *sym = new_sym;
                         }
                     }
                 } else {

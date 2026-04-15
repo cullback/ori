@@ -3294,3 +3294,21 @@ main = |_| (
     // start + 6 distinct positions = 7
     assert_eq!(run_u64(source, 0), 7);
 }
+
+#[test]
+fn bare_polymorphic_function_reference() {
+    // Regression: passing a polymorphic function as a bare name (not
+    // wrapped in a lambda) would crash with "undefined name" because
+    // monomorphization didn't specialize the function for value-position
+    // references.
+    let source = "\
+inc = |(x, y), _| (x + 1, y)
+
+main : I64 -> I64
+main = |_| (
+    (result, _) = [1, 2, 3].trail((0, 0), inc).get(2).unwrap()
+    result
+)";
+    // trail with inc: (0,0) -> (1,0) -> (2,0) -> (3,0); element at index 2 = (3,0)
+    assert_eq!(run_i64(source, 0), 3);
+}
