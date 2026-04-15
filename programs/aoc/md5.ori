@@ -61,7 +61,7 @@ pad = |msg| (
 
 pad_zeros : List(U8) -> List(U8)
 pad_zeros = |msg|
-    List.repeat(0, 64).walk_until(msg, |m, x|
+    List.range(0, 64).walk_until(msg, |m, x|
         if m.len() % 64 == 56 then Break(m)
         else Continue(m.append(0)))
 
@@ -79,8 +79,7 @@ append_length = |msg, n|
 # Parse a 64-byte chunk into 16 U32 words (little-endian).
 chunk_to_words : List(U8), U64 -> List(U32)
 chunk_to_words = |bytes, offset|
-    List.repeat(0, 16).walk([], |acc, x| (
-        i = acc.len()
+    List.range(0, 16).walk([], |acc, i| (
         j = offset + i * 4
         w = pack_le(
             bytes.get(j).unwrap(),
@@ -99,11 +98,11 @@ process_block = |(a0, b0, c0, d0), m| (
 )
 
 round_loop = |a, b, c, d, m|
-    List.repeat(0, 64).walk({ i: 0, a: a, b: b, c: c, d: d }, |state, x| (
-        (f, g) = round_fg(state.b, state.c, state.d, state.i)
-        temp = state.a + f + k_table.get(state.i).unwrap() + m.get(g).unwrap()
-        new_b = state.b + temp.rotate_left(s_table.get(state.i).unwrap())
-        { i: state.i + 1, a: state.d, b: new_b, c: state.b, d: state.c }
+    List.range(0, 64).walk({ a: a, b: b, c: c, d: d }, |state, i| (
+        (f, g) = round_fg(state.b, state.c, state.d, i)
+        temp = state.a + f + k_table.get(i).unwrap() + m.get(g).unwrap()
+        new_b = state.b + temp.rotate_left(s_table.get(i).unwrap())
+        { a: state.d, b: new_b, c: state.b, d: state.c }
     ))
 
 round_fg : U32, U32, U32, U64 -> (U32, U64)
@@ -131,8 +130,5 @@ md5_hash = |input| (
 
 process_blocks : List(U8), (U32, U32, U32, U32), U64 -> (U32, U32, U32, U32)
 process_blocks = |padded, state, num_blocks|
-    List.repeat(0, num_blocks).walk({ idx: 0, st: state }, |acc, x| (
-        words = chunk_to_words(padded, acc.idx * 64)
-        new_state = process_block(acc.st, words)
-        { idx: acc.idx + 1, st: new_state }
-    )).st
+    List.range(0, num_blocks).walk(state, |st, i|
+        process_block(st, chunk_to_words(padded, i * 64)))

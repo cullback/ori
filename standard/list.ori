@@ -34,6 +34,10 @@ List := {}.(
     # Creates a list of `n` copies of `val`.
     repeat : a, U64 -> List(a)
 
+    # Returns a list of integers from `start` (inclusive) to `end` (exclusive).
+    # `List.range(0, 5)` produces `[0, 1, 2, 3, 4]`.
+    range : U64, U64 -> List(U64)
+
     # Same as walk, except the callback can stop iteration early.
     walk_until : List(a), b, (b, a -> Step(b)) -> b
 

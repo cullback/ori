@@ -508,6 +508,27 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(list, 2, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
+        "__list_range" => {
+            // args: [start, end] → list_ptr of U64s
+            let Scalar::U64(start) = args[0] else {
+                panic!("__list_range: expected U64 start");
+            };
+            let Scalar::U64(end) = args[1] else {
+                panic!("__list_range: expected U64 end");
+            };
+            let n = if end > start { end - start } else { 0 };
+            #[expect(clippy::cast_possible_truncation)]
+            let n_usize = n as usize;
+            let data = heap.alloc(n_usize);
+            for i in 0..n_usize {
+                heap.store(data, i, Scalar::U64(start + i as u64));
+            }
+            let list = heap.alloc(3);
+            heap.store(list, 0, Scalar::U64(n));
+            heap.store(list, 1, Scalar::U64(n));
+            heap.store(list, 2, Scalar::Ptr(data));
+            Some(Scalar::Ptr(list))
+        }
         "__num_to_str" => {
             // args: [number] → str_ptr (List(U8))
             let s = match args[0] {

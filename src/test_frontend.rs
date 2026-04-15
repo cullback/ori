@@ -3405,8 +3405,7 @@ pack_le = |b0, b1, b2, b3|
 
 build_words : List(U8), U64 -> List(U32)
 build_words = |bytes, offset|
-    List.repeat(0, 16).walk([], |acc, x| (
-        i = acc.len()
+    List.range(0, 16).walk([], |acc, i| (
         j = offset + i * 4
         w = pack_le(
             bytes.get(j).unwrap(),
@@ -3429,16 +3428,16 @@ round_fg = |b, c, d, i|
         (c.bit_xor(b.bit_or(d.bit_not())), (7 * i) % 16)
 
 round_loop = |a, b, c, d, m|
-    List.repeat(0, 64).walk({ i: 0, a: a, b: b, c: c, d: d }, |state, x| (
-        (f, g) = round_fg(state.b, state.c, state.d, state.i)
-        temp = state.a + f + k_table.get(state.i).unwrap() + m.get(g).unwrap()
-        new_b = state.b + temp.rotate_left(s_table.get(state.i).unwrap())
-        { i: state.i + 1, a: state.d, b: new_b, c: state.b, d: state.c }
+    List.range(0, 64).walk({ a: a, b: b, c: c, d: d }, |state, i| (
+        (f, g) = round_fg(state.b, state.c, state.d, i)
+        temp = state.a + f + k_table.get(i).unwrap() + m.get(g).unwrap()
+        new_b = state.b + temp.rotate_left(s_table.get(i).unwrap())
+        { a: state.d, b: new_b, c: state.b, d: state.c }
     ))
 
 pad_zeros : List(U8) -> List(U8)
 pad_zeros = |msg|
-    List.repeat(0, 64).walk_until(msg, |m, x|
+    List.range(0, 64).walk_until(msg, |m, x|
         if m.len() % 64 == 56 then Break(m)
         else Continue(m.append(0)))
 
