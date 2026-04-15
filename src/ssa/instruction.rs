@@ -86,6 +86,9 @@ pub enum Inst {
     /// dest = if token is non-null, reuse that memory. Otherwise
     /// allocate `num_slots` fresh slots.
     Reuse(Value, Value, usize),
+    /// dest = pointer to a pre-allocated static object by index.
+    /// The object lives in `Module::statics` and is never freed.
+    StaticRef(Value, usize),
 }
 
 impl Inst {
@@ -99,7 +102,8 @@ impl Inst {
             | Self::Load(v, _, _)
             | Self::LoadDyn(v, _, _)
             | Self::Reset(v, _, _)
-            | Self::Reuse(v, _, _) => Some(*v),
+            | Self::Reuse(v, _, _)
+            | Self::StaticRef(v, _) => Some(*v),
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
         }
     }
@@ -117,6 +121,7 @@ impl Inst {
             Self::RcInc(v) | Self::RcDec(v) => vec![*v],
             Self::Reset(_, ptr, _) => vec![*ptr],
             Self::Reuse(_, token, _) => vec![*token],
+            Self::StaticRef(..) => vec![],
         }
     }
 }

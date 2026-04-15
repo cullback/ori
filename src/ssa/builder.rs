@@ -257,6 +257,7 @@ impl Builder {
     pub fn build(self, entry: &str) -> Module {
         Module {
             functions: self.functions,
+            statics: Vec::new(),
             entry: entry.to_owned(),
         }
     }

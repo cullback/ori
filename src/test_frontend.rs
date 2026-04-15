@@ -39,6 +39,7 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
+    crate::ssa::static_promote::promote(&mut ssa_module);
     crate::ssa::rc::insert_rc(&mut ssa_module);
     crate::ssa::rc::insert_reuse(&mut ssa_module);
     (ssa_module, input_vals)
@@ -50,6 +51,7 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
 fn run(source: &str, input: i64) -> Scalar {
     let (ssa_module, input_vals) = compile(source);
     let mut heap = crate::ssa::eval::new_heap();
+    crate::ssa::eval::load_statics(&ssa_module, &mut heap);
     let ssa_args: Vec<Scalar> = input_vals
         .iter()
         .enumerate()

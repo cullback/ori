@@ -21,6 +21,9 @@ pub enum Scalar {
 
 /// Simulated heap for the interpreter.
 /// Each allocation is a Vec of Scalar slots.
+/// Sentinel refcount for static/permanent objects (never freed).
+const RC_STATIC: usize = usize::MAX;
+
 pub struct Heap {
     /// Each entry: (refcount, slots).
     objects: Vec<(usize, Vec<Scalar>)>,
@@ -37,6 +40,13 @@ impl Heap {
     pub fn alloc(&mut self, num_slots: usize) -> usize {
         let idx = self.objects.len();
         self.objects.push((1, vec![Scalar::I64(0); num_slots]));
+        idx
+    }
+
+    /// Allocate a static (permanent) object that is never freed.
+    pub fn alloc_static(&mut self, slots: Vec<Scalar>) -> usize {
+        let idx = self.objects.len();
+        self.objects.push((RC_STATIC, slots));
         idx
     }
 
@@ -62,16 +72,14 @@ impl Heap {
     }
 
     fn rc_inc(&mut self, idx: usize) {
-        if idx != 0 {
+        if idx != 0 && self.objects[idx].0 != RC_STATIC {
             self.objects[idx].0 += 1;
         }
     }
 
     fn rc_dec(&mut self, idx: usize) {
-        if idx != 0 && self.objects[idx].0 > 0 {
+        if idx != 0 && self.objects[idx].0 != RC_STATIC && self.objects[idx].0 > 0 {
             self.objects[idx].0 -= 1;
-            // Don't free yet — recursive child decrement not implemented.
-            // For now, just track the count.
         }
     }
 
@@ -91,9 +99,41 @@ impl Heap {
 
 type Env = HashMap<Value, Scalar>;
 
+/// Pre-allocate static objects on the heap. Must be called before
+/// any other heap allocations so that `StaticRef` indices are stable.
+pub fn load_statics(module: &Module, heap: &mut Heap) {
+    init_statics(module, heap);
+}
+
 /// Evaluate the entry function of an SSA module.
 pub fn eval(module: &Module, heap: &mut Heap, args: &[Scalar]) -> Scalar {
     eval_function(module, heap, &module.entry, args)
+}
+
+/// Pre-allocate static objects on the heap. Static objects get
+/// indices 1..=N (0 is null). They use a sentinel refcount so
+/// RC operations are no-ops.
+fn init_statics(module: &Module, heap: &mut Heap) {
+    use super::{StaticSlot, StaticObject};
+    // First pass: allocate all static objects with placeholder slots
+    // so they have stable indices for cross-references.
+    let base = heap.objects.len();
+    for obj in &module.statics {
+        let slots = vec![Scalar::I64(0); obj.slots.len()];
+        heap.objects.push((RC_STATIC, slots));
+    }
+    // Second pass: fill in slot values now that all indices are known.
+    for (i, obj) in module.statics.iter().enumerate() {
+        for (si, slot) in obj.slots.iter().enumerate() {
+            let scalar = match slot {
+                StaticSlot::U8(b) => Scalar::U8(*b),
+                StaticSlot::U64(n) => Scalar::U64(*n),
+                StaticSlot::I64(n) => Scalar::I64(*n),
+                StaticSlot::StaticPtr(id) => Scalar::Ptr(base + id),
+            };
+            heap.objects[base + i].1[si] = scalar;
+        }
+    }
 }
 
 /// Create a new heap for interpretation.
@@ -247,9 +287,15 @@ fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option
             None
         }
 
+        Inst::StaticRef(_dest, static_id) => {
+            // Statics are pre-allocated starting at heap index 1
+            // (index 0 is null). static_id 0 → heap index 1, etc.
+            Some(Scalar::Ptr(1 + static_id))
+        }
+
         Inst::Reset(_dest, ptr, slot_types) => {
             if let Scalar::Ptr(idx) = env[ptr] {
-                if idx != 0 && heap.objects[idx].0 == 1 {
+                if idx != 0 && heap.objects[idx].0 == 1 && heap.objects[idx].0 != RC_STATIC {
                     // Unique: dec pointer-typed fields, return address for reuse.
                     for (i, ty) in slot_types.iter().enumerate() {
                         if *ty == ScalarType::Ptr {

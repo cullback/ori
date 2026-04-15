@@ -50,6 +50,7 @@ fn compile(
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = ssa::lower::lower(&mono, &resolved.fields)?;
+    ssa::static_promote::promote(&mut ssa_module);
     ssa::rc::insert_rc(&mut ssa_module);
     ssa::rc::insert_reuse(&mut ssa_module);
     Ok((ssa_module, input_vals))
@@ -141,6 +142,7 @@ fn main() {
 
     // Build SSA inputs
     let mut heap = ssa::eval::new_heap();
+    ssa::eval::load_statics(&ssa_module, &mut heap);
     let program_args: Vec<&String> = file_args[1..].to_vec();
 
     let cli_args: Vec<ssa::eval::Scalar> = program_args

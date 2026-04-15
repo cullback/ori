@@ -103,6 +103,7 @@ impl fmt::Display for InstDisplay<'_> {
             Inst::RcDec(ptr) => write!(f, "rc_dec {ptr}"),
             Inst::Reset(d, ptr, _) => write!(f, "{d}: ptr = reset {ptr}"),
             Inst::Reuse(d, tok, n) => write!(f, "{d}: ptr = reuse {tok}, {n}"),
+            Inst::StaticRef(d, id) => write!(f, "{d}: ptr = static_ref @{id}"),
         }
     }
 }

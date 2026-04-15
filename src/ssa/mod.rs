@@ -4,6 +4,7 @@ pub mod eval;
 mod instruction;
 pub mod lower;
 pub mod rc;
+pub mod static_promote;
 
 #[allow(unused_imports)]
 pub use builder::Builder;
@@ -29,9 +30,28 @@ pub struct Function {
     pub value_types: std::collections::HashMap<Value, ScalarType>,
 }
 
-/// Top-level SSA module — all functions.
+/// A static (permanent) heap object. Allocated once before execution,
+/// never freed (sentinel refcount). Used for string/list literals
+/// whose contents are known at compile time.
+#[derive(Debug, Clone)]
+pub struct StaticObject {
+    pub slots: Vec<StaticSlot>,
+}
+
+/// A slot value in a static object.
+#[derive(Debug, Clone)]
+pub enum StaticSlot {
+    U8(u8),
+    U64(u64),
+    I64(i64),
+    /// Reference to another static object by index.
+    StaticPtr(usize),
+}
+
+/// Top-level SSA module — all functions plus static data.
 #[derive(Debug)]
 pub struct Module {
     pub functions: std::collections::HashMap<String, Function>,
+    pub statics: Vec<StaticObject>,
     pub entry: String,
 }
