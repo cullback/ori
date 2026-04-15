@@ -171,10 +171,19 @@ fn nop_elim(func: &mut Function) -> bool {
 /// redirected to the final target with arguments composed through
 /// the chain. Also merges trivial entry-block forwards.
 fn jump_threading(func: &mut Function) -> bool {
-    // Build a redirect map: block → (target, param-to-arg mapping).
-    // A block qualifies if it has no instructions and terminates with Jump,
-    // and every jump argument is one of the block's own parameters.
-    let mut redirects: HashMap<BlockId, (BlockId, Vec<usize>)> = HashMap::new();
+    // Two kinds of redirectable blocks (no instructions, terminates with Jump):
+    //
+    // 1. Param-forwarding: all jump args are block params. Predecessors
+    //    remap their args through the index mapping.
+    // 2. Fixed-arg: block has no params. Predecessors replace their
+    //    edge with the block's fixed jump target and args.
+    #[derive(Clone)]
+    enum Redirect {
+        ParamForward(BlockId, Vec<usize>),
+        FixedArgs(BlockId, Vec<Value>),
+    }
+
+    let mut redirects: HashMap<BlockId, Redirect> = HashMap::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         if !block.insts.is_empty() {
             continue;
@@ -182,39 +191,66 @@ fn jump_threading(func: &mut Function) -> bool {
         let Terminator::Jump(target, ref args) = block.terminator else {
             continue;
         };
-        // Check that each arg is a block param, and record the mapping.
-        let param_indices: Option<Vec<usize>> = args
-            .iter()
-            .map(|arg| block.params.iter().position(|p| p == arg))
-            .collect();
-        let Some(indices) = param_indices else {
-            continue;
-        };
-        redirects.insert(BlockId(bi), (target, indices));
+        if block.params.is_empty() {
+            // Fixed-arg: no params, just forwards constant args.
+            redirects.insert(BlockId(bi), Redirect::FixedArgs(target, args.clone()));
+        } else {
+            // Param-forwarding: each arg must be a block param.
+            let param_indices: Option<Vec<usize>> = args
+                .iter()
+                .map(|arg| block.params.iter().position(|p| p == arg))
+                .collect();
+            if let Some(indices) = param_indices {
+                redirects.insert(BlockId(bi), Redirect::ParamForward(target, indices));
+            }
+        }
     }
 
     if redirects.is_empty() {
         return false;
     }
 
-    // Resolve chains: if B→C and C→D, then B→D (compose index mappings).
-    let resolved: HashMap<BlockId, (BlockId, Vec<usize>)> = redirects
+    // Resolve chains.
+    let resolved: HashMap<BlockId, Redirect> = redirects
         .keys()
         .map(|&bid| {
-            let (mut target, mut indices) = redirects[&bid].clone();
-            while let Some((next_target, next_indices)) = redirects.get(&target) {
-                indices = indices.iter().map(|&i| next_indices[i]).collect();
-                target = *next_target;
+            let mut current = redirects[&bid].clone();
+            loop {
+                let next_target = match &current {
+                    Redirect::ParamForward(t, _) | Redirect::FixedArgs(t, _) => *t,
+                };
+                let Some(next) = redirects.get(&next_target) else {
+                    break;
+                };
+                current = match (&current, next) {
+                    (Redirect::ParamForward(_, indices), Redirect::ParamForward(t2, indices2)) => {
+                        Redirect::ParamForward(*t2, indices.iter().map(|&i| indices2[i]).collect())
+                    }
+                    (Redirect::ParamForward(_, indices), Redirect::FixedArgs(t2, args2)) => {
+                        Redirect::FixedArgs(*t2, indices.iter().map(|&i| args2[i]).collect())
+                    }
+                    (Redirect::FixedArgs(_, args), Redirect::ParamForward(t2, indices2)) => {
+                        Redirect::FixedArgs(*t2, indices2.iter().map(|&i| args[i]).collect())
+                    }
+                    (Redirect::FixedArgs(_, args), Redirect::FixedArgs(t2, _)) => {
+                        // Fixed→Fixed: second block has no params, so first block's
+                        // args are irrelevant — just use the second block's fixed args.
+                        Redirect::FixedArgs(*t2, args.clone())
+                    }
+                };
             }
-            (bid, (target, indices))
+            (bid, current)
         })
         .collect();
 
     // Rewrite all terminators that reference redirected blocks.
     let mut changed = false;
     let remap = |bid: BlockId, args: &[Value]| -> Option<(BlockId, Vec<Value>)> {
-        resolved.get(&bid).map(|(target, indices)| {
-            (*target, indices.iter().map(|&i| args[i]).collect())
+        resolved.get(&bid).map(|redirect| match redirect {
+            Redirect::ParamForward(target, indices) => {
+                (*target, indices.iter().map(|&i| args[i]).collect())
+            }
+            Redirect::FixedArgs(target, fixed_args) => (*target, fixed_args.clone()),
         })
     };
 
