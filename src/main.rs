@@ -51,6 +51,7 @@ fn compile(
     passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = ssa::lower::lower(&mono, &resolved.fields)?;
     ssa::static_promote::promote(&mut ssa_module);
+    ssa::opt::optimize(&mut ssa_module);
     ssa::rc::insert_rc(&mut ssa_module);
     ssa::rc::insert_reuse(&mut ssa_module);
     Ok((ssa_module, input_vals))

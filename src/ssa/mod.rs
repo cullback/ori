@@ -3,6 +3,7 @@ mod display;
 pub mod eval;
 mod instruction;
 pub mod lower;
+pub mod opt;
 pub mod rc;
 pub mod static_promote;
 
