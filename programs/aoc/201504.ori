@@ -21,7 +21,7 @@ has_6_zeros = |hash|
 
 search5 : List(U8), U64 -> U64
 search5 = |key, start|
-    List.repeat(0, 1000000).walk_until(start, |n, x| (
+    List.range(start, start + 1000000).walk_until(start, |n, x| (
         hsh = md5_hash(key.concat(n.to_str().to_utf8()))
         if has_5_zeros(hsh) then Break(n)
         else Continue(n + 1)
@@ -29,7 +29,7 @@ search5 = |key, start|
 
 search6 : List(U8), U64 -> U64
 search6 = |key, start|
-    List.repeat(0, 10000000).walk_until(start, |n, x| (
+    List.range(start, start + 10000000).walk_until(start, |n, x| (
         hsh = md5_hash(key.concat(n.to_str().to_utf8()))
         if has_6_zeros(hsh) then Break(n)
         else Continue(n + 1)
@@ -43,4 +43,4 @@ part2 = |input| search6(strip(input), 1)
 
 main : List(Str), Str -> Result(Str, Str)
 main = |args, input|
-    Ok("part1: ${part1(input)} part2: ${part2(input)}")
+    Ok("part1: ${part1(input)}")
