@@ -104,6 +104,28 @@ List := {}.(
         List.walk_until(xs, False, |_, x|
             if x == target then Break(True) else Continue(False))
 
+    # Splits the list into chunks of the given size. The last chunk
+    # may be shorter if the list doesn't divide evenly. Returns an
+    # empty list if the input is empty or chunk_size is 0.
+    # `[1, 2, 3, 4, 5].chunks_of(2)` produces `[[1, 2], [3, 4], [5]]`.
+    chunks_of : List(a), U64 -> List(List(a))
+    chunks_of = |xs, chunk_size| (
+        if chunk_size == 0 then []
+        else (
+            total = List.len(xs)
+            result = List.walk_until(xs, { i: 0, out: [] }, |state, _|
+                if state.i >= total then Break(state)
+                else (
+                    remaining = total - state.i
+                    size = if remaining < chunk_size then remaining else chunk_size
+                    chunk = List.sublist(xs, state.i, size)
+                    Continue({ i: state.i + size, out: List.append(state.out, chunk) })
+                )
+            )
+            result.out
+        )
+    )
+
     # Returns the sum of all elements.
     sum : List(a) -> a where [a.add]
     sum = |xs| List.walk(xs, 0, |acc, x| acc + x)
