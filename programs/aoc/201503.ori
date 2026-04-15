@@ -1,3 +1,5 @@
+import set
+
 # Advent of Code 2015, Day 3: Perfectly Spherical Houses in a Vacuum
 
 step = |pos, ch|
@@ -11,13 +13,13 @@ step = |pos, ch|
 part1 : Str -> U64
 part1 = |input| (
     start = { x: 0, y: 0 }
-    state = input.to_utf8().walk({ pos: start, visited: [start] }, |acc, ch| (
+    state = input.to_utf8().walk({ pos: start, visited: Set.from_list([start]) }, |acc, ch| (
         next = step(acc.pos, ch)
-        if acc.visited.contains(next)
+        if Set.contains(acc.visited, next)
             then { pos: next, visited: acc.visited }
-            else { pos: next, visited: List.append(acc.visited, next) }
+            else { pos: next, visited: Set.insert(acc.visited, next) }
     ))
-    List.len(state.visited)
+    Set.len(state.visited)
 )
 
 main : List(Str), Str -> Result(Str, Str)
