@@ -507,7 +507,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         let true_val = self.const_tag(true_tag, disc_ty);
                         let is_true =
                             self.builder
-                                .binop(BinaryOp::Eq, cond_val, true_val, ScalarType::Bool);
+                                .binop(BinaryOp::Eq, cond_val, true_val, ScalarType::U8);
                         let ret_block = self.builder.create_block();
                         let cont_block = self.builder.create_block();
                         self.builder
@@ -816,8 +816,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let eq_tag_idx = eq_meta.tag_index;
         let gt_tag_idx = gt_meta.tag_index;
 
-        let is_lt = self.builder.binop(BinaryOp::Lt, lhs, rhs, ScalarType::Bool);
-        let is_eq = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::Bool);
+        let is_lt = self.builder.binop(BinaryOp::Lt, lhs, rhs, ScalarType::U8);
+        let is_eq = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::U8);
 
         let lt_block = self.builder.create_block();
         let not_lt_block = self.builder.create_block();
@@ -915,7 +915,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// lowering and by `x is Con(..)` expressions. Pass `negate =
     /// true` to flip which branch emits `True`.
     fn lower_eq(&mut self, lhs: Value, rhs: Value, negate: bool) -> Value {
-        let cmp = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::Bool);
+        let cmp = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::U8);
         self.lower_bool_from_cmp_neg(cmp, negate)
     }
 
@@ -931,14 +931,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         if sorted.is_empty() {
             // Empty records are always equal.
-            let cmp = self.builder.const_bool(true);
+            let cmp = self.builder.const_u8(1);
             return self.lower_bool_from_cmp_neg(cmp, negate);
         }
 
         let false_block = self.builder.create_block();
         let true_block = self.builder.create_block();
         let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::Bool);
+        let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
 
         for (slot, (_name, field_ty)) in sorted.iter().enumerate() {
             let l = self.builder.load(lhs, slot, self.scalar_type(field_ty));
@@ -949,9 +949,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
                 let true_tag = self.decls.constructors["True"].tag_index;
                 let true_val = self.const_tag(true_tag, disc_ty);
-                self.builder.binop(BinaryOp::Eq, bool_val, true_val, ScalarType::Bool)
+                self.builder.binop(BinaryOp::Eq, bool_val, true_val, ScalarType::U8)
             } else {
-                self.builder.binop(BinaryOp::Eq, l, r, ScalarType::Bool)
+                self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8)
             };
             let next = if slot + 1 < sorted.len() {
                 self.builder.create_block()
@@ -965,11 +965,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
 
         self.builder.switch_to(true_block);
-        let t = self.builder.const_bool(true);
+        let t = self.builder.const_u8(1);
         self.builder.jump(merge, vec![t]);
 
         self.builder.switch_to(false_block);
-        let f = self.builder.const_bool(false);
+        let f = self.builder.const_u8(0);
         self.builder.jump(merge, vec![f]);
 
         self.builder.switch_to(merge);
@@ -1136,7 +1136,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     fn lower_cmp(&mut self, lhs: Value, rhs: Value, op: BinaryOp) -> Value {
-        let cmp = self.builder.binop(op, lhs, rhs, ScalarType::Bool);
+        let cmp = self.builder.binop(op, lhs, rhs, ScalarType::U8);
         self.lower_bool_from_cmp(cmp)
     }
 
@@ -1145,29 +1145,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     fn lower_bool_from_cmp_neg(&mut self, cmp: Value, negate: bool) -> Value {
-        // Bool := [False, True] → False=0, True=1, matching native
-        // bool. Convert the ScalarType::Bool comparison result to a
-        // U8 tag discriminant via branch (bit-identical values, just
-        // different SSA types).
+        // Comparisons produce U8(0/1). Bool := [False, True] has
+        // False=0, True=1. They're bit-identical — no conversion.
         debug_assert_eq!(self.decls.constructors["False"].tag_index, 0);
         debug_assert_eq!(self.decls.constructors["True"].tag_index, 1);
-        let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
-        let (on_true, on_false) = if negate { (0_u64, 1) } else { (1, 0) };
-
-        let then_block = self.builder.create_block();
-        let else_block = self.builder.create_block();
-        let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, disc_ty);
-        self.builder
-            .branch(cmp, then_block, vec![], else_block, vec![]);
-        self.builder.switch_to(then_block);
-        let t = self.const_tag(on_true, disc_ty);
-        self.builder.jump(merge, vec![t]);
-        self.builder.switch_to(else_block);
-        let f = self.const_tag(on_false, disc_ty);
-        self.builder.jump(merge, vec![f]);
-        self.builder.switch_to(merge);
-        merge_param
+        if negate {
+            let one = self.builder.const_u8(1);
+            self.builder.binop(BinaryOp::Xor, cmp, one, ScalarType::U8)
+        } else {
+            cmp
+        }
     }
 
     /// Lower a standalone `x is Pattern` expression (produces Bool, no binding flow).
@@ -1191,7 +1178,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let expected_tag = self.const_tag(tag_index, disc_ty);
                 let matches = self
                     .builder
-                    .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
+                    .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::U8);
                 self.lower_bool_from_cmp(matches)
             }
             ast::Pattern::IntLit(n) => {
@@ -1265,7 +1252,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         let expected_tag = self.const_tag(tag_index, disc_ty);
                         let matches =
                             self.builder
-                                .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
+                                .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::U8);
                         let match_block = self.builder.create_block();
                         self.builder
                             .branch(matches, match_block, vec![], false_block, vec![]);
@@ -1306,7 +1293,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let true_val = self.const_tag(true_tag, disc_ty);
                 let is_true = self
                     .builder
-                    .binop(BinaryOp::Eq, val, true_val, ScalarType::Bool);
+                    .binop(BinaryOp::Eq, val, true_val, ScalarType::U8);
                 let continue_block = self.builder.create_block();
                 self.builder
                     .branch(is_true, continue_block, vec![], false_block, vec![]);
@@ -1326,7 +1313,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let true_val = self.const_tag(true_tag, disc_ty);
         let is_true = self
             .builder
-            .binop(BinaryOp::Eq, lhs_val, true_val, ScalarType::Bool);
+            .binop(BinaryOp::Eq, lhs_val, true_val, ScalarType::U8);
         let rhs_block = self.builder.create_block();
         // If LHS is True, short-circuit to merge with LHS value
         self.builder
@@ -1513,7 +1500,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             };
             let eq = self
                 .builder
-                .binop(BinaryOp::Eq, scr_val, lit_val, ScalarType::Bool);
+                .binop(BinaryOp::Eq, scr_val, lit_val, ScalarType::U8);
             self.builder.branch(eq, body_block, vec![], next_block, vec![]);
 
             self.builder.switch_to(body_block);
@@ -1674,7 +1661,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.switch_to(header);
         let cmp = self
             .builder
-            .binop(BinaryOp::Eq, i_param, len_val, ScalarType::Bool);
+            .binop(BinaryOp::Eq, i_param, len_val, ScalarType::U8);
         self.builder
             .branch(cmp, done, vec![acc_param], body_block, vec![]);
 
@@ -1708,7 +1695,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let break_val = self.builder.const_u64(break_tag);
             let is_break = self
                 .builder
-                .binop(BinaryOp::Eq, tag, break_val, ScalarType::Bool);
+                .binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
             self.builder
                 .branch(is_break, done, vec![payload], header, vec![next_i, payload]);
         } else {

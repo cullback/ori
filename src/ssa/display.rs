@@ -51,7 +51,6 @@ impl fmt::Display for Module {
 fn fmt_const(ty: ScalarType, bits: u64) -> String {
     match ty {
         ScalarType::F64 => format!("{}_f64", f64::from_bits(bits)),
-        ScalarType::Bool => format!("{}", bits != 0),
         ScalarType::Ptr => format!("0x{bits:x}_ptr"),
         _ => format!("{bits}_{ty}"),
     }
@@ -242,7 +241,6 @@ impl fmt::Display for ScalarType {
             Self::I64 => write!(f, "i64"),
             Self::U64 => write!(f, "u64"),
             Self::F64 => write!(f, "f64"),
-            Self::Bool => write!(f, "bool"),
             Self::Ptr => write!(f, "ptr"),
         }
     }

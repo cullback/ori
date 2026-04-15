@@ -143,13 +143,6 @@ impl Builder {
         v
     }
 
-    pub fn const_bool(&mut self, b: bool) -> Value {
-        let v = self.fresh_value();
-        self.push(Inst::Const(v, ScalarType::Bool, u64::from(b)));
-        self.set_type(v, ScalarType::Bool);
-        v
-    }
-
     pub fn const_ptr_null(&mut self) -> Value {
         let v = self.fresh_value();
         self.push(Inst::Const(v, ScalarType::Ptr, 0));

@@ -32,7 +32,6 @@ pub enum ScalarType {
     I64,
     U64,
     F64,
-    Bool,
     Ptr,
 }
 
@@ -192,7 +191,7 @@ pub enum Terminator {
     Return(Value),
     /// Unconditional jump with block arguments.
     Jump(BlockId, Vec<Value>),
-    /// Conditional branch on a Bool value.
+    /// Conditional branch: nonzero → then_block, zero → else_block.
     Branch {
         cond: Value,
         then_block: BlockId,
