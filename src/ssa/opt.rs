@@ -21,7 +21,31 @@ pub fn optimize(module: &mut Module) {
 /// value is never used by any other instruction or terminator.
 /// Returns true if any instructions were removed.
 fn dce(func: &mut Function) -> bool {
-    // Collect all values that are used as operands.
+    let mut changed = false;
+
+    // 1. Remove unreachable blocks by marking reachable ones from entry.
+    let mut reachable = HashSet::new();
+    let mut worklist = vec![BlockId(0)];
+    while let Some(bid) = worklist.pop() {
+        if !reachable.insert(bid) {
+            continue;
+        }
+        for (succ, _) in func.blocks[bid.0].terminator.successors() {
+            worklist.push(succ);
+        }
+    }
+    if reachable.len() < func.blocks.len() {
+        for (bi, block) in func.blocks.iter_mut().enumerate() {
+            if !reachable.contains(&BlockId(bi)) {
+                block.insts.clear();
+                block.params.clear();
+                block.terminator = Terminator::None;
+                changed = true;
+            }
+        }
+    }
+
+    // 2. Remove instructions whose destination value is never used.
     let mut used: HashSet<Value> = HashSet::new();
     for block in &func.blocks {
         for inst in &block.insts {
@@ -34,19 +58,15 @@ fn dce(func: &mut Function) -> bool {
         }
     }
 
-    let mut changed = false;
     for block in &mut func.blocks {
         let before = block.insts.len();
         block.insts.retain(|inst| {
             if let Some(dest) = inst.dest() {
-                // Keep side-effecting instructions even if unused.
                 if is_side_effect(inst) {
                     return true;
                 }
-                // Keep if the result is used somewhere.
                 used.contains(&dest)
             } else {
-                // No destination (Store, RcInc, RcDec) — always keep.
                 true
             }
         });
@@ -149,7 +169,7 @@ fn nop_elim(func: &mut Function) -> bool {
 /// Jump threading: eliminate blocks that contain no instructions and
 /// just unconditionally jump to another block. Predecessors are
 /// redirected to the final target with arguments composed through
-/// the chain.
+/// the chain. Also merges trivial entry-block forwards.
 fn jump_threading(func: &mut Function) -> bool {
     // Build a redirect map: block → (target, param-to-arg mapping).
     // A block qualifies if it has no instructions and terminates with Jump,
@@ -183,7 +203,6 @@ fn jump_threading(func: &mut Function) -> bool {
         .map(|&bid| {
             let (mut target, mut indices) = redirects[&bid].clone();
             while let Some((next_target, next_indices)) = redirects.get(&target) {
-                // Compose: new_indices[i] = next_indices[indices[i]]
                 indices = indices.iter().map(|&i| next_indices[i]).collect();
                 target = *next_target;
             }
@@ -243,6 +262,32 @@ fn jump_threading(func: &mut Function) -> bool {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Merge trivial entry block: if block 0 has no instructions and
+    // jumps to a target, substitute jump args for the target's block
+    // params and splice the target's content into block 0.
+    if func.blocks[0].insts.is_empty() {
+        if let Terminator::Jump(target, ref args) = func.blocks[0].terminator {
+            let ti = target.0;
+            if ti != 0 && ti < func.blocks.len() {
+                let target_block = func.blocks[ti].clone();
+                let arg_map: HashMap<Value, Value> = target_block
+                    .params
+                    .iter()
+                    .zip(args.iter())
+                    .map(|(&p, &a)| (p, a))
+                    .collect();
+                func.blocks[0].insts = target_block.insts;
+                func.blocks[0].terminator = target_block.terminator;
+                // Rewrite block 0's new content to use the jump args.
+                for inst in &mut func.blocks[0].insts {
+                    rewrite_operands(inst, &arg_map);
+                }
+                rewrite_terminator_operands(&mut func.blocks[0].terminator, &arg_map);
+                changed = true;
+            }
         }
     }
 
