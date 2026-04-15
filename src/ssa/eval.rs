@@ -148,6 +148,28 @@ pub fn eval(module: &Module, heap: &mut Heap, args: &[Scalar]) -> Scalar {
     eval_function(module, heap, &module.entry, args)
 }
 
+/// Scratch space for register files, reused across calls to avoid allocation.
+struct Scratch {
+    envs: Vec<Vec<Scalar>>,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self { envs: Vec::new() }
+    }
+
+    fn acquire(&mut self, size: usize) -> Vec<Scalar> {
+        let mut env = self.envs.pop().unwrap_or_default();
+        env.clear();
+        env.resize(size, Scalar::I64(0));
+        env
+    }
+
+    fn release(&mut self, env: Vec<Scalar>) {
+        self.envs.push(env);
+    }
+}
+
 /// Pre-allocate static objects on the heap. Static objects get
 /// indices 1..=N (0 is null). They use a sentinel refcount so
 /// RC operations are no-ops.
@@ -181,6 +203,17 @@ pub fn new_heap() -> Heap {
 }
 
 pub fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) -> Scalar {
+    let mut scratch = Scratch::new();
+    eval_function_inner(module, heap, &mut scratch, name, args)
+}
+
+fn eval_function_inner(
+    module: &Module,
+    heap: &mut Heap,
+    scratch: &mut Scratch,
+    name: &str,
+    args: &[Scalar],
+) -> Scalar {
     // Check for runtime intrinsics
     if let Some(result) = eval_intrinsic(name, heap, args) {
         return result;
@@ -190,15 +223,21 @@ pub fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scala
         .functions
         .get(name)
         .unwrap_or_else(|| panic!("undefined SSA function: {name}"));
-    let max_from_types = func.value_types.keys().map(|v| v.0 + 1).max().unwrap_or(0);
-    let max_from_params = func.params.iter().map(|v| v.0 + 1).max().unwrap_or(0);
-    let max_from_blocks = func.blocks.values()
-        .flat_map(|b| b.params.iter())
-        .map(|v| v.0 + 1)
-        .max()
-        .unwrap_or(0);
-    let num_values = max_from_types.max(max_from_params).max(max_from_blocks);
-    let mut env = vec![Scalar::I64(0); num_values];
+    let num_values = if func.num_values > 0 {
+        func.num_values
+    } else {
+        // Fallback for functions not processed by compute_num_values
+        // (e.g., in tests or const_eval).
+        let from_types = func.value_types.keys().map(|v| v.0 + 1).max().unwrap_or(0);
+        let from_params = func.params.iter().map(|v| v.0 + 1).max().unwrap_or(0);
+        let from_blocks = func.blocks.values()
+            .flat_map(|b| b.params.iter())
+            .map(|v| v.0 + 1)
+            .max()
+            .unwrap_or(0);
+        from_types.max(from_params).max(from_blocks)
+    };
+    let mut env = scratch.acquire(num_values);
 
     for (param, arg) in func.params.iter().zip(args) {
         env[param.0] = *arg;
@@ -215,7 +254,7 @@ pub fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scala
         }
 
         for inst in &block.insts {
-            let val = eval_inst(module, heap, &env, inst);
+            let val = eval_inst(module, heap, scratch, &env, inst);
             if let Some(dest) = inst.dest() {
                 if let Some(v) = val {
                     env[dest.0] = v;
@@ -224,7 +263,11 @@ pub fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scala
         }
 
         match &block.terminator {
-            Terminator::Return(v) => return env[v.0],
+            Terminator::Return(v) => {
+                let result = env[v.0];
+                scratch.release(env);
+                return result;
+            }
 
             Terminator::Jump(target, args) => {
                 block_args = args.iter().map(|v| env[v.0]).collect();
@@ -268,7 +311,7 @@ pub fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scala
     }
 }
 
-fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option<Scalar> {
+fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env, inst: &Inst) -> Option<Scalar> {
     match inst {
         Inst::Const(_, ty, bits) => Some(bits_to_scalar(*ty, *bits)),
 
@@ -276,7 +319,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option
 
         Inst::Call(_, name, args) => {
             let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.0]).collect();
-            Some(eval_function(module, heap, name, &arg_vals))
+            Some(eval_function_inner(module, heap, scratch, name, &arg_vals))
         }
 
         Inst::Alloc(_, size) => {

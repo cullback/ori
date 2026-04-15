@@ -278,6 +278,7 @@ impl Builder {
                 value_types,
                 entry: BlockId(0),
                 next_block: fb.next_block,
+                num_values: 0,
             },
         );
         self.current_block = None;

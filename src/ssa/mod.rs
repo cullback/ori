@@ -36,6 +36,8 @@ pub struct Function {
     pub entry: BlockId,
     /// Counter for generating fresh BlockIds.
     pub next_block: usize,
+    /// Number of SSA values (for register file sizing). Set by `cache_num_values`.
+    pub num_values: usize,
 }
 
 /// A static (permanent) heap object. Allocated once before execution,
@@ -55,6 +57,20 @@ pub enum StaticSlot {
     I64(i64),
     /// Reference to another static object by index.
     StaticPtr(usize),
+}
+
+impl Function {
+    /// Compute the register file size (max Value index + 1).
+    pub fn compute_num_values(&mut self) {
+        let from_types = self.value_types.keys().map(|v| v.0 + 1).max().unwrap_or(0);
+        let from_params = self.params.iter().map(|v| v.0 + 1).max().unwrap_or(0);
+        let from_blocks = self.blocks.values()
+            .flat_map(|b| b.params.iter())
+            .map(|v| v.0 + 1)
+            .max()
+            .unwrap_or(0);
+        self.num_values = from_types.max(from_params).max(from_blocks);
+    }
 }
 
 /// Top-level SSA module — all functions plus static data.

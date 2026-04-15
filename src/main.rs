@@ -61,6 +61,9 @@ fn compile(
     ssa::rc::insert_reuse(&mut ssa_module);
     ssa::rc::fuse_inc_dec(&mut ssa_module);
     ssa::opt::optimize(&mut ssa_module);
+    for func in ssa_module.functions.values_mut() {
+        func.compute_num_values();
+    }
     Ok((ssa_module, input_vals))
 }
 
