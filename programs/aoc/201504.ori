@@ -43,4 +43,4 @@ part2 = |input| search6(strip(input), 1)
 
 main : List(Str), Str -> Result(Str, Str)
 main = |args, input|
-    Ok("part1: ${part1(input)}")
+    Ok("part1: ${part1(input)} part2: ${part2(input)}")

@@ -694,6 +694,22 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             // after monomorphization).
             self.resolve_method_at_lower_time(method, &receiver.ty)
         };
+        // Deforestation: check for List.range(a,b).walk(...) BEFORE
+        // lowering the receiver to avoid materializing the range list.
+        if let Some(walk) = classify_walk(&mangled) {
+            if let Some((start, end)) = self.as_range_call(receiver) {
+                assert!(args.len() == 2, "List.walk* method form takes 2 args");
+                let init_val = self.lower_expr(&args[0]);
+                let acc_ty = self.expr_scalar_type(&args[0]);
+                let direct = self.resolve_closure_target(&args[1]);
+                let closure_val = self.lower_expr(&args[1]);
+                let apply_name = format!("__apply_{mangled}_2");
+                return self.lower_range_walk(
+                    start, end, init_val, closure_val, &apply_name,
+                    walk.until, acc_ty, direct,
+                );
+            }
+        }
         let recv_val = self.lower_expr(receiver);
         if mangled == "__record_equals" {
             let rhs = self.lower_expr(&args[0]);
@@ -783,12 +799,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     ) -> Value {
         if let Some(walk) = classify_walk(func) {
             assert!(args.len() >= 3, "List.walk* takes 3 arguments");
-            let list_val = self.lower_expr(&args[0]);
             let init_val = self.lower_expr(&args[1]);
             let acc_ty = self.expr_scalar_type(&args[1]);
             let direct = self.resolve_closure_target(&args[2]);
             let closure_val = self.lower_expr(&args[2]);
             let apply_name = format!("__apply_{func}_2");
+            // Deforestation: List.walk(List.range(a, b), init, f) → counter loop.
+            if let Some((start, end)) = self.as_range_call(&args[0]) {
+                return self.lower_range_walk(
+                    start, end, init_val, closure_val, &apply_name,
+                    walk.until, acc_ty, direct,
+                );
+            }
+            let list_val = self.lower_expr(&args[0]);
             return self.lower_list_walk(
                 list_val,
                 init_val,
@@ -1741,6 +1764,96 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ast::Pattern::Wildcard | ast::Pattern::IntLit(_) | ast::Pattern::StrLit(_) => {}
             _ => panic!("unsupported nested pattern in match arm field"),
         }
+    }
+
+    /// Detect `List.range(a, b)` as the receiver/list expression.
+    /// Returns lowered (start, end) Values if matched.
+    /// Detect `List.range(a, b)` as the list expression in a walk.
+    fn as_range_call(&mut self, expr: &Expr<'src>) -> Option<(Value, Value)> {
+        let is_range = |r: &str| r == "List.range" || r.ends_with(".range");
+        match &expr.kind {
+            ExprKind::QualifiedCall { resolved, segments, args, .. } => {
+                let full = resolved.clone()
+                    .unwrap_or_else(|| segments.join("."));
+                if is_range(&full) && args.len() == 2 {
+                    let start = self.lower_expr(&args[0]);
+                    let end = self.lower_expr(&args[1]);
+                    Some((start, end))
+                } else {
+                    None
+                }
+            }
+            ExprKind::Call { target, args } if args.len() == 2 => {
+                let name = self.symbols.display(*target);
+                if is_range(name) {
+                    let start = self.lower_expr(&args[0]);
+                    let end = self.lower_expr(&args[1]);
+                    Some((start, end))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit a range-walk loop: counter from start to end, no list allocation.
+    fn lower_range_walk(
+        &mut self,
+        start: Value,
+        end: Value,
+        init_val: Value,
+        step_val: Value,
+        apply_name: &str,
+        until: bool,
+        acc_ty: ScalarType,
+        direct: Option<&SingletonTarget>,
+    ) -> Value {
+        let header = self.builder.create_block();
+        let i_param = self.builder.add_block_param(header, ScalarType::U64);
+        let acc_param = self.builder.add_block_param(header, acc_ty);
+        let body_block = self.builder.create_block();
+        let done = self.builder.create_block();
+        let done_param = self.builder.add_block_param(done, acc_ty);
+
+        self.builder.jump(header, vec![start, init_val]);
+
+        self.builder.switch_to(header);
+        let cmp = self.builder.binop(BinaryOp::Eq, i_param, end, ScalarType::U8);
+        self.builder.branch(cmp, done, vec![acc_param], body_block, vec![]);
+
+        self.builder.switch_to(body_block);
+        // The element IS the counter — no list load needed.
+        let elem = i_param;
+        let resolved = direct.or_else(|| self.singletons.get(apply_name));
+        let result = if let Some(st) = resolved {
+            let mut call_args = Vec::with_capacity(st.num_captures + 2);
+            for i in 0..st.num_captures {
+                call_args.push(self.builder.load(step_val, i + 1, ScalarType::Ptr));
+            }
+            call_args.push(acc_param);
+            call_args.push(elem);
+            self.builder.call(&st.target_func, call_args, ScalarType::Ptr)
+        } else {
+            self.builder.call(apply_name, vec![step_val, acc_param, elem], ScalarType::Ptr)
+        };
+
+        let one = self.builder.const_u64(1);
+        let next_i = self.builder.binop(BinaryOp::Add, i_param, one, ScalarType::U64);
+
+        if until {
+            let tag = self.builder.load(result, 0, ScalarType::U64);
+            let payload = self.builder.load(result, 1, acc_ty);
+            let break_tag = self.decls.constructors["Break"].tag_index;
+            let break_val = self.builder.const_u64(break_tag);
+            let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
+            self.builder.branch(is_break, done, vec![payload], header, vec![next_i, payload]);
+        } else {
+            self.builder.jump(header, vec![next_i, result]);
+        }
+
+        self.builder.switch_to(done);
+        done_param
     }
 
     // ---- List walk lowering ----
