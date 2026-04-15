@@ -40,6 +40,7 @@ part2 = |input| (
                   { santa: santa_next, robo: s.robo,
                     visited: s.visited.insert(santa_next) }
               )
+              else s
     )
     state.visited.len()
 )

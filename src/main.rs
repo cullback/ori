@@ -40,7 +40,7 @@ fn compile(
     mut resolved: passes::resolve::Resolved<'static>,
 ) -> Result<(crate::ssa::Module, Vec<crate::ssa::Value>), CompileError> {
     passes::fold_lift::lift(&mut resolved);
-    passes::flatten_patterns::flatten(&mut resolved);
+    passes::flatten_patterns::flatten(&mut resolved)?;
     passes::topo::compute(&mut resolved)?;
     let infer_result = types::infer::check(&mut resolved)?;
     let mut mono = passes::mono::specialize(resolved.module, infer_result, resolved.symbols);

@@ -90,25 +90,30 @@
 use crate::ast::{
     BinOp, Decl, Expr, ExprKind, ListPatternElem, MatchArm, Module, Pattern, Span, Stmt,
 };
+use crate::error::CompileError;
 use crate::passes::resolve::Resolved;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 
 /// Flatten nested patterns into shallow match chains.
-pub fn flatten(resolved: &mut Resolved<'_>) {
+pub fn flatten(resolved: &mut Resolved<'_>) -> Result<(), CompileError> {
     let module = std::mem::take(&mut resolved.module);
-    resolved.module = flatten_module(module, &mut resolved.symbols);
+    resolved.module = flatten_module(module, &mut resolved.symbols)?;
+    Ok(())
 }
 
-fn flatten_module<'src>(mut module: Module<'src>, symbols: &mut SymbolTable) -> Module<'src> {
+fn flatten_module<'src>(
+    mut module: Module<'src>,
+    symbols: &mut SymbolTable,
+) -> Result<Module<'src>, CompileError> {
     let mut ctx = FlattenCtx {
         temp_counter: 0,
         synth_span_offset: SPAN_OFFSET_BASE,
         symbols,
     };
     for decl in &mut module.decls {
-        flatten_decl(&mut ctx, decl);
+        flatten_decl(&mut ctx, decl)?;
     }
-    module
+    Ok(module)
 }
 
 /// Starting point for synthetic span offsets. Sits near the middle of
@@ -143,44 +148,45 @@ impl FlattenCtx<'_> {
 
 // ---- Walker ----
 
-fn flatten_decl(ctx: &mut FlattenCtx<'_>, decl: &mut Decl<'_>) {
+fn flatten_decl(ctx: &mut FlattenCtx<'_>, decl: &mut Decl<'_>) -> Result<(), CompileError> {
     match decl {
         Decl::FuncDef { body, .. } => flatten_expr(ctx, body),
         Decl::TypeAnno { methods, .. } => {
             for m in methods {
-                flatten_decl(ctx, m);
+                flatten_decl(ctx, m)?;
             }
+            Ok(())
         }
     }
 }
 
-fn flatten_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) {
+fn flatten_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) -> Result<(), CompileError> {
     match &mut expr.kind {
         ExprKind::IntLit(_)
         | ExprKind::FloatLit(_)
         | ExprKind::StrLit(_)
         | ExprKind::Name(_) => {}
         ExprKind::BinOp { lhs, rhs, .. } => {
-            flatten_expr(ctx, lhs);
-            flatten_expr(ctx, rhs);
+            flatten_expr(ctx, lhs)?;
+            flatten_expr(ctx, rhs)?;
         }
         ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
             for a in args {
-                flatten_expr(ctx, a);
+                flatten_expr(ctx, a)?;
             }
         }
         ExprKind::Block(stmts, result) => {
             for s in stmts {
-                flatten_stmt(ctx, s);
+                flatten_stmt(ctx, s)?;
             }
-            flatten_expr(ctx, result);
+            flatten_expr(ctx, result)?;
         }
         ExprKind::If {
             expr: scrutinee,
             arms,
             else_body,
         } => {
-            flatten_expr(ctx, scrutinee);
+            flatten_expr(ctx, scrutinee)?;
             // Check if any arm uses a list pattern — if so, desugar the
             // entire match into a nested if-else chain on List.len.
             if arms.iter().any(|a| matches!(a.pattern, Pattern::List(_))) {
@@ -191,48 +197,48 @@ fn flatten_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) {
                     Box::new(Expr::new(ExprKind::IntLit(0), Span::default())),
                 );
                 let desugared =
-                    desugar_list_match(ctx, *scrutinee_taken, arms_taken, else_taken);
+                    desugar_list_match(ctx, *scrutinee_taken, arms_taken, else_taken)?;
                 *expr = desugared;
-                flatten_expr(ctx, expr);
-                return;
+                flatten_expr(ctx, expr)?;
+                return Ok(());
             }
             for arm in arms {
-                flatten_arm(ctx, arm);
+                flatten_arm(ctx, arm)?;
             }
             if let Some(eb) = else_body {
-                flatten_expr(ctx, eb);
+                flatten_expr(ctx, eb)?;
             }
         }
         ExprKind::Fold {
             expr: scrutinee,
             arms,
         } => {
-            flatten_expr(ctx, scrutinee);
+            flatten_expr(ctx, scrutinee)?;
             for arm in arms {
-                flatten_arm(ctx, arm);
+                flatten_arm(ctx, arm)?;
             }
         }
-        ExprKind::Lambda { body, .. } => flatten_expr(ctx, body),
+        ExprKind::Lambda { body, .. } => flatten_expr(ctx, body)?,
         ExprKind::Record { fields } => {
             for (_, e) in fields {
-                flatten_expr(ctx, e);
+                flatten_expr(ctx, e)?;
             }
         }
-        ExprKind::FieldAccess { record, .. } => flatten_expr(ctx, record),
+        ExprKind::FieldAccess { record, .. } => flatten_expr(ctx, record)?,
         ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
             for e in elems {
-                flatten_expr(ctx, e);
+                flatten_expr(ctx, e)?;
             }
         }
         ExprKind::MethodCall { receiver, args, .. } => {
-            flatten_expr(ctx, receiver);
+            flatten_expr(ctx, receiver)?;
             for a in args {
-                flatten_expr(ctx, a);
+                flatten_expr(ctx, a)?;
             }
         }
         ExprKind::Is { expr: inner, pattern } => {
             if matches!(pattern, Pattern::List(_)) {
-                flatten_expr(ctx, inner);
+                flatten_expr(ctx, inner)?;
                 let base_span = expr.span;
                 let kind = std::mem::replace(&mut expr.kind, ExprKind::IntLit(0));
                 let ExprKind::Is { expr: inner_box, pattern } = kind else {
@@ -242,31 +248,32 @@ fn flatten_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) {
                 let desugared = desugar_list_is(ctx, *inner_box, &elems, base_span);
                 expr.kind = desugared.kind;
                 expr.span = desugared.span;
-                return;
+                return Ok(());
             }
-            flatten_is_expr(ctx, expr);
+            flatten_is_expr(ctx, expr)?;
         }
         ExprKind::RecordUpdate { base, updates } => {
-            flatten_expr(ctx, base);
+            flatten_expr(ctx, base)?;
             for (_, e) in updates {
-                flatten_expr(ctx, e);
+                flatten_expr(ctx, e)?;
             }
         }
         ExprKind::Closure { .. } => {}
     }
+    Ok(())
 }
 
-fn flatten_stmt(ctx: &mut FlattenCtx<'_>, stmt: &mut Stmt<'_>) {
+fn flatten_stmt(ctx: &mut FlattenCtx<'_>, stmt: &mut Stmt<'_>) -> Result<(), CompileError> {
     match stmt {
         Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => flatten_expr(ctx, val),
         Stmt::Guard {
             condition,
             return_val,
         } => {
-            flatten_expr(ctx, condition);
-            flatten_expr(ctx, return_val);
+            flatten_expr(ctx, condition)?;
+            flatten_expr(ctx, return_val)
         }
-        Stmt::TypeHint { .. } => {}
+        Stmt::TypeHint { .. } => Ok(()),
     }
 }
 
@@ -274,22 +281,22 @@ fn flatten_stmt(ctx: &mut FlattenCtx<'_>, stmt: &mut Stmt<'_>) {
 
 /// Rewrite one match arm in place so its top pattern is a Constructor
 /// with only shallow (`Binding` / `Wildcard`) field patterns.
-fn flatten_arm<'src>(ctx: &mut FlattenCtx<'_>, arm: &mut MatchArm<'src>) {
+fn flatten_arm<'src>(ctx: &mut FlattenCtx<'_>, arm: &mut MatchArm<'src>) -> Result<(), CompileError> {
     // Children first: guards and body may themselves contain patterns
     // (e.g. nested `is` expressions, or other `if`/`fold` with arms).
     for g in &mut arm.guards {
-        flatten_expr(ctx, g);
+        flatten_expr(ctx, g)?;
     }
-    flatten_expr(ctx, &mut arm.body);
+    flatten_expr(ctx, &mut arm.body)?;
 
     let Pattern::Constructor { fields, .. } = &mut arm.pattern else {
-        return;
+        return Ok(());
     };
     if fields
         .iter()
         .all(|f| matches!(f, Pattern::Binding(_) | Pattern::Wildcard))
     {
-        return;
+        return Ok(());
     }
 
     let body_span = arm.body.span;
@@ -318,6 +325,7 @@ fn flatten_arm<'src>(ctx: &mut FlattenCtx<'_>, arm: &mut MatchArm<'src>) {
             body_span,
         );
     }
+    Ok(())
 }
 
 /// Normalize one constructor-field pattern in place. Mutates `field`
@@ -386,22 +394,22 @@ fn flatten_field<'src>(
 /// Handles only the case where the nested shapes are all Constructors —
 /// tuple/record nesting inside an `is` pattern has nowhere to hoist a
 /// destructure to, so the pass leaves those unchanged.
-fn flatten_is_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) {
+fn flatten_is_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) -> Result<(), CompileError> {
     let ExprKind::Is {
         expr: inner,
         pattern,
     } = &mut expr.kind
     else {
-        return;
+        return Ok(());
     };
 
-    flatten_expr(ctx, inner);
+    flatten_expr(ctx, inner)?;
 
     if !is_pattern_flattenable(pattern) {
-        return;
+        return Ok(());
     }
     if !pattern_has_nested_con(pattern) {
-        return;
+        return Ok(());
     }
 
     let base_span = expr.span;
@@ -415,6 +423,7 @@ fn flatten_is_expr(ctx: &mut FlattenCtx<'_>, expr: &mut Expr<'_>) {
     };
     expr.kind = build_flattened_is(ctx, *inner_box, pattern, base_span);
     expr.span = base_span;
+    Ok(())
 }
 
 /// True iff `pat` is a tree of only `Constructor` / `Binding` /
@@ -534,6 +543,39 @@ fn analyse_list_pattern(elems: &[ListPatternElem<'_>]) -> ListPatternInfo {
 /// Minimum list length required by a pattern.
 const fn min_len(info: &ListPatternInfo) -> usize {
     info.prefix_len + info.suffix_len
+}
+
+/// Check whether a set of list pattern arms covers all possible list lengths.
+///
+/// A spread pattern `[a, b, ..rest]` covers all lengths >= its fixed element
+/// count. An exact pattern `[a, b]` covers exactly that length. The arms are
+/// exhaustive when their union covers 0..∞.
+fn list_patterns_exhaustive(arms: &[MatchArm<'_>]) -> bool {
+    let mut exact_lengths = std::collections::HashSet::new();
+    let mut min_spread_threshold: Option<usize> = None;
+
+    for arm in arms {
+        let Pattern::List(elems) = &arm.pattern else {
+            continue;
+        };
+        let info = analyse_list_pattern(elems);
+        let min = min_len(&info);
+        if info.has_spread {
+            min_spread_threshold = Some(
+                min_spread_threshold.map_or(min, |prev: usize| prev.min(min)),
+            );
+        } else {
+            exact_lengths.insert(min);
+        }
+    }
+
+    let Some(threshold) = min_spread_threshold else {
+        // No spread pattern — can't cover all lengths.
+        return false;
+    };
+
+    // Spread covers threshold..∞. Check that exact patterns cover 0..threshold.
+    (0..threshold).all(|len| exact_lengths.contains(&len))
 }
 
 /// Build a `QualifiedCall` expression: `List.method(args...)`.
@@ -816,8 +858,16 @@ fn desugar_list_match<'src>(
     scrutinee: Expr<'src>,
     arms: Vec<MatchArm<'src>>,
     else_body: Option<Box<Expr<'src>>>,
-) -> Expr<'src> {
+) -> Result<Expr<'src>, CompileError> {
     let span = scrutinee.span;
+
+    // Check exhaustiveness when no else body is provided.
+    if else_body.is_none() && !list_patterns_exhaustive(&arms) {
+        return Err(CompileError::at(
+            span,
+            "non-exhaustive list pattern match — add an `else` branch",
+        ));
+    }
 
     // Bind the scrutinee to a temp so we only evaluate it once.
     let scr_sym = ctx.fresh_local(span);
@@ -830,16 +880,16 @@ fn desugar_list_match<'src>(
     let len_call = list_call("len", vec![scr_ref_for_len], sp_len);
 
     // Build the if-else chain from bottom up (last arm first).
+    // If there's no else body we verified exhaustiveness above, but we
+    // still need a fallback expression for the chain — use unreachable crash.
     let mut result: Expr<'src> = if let Some(eb) = else_body {
         *eb
     } else {
-        // No else body — this is an error at runtime if nothing matches,
-        // but for now emit a crash.
         Expr::new(
             ExprKind::QualifiedCall {
                 segments: vec!["crash"],
                 args: vec![Expr::new(
-                    ExprKind::StrLit(b"non-exhaustive list pattern match".to_vec()),
+                    ExprKind::StrLit(b"unreachable: exhaustive list match".to_vec()),
                     span,
                 )],
                 resolved: None,
@@ -952,7 +1002,7 @@ fn desugar_list_match<'src>(
 
     // Wrap everything in a block: let scr = scrutinee; let len = List.len(scr); <chain>
     let bsp = ctx.fresh_span(span);
-    Expr::new(
+    Ok(Expr::new(
         ExprKind::Block(
             vec![
                 Stmt::Let {
@@ -967,7 +1017,7 @@ fn desugar_list_match<'src>(
             Box::new(result),
         ),
         bsp,
-    )
+    ))
 }
 
 /// Desugar `x is [first, ..rest]` into a len-check expression.

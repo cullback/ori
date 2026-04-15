@@ -22,7 +22,7 @@ fn through_infer(
     resolved: &mut Resolved<'_>,
 ) -> crate::types::infer::InferResult {
     crate::passes::fold_lift::lift(resolved);
-    crate::passes::flatten_patterns::flatten(resolved);
+    crate::passes::flatten_patterns::flatten(resolved).unwrap();
     crate::passes::topo::compute(resolved).unwrap();
     crate::types::infer::check(resolved).unwrap()
 }
