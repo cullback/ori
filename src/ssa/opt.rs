@@ -13,6 +13,7 @@ pub fn optimize(module: &mut Module) {
         const_fold(func);
         nop_elim(func);
         jump_threading(func);
+        merge_blocks(func);
         dce(func);
     }
 }
@@ -331,6 +332,76 @@ fn jump_threading(func: &mut Function) -> bool {
     }
 
     changed
+}
+
+/// Merge single-predecessor blocks: if block B has exactly one
+/// predecessor A, and A unconditionally jumps to B, append B's
+/// content into A and remove B.
+fn merge_blocks(func: &mut Function) {
+    // Count how many incoming edges each block has, and from where.
+    // Only track blocks reached by exactly one Jump (not Branch/SwitchInt).
+    let mut jump_preds: HashMap<BlockId, BlockId> = HashMap::new();
+    let mut multi_pred: HashSet<BlockId> = HashSet::new();
+
+    for (&src, block) in &func.blocks {
+        match &block.terminator {
+            Terminator::Jump(target, _) => {
+                if multi_pred.contains(target) {
+                    // already has multiple predecessors
+                } else if jump_preds.contains_key(target) {
+                    // second predecessor — no longer mergeable
+                    jump_preds.remove(target);
+                    multi_pred.insert(*target);
+                } else {
+                    jump_preds.insert(*target, src);
+                }
+            }
+            term => {
+                // Branch/SwitchInt — all successors get marked as multi-pred
+                // (the predecessor has multiple outgoing edges, so the
+                // successor can't be merged back into it).
+                for (succ, _) in term.successors() {
+                    jump_preds.remove(&succ);
+                    multi_pred.insert(succ);
+                }
+            }
+        }
+    }
+
+    // Don't merge the entry block into anything.
+    jump_preds.remove(&func.entry);
+
+    // Merge each eligible block into its sole predecessor.
+    for (target, pred) in &jump_preds {
+        let Some(target_block) = func.blocks.remove(target) else {
+            continue;
+        };
+        let Some(pred_block) = func.blocks.get_mut(pred) else {
+            continue;
+        };
+
+        // Build param→arg substitution from the Jump.
+        let Terminator::Jump(_, ref args) = pred_block.terminator else {
+            continue;
+        };
+        let arg_map: HashMap<Value, Value> = target_block
+            .params
+            .iter()
+            .zip(args.iter())
+            .map(|(&p, &a)| (p, a))
+            .collect();
+
+        // Append target's instructions (with params substituted) to predecessor.
+        for mut inst in target_block.insts {
+            rewrite_operands(&mut inst, &arg_map);
+            pred_block.insts.push(inst);
+        }
+
+        // Replace predecessor's terminator with target's terminator.
+        let mut new_term = target_block.terminator;
+        rewrite_terminator_operands(&mut new_term, &arg_map);
+        pred_block.terminator = new_term;
+    }
 }
 
 // ---- Helpers ----
