@@ -40,6 +40,7 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
     crate::ssa::rc::insert_rc(&mut ssa_module);
+    crate::ssa::rc::insert_reuse(&mut ssa_module);
     (ssa_module, input_vals)
 }
 

@@ -246,6 +246,47 @@ fn eval_inst(module: &Module, heap: &mut Heap, env: &Env, inst: &Inst) -> Option
             }
             None
         }
+
+        Inst::Reset(_dest, ptr, slot_types) => {
+            if let Scalar::Ptr(idx) = env[ptr] {
+                if idx != 0 && heap.objects[idx].0 == 1 {
+                    // Unique: dec pointer-typed fields, return address for reuse.
+                    for (i, ty) in slot_types.iter().enumerate() {
+                        if *ty == ScalarType::Ptr {
+                            if let Scalar::Ptr(child) = heap.load(idx, i) {
+                                heap.rc_dec(child);
+                            }
+                        }
+                    }
+                    heap.objects[idx].0 = 0;
+                    Some(Scalar::Ptr(idx))
+                } else {
+                    // Shared: normal dec, return null.
+                    heap.rc_dec(idx);
+                    Some(Scalar::Ptr(0))
+                }
+            } else {
+                Some(Scalar::Ptr(0))
+            }
+        }
+
+        Inst::Reuse(_dest, token, num_slots) => {
+            if let Scalar::Ptr(idx) = env[token] {
+                if idx != 0 {
+                    // Reuse the existing allocation. Reset refcount to 1.
+                    heap.objects[idx].0 = 1;
+                    // Ensure enough slots (may already be the right size).
+                    let slots = &mut heap.objects[idx].1;
+                    slots.resize(*num_slots, Scalar::I64(0));
+                    Some(Scalar::Ptr(idx))
+                } else {
+                    // Token was null — allocate fresh.
+                    Some(Scalar::Ptr(heap.alloc(*num_slots)))
+                }
+            } else {
+                Some(Scalar::Ptr(heap.alloc(*num_slots)))
+            }
+        }
     }
 }
 

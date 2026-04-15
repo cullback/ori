@@ -101,6 +101,8 @@ impl fmt::Display for InstDisplay<'_> {
             Inst::StoreDyn(ptr, idx, val) => write!(f, "store_dyn {val} -> {ptr}[{idx}]"),
             Inst::RcInc(ptr) => write!(f, "rc_inc {ptr}"),
             Inst::RcDec(ptr) => write!(f, "rc_dec {ptr}"),
+            Inst::Reset(d, ptr, _) => write!(f, "{d}: ptr = reset {ptr}"),
+            Inst::Reuse(d, tok, n) => write!(f, "{d}: ptr = reuse {tok}, {n}"),
         }
     }
 }

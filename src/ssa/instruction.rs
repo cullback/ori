@@ -79,6 +79,13 @@ pub enum Inst {
     RcInc(Value),
     /// Decrement reference count of `ptr`, free if zero.
     RcDec(Value),
+    /// dest = if refcount(ptr) == 1: dec Ptr-typed fields per
+    /// `slot_types`, return ptr for reuse. Otherwise: normal dec,
+    /// return null sentinel.
+    Reset(Value, Value, Vec<ScalarType>),
+    /// dest = if token is non-null, reuse that memory. Otherwise
+    /// allocate `num_slots` fresh slots.
+    Reuse(Value, Value, usize),
 }
 
 impl Inst {
@@ -90,7 +97,9 @@ impl Inst {
             | Self::Call(v, _, _)
             | Self::Alloc(v, _)
             | Self::Load(v, _, _)
-            | Self::LoadDyn(v, _, _) => Some(*v),
+            | Self::LoadDyn(v, _, _)
+            | Self::Reset(v, _, _)
+            | Self::Reuse(v, _, _) => Some(*v),
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
         }
     }
@@ -106,6 +115,8 @@ impl Inst {
             Self::LoadDyn(_, ptr, idx) => vec![*ptr, *idx],
             Self::StoreDyn(ptr, idx, val) => vec![*ptr, *idx, *val],
             Self::RcInc(v) | Self::RcDec(v) => vec![*v],
+            Self::Reset(_, ptr, _) => vec![*ptr],
+            Self::Reuse(_, token, _) => vec![*token],
         }
     }
 }

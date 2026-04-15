@@ -25,15 +25,112 @@
 //! - `Load(dest, ptr, offset)` where dest is Ptr: creates a new
 //!   alias from the heap slot → emit `RcInc(dest)`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use super::instruction::{Inst, ScalarType, Terminator, Value, BlockId};
+use super::instruction::{BlockId, Inst, ScalarType, Terminator, Value};
 use super::{Function, Module};
 
 /// Insert reference counting operations into every function.
 pub fn insert_rc(module: &mut Module) {
     for func in module.functions.values_mut() {
         insert_rc_function(func);
+    }
+}
+
+/// Replace RcDec+Alloc pairs with Reset+Reuse when the allocation
+/// sizes match, enabling in-place mutation of unique values.
+pub fn insert_reuse(module: &mut Module) {
+    for func in module.functions.values_mut() {
+        insert_reuse_function(func);
+    }
+}
+
+fn insert_reuse_function(func: &mut Function) {
+    // Build a map: Value → alloc size, for values defined by Alloc.
+    let mut alloc_sizes: HashMap<Value, usize> = HashMap::new();
+    // Build a map: Value → slot types, for computing Reset field decs.
+    let mut alloc_slot_types: HashMap<Value, Vec<ScalarType>> = HashMap::new();
+    // Track the next available Value ID for fresh tokens.
+    let mut next_value: usize = func
+        .value_types
+        .keys()
+        .map(|v| v.0 + 1)
+        .max()
+        .unwrap_or(0);
+
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let Inst::Alloc(dest, size) = inst {
+                alloc_sizes.insert(*dest, *size);
+                alloc_slot_types.insert(*dest, vec![ScalarType::Ptr; *size]);
+            }
+            if let Inst::Store(ptr, offset, val) = inst {
+                if let Some(slots) = alloc_slot_types.get_mut(ptr) {
+                    if let Some(ty) = func.value_types.get(val) {
+                        if *offset < slots.len() {
+                            slots[*offset] = *ty;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // For each block, find RcDec(v) → Alloc(dest, size) patterns.
+    for block in &mut func.blocks {
+        let mut new_insts: Vec<Inst> = Vec::with_capacity(block.insts.len());
+        // Track which allocs have been claimed by a reset.
+
+        // First pass: find RcDec+Alloc pairs.
+        let mut reset_for_dec: HashMap<usize, (Value, Vec<ScalarType>)> = HashMap::new();
+        let mut reuse_for_alloc: HashMap<usize, Value> = HashMap::new();
+
+        // Find each RcDec and look for a matching Alloc after it.
+        for (i, inst) in block.insts.iter().enumerate() {
+            if let Inst::RcDec(ptr) = inst {
+                let dec_size = alloc_sizes.get(ptr).copied();
+                if let Some(size) = dec_size {
+                    // Look for the first unclaimed Alloc of the same size.
+                    for (j, later) in block.insts[i + 1..].iter().enumerate() {
+                        let j = i + 1 + j;
+                        if let Inst::Alloc(_dest, alloc_size) = later {
+                            if *alloc_size == size && !reuse_for_alloc.contains_key(&j) {
+                                // Found a match. Create a fresh value for the token.
+                                let token = Value(next_value);
+                                next_value += 1;
+                                func.value_types.insert(token, ScalarType::Ptr);
+                                let slot_types = alloc_slot_types
+                                    .get(ptr)
+                                    .cloned()
+                                    .unwrap_or_else(|| vec![ScalarType::Ptr; size]);
+                                reset_for_dec.insert(i, (token, slot_types));
+                                reuse_for_alloc.insert(j, token);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Second pass: rewrite instructions.
+        for (i, inst) in block.insts.iter().enumerate() {
+            if let Some((token, slot_types)) = reset_for_dec.get(&i) {
+                // Replace RcDec with Reset.
+                if let Inst::RcDec(ptr) = inst {
+                    new_insts.push(Inst::Reset(*token, *ptr, slot_types.clone()));
+                }
+            } else if let Some(token) = reuse_for_alloc.get(&i) {
+                // Replace Alloc with Reuse.
+                if let Inst::Alloc(dest, size) = inst {
+                    new_insts.push(Inst::Reuse(*dest, *token, *size));
+                }
+            } else {
+                new_insts.push(inst.clone());
+            }
+        }
+
+        block.insts = new_insts;
     }
 }
 
@@ -132,11 +229,39 @@ fn insert_rc_function(func: &mut Function) {
             }
         }
 
-        // Build new instruction list with RC operations.
+        // Find the last instruction index where each Ptr value is
+        // used as an operand.
         let old_insts = func.blocks[bi].insts.clone();
+        let mut last_use: HashMap<Value, usize> = HashMap::new();
+        for (idx, inst) in old_insts.iter().enumerate() {
+            for v in inst.operands() {
+                if is_ptr(v) {
+                    last_use.insert(v, idx);
+                }
+            }
+        }
+
+        // Values that die in this block: alive here, not needed by
+        // any successor edge, and not used in the terminator.
+        let term_operands: HashSet<Value> = func.blocks[bi]
+            .terminator
+            .operands()
+            .into_iter()
+            .filter(|v| is_ptr(*v))
+            .collect();
+        let mut dies_in_block: HashSet<Value> = HashSet::new();
+        for &v in &alive {
+            let tokens = successor_tokens.get(&v).copied().unwrap_or(0);
+            if tokens == 0 && !term_operands.contains(&v) {
+                dies_in_block.insert(v);
+            }
+        }
+
+        // Build new instruction list. Insert RcDec right after each
+        // value's last use (not at block end) to enable reset/reuse.
         let mut new_insts: Vec<Inst> = Vec::new();
 
-        for inst in &old_insts {
+        for (idx, inst) in old_insts.iter().enumerate() {
             match inst {
                 Inst::Store(_, _, val) | Inst::StoreDyn(_, _, val) if is_ptr(*val) => {
                     new_insts.push(Inst::RcInc(*val));
@@ -152,16 +277,27 @@ fn insert_rc_function(func: &mut Function) {
                 }
                 _ => {}
             }
+
+            // Insert RcDec right after a value's last use.
+            for &v in &dies_in_block {
+                if last_use.get(&v) == Some(&idx) {
+                    new_insts.push(Inst::RcDec(v));
+                }
+            }
         }
 
-        // Before the terminator: emit RC ops for each alive value.
+        // Values that die but have NO instruction uses (e.g. defined
+        // but unused). Dec at block end.
+        for &v in &dies_in_block {
+            if !last_use.contains_key(&v) {
+                new_insts.push(Inst::RcDec(v));
+            }
+        }
+
+        // Values needed on multiple successor edges: emit extra incs.
         for &v in &alive {
             let tokens_needed = successor_tokens.get(&v).copied().unwrap_or(0);
-            if tokens_needed == 0 {
-                // Value dies in this block entirely.
-                new_insts.push(Inst::RcDec(v));
-            } else if tokens_needed > 1 {
-                // Value needed on multiple edges — create extra tokens.
+            if tokens_needed > 1 {
                 for _ in 0..tokens_needed - 1 {
                     new_insts.push(Inst::RcInc(v));
                 }
