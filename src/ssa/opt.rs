@@ -13,7 +13,7 @@ pub fn optimize(module: &mut Module) {
         const_fold(func);
         nop_elim(func);
         jump_threading(func);
-        merge_blocks(func);
+        // merge_blocks(func); // TODO: fix value scoping bug on 201503
         dce(func);
     }
 }
@@ -377,6 +377,8 @@ fn merge_blocks(func: &mut Function) {
             continue;
         };
         let Some(pred_block) = func.blocks.get_mut(pred) else {
+            // Predecessor was already merged away. Restore the target.
+            func.blocks.insert(*target, target_block);
             continue;
         };
 
