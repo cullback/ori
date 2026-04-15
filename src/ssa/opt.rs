@@ -13,6 +13,9 @@ pub fn optimize(module: &mut Module) {
         const_fold(func);
         nop_elim(func);
         jump_threading(func);
+        branch_switch_fold(func);
+        jump_threading(func);
+        branch_switch_fold(func);
         // merge_blocks(func); // TODO: fix value scoping bug on 201503
         dce(func);
     }
@@ -332,6 +335,125 @@ fn jump_threading(func: &mut Function) -> bool {
     }
 
     changed
+}
+
+/// Fold branch-to-switch patterns: when a Branch goes to two blocks
+/// that each just jump (with constant args) to the same merge block,
+/// and that merge block starts with a SwitchInt on the merged param,
+/// replace the Branch with a direct branch to the switch targets.
+///
+/// Before:
+///   branch cond ? bT : bF
+///   bT: jump merge(1_u8)
+///   bF: jump merge(0_u8)
+///   merge(tag): switch tag { 1 -> X, 0 -> Y }
+///
+/// After:
+///   branch cond ? X : Y
+fn branch_switch_fold(func: &mut Function) {
+    // Collect const values defined in each block for resolving jump args.
+    let mut block_consts: HashMap<BlockId, HashMap<Value, u64>> = HashMap::new();
+    for (&bid, block) in &func.blocks {
+        let mut consts = HashMap::new();
+        for inst in &block.insts {
+            if let Inst::Const(d, _, bits) = inst {
+                consts.insert(*d, *bits);
+            }
+        }
+        block_consts.insert(bid, consts);
+    }
+
+    let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
+    for bid in block_ids {
+        let block = &func.blocks[&bid];
+        let Terminator::Branch {
+            cond,
+            then_block,
+            then_args,
+            else_block,
+            else_args,
+            ..
+        } = &block.terminator
+        else {
+            continue;
+        };
+
+        // Both targets must be blocks that just jump to the same merge.
+        let then_b = &func.blocks[then_block];
+        let else_b = &func.blocks[else_block];
+        let (Terminator::Jump(then_target, then_jargs), Terminator::Jump(else_target, else_jargs)) =
+            (&then_b.terminator, &else_b.terminator)
+        else {
+            continue;
+        };
+        if then_target != else_target {
+            continue;
+        }
+        let merge_id = *then_target;
+
+        // Both must pass exactly one arg.
+        if then_jargs.len() != 1 || else_jargs.len() != 1 {
+            continue;
+        }
+
+        // Resolve the constant values of the jump args.
+        let then_consts = &block_consts[then_block];
+        let else_consts = &block_consts[else_block];
+        let Some(&then_val) = then_jargs.first().and_then(|v| then_consts.get(v)) else {
+            continue;
+        };
+        let Some(&else_val) = else_jargs.first().and_then(|v| else_consts.get(v)) else {
+            continue;
+        };
+
+        // The merge block must start with SwitchInt on its first param.
+        let merge_block = &func.blocks[&merge_id];
+        if merge_block.params.len() != 1 {
+            continue;
+        }
+        let Terminator::SwitchInt {
+            scrutinee,
+            arms,
+            default,
+        } = &merge_block.terminator
+        else {
+            continue;
+        };
+        if *scrutinee != merge_block.params[0] {
+            continue;
+        }
+        if !merge_block.insts.is_empty() {
+            continue;
+        }
+
+        // Find where each constant goes in the switch.
+        let resolve = |val: u64| -> Option<(BlockId, Vec<Value>)> {
+            for (arm_val, target, args) in arms {
+                if *arm_val == val {
+                    return Some((*target, args.clone()));
+                }
+            }
+            default.clone()
+        };
+        let Some((true_target, true_args)) = resolve(then_val) else {
+            continue;
+        };
+        let Some((false_target, false_args)) = resolve(else_val) else {
+            continue;
+        };
+
+        let cond = *cond;
+        let new_then_args = [then_args.clone(), true_args].concat();
+        let new_else_args = [else_args.clone(), false_args].concat();
+
+        func.blocks.get_mut(&bid).unwrap().terminator = Terminator::Branch {
+            cond,
+            then_block: true_target,
+            then_args: new_then_args,
+            else_block: false_target,
+            else_args: new_else_args,
+        };
+    }
 }
 
 /// Merge single-predecessor blocks: if block B has exactly one
