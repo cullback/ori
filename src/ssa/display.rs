@@ -164,6 +164,7 @@ impl fmt::Display for BinaryOp {
             Self::Mul => write!(f, "mul"),
             Self::Div => write!(f, "div"),
             Self::Rem => write!(f, "rem"),
+            Self::Xor => write!(f, "xor"),
             Self::Eq => write!(f, "eq"),
             Self::Neq => write!(f, "neq"),
             Self::Lt => write!(f, "lt"),

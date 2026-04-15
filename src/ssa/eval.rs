@@ -467,6 +467,27 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(list, 2, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
+        "__num_hash" => {
+            // args: [number] → U64 hash
+            // FNV-1a-style bit mixing: cast to u64, then mix.
+            #[expect(clippy::cast_sign_loss)]
+            let bits: u64 = match args[0] {
+                Scalar::I64(n) => n as u64,
+                Scalar::U64(n) => n,
+                Scalar::I32(n) => n as u64,
+                Scalar::U32(n) => u64::from(n),
+                Scalar::I16(n) => n as u64,
+                Scalar::U16(n) => u64::from(n),
+                Scalar::I8(n) => n as u64,
+                Scalar::U8(n) => u64::from(n),
+                Scalar::F64(n) => n.to_bits(),
+                Scalar::Bool(b) => u64::from(b),
+                Scalar::Ptr(_) => panic!("__num_hash: unexpected Ptr"),
+            };
+            // FNV-1a: hash one u64 value
+            let hash = (14695981039346656037_u64 ^ bits).wrapping_mul(1099511628211);
+            Some(Scalar::U64(hash))
+        }
         "__str_concat" => {
             // args: [str_a, str_b] → str_ptr (List(U8))
             let Scalar::Ptr(a_idx) = args[0] else {
@@ -603,6 +624,7 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Mul, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.wrapping_mul(b)),
         (BinaryOp::Div, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a / b),
         (BinaryOp::Rem, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a % b),
+        (BinaryOp::Xor, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a ^ b),
         (BinaryOp::Max, Scalar::U64(a), Scalar::U64(b)) => Scalar::U64(a.max(b)),
         (BinaryOp::Eq, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a == b),
         (BinaryOp::Neq, Scalar::U64(a), Scalar::U64(b)) => Scalar::Bool(a != b),

@@ -1261,6 +1261,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         .insert(span, "__record_to_str".to_owned());
                     return Ok(ret);
                 }
+                "hash" => {
+                    let u64_ty = Type::Con("U64".to_owned());
+                    self.unify_at(&ret, &u64_ty, span)?;
+                    self.method_resolutions
+                        .insert(span, "__record_hash".to_owned());
+                    return Ok(ret);
+                }
                 _ => {}
             }
         }
@@ -1655,9 +1662,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 let resolved = self.engine.resolve(&Type::Var(c.type_var));
                 let maybe_span = c.span;
 
-                // Record types: compiler-generated equals/to_str.
+                // Record types: compiler-generated equals/to_str/hash.
                 if let Type::Record { .. } = &resolved
-                    && matches!(c.method_name.as_str(), "equals" | "to_str")
+                    && matches!(c.method_name.as_str(), "equals" | "to_str" | "hash")
                 {
                     if let Some(s) = maybe_span {
                         self.method_resolutions
@@ -1793,18 +1800,23 @@ pub fn check(
     );
     let mut ctx = InferCtx::new(&*symbols, fields);
 
-    // Register to_str for all numeric types (not as full modules — their
-    // := {} declaration would incorrectly make them transparent to {}).
+    // Register to_str and hash for all numeric types (not as full
+    // modules — their := {} declaration would incorrectly make them
+    // transparent to {}).
     for num in crate::numeric::ALL {
-        let mangled = format!("{}.to_str", num.name());
         let param_ty = Type::Con(num.name().to_owned());
-        let ret_ty = Type::Con("Str".to_owned());
-        let scheme = Scheme {
+        let to_str_scheme = Scheme {
             vars: vec![],
             constraints: vec![],
-            ty: Type::Arrow(vec![param_ty], Box::new(ret_ty)),
+            ty: Type::Arrow(vec![param_ty.clone()], Box::new(Type::Con("Str".to_owned()))),
         };
-        ctx.env.insert(mangled, scheme);
+        ctx.env.insert(format!("{}.to_str", num.name()), to_str_scheme);
+        let hash_scheme = Scheme {
+            vars: vec![],
+            constraints: vec![],
+            ty: Type::Arrow(vec![param_ty], Box::new(Type::Con("U64".to_owned()))),
+        };
+        ctx.env.insert(format!("{}.hash", num.name()), hash_scheme);
     }
 
     // `crash : Str -> a` — polymorphic return; aborts with a message.

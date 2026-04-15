@@ -89,7 +89,7 @@ impl NumericType {
     /// `to_str`. Only integers support `mod`.
     pub fn has_builtin_method(self, method: &str) -> bool {
         match method {
-            "add" | "sub" | "mul" | "div" | "equals" | "compare" | "to_str" => true,
+            "add" | "sub" | "mul" | "div" | "equals" | "compare" | "to_str" | "hash" => true,
             "mod" => self.is_integer(),
             "from_u8" => matches!(self, Self::U64),
             _ => false,

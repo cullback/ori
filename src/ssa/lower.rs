@@ -565,11 +565,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         if mangled == "__record_to_str" {
             return self.lower_record_to_str(recv_val, &receiver.ty);
         }
+        if mangled == "__record_hash" {
+            return self.lower_record_hash(recv_val, &receiver.ty);
+        }
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
             if op_name == "to_str" {
                 return self
                     .builder
                     .call("__num_to_str", vec![recv_val], ScalarType::Ptr);
+            }
+            if op_name == "hash" {
+                return self
+                    .builder
+                    .call("__num_hash", vec![recv_val], ScalarType::U64);
             }
             if op_name == "from_u8" {
                 return self
@@ -854,6 +862,39 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         self.builder.switch_to(merge);
         self.lower_bool_from_cmp_neg(merge_param, negate)
+    }
+
+    /// Record hash: FNV-1a over each field in sorted order.
+    fn lower_record_hash(&mut self, recv: Value, ty: &Type) -> Value {
+        let Type::Record { fields, .. } = ty else {
+            panic!("lower_record_hash called on non-record type");
+        };
+        let mut sorted: Vec<(&str, &Type)> = fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        sorted.sort_by_key(|(n, _)| *n);
+
+        // FNV-1a offset basis
+        #[expect(clippy::unreadable_literal)]
+        let mut hash = self.builder.const_u64(14695981039346656037);
+
+        for (slot, (_name, field_ty)) in sorted.iter().enumerate() {
+            let field_val = self.builder.load(recv, slot, type_to_scalar(field_ty));
+            let field_hash = if let Type::Record { .. } = field_ty {
+                self.lower_record_hash(field_val, field_ty)
+            } else {
+                self.builder
+                    .call("__num_hash", vec![field_val], ScalarType::U64)
+            };
+            // hash = (hash XOR field_hash) * FNV prime
+            hash = self
+                .builder
+                .binop(BinaryOp::Xor, hash, field_hash, ScalarType::U64);
+            #[expect(clippy::unreadable_literal)]
+            let prime = self.builder.const_u64(1099511628211);
+            hash = self
+                .builder
+                .binop(BinaryOp::Mul, hash, prime, ScalarType::U64);
+        }
+        hash
     }
 
     /// Record to_str: produces `"{ field1: val1, field2: val2 }"`.
