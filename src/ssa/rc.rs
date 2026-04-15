@@ -37,6 +37,61 @@ pub fn insert_rc(module: &mut Module) {
     }
 }
 
+/// Cancel `rc_inc(v)` / `rc_dec(v)` pairs within the same block
+/// where the refcount elevation isn't observed between them
+/// (no `Reset` on v, which checks uniqueness).
+pub fn fuse_inc_dec(module: &mut Module) {
+    for func in module.functions.values_mut() {
+        for block in &mut func.blocks {
+            loop {
+                if !fuse_one_pair(&mut block.insts) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Find and remove one rc_inc/rc_dec pair. Returns true if a pair
+/// was removed.
+fn fuse_one_pair(insts: &mut Vec<Inst>) -> bool {
+    // Look for rc_inc(v) followed by rc_dec(v) (or vice versa).
+    for i in 0..insts.len() {
+        let (is_inc, v) = match &insts[i] {
+            Inst::RcInc(v) => (true, *v),
+            Inst::RcDec(v) => (false, *v),
+            _ => continue,
+        };
+        // Scan forward for the matching opposite.
+        let target = if is_inc { Inst::RcDec(v) } else { Inst::RcInc(v) };
+        let mut safe = true;
+        for j in (i + 1)..insts.len() {
+            // Check if this is the matching op.
+            let is_match = match (&insts[j], &target) {
+                (Inst::RcInc(a), Inst::RcInc(b)) | (Inst::RcDec(a), Inst::RcDec(b)) => a == b,
+                _ => false,
+            };
+            if is_match {
+                // Found a canceling pair — remove both.
+                insts.remove(j);
+                insts.remove(i);
+                return true;
+            }
+            // If v's refcount is observed (Reset checks uniqueness),
+            // or if there's another inc/dec on v, stop searching.
+            match &insts[j] {
+                Inst::Reset(_, ptr, _) if *ptr == v => { safe = false; break; }
+                Inst::RcInc(w) | Inst::RcDec(w) if *w == v => break,
+                _ => {}
+            }
+        }
+        if !safe {
+            continue;
+        }
+    }
+    false
+}
+
 /// Remove RcInc/RcDec on values defined by StaticRef, since
 /// static objects have a sentinel refcount and RC is a no-op.
 pub fn elide_static_rc(module: &mut Module) {
