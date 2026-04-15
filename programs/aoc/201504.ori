@@ -1,0 +1,46 @@
+import md5
+
+# Advent of Code 2015, Day 4: The Ideal Stocking Stuffer
+
+strip : Str -> List(U8)
+strip = |s| s.to_utf8().walk([], |acc, b|
+    if b == 10 or b == 13 then acc
+    else acc.append(b))
+
+has_5_zeros : List(U8) -> Bool
+has_5_zeros = |hash|
+    hash.get(0).unwrap() == 0
+        and hash.get(1).unwrap() == 0
+        and hash.get(2).unwrap() < 16
+
+has_6_zeros : List(U8) -> Bool
+has_6_zeros = |hash|
+    hash.get(0).unwrap() == 0
+        and hash.get(1).unwrap() == 0
+        and hash.get(2).unwrap() == 0
+
+search5 : List(U8), U64 -> U64
+search5 = |key, start|
+    List.repeat(0, 1000000).walk_until(start, |n, x| (
+        hsh = Md5.hash(key.concat(n.to_str().to_utf8()))
+        if has_5_zeros(hsh) then Break(n)
+        else Continue(n + 1)
+    ))
+
+search6 : List(U8), U64 -> U64
+search6 = |key, start|
+    List.repeat(0, 10000000).walk_until(start, |n, x| (
+        hsh = Md5.hash(key.concat(n.to_str().to_utf8()))
+        if has_6_zeros(hsh) then Break(n)
+        else Continue(n + 1)
+    ))
+
+part1 : Str -> U64
+part1 = |input| search5(strip(input), 1)
+
+part2 : Str -> U64
+part2 = |input| search6(strip(input), 1)
+
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input|
+    Ok("part1: ${part1(input)} part2: ${part2(input)}")

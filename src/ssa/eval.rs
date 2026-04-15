@@ -26,6 +26,8 @@ const RC_STATIC: usize = usize::MAX;
 pub struct Heap {
     /// Each entry: (refcount, slots).
     objects: Vec<(usize, Vec<Scalar>)>,
+    /// Free-list of indices with refcount 0, available for reuse.
+    free_list: Vec<usize>,
 }
 
 impl Heap {
@@ -33,13 +35,22 @@ impl Heap {
         // Index 0 is null
         Self {
             objects: vec![(0, vec![])],
+            free_list: Vec::new(),
         }
     }
 
     pub fn alloc(&mut self, num_slots: usize) -> usize {
-        let idx = self.objects.len();
-        self.objects.push((1, vec![Scalar::I64(0); num_slots]));
-        idx
+        if let Some(idx) = self.free_list.pop() {
+            let entry = &mut self.objects[idx];
+            entry.0 = 1;
+            entry.1.clear();
+            entry.1.resize(num_slots, Scalar::I64(0));
+            idx
+        } else {
+            let idx = self.objects.len();
+            self.objects.push((1, vec![Scalar::I64(0); num_slots]));
+            idx
+        }
     }
 
     /// Allocate a static (permanent) object that is never freed.
@@ -77,17 +88,49 @@ impl Heap {
     }
 
     fn rc_dec(&mut self, idx: usize) {
-        if idx != 0 && self.objects[idx].0 != RC_STATIC && self.objects[idx].0 > 0 {
+        if idx == 0 || self.objects[idx].0 == RC_STATIC {
+            return;
+        }
+        if self.objects[idx].0 > 0 {
             self.objects[idx].0 -= 1;
+        }
+        if self.objects[idx].0 == 0 {
+            // Collect Ptr children before adding to free list.
+            let children: Vec<usize> = self.objects[idx]
+                .1
+                .iter()
+                .filter_map(|s| match s {
+                    Scalar::Ptr(p) => Some(*p),
+                    _ => None,
+                })
+                .collect();
+            self.free_list.push(idx);
+            for child in children {
+                self.rc_dec(child);
+            }
         }
     }
 
     /// Clone a heap object, returning the new index.
+    /// Increments refcounts of any Ptr children in the cloned data.
     pub fn clone_object(&mut self, idx: usize) -> usize {
-        let new_idx = self.objects.len();
         let data = self.objects[idx].1.clone();
-        self.objects.push((1, data));
-        new_idx
+        // The clone creates new references to all Ptr children.
+        for slot in &data {
+            if let Scalar::Ptr(child) = slot {
+                self.rc_inc(*child);
+            }
+        }
+        if let Some(new_idx) = self.free_list.pop() {
+            let entry = &mut self.objects[new_idx];
+            entry.0 = 1;
+            entry.1 = data;
+            new_idx
+        } else {
+            let new_idx = self.objects.len();
+            self.objects.push((1, data));
+            new_idx
+        }
     }
 
     /// Get the number of slots in an object.
@@ -367,7 +410,13 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             };
             // Clone data buffer and list header
             let new_data = heap.clone_object(old_data);
-            heap.store_dyn(new_data, idx, args[2]);
+            // The old element at this index was rc_inc'd by clone;
+            // we're replacing it, so dec the old and inc the new.
+            let old_elem = heap.load_dyn(new_data, idx);
+            if let Scalar::Ptr(p) = old_elem { heap.rc_dec(p); }
+            let val = args[2];
+            if let Scalar::Ptr(p) = val { heap.rc_inc(p); }
+            heap.store_dyn(new_data, idx, val);
             let new_list = heap.alloc(3);
             heap.store(new_list, 0, len);
             heap.store(new_list, 1, cap);
@@ -410,6 +459,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let new_data = heap.alloc(len_usize);
             for i in 0..len_usize {
                 let elem = heap.load_dyn(old_data, i);
+                if let Scalar::Ptr(p) = elem { heap.rc_inc(p); }
                 heap.store(new_data, len_usize - 1 - i, elem);
             }
             let new_list = heap.alloc(3);
@@ -431,6 +481,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let new_data = heap.alloc(count);
             for i in 0..count {
                 let elem = heap.load_dyn(old_data, start + i);
+                if let Scalar::Ptr(p) = elem { heap.rc_inc(p); }
                 heap.store(new_data, i, elem);
             }
             let new_list = heap.alloc(3);
@@ -450,6 +501,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let n = count as usize;
             let data = heap.alloc(n);
             for i in 0..n {
+                if let Scalar::Ptr(p) = val { heap.rc_inc(p); }
                 heap.store(data, i, val);
             }
             let list = heap.alloc(3);
