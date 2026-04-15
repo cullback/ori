@@ -14,7 +14,7 @@ use super::instruction::{BlockId, Inst, Terminator, Value};
 use super::{Block, Function, Module};
 
 /// Maximum number of instructions in a callee for it to be inlined.
-const MAX_INLINE_INSTS: usize = 12;
+pub const MAX_INLINE_INSTS: usize = 80;
 
 /// Run inlining on all functions in the module.
 pub fn inline(module: &mut Module) {
