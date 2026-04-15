@@ -1,11 +1,41 @@
 use std::fmt;
 
-use super::{Function, Module};
+use super::{Function, Module, StaticSlot};
 use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
 use std::collections::HashMap;
 
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.statics.is_empty() {
+            writeln!(f, ".statics:")?;
+            for (i, obj) in self.statics.iter().enumerate() {
+                write!(f, "  @{i} = [")?;
+                for (j, slot) in obj.slots.iter().enumerate() {
+                    if j > 0 {
+                        write!(f, ", ")?;
+                    }
+                    match slot {
+                        StaticSlot::U8(b) => write!(f, "{b}_u8")?,
+                        StaticSlot::U64(n) => write!(f, "{n}_u64")?,
+                        StaticSlot::I64(n) => write!(f, "{n}_i64")?,
+                        StaticSlot::StaticPtr(id) => write!(f, "@{id}")?,
+                    }
+                }
+                // Try to render U8 arrays as strings for readability.
+                if obj.slots.iter().all(|s| matches!(s, StaticSlot::U8(_))) {
+                    let bytes: Vec<u8> = obj
+                        .slots
+                        .iter()
+                        .filter_map(|s| if let StaticSlot::U8(b) = s { Some(*b) } else { None })
+                        .collect();
+                    if let Ok(s) = std::str::from_utf8(&bytes) {
+                        write!(f, "  ; \"{s}\"")?;
+                    }
+                }
+                writeln!(f, "]")?;
+            }
+            writeln!(f)?;
+        }
         let mut names: Vec<&String> = self.functions.keys().collect();
         names.sort();
         for name in names {
