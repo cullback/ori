@@ -146,7 +146,7 @@ fn render_scheme(ty: &crate::types::engine::Type) -> String {
 fn infer_err(source: &str) -> String {
     let (arena, _file_id, mut resolved) = parse_and_resolve(source);
     crate::passes::fold_lift::lift(&mut resolved);
-    crate::passes::flatten_patterns::flatten(&mut resolved);
+    crate::passes::flatten_patterns::flatten(&mut resolved).unwrap();
     crate::passes::topo::compute(&mut resolved).unwrap();
     match crate::types::infer::check(&mut resolved) {
         Ok(_) => panic!("expected inference to fail, but it succeeded"),
@@ -3264,4 +3264,33 @@ mod ast_snapshots {
     snapshot_typed!(list_import_typed, "list_import.ori");
     snapshot_typed!(records_typed, "records.ori");
     snapshot_typed!(echo_typed, "echo.ori");
+}
+
+// ============================================================
+// RC reuse safety
+// ============================================================
+
+#[test]
+fn trail_record_set_grow_reuse() {
+    // Regression: insert_reuse would convert RcDec+Alloc into Reset+Reuse
+    // for values that were passed to calls (like __list_repeat). The callee
+    // stores the value N times without rc_inc, so Reset's uniqueness check
+    // was wrong and Reuse would overwrite shared memory.
+    //
+    // trail stores new_acc in both state.acc AND state.out (via append).
+    // When the resulting list is walked to build a Set, the 7th insert
+    // triggers Set.grow which calls __list_repeat. Without the fix, grow
+    // would corrupt the bucket array and produce a set of size 1.
+    let source = "\
+import set
+
+main : I64 -> U64
+main = |_| (
+    start = { x: 0, y: 0 }
+    moves = [1, 1, 1, 1, 1, 1]
+    positions = moves.trail(start, |pos, _| { x: pos.x + 1, y: 0 })
+    positions.walk(Set.single(start), |s, pos| s.insert(pos)).len()
+)";
+    // start + 6 distinct positions = 7
+    assert_eq!(run_u64(source, 0), 7);
 }

@@ -135,6 +135,10 @@ fn insert_reuse_function(func: &mut Function) {
     let mut alloc_sizes: HashMap<Value, usize> = HashMap::new();
     // Build a map: Value → slot types, for computing Reset field decs.
     let mut alloc_slot_types: HashMap<Value, Vec<ScalarType>> = HashMap::new();
+    // Values passed as arguments to calls — these may have been stored
+    // in heap objects by the callee, making the uniqueness check in
+    // Reset unreliable. Exclude them from reuse.
+    let mut call_args: HashSet<Value> = HashSet::new();
     // Track the next available Value ID for fresh tokens.
     let mut next_value: usize = func
         .value_types
@@ -158,6 +162,11 @@ fn insert_reuse_function(func: &mut Function) {
                     }
                 }
             }
+            if let Inst::Call(_, _, args) = inst {
+                for arg in args {
+                    call_args.insert(*arg);
+                }
+            }
         }
     }
 
@@ -173,6 +182,12 @@ fn insert_reuse_function(func: &mut Function) {
         // Find each RcDec and look for a matching Alloc after it.
         for (i, inst) in block.insts.iter().enumerate() {
             if let Inst::RcDec(ptr) = inst {
+                // Skip if this value was passed to a call — the callee
+                // may have stored it, creating hidden heap references
+                // that make the uniqueness check unreliable.
+                if call_args.contains(ptr) {
+                    continue;
+                }
                 let dec_size = alloc_sizes.get(ptr).copied();
                 if let Some(size) = dec_size {
                     // Look for the first unclaimed Alloc of the same size.
