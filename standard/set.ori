@@ -1,4 +1,4 @@
-exports [Set, SetSlot]
+exports [Set]
 
 # Hash set using open addressing with linear probing.
 #

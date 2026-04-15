@@ -215,7 +215,7 @@ fn check_bodyless_methods(decls: &[Decl<'_>]) -> Result<(), CompileError> {
 
 // ---- Transitive dependency computation for imports ----
 
-use crate::syntax::raw::{Expr, ExprKind, ListPatternElem, Pattern, Stmt};
+use crate::syntax::raw::{Expr, ExprKind, ListPatternElem, Pattern, Stmt, TypeExpr, TagDecl};
 
 /// Compute the set of declaration names reachable from `roots` via
 /// references in function bodies. Returns all names that need to be
@@ -239,11 +239,15 @@ fn reachable_decls(decls: &[Decl<'_>], roots: &HashSet<&str>) -> HashSet<String>
                 names.retain(|n| decl_names.contains(n));
                 refs_map.insert(name, names);
             }
-            Decl::TypeAnno { name, methods, .. } => {
+            Decl::TypeAnno { name, methods, ty, .. } => {
                 let mut names = HashSet::new();
+                collect_type_refs(ty, &mut names);
                 for method in methods {
                     if let Decl::FuncDef { body, .. } = method {
                         collect_raw_refs(body, &mut names);
+                    }
+                    if let Decl::TypeAnno { ty: method_ty, .. } = method {
+                        collect_type_refs(method_ty, &mut names);
                     }
                 }
                 names.retain(|n| decl_names.contains(n));
@@ -269,6 +273,44 @@ fn reachable_decls(decls: &[Decl<'_>], roots: &HashSet<&str>) -> HashSet<String>
 }
 
 /// Collect all name references from a raw expression tree.
+/// Collect type name references from a type expression.
+fn collect_type_refs<'src>(ty: &TypeExpr<'src>, out: &mut HashSet<&'src str>) {
+    match ty {
+        TypeExpr::Named(name) => {
+            out.insert(name);
+        }
+        TypeExpr::App(name, args) => {
+            out.insert(name);
+            for a in args {
+                collect_type_refs(a, out);
+            }
+        }
+        TypeExpr::TagUnion(tags, _) => {
+            for tag in tags {
+                for field in &tag.fields {
+                    collect_type_refs(field, out);
+                }
+            }
+        }
+        TypeExpr::Arrow(params, ret) => {
+            for p in params {
+                collect_type_refs(p, out);
+            }
+            collect_type_refs(ret, out);
+        }
+        TypeExpr::Record(fields) => {
+            for (_, t) in fields {
+                collect_type_refs(t, out);
+            }
+        }
+        TypeExpr::Tuple(elems) => {
+            for e in elems {
+                collect_type_refs(e, out);
+            }
+        }
+    }
+}
+
 fn collect_raw_refs<'src>(expr: &Expr<'src>, out: &mut HashSet<&'src str>) {
     match &expr.kind {
         ExprKind::Name(n) => {
