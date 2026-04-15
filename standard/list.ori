@@ -1,4 +1,4 @@
-exports [List, Step]
+exports [List]
 
 # Control flow for walk_until: continue iterating or break early.
 Step(a) := [Continue(a), Break(a)]

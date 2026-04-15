@@ -61,17 +61,19 @@ pub fn resolve_imports<'src>(
         let src = stdlib::get(name).unwrap();
         let file_id = arena.add(format!("<stdlib:{name}>"), src.to_owned());
         let imported = parse::parse(arena.content(file_id), file_id)?;
-        let exported: Vec<Decl<'_>> = imported
+        let export_set: HashSet<&str> = imported.exports.iter().copied().collect();
+        let reachable = reachable_decls(&imported.decls, &export_set);
+        let included: Vec<Decl<'_>> = imported
             .decls
             .into_iter()
             .filter(|d| {
                 let n = match d {
                     Decl::TypeAnno { name, .. } | Decl::FuncDef { name, .. } => *name,
                 };
-                imported.exports.contains(&n)
+                reachable.contains(n)
             })
             .collect();
-        all_decls.extend(exported);
+        all_decls.extend(included);
     }
 
     for import in &module.imports {
