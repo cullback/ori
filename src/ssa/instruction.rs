@@ -11,7 +11,7 @@ impl fmt::Display for Value {
 }
 
 /// A basic block identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(pub usize);
 
 impl fmt::Display for BlockId {

@@ -25,29 +25,31 @@ fn dce(func: &mut Function) -> bool {
 
     // 1. Remove unreachable blocks by marking reachable ones from entry.
     let mut reachable = HashSet::new();
-    let mut worklist = vec![BlockId(0)];
+    let mut worklist = vec![func.entry];
     while let Some(bid) = worklist.pop() {
         if !reachable.insert(bid) {
             continue;
         }
-        for (succ, _) in func.blocks[bid.0].terminator.successors() {
+        for (succ, _) in func.blocks[&bid].terminator.successors() {
             worklist.push(succ);
         }
     }
     if reachable.len() < func.blocks.len() {
-        for (bi, block) in func.blocks.iter_mut().enumerate() {
-            if !reachable.contains(&BlockId(bi)) {
-                block.insts.clear();
-                block.params.clear();
-                block.terminator = Terminator::None;
-                changed = true;
-            }
+        let dead: Vec<BlockId> = func
+            .blocks
+            .keys()
+            .copied()
+            .filter(|bid| !reachable.contains(bid))
+            .collect();
+        for bid in dead {
+            func.blocks.remove(&bid);
+            changed = true;
         }
     }
 
     // 2. Remove instructions whose destination value is never used.
     let mut used: HashSet<Value> = HashSet::new();
-    for block in &func.blocks {
+    for block in func.blocks.values() {
         for inst in &block.insts {
             for v in inst.operands() {
                 used.insert(v);
@@ -58,7 +60,7 @@ fn dce(func: &mut Function) -> bool {
         }
     }
 
-    for block in &mut func.blocks {
+    for block in func.blocks.values_mut() {
         let before = block.insts.len();
         block.insts.retain(|inst| {
             if let Some(dest) = inst.dest() {
@@ -86,7 +88,7 @@ fn const_fold(func: &mut Function) -> bool {
 
     // Map from Value → (ScalarType, bits) for known constants.
     let mut consts: HashMap<Value, (ScalarType, u64)> = HashMap::new();
-    for block in &func.blocks {
+    for block in func.blocks.values() {
         for inst in &block.insts {
             if let Inst::Const(dest, ty, bits) = inst {
                 consts.insert(*dest, (*ty, *bits));
@@ -95,7 +97,7 @@ fn const_fold(func: &mut Function) -> bool {
     }
 
     let mut changed = false;
-    for block in &mut func.blocks {
+    for block in func.blocks.values_mut() {
         for inst in &mut block.insts {
             if let Inst::BinOp(dest, op, lhs, rhs) = inst {
                 let lc = consts.get(lhs).copied();
@@ -125,7 +127,7 @@ fn nop_elim(func: &mut Function) -> bool {
     // Map from dest → replacement value (the identity operand).
     let mut replacements: HashMap<Value, Value> = HashMap::new();
 
-    for block in &func.blocks {
+    for block in func.blocks.values() {
         for inst in &block.insts {
             if let Inst::Const(dest, ty, bits) = inst {
                 consts.insert(*dest, (*ty, *bits));
@@ -153,7 +155,7 @@ fn nop_elim(func: &mut Function) -> bool {
     }
 
     // Rewrite all operand references and remove the now-dead no-op instructions.
-    for block in &mut func.blocks {
+    for block in func.blocks.values_mut() {
         for inst in &mut block.insts {
             rewrite_operands(inst, &resolved);
         }
@@ -184,7 +186,7 @@ fn jump_threading(func: &mut Function) -> bool {
     }
 
     let mut redirects: HashMap<BlockId, Redirect> = HashMap::new();
-    for (bi, block) in func.blocks.iter().enumerate() {
+    for (&bid, block) in &func.blocks {
         if !block.insts.is_empty() {
             continue;
         }
@@ -193,7 +195,7 @@ fn jump_threading(func: &mut Function) -> bool {
         };
         if block.params.is_empty() {
             // Fixed-arg: no params, just forwards constant args.
-            redirects.insert(BlockId(bi), Redirect::FixedArgs(target, args.clone()));
+            redirects.insert(bid, Redirect::FixedArgs(target, args.clone()));
         } else {
             // Param-forwarding: each arg must be a block param.
             let param_indices: Option<Vec<usize>> = args
@@ -201,7 +203,7 @@ fn jump_threading(func: &mut Function) -> bool {
                 .map(|arg| block.params.iter().position(|p| p == arg))
                 .collect();
             if let Some(indices) = param_indices {
-                redirects.insert(BlockId(bi), Redirect::ParamForward(target, indices));
+                redirects.insert(bid, Redirect::ParamForward(target, indices));
             }
         }
     }
@@ -254,7 +256,7 @@ fn jump_threading(func: &mut Function) -> bool {
         })
     };
 
-    for block in &mut func.blocks {
+    for block in func.blocks.values_mut() {
         match &mut block.terminator {
             Terminator::Jump(target, args) => {
                 if let Some((nt, na)) = remap(*target, args) {
@@ -301,27 +303,28 @@ fn jump_threading(func: &mut Function) -> bool {
         }
     }
 
-    // Merge trivial entry block: if block 0 has no instructions and
-    // jumps to a target, substitute jump args for the target's block
-    // params and splice the target's content into block 0.
-    if func.blocks[0].insts.is_empty() {
-        if let Terminator::Jump(target, ref args) = func.blocks[0].terminator {
-            let ti = target.0;
-            if ti != 0 && ti < func.blocks.len() {
-                let target_block = func.blocks[ti].clone();
+    // Merge trivial entry block: if the entry block has no instructions
+    // and jumps to a target, substitute jump args for the target's block
+    // params and splice the target's content into the entry block.
+    if func.blocks[&func.entry].insts.is_empty() {
+        if let Terminator::Jump(target, ref args) = func.blocks[&func.entry].terminator {
+            if target != func.entry && func.blocks.contains_key(&target) {
+                let target_block = func.blocks[&target].clone();
                 let arg_map: HashMap<Value, Value> = target_block
                     .params
                     .iter()
                     .zip(args.iter())
                     .map(|(&p, &a)| (p, a))
                     .collect();
-                func.blocks[0].insts = target_block.insts;
-                func.blocks[0].terminator = target_block.terminator;
-                // Rewrite block 0's new content to use the jump args.
-                for inst in &mut func.blocks[0].insts {
+                let entry = func.entry;
+                func.blocks.get_mut(&entry).unwrap().insts = target_block.insts;
+                func.blocks.get_mut(&entry).unwrap().terminator = target_block.terminator;
+                // Rewrite entry block's new content to use the jump args.
+                let entry_block = func.blocks.get_mut(&entry).unwrap();
+                for inst in &mut entry_block.insts {
                     rewrite_operands(inst, &arg_map);
                 }
-                rewrite_terminator_operands(&mut func.blocks[0].terminator, &arg_map);
+                rewrite_terminator_operands(&mut entry_block.terminator, &arg_map);
                 changed = true;
             }
         }

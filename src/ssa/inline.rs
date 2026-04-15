@@ -42,7 +42,7 @@ fn find_candidates(module: &Module) -> HashSet<String> {
         if name == &module.entry {
             continue;
         }
-        let inst_count: usize = func.blocks.iter().map(|b| b.insts.len()).sum();
+        let inst_count: usize = func.blocks.values().map(|b| b.insts.len()).sum();
         if inst_count <= MAX_INLINE_INSTS {
             candidates.insert(name.clone());
         }
@@ -54,11 +54,11 @@ fn find_candidates(module: &Module) -> HashSet<String> {
 fn inline_calls_in_function(caller: &mut Function, snapshots: &HashMap<String, Function>) {
     // Iterate until no more inlining happens (handles transitive inlining).
     loop {
-        let Some((block_idx, inst_idx, callee_name)) = find_inline_site(caller, snapshots) else {
+        let Some((block_id, inst_idx, callee_name)) = find_inline_site(caller, snapshots) else {
             break;
         };
         let callee = &snapshots[&callee_name];
-        perform_inline(caller, block_idx, inst_idx, callee);
+        perform_inline(caller, block_id, inst_idx, callee);
     }
 }
 
@@ -66,12 +66,12 @@ fn inline_calls_in_function(caller: &mut Function, snapshots: &HashMap<String, F
 fn find_inline_site(
     caller: &Function,
     snapshots: &HashMap<String, Function>,
-) -> Option<(usize, usize, String)> {
-    for (bi, block) in caller.blocks.iter().enumerate() {
+) -> Option<(BlockId, usize, String)> {
+    for (&bid, block) in &caller.blocks {
         for (ii, inst) in block.insts.iter().enumerate() {
             if let Inst::Call(_, name, _) = inst {
                 if snapshots.contains_key(name) && name != &caller.name {
-                    return Some((bi, ii, name.clone()));
+                    return Some((bid, ii, name.clone()));
                 }
             }
         }
@@ -82,11 +82,11 @@ fn find_inline_site(
 /// Splice the callee's body into the caller at the given call site.
 fn perform_inline(
     caller: &mut Function,
-    block_idx: usize,
+    block_id: BlockId,
     inst_idx: usize,
     callee: &Function,
 ) {
-    let Inst::Call(call_dest, _, ref call_args) = caller.blocks[block_idx].insts[inst_idx] else {
+    let Inst::Call(call_dest, _, ref call_args) = caller.blocks[&block_id].insts[inst_idx] else {
         panic!("expected Call instruction at inline site");
     };
     let call_dest = call_dest;
@@ -96,7 +96,7 @@ fn perform_inline(
 
     // Find the max Value index in the caller to avoid collisions.
     let mut max_val = 0_usize;
-    for block in &caller.blocks {
+    for block in caller.blocks.values() {
         for &p in &block.params {
             max_val = max_val.max(p.0 + 1);
         }
@@ -129,7 +129,7 @@ fn perform_inline(
     };
 
     // Pre-scan all callee values to allocate fresh IDs.
-    for block in &callee.blocks {
+    for block in callee.blocks.values() {
         for &p in &block.params {
             fresh(p, &mut val_map);
         }
@@ -140,33 +140,45 @@ fn perform_inline(
         }
     }
 
-    // BlockId remap: callee block i → caller block (caller.blocks.len() + i),
-    // but block 0 (entry) will be merged into the call site block.
-    let block_base = caller.blocks.len();
+    // BlockId remap: callee non-entry blocks → fresh BlockIds in the caller.
+    let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
+    for &bid in callee.blocks.keys() {
+        if bid == callee.entry {
+            continue; // Entry block is merged into the call site block.
+        }
+        let new_bid = BlockId(caller.next_block);
+        caller.next_block += 1;
+        block_map.insert(bid, new_bid);
+    }
+
     let remap_block = |bid: BlockId| -> BlockId {
-        debug_assert!(bid.0 != 0, "callee entry block should not appear as jump target");
-        BlockId(block_base + bid.0 - 1)
+        debug_assert!(
+            bid != callee.entry,
+            "callee entry block should not appear as jump target"
+        );
+        block_map[&bid]
     };
 
     // --- Step 2: create continuation block ---
 
     // The continuation block receives the return value as a parameter.
-    let cont_block_id = BlockId(block_base + callee.blocks.len() - 1);
+    let cont_block_id = BlockId(caller.next_block);
+    caller.next_block += 1;
     let cont_param = Value(next_val);
 
     // Map call_dest → cont_param so later instructions use the right value.
     // Split the caller block: instructions after the call go into the continuation.
-    let remaining_insts: Vec<Inst> = caller.blocks[block_idx]
+    let remaining_insts: Vec<Inst> = caller.blocks.get_mut(&block_id).unwrap()
         .insts
         .split_off(inst_idx + 1);
     // Remove the Call instruction itself.
-    caller.blocks[block_idx].insts.pop();
+    caller.blocks.get_mut(&block_id).unwrap().insts.pop();
     let original_terminator =
-        std::mem::replace(&mut caller.blocks[block_idx].terminator, Terminator::None);
+        std::mem::replace(&mut caller.blocks.get_mut(&block_id).unwrap().terminator, Terminator::None);
 
     // --- Step 3: copy callee entry block instructions into caller block ---
 
-    let callee_entry = &callee.blocks[0];
+    let callee_entry = &callee.blocks[&callee.entry];
     for inst in &callee_entry.insts {
         let remapped = remap_inst(inst, &val_map);
         if let Some(d) = inst.dest() {
@@ -174,7 +186,7 @@ fn perform_inline(
                 caller.value_types.insert(val_map[&d], *ty);
             }
         }
-        caller.blocks[block_idx].insts.push(remapped);
+        caller.blocks.get_mut(&block_id).unwrap().insts.push(remapped);
     }
 
     // Copy callee param types into caller's value_types.
@@ -187,12 +199,16 @@ fn perform_inline(
     }
 
     // Set the caller block's terminator to the remapped callee entry terminator.
-    caller.blocks[block_idx].terminator =
+    caller.blocks.get_mut(&block_id).unwrap().terminator =
         remap_terminator(&callee_entry.terminator, &val_map, &remap_block, cont_block_id);
 
     // --- Step 4: copy non-entry callee blocks ---
 
-    for (ci, callee_block) in callee.blocks.iter().enumerate().skip(1) {
+    for (&callee_bid, callee_block) in &callee.blocks {
+        if callee_bid == callee.entry {
+            continue;
+        }
+        let new_bid = block_map[&callee_bid];
         let mut new_block = Block {
             params: callee_block
                 .params
@@ -223,8 +239,7 @@ fn perform_inline(
             &remap_block,
             cont_block_id,
         );
-        let _ = ci; // block index not needed — appended sequentially
-        caller.blocks.push(new_block);
+        caller.blocks.insert(new_bid, new_block);
     }
 
     // --- Step 5: create continuation block with remaining instructions ---
@@ -235,7 +250,7 @@ fn perform_inline(
     // in remaining instructions and the original terminator.
     let dest_map: HashMap<Value, Value> = [(call_dest, cont_param)].into();
 
-    let mut cont_block = Block {
+    let cont_block = Block {
         params: vec![cont_param],
         insts: remaining_insts
             .into_iter()
@@ -250,9 +265,7 @@ fn perform_inline(
             t
         },
     };
-    // Also rewrite any operands in the continuation's instructions.
-    let _ = &mut cont_block;
-    caller.blocks.push(cont_block);
+    caller.blocks.insert(cont_block_id, cont_block);
 }
 
 // ---- Remapping helpers ----

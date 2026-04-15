@@ -59,8 +59,8 @@ impl fmt::Display for Function {
         }
         write!(f, ") -> {}:", self.return_type)?;
         writeln!(f)?;
-        for (i, block) in self.blocks.iter().enumerate() {
-            write!(f, "  b{i}")?;
+        for (&bid, block) in &self.blocks {
+            write!(f, "  {bid}")?;
             if !block.params.is_empty() {
                 write!(f, "(")?;
                 for (j, p) in block.params.iter().enumerate() {

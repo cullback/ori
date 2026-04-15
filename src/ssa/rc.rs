@@ -42,7 +42,7 @@ pub fn insert_rc(module: &mut Module) {
 /// (no `Reset` on v, which checks uniqueness).
 pub fn fuse_inc_dec(module: &mut Module) {
     for func in module.functions.values_mut() {
-        for block in &mut func.blocks {
+        for (_, block) in &mut func.blocks {
             loop {
                 if !fuse_one_pair(&mut block.insts) {
                     break;
@@ -98,7 +98,7 @@ pub fn elide_static_rc(module: &mut Module) {
     for func in module.functions.values_mut() {
         let statics: HashSet<Value> = func
             .blocks
-            .iter()
+            .values()
             .flat_map(|b| &b.insts)
             .filter_map(|inst| {
                 if let Inst::StaticRef(dest, _) = inst {
@@ -111,7 +111,7 @@ pub fn elide_static_rc(module: &mut Module) {
         if statics.is_empty() {
             continue;
         }
-        for block in &mut func.blocks {
+        for (_, block) in &mut func.blocks {
             block.insts.retain(|inst| {
                 !matches!(
                     inst,
@@ -143,7 +143,7 @@ fn insert_reuse_function(func: &mut Function) {
         .max()
         .unwrap_or(0);
 
-    for block in &func.blocks {
+    for (_, block) in &func.blocks {
         for inst in &block.insts {
             if let Inst::Alloc(dest, size) = inst {
                 alloc_sizes.insert(*dest, *size);
@@ -162,7 +162,7 @@ fn insert_reuse_function(func: &mut Function) {
     }
 
     // For each block, find RcDec(v) → Alloc(dest, size) patterns.
-    for block in &mut func.blocks {
+    for (_, block) in &mut func.blocks {
         let mut new_insts: Vec<Inst> = Vec::with_capacity(block.insts.len());
         // Track which allocs have been claimed by a reset.
 
@@ -220,8 +220,7 @@ fn insert_reuse_function(func: &mut Function) {
 }
 
 fn insert_rc_function(func: &mut Function) {
-    let num_blocks = func.blocks.len();
-    if num_blocks == 0 {
+    if func.blocks.is_empty() {
         return;
     }
 
@@ -231,25 +230,25 @@ fn insert_rc_function(func: &mut Function) {
     let (live_in, _live_out) = compute_liveness(func);
 
     // Phase 2: rewrite each block.
-    // Edge decs: (block_idx, edge_idx) → values to RcDec on that edge.
+    // Edge decs: (block_id, edge_idx) → values to RcDec on that edge.
     // Applied in phase 3 by inserting trampoline blocks.
-    let mut edge_decs: std::collections::HashMap<(usize, usize), Vec<Value>> =
-        std::collections::HashMap::new();
+    let mut edge_decs: HashMap<(BlockId, usize), Vec<Value>> = HashMap::new();
 
-    for bi in 0..num_blocks {
+    let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
+    for bid in &block_ids {
         // Collect ALL Ptr values visible in this block: live-in +
         // block params + instruction defs.
-        let mut alive: HashSet<Value> = live_in[bi]
+        let mut alive: HashSet<Value> = live_in[bid]
             .iter()
             .copied()
             .filter(|v| is_ptr(*v))
             .collect();
-        for &p in &func.blocks[bi].params {
+        for &p in &func.blocks[bid].params {
             if is_ptr(p) {
                 alive.insert(p);
             }
         }
-        for inst in &func.blocks[bi].insts {
+        for inst in &func.blocks[bid].insts {
             if let Some(d) = inst.dest() {
                 if is_ptr(d) {
                     alive.insert(d);
@@ -261,7 +260,7 @@ fn insert_rc_function(func: &mut Function) {
         // for. A value needs a token on an edge if it's either:
         // - passed as a block arg on that edge, or
         // - live-in to the successor via dominance (not a block param).
-        let successors = func.blocks[bi].terminator.successors();
+        let successors = func.blocks[bid].terminator.successors();
         let num_succ = successors.len();
 
         // Per-edge token needs for each value.
@@ -274,8 +273,8 @@ fn insert_rc_function(func: &mut Function) {
                 }
             }
             let succ_params: HashSet<Value> =
-                func.blocks[succ_id.0].params.iter().copied().collect();
-            for &v in &live_in[succ_id.0] {
+                func.blocks[succ_id].params.iter().copied().collect();
+            for &v in &live_in[succ_id] {
                 if is_ptr(v) && !succ_params.contains(&v) && alive.contains(&v) {
                     needs.insert(v);
                 }
@@ -284,14 +283,13 @@ fn insert_rc_function(func: &mut Function) {
         }
 
         // Total tokens needed = number of edges needing this value.
-        let mut successor_tokens: std::collections::HashMap<Value, usize> =
-            std::collections::HashMap::new();
+        let mut successor_tokens: HashMap<Value, usize> = HashMap::new();
         for needs in &edge_needs {
             for &v in needs {
                 *successor_tokens.entry(v).or_insert(0) += 1;
             }
         }
-        if let Terminator::Return(v) = &func.blocks[bi].terminator {
+        if let Terminator::Return(v) = &func.blocks[bid].terminator {
             if is_ptr(*v) {
                 *successor_tokens.entry(*v).or_insert(0) += 1;
             }
@@ -306,7 +304,7 @@ fn insert_rc_function(func: &mut Function) {
                 for (ei, (_succ_id, _)) in successors.iter().enumerate() {
                     if !edge_needs[ei].contains(&v) {
                         edge_decs
-                            .entry((bi, ei))
+                            .entry((*bid, ei))
                             .or_insert_with(Vec::new)
                             .push(v);
                     }
@@ -316,7 +314,7 @@ fn insert_rc_function(func: &mut Function) {
 
         // Find the last instruction index where each Ptr value is
         // used as an operand.
-        let old_insts = func.blocks[bi].insts.clone();
+        let old_insts = func.blocks[bid].insts.clone();
         let mut last_use: HashMap<Value, usize> = HashMap::new();
         for (idx, inst) in old_insts.iter().enumerate() {
             for v in inst.operands() {
@@ -328,7 +326,7 @@ fn insert_rc_function(func: &mut Function) {
 
         // Values that die in this block: alive here, not needed by
         // any successor edge, and not used in the terminator.
-        let term_operands: HashSet<Value> = func.blocks[bi]
+        let term_operands: HashSet<Value> = func.blocks[bid]
             .terminator
             .operands()
             .into_iter()
@@ -389,31 +387,31 @@ fn insert_rc_function(func: &mut Function) {
             }
         }
 
-        func.blocks[bi].insts = new_insts;
+        func.blocks.get_mut(bid).unwrap().insts = new_insts;
     }
 
     // Phase 3: for each edge that needs decs, insert a trampoline
     // block that dec's the values and jumps to the original target.
-    // Process in reverse order so block indices stay valid.
-    let mut edges: Vec<((usize, usize), Vec<Value>)> = edge_decs.into_iter().collect();
+    let mut edges: Vec<((BlockId, usize), Vec<Value>)> = edge_decs.into_iter().collect();
     edges.sort_by(|a, b| b.0.cmp(&a.0));
-    for ((block_idx, edge_idx), decs) in edges {
-        let successors = func.blocks[block_idx].terminator.successors();
+    for ((block_id, edge_idx), decs) in edges {
+        let successors = func.blocks[&block_id].terminator.successors();
         let (target, target_args) = &successors[edge_idx];
         let target_id = *target;
         let target_args = target_args.to_vec();
 
         // Create trampoline: dec values, then jump to original target.
-        let tramp_id = BlockId(func.blocks.len());
+        let tramp_id = BlockId(func.next_block);
+        func.next_block += 1;
         let tramp_insts: Vec<Inst> = decs.into_iter().map(Inst::RcDec).collect();
-        func.blocks.push(super::Block {
+        func.blocks.insert(tramp_id, super::Block {
             params: vec![],
             insts: tramp_insts,
             terminator: Terminator::Jump(target_id, target_args.clone()),
         });
 
         // Rewrite the edge in the original terminator to point at the trampoline.
-        rewrite_edge(&mut func.blocks[block_idx].terminator, edge_idx, tramp_id, target_args);
+        rewrite_edge(&mut func.blocks.get_mut(&block_id).unwrap().terminator, edge_idx, tramp_id, target_args);
     }
 }
 
@@ -460,69 +458,74 @@ fn rewrite_edge(term: &mut Terminator, edge_idx: usize, new_target: BlockId, _or
 
 /// Compute live-in and live-out sets for each block. Only tracks
 /// Ptr-typed values since those are the only ones needing RC.
-fn compute_liveness(func: &Function) -> (Vec<HashSet<Value>>, Vec<HashSet<Value>>) {
-    let n = func.blocks.len();
+fn compute_liveness(func: &Function) -> (HashMap<BlockId, HashSet<Value>>, HashMap<BlockId, HashSet<Value>>) {
     let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
 
     // Compute defs and upward-exposed uses per block.
-    let mut defs: Vec<HashSet<Value>> = vec![HashSet::new(); n];
-    let mut ue_uses: Vec<HashSet<Value>> = vec![HashSet::new(); n];
+    let mut defs: HashMap<BlockId, HashSet<Value>> = HashMap::new();
+    let mut ue_uses: HashMap<BlockId, HashSet<Value>> = HashMap::new();
 
-    for (bi, block) in func.blocks.iter().enumerate() {
+    for (&bid, block) in &func.blocks {
+        let block_defs = defs.entry(bid).or_insert_with(HashSet::new);
+        let block_ue = ue_uses.entry(bid).or_insert_with(HashSet::new);
         // Block params are defs.
         for &p in &block.params {
             if is_ptr(p) {
-                defs[bi].insert(p);
+                block_defs.insert(p);
             }
         }
         // Walk instructions: a use is upward-exposed if not preceded
         // by a def in this block.
         for inst in &block.insts {
             for v in inst.operands() {
-                if is_ptr(v) && !defs[bi].contains(&v) {
-                    ue_uses[bi].insert(v);
+                if is_ptr(v) && !block_defs.contains(&v) {
+                    block_ue.insert(v);
                 }
             }
             if let Some(d) = inst.dest() {
                 if is_ptr(d) {
-                    defs[bi].insert(d);
+                    block_defs.insert(d);
                 }
             }
         }
         // Terminator operands.
         for v in block.terminator.operands() {
-            if is_ptr(v) && !defs[bi].contains(&v) {
-                ue_uses[bi].insert(v);
+            if is_ptr(v) && !block_defs.contains(&v) {
+                block_ue.insert(v);
             }
         }
     }
 
     // Backward dataflow to fixpoint.
-    let mut live_in: Vec<HashSet<Value>> = vec![HashSet::new(); n];
-    let mut live_out: Vec<HashSet<Value>> = vec![HashSet::new(); n];
+    let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
+    let mut live_in: HashMap<BlockId, HashSet<Value>> = block_ids.iter().map(|&bid| (bid, HashSet::new())).collect();
+    let mut live_out: HashMap<BlockId, HashSet<Value>> = block_ids.iter().map(|&bid| (bid, HashSet::new())).collect();
 
     loop {
         let mut changed = false;
-        for bi in (0..n).rev() {
+        for &bid in block_ids.iter().rev() {
             // live_out = union of live_in of all successors.
             let mut new_out: HashSet<Value> = HashSet::new();
-            for (succ, _) in func.blocks[bi].terminator.successors() {
-                new_out.extend(&live_in[succ.0]);
+            for (succ, _) in func.blocks[&bid].terminator.successors() {
+                new_out.extend(&live_in[&succ]);
             }
-            if new_out != live_out[bi] {
-                live_out[bi] = new_out;
+            if new_out != live_out[&bid] {
+                live_out.insert(bid, new_out);
                 changed = true;
             }
 
             // live_in = ue_uses ∪ (live_out \ defs).
-            let mut new_in: HashSet<Value> = ue_uses[bi].clone();
-            for &v in &live_out[bi] {
-                if !defs[bi].contains(&v) {
+            let empty = HashSet::new();
+            let block_ue = ue_uses.get(&bid).unwrap_or(&empty);
+            let block_defs = defs.get(&bid).unwrap_or(&empty);
+            let mut new_in: HashSet<Value> = block_ue.clone();
+            for &v in &live_out[&bid] {
+                if !block_defs.contains(&v) {
                     new_in.insert(v);
                 }
             }
-            if new_in != live_in[bi] {
-                live_in[bi] = new_in;
+            if new_in != live_in[&bid] {
+                live_in.insert(bid, new_in);
                 changed = true;
             }
         }

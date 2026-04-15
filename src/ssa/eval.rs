@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::ssa::Module;
-use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
+use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
 
 /// A scalar runtime value that fits in a register.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -157,11 +157,11 @@ fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) 
         env.insert(*param, *arg);
     }
 
-    let mut current = BlockId(0);
+    let mut current = func.entry;
     let mut block_args: Vec<Scalar> = vec![];
 
     loop {
-        let block = &func.blocks[current.0];
+        let block = &func.blocks[&current];
 
         for (param, arg) in block.params.iter().zip(&block_args) {
             env.insert(*param, *arg);

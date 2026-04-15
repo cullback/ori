@@ -18,7 +18,7 @@ pub fn promote(module: &mut Module) {
 }
 
 fn promote_function(func: &mut Function, statics: &mut Vec<StaticObject>) {
-    for block in &mut func.blocks {
+    for block in func.blocks.values_mut() {
         promote_block(block, statics);
     }
 }
