@@ -15,12 +15,31 @@ part1 = |input| (
     start = { x: 0, y: 0 }
     state = input.to_utf8().walk({ pos: start, visited: Set.from_list([start]) }, |acc, ch| (
         next = step(acc.pos, ch)
-        if Set.contains(acc.visited, next)
+        if acc.visited.contains(next)
             then { pos: next, visited: acc.visited }
-            else { pos: next, visited: Set.insert(acc.visited, next) }
+            else { pos: next, visited: acc.visited.insert(next) }
     ))
-    Set.len(state.visited)
+    state.visited.len()
+)
+
+part2 : Str -> U64
+part2 = |input| (
+    start = { x: 0, y: 0 }
+    state = input.to_utf8().chunks_of(2).walk(
+        { santa: start, robo: start, visited: Set.from_list([start]) },
+        |s, pair| (
+            santa_next = step(s.santa, pair.get(0))
+            v = s.visited.insert(santa_next)
+            if pair.len() > 1
+                then (
+                    robo_next = step(s.robo, pair.get(1))
+                    { santa: santa_next, robo: robo_next, visited: v.insert(robo_next) }
+                )
+                else { santa: santa_next, robo: s.robo, visited: v }
+        )
+    )
+    state.visited.len()
 )
 
 main : List(Str), Str -> Result(Str, Str)
-main = |args, input| Ok(part1(input).to_str())
+main = |args, input| Ok(part2(input).to_str())
