@@ -2100,10 +2100,22 @@ pub fn check(
         .iter()
         .map(|(name, scheme)| {
             let resolved_ty = ctx.engine.resolve(&scheme.ty);
+            // Resolve vars to their representative type variables so
+            // they match the variables used in the resolved type.
+            let resolved_vars: Vec<TypeVar> = scheme
+                .vars
+                .iter()
+                .map(|tv| {
+                    match ctx.engine.resolve(&Type::Var(*tv)) {
+                        Type::Var(resolved_tv) => resolved_tv,
+                        _ => *tv, // unified to concrete — keep original
+                    }
+                })
+                .collect();
             (
                 name.clone(),
                 Scheme {
-                    vars: scheme.vars.clone(),
+                    vars: resolved_vars,
                     constraints: scheme.constraints.clone(),
                     ty: resolved_ty,
                 },

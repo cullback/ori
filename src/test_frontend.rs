@@ -3312,3 +3312,19 @@ main = |_| (
     // trail with inc: (0,0) -> (1,0) -> (2,0) -> (3,0); element at index 2 = (3,0)
     assert_eq!(run_i64(source, 0), 3);
 }
+
+#[test]
+fn set_from_list_with_tuples() {
+    // Regression: Set.from_list lost the element type when the type
+    // variable in the scheme was unified to a different representative
+    // during inference. The scheme's vars list used the original
+    // variable ID while the resolved type used the representative,
+    // causing the monomorphizer to extract the wrong substitution.
+    let source = "\
+import set
+
+main : I64 -> U64
+main = |_| Set.from_list([(0, 0), (1, 0), (2, 0), (1, 0)]).len()";
+    // 4 elements, 3 unique
+    assert_eq!(run_u64(source, 0), 3);
+}

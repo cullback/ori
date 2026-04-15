@@ -525,13 +525,10 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
             }
             ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
             ExprKind::Closure { func, captures } => {
-                // Specialize the closure's target if needed.
-                let name = self.symbols.display(*func).to_owned();
-                if let Some(new_sym) = self.specialize_target(*func, &Type::Con("_".to_owned())) {
+                // Specialize the closure's target using the concrete
+                // closure type (available on expr.ty after substitution).
+                if let Some(new_sym) = self.specialize_target(*func, &expr.ty) {
                     *func = new_sym;
-                } else {
-                    // Ensure identity specialization exists.
-                    let _ = &name;
                 }
                 for c in captures.iter_mut() {
                     self.rewrite_calls_in_expr(c);
