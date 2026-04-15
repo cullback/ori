@@ -25,13 +25,13 @@ pub fn method_key(type_name: &str, method: &str) -> String {
 }
 
 /// Map a resolved concrete type to the SSA scalar type used at runtime.
+/// This is the basic version without fieldless-tag awareness — use
+/// [`resolve_scalar_type`] when `DeclInfo` is available.
 pub fn type_to_scalar(ty: &Type) -> ScalarType {
     match ty {
         Type::Con(name) => {
             if let Some(num) = crate::numeric::NumericType::from_name(name) {
                 num.scalar_type()
-            } else if name == "Bool" {
-                ScalarType::Bool
             } else {
                 ScalarType::Ptr
             }
@@ -40,11 +40,45 @@ pub fn type_to_scalar(ty: &Type) -> ScalarType {
     }
 }
 
+/// Like [`type_to_scalar`] but also maps fieldless tag unions to their
+/// discriminant type (U8/U16/U32/U64) instead of Ptr.
+pub fn resolve_scalar_type(ty: &Type, fieldless: &HashMap<String, ScalarType>) -> ScalarType {
+    let base = type_to_scalar(ty);
+    if base == ScalarType::Ptr {
+        match ty {
+            Type::Con(name) => {
+                if let Some(&disc) = fieldless.get(name.as_str()) {
+                    return disc;
+                }
+            }
+            Type::TagUnion { tags, .. } => {
+                if tags.iter().all(|(_, fields)| fields.is_empty()) {
+                    return discriminant_type(tags.len());
+                }
+            }
+            _ => {}
+        }
+    }
+    base
+}
+
+/// Choose the smallest unsigned integer type that can represent
+/// `num_variants` distinct values.
+pub fn discriminant_type(num_variants: usize) -> ScalarType {
+    if num_variants <= 256 {
+        ScalarType::U8
+    } else if num_variants <= 65536 {
+        ScalarType::U16
+    } else {
+        ScalarType::U64
+    }
+}
+
 /// Extract the return type from a function type scheme.
-fn scheme_return_type(scheme: &Scheme) -> ScalarType {
+fn scheme_return_type(scheme: &Scheme, fieldless: &HashMap<String, ScalarType>) -> ScalarType {
     match &scheme.ty {
-        Type::Arrow(_, ret) => type_to_scalar(ret),
-        other => type_to_scalar(other),
+        Type::Arrow(_, ret) => resolve_scalar_type(ret, fieldless),
+        other => resolve_scalar_type(other, fieldless),
     }
 }
 
@@ -77,17 +111,41 @@ pub struct DeclInfo {
     /// Raw constructor schemes from inference, used to compute the
     /// field-type layout during tag-union registration.
     pub constructor_schemes: HashMap<String, Scheme>,
+    /// Type names that are fieldless tag unions (all variants have 0
+    /// payload fields), mapped to their discriminant SSA type.
+    /// These are represented as a bare integer tag index at runtime.
+    pub fieldless_tags: HashMap<String, ScalarType>,
 }
 
 /// Build `DeclInfo` from the resolved module declarations.
 pub fn build(mono: &Monomorphized<'_>) -> DeclInfo {
     let (module, infer_result, symbols) = (&mono.module, &mono.infer, &mono.symbols);
+
+    // Phase 1: identify fieldless tag unions so `resolve_scalar_type`
+    // can use the correct discriminant types during registration.
+    let mut fieldless_tags: HashMap<String, ScalarType> = HashMap::new();
+    for decl in &module.decls {
+        if let Decl::TypeAnno {
+            name,
+            ty: TypeExpr::TagUnion(tags, _),
+            ..
+        } = decl
+        {
+            let max_fields = tags.iter().map(|t| t.fields.len()).max().unwrap_or(0);
+            if max_fields == 0 {
+                let disc = discriminant_type(tags.len());
+                fieldless_tags.insert(symbols.display(*name).to_owned(), disc);
+            }
+        }
+    }
+
     let mut info = DeclInfo {
         funcs: HashSet::new(),
         func_arities: HashMap::new(),
         func_return_types: HashMap::new(),
         constructors: HashMap::new(),
         constructor_schemes: infer_result.constructor_schemes.clone(),
+        fieldless_tags,
     };
 
     // Register the num-to-str intrinsic method names as known
@@ -99,6 +157,7 @@ pub fn build(mono: &Monomorphized<'_>) -> DeclInfo {
         info.func_arities.insert(key, 1);
     }
 
+    // Phase 2: register all declarations with fieldless-tag awareness.
     for decl in &module.decls {
         register_decl(&mut info, decl, infer_result, symbols);
     }
@@ -136,8 +195,8 @@ fn register_decl(
             info.funcs.insert(name_str.to_owned());
             info.func_arities.insert(name_str.to_owned(), params.len());
             if let Some(scheme) = infer_result.func_schemes.get(name_str) {
-                info.func_return_types
-                    .insert(name_str.to_owned(), scheme_return_type(scheme));
+                let ret = scheme_return_type(scheme, &info.fieldless_tags);
+                info.func_return_types.insert(name_str.to_owned(), ret);
             }
         }
     }
@@ -161,8 +220,8 @@ fn register_method(
         info.funcs.insert(mangled.clone());
         info.func_arities.insert(mangled.clone(), params.len());
         if let Some(scheme) = infer_result.func_schemes.get(&mangled) {
-            info.func_return_types
-                .insert(mangled, scheme_return_type(scheme));
+            let ret = scheme_return_type(scheme, &info.fieldless_tags);
+            info.func_return_types.insert(mangled, ret);
         }
     }
 }
@@ -178,10 +237,13 @@ fn register_tag_union(info: &mut DeclInfo, type_name: &str, tags: &[ast::TagDecl
                 matches!(field_ty, TypeExpr::Named(name) | TypeExpr::App(name, _) if *name == type_name)
             })
             .collect();
+        let fieldless = &info.fieldless_tags;
         let field_types: Vec<ScalarType> = info.constructor_schemes.get(tag.name).map_or_else(
             || vec![ScalarType::Ptr; tag.fields.len()],
             |scheme| match &scheme.ty {
-                Type::Arrow(params, _) => params.iter().map(type_to_scalar).collect(),
+                Type::Arrow(params, _) => {
+                    params.iter().map(|t| resolve_scalar_type(t, fieldless)).collect()
+                }
                 _ => vec![ScalarType::Ptr; tag.fields.len()],
             },
         );

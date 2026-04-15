@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};
-use crate::passes::decl_info::{self, DeclInfo, method_key, type_to_scalar};
+use crate::passes::decl_info::{self, DeclInfo, method_key, resolve_scalar_type};
 use crate::passes::mono::Monomorphized;
 use crate::error::CompileError;
 use crate::ssa::Module;
@@ -82,7 +82,21 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     // ---- Type helpers ----
 
     fn expr_scalar_type(&self, expr: &Expr<'src>) -> ScalarType {
-        type_to_scalar(&expr.ty)
+        self.scalar_type(&expr.ty)
+    }
+
+    /// Resolve a type to its SSA scalar type, aware of fieldless tag unions.
+    fn scalar_type(&self, ty: &Type) -> ScalarType {
+        resolve_scalar_type(ty, &self.decls.fieldless_tags)
+    }
+
+    /// Emit a constant for a fieldless tag index using the appropriate discriminant type.
+    fn const_tag(&mut self, tag_index: u64, disc_ty: ScalarType) -> Value {
+        match disc_ty {
+            ScalarType::U8 => self.builder.const_u8(tag_index as u8),
+            ScalarType::U16 => self.builder.const_u16(tag_index as u16),
+            _ => self.builder.const_u64(tag_index),
+        }
     }
 
     fn func_ret_type(&self, name: &str) -> ScalarType {
@@ -194,12 +208,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         // don't have schemes — they default to all-`Ptr`, which is
         // correct since closures carry type-erased captures and
         // arguments.
+        let fieldless = &self.decls.fieldless_tags;
         let param_types: Vec<ScalarType> = self
             .infer
             .func_schemes
             .get(name)
             .map(|scheme| match &scheme.ty {
-                Type::Arrow(params, _) => params.iter().map(type_to_scalar).collect(),
+                Type::Arrow(params, _) => {
+                    params.iter().map(|t| resolve_scalar_type(t, fieldless)).collect()
+                }
                 _ => vec![ScalarType::Ptr; ssa_params.len()],
             })
             .unwrap_or_else(|| vec![ScalarType::Ptr; ssa_params.len()]);
@@ -414,7 +431,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         let mut sorted: Vec<(&str, &Type)> =
                             fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
                         sorted.sort_unstable_by_key(|(n, _)| *n);
-                        sorted.iter().map(|(_, t)| type_to_scalar(t)).collect()
+                        sorted.iter().map(|(_, t)| self.scalar_type(t)).collect()
                     }
                     _ => vec![],
                 };
@@ -485,12 +502,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     } else {
                         // Lower: if condition is true, return return_val from function
                         let cond_val = self.lower_expr(condition);
-                        let cond_tag = self.builder.load(cond_val, 0, ScalarType::U64);
+                        let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
                         let true_tag = self.decls.constructors["True"].tag_index;
-                        let true_val = self.builder.const_u64(true_tag);
+                        let true_val = self.const_tag(true_tag, disc_ty);
                         let is_true =
                             self.builder
-                                .binop(BinaryOp::Eq, cond_tag, true_val, ScalarType::Bool);
+                                .binop(BinaryOp::Eq, cond_val, true_val, ScalarType::Bool);
                         let ret_block = self.builder.create_block();
                         let cont_block = self.builder.create_block();
                         self.builder
@@ -857,7 +874,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let ty = ctx_ty.unwrap_or_else(|| {
             panic!("structural constructor '{name}' without context type")
         });
-        structural_con_layout(ty, name)
+        structural_con_layout(ty, name, &self.decls.fieldless_tags)
     }
 
     // ---- Constructor call emission ----
@@ -874,6 +891,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         ctx_ty: Option<&Type>,
     ) -> Value {
         let (tag_index, max_fields, _field_types) = self.con_layout(name, ctx_ty);
+        // Fieldless tag union: represent as a bare discriminant integer.
+        if max_fields == 0 {
+            let disc_ty = ctx_ty
+                .map(|t| self.scalar_type(t))
+                .unwrap_or(ScalarType::U8);
+            return self.const_tag(tag_index, disc_ty);
+        }
         let alloc_size = 1 + max_fields;
         let ptr = self.builder.alloc(alloc_size);
         let tag_val = self.builder.const_u64(tag_index);
@@ -917,14 +941,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let merge_param = self.builder.add_block_param(merge, ScalarType::Bool);
 
         for (slot, (_name, field_ty)) in sorted.iter().enumerate() {
-            let l = self.builder.load(lhs, slot, type_to_scalar(field_ty));
-            let r = self.builder.load(rhs, slot, type_to_scalar(field_ty));
+            let l = self.builder.load(lhs, slot, self.scalar_type(field_ty));
+            let r = self.builder.load(rhs, slot, self.scalar_type(field_ty));
             let field_eq = if let Type::Record { .. } = field_ty {
-                // Nested record: recurse, extract raw Bool tag.
+                // Nested record: recurse, compare unboxed Bool tag.
                 let bool_val = self.lower_record_eq(l, r, field_ty, false);
-                let tag = self.builder.load(bool_val, 0, ScalarType::U64);
-                let true_tag = self.builder.const_u64(self.decls.constructors["True"].tag_index);
-                self.builder.binop(BinaryOp::Eq, tag, true_tag, ScalarType::Bool)
+                let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
+                let true_tag = self.decls.constructors["True"].tag_index;
+                let true_val = self.const_tag(true_tag, disc_ty);
+                self.builder.binop(BinaryOp::Eq, bool_val, true_val, ScalarType::Bool)
             } else {
                 self.builder.binop(BinaryOp::Eq, l, r, ScalarType::Bool)
             };
@@ -964,7 +989,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let mut hash = self.builder.const_u64(14695981039346656037);
 
         for (slot, (_name, field_ty)) in sorted.iter().enumerate() {
-            let field_val = self.builder.load(recv, slot, type_to_scalar(field_ty));
+            let field_val = self.builder.load(recv, slot, self.scalar_type(field_ty));
             let field_hash = if let Type::Record { .. } = field_ty {
                 self.lower_record_hash(field_val, field_ty)
             } else {
@@ -994,7 +1019,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let mut hash = self.builder.const_u64(14695981039346656037);
 
         for (slot, elem_ty) in elem_types.iter().enumerate() {
-            let elem_val = self.builder.load(recv, slot, type_to_scalar(elem_ty));
+            let elem_val = self.builder.load(recv, slot, self.scalar_type(elem_ty));
             let elem_hash = if let Type::Record { .. } = elem_ty {
                 self.lower_record_hash(elem_val, elem_ty)
             } else if let Type::Tuple(_) = elem_ty {
@@ -1076,7 +1101,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let label_val = self.lower_str_literal(label.as_bytes());
             acc = self.lower_str_concat(acc, label_val);
             // value.to_str()
-            let field_val = self.builder.load(recv, i, type_to_scalar(&field_ty));
+            let field_val = self.builder.load(recv, i, self.scalar_type(&field_ty));
             let val_str = if let Type::Record { .. } = &field_ty {
                 self.lower_record_to_str(field_val, &field_ty)
             } else {
@@ -1120,35 +1145,27 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     fn lower_bool_from_cmp_neg(&mut self, cmp: Value, negate: bool) -> Value {
-        let true_meta = &self.decls.constructors["True"];
-        let false_meta = &self.decls.constructors["False"];
-        let alloc_size = 1 + true_meta.max_fields;
-        let (then_tag_idx, else_tag_idx) = if negate {
-            (false_meta.tag_index, true_meta.tag_index)
-        } else {
-            (true_meta.tag_index, false_meta.tag_index)
-        };
+        // Bool := [False, True] → False=0, True=1, matching native
+        // bool. Convert the ScalarType::Bool comparison result to a
+        // U8 tag discriminant via branch (bit-identical values, just
+        // different SSA types).
+        debug_assert_eq!(self.decls.constructors["False"].tag_index, 0);
+        debug_assert_eq!(self.decls.constructors["True"].tag_index, 1);
+        let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
+        let (on_true, on_false) = if negate { (0_u64, 1) } else { (1, 0) };
 
         let then_block = self.builder.create_block();
         let else_block = self.builder.create_block();
         let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
-
+        let merge_param = self.builder.add_block_param(merge, disc_ty);
         self.builder
             .branch(cmp, then_block, vec![], else_block, vec![]);
-
         self.builder.switch_to(then_block);
-        let true_ptr = self.builder.alloc(alloc_size);
-        let true_tag = self.builder.const_u64(then_tag_idx);
-        self.builder.store(true_ptr, 0, true_tag);
-        self.builder.jump(merge, vec![true_ptr]);
-
+        let t = self.const_tag(on_true, disc_ty);
+        self.builder.jump(merge, vec![t]);
         self.builder.switch_to(else_block);
-        let false_ptr = self.builder.alloc(alloc_size);
-        let false_tag = self.builder.const_u64(else_tag_idx);
-        self.builder.store(false_ptr, 0, false_tag);
-        self.builder.jump(merge, vec![false_ptr]);
-
+        let f = self.const_tag(on_false, disc_ty);
+        self.builder.jump(merge, vec![f]);
         self.builder.switch_to(merge);
         merge_param
     }
@@ -1159,9 +1176,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let scr = self.lower_expr(inner);
         match pattern {
             ast::Pattern::Constructor { name, .. } => {
-                let (tag_index, _, _) = self.con_layout(name, Some(&inner_ty));
-                let tag = self.builder.load(scr, 0, ScalarType::U64);
-                let expected_tag = self.builder.const_u64(tag_index);
+                let (tag_index, max_fields, _) = self.con_layout(name, Some(&inner_ty));
+                let fieldless = max_fields == 0;
+                let tag = if fieldless {
+                    scr
+                } else {
+                    self.builder.load(scr, 0, ScalarType::U64)
+                };
+                let disc_ty = if fieldless {
+                    self.scalar_type(&inner_ty)
+                } else {
+                    ScalarType::U64
+                };
+                let expected_tag = self.const_tag(tag_index, disc_ty);
                 let matches = self
                     .builder
                     .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
@@ -1185,8 +1212,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     /// Lower `lhs and rhs` with fused Is-chain support (bindings flow from lhs into rhs).
     fn lower_and_expr(&mut self, lhs: &Expr<'src>, rhs: &Expr<'src>) -> Value {
+        let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
         let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
+        let merge_param = self.builder.add_block_param(merge, disc_ty);
         let false_block = self.builder.create_block();
 
         let saved_vars = self.vars.clone();
@@ -1198,9 +1226,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let rhs_val = self.lower_expr(rhs);
         self.builder.jump(merge, vec![rhs_val]);
 
-        // False block: produce False and jump to merge
+        // False block: produce False tag and jump to merge
         self.builder.switch_to(false_block);
-        let false_val = self.lower_constructor_call("False", &[], None);
+        let false_tag_idx = self.decls.constructors["False"].tag_index;
+        let false_val = self.const_tag(false_tag_idx, disc_ty);
         self.builder.jump(merge, vec![false_val]);
 
         self.vars = saved_vars;
@@ -1220,10 +1249,20 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let scr = self.lower_expr(inner);
                 match pattern {
                     ast::Pattern::Constructor { name, fields } => {
-                        let (tag_index, _, field_types) =
+                        let (tag_index, max_fields, field_types) =
                             self.con_layout(name, Some(&inner_ty));
-                        let tag = self.builder.load(scr, 0, ScalarType::U64);
-                        let expected_tag = self.builder.const_u64(tag_index);
+                        let fieldless = max_fields == 0;
+                        let tag = if fieldless {
+                            scr // already the discriminant
+                        } else {
+                            self.builder.load(scr, 0, ScalarType::U64)
+                        };
+                        let disc_ty = if fieldless {
+                            self.scalar_type(&inner_ty)
+                        } else {
+                            ScalarType::U64
+                        };
+                        let expected_tag = self.const_tag(tag_index, disc_ty);
                         let matches =
                             self.builder
                                 .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::Bool);
@@ -1231,7 +1270,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         self.builder
                             .branch(matches, match_block, vec![], false_block, vec![]);
                         self.builder.switch_to(match_block);
-                        // Bind pattern fields
+                        // Bind pattern fields (empty for fieldless tags)
                         for (fi, field_pat) in fields.iter().enumerate() {
                             let field_ty =
                                 field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
@@ -1260,14 +1299,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 self.lower_and_chain(rhs, false_block);
             }
             _ => {
-                // Regular boolean expression — evaluate, check True tag, branch
+                // Regular boolean expression — evaluate, compare unboxed tag, branch
                 let val = self.lower_expr(expr);
-                let tag = self.builder.load(val, 0, ScalarType::U64);
+                let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
                 let true_tag = self.decls.constructors["True"].tag_index;
-                let true_val = self.builder.const_u64(true_tag);
+                let true_val = self.const_tag(true_tag, disc_ty);
                 let is_true = self
                     .builder
-                    .binop(BinaryOp::Eq, tag, true_val, ScalarType::Bool);
+                    .binop(BinaryOp::Eq, val, true_val, ScalarType::Bool);
                 let continue_block = self.builder.create_block();
                 self.builder
                     .branch(is_true, continue_block, vec![], false_block, vec![]);
@@ -1278,16 +1317,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     /// Lower `lhs or rhs` with short-circuit evaluation.
     fn lower_or_expr(&mut self, lhs: &Expr<'src>, rhs: &Expr<'src>) -> Value {
+        let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
         let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
+        let merge_param = self.builder.add_block_param(merge, disc_ty);
 
         let lhs_val = self.lower_expr(lhs);
-        let tag = self.builder.load(lhs_val, 0, ScalarType::U64);
         let true_tag = self.decls.constructors["True"].tag_index;
-        let true_val = self.builder.const_u64(true_tag);
+        let true_val = self.const_tag(true_tag, disc_ty);
         let is_true = self
             .builder
-            .binop(BinaryOp::Eq, tag, true_val, ScalarType::Bool);
+            .binop(BinaryOp::Eq, lhs_val, true_val, ScalarType::Bool);
         let rhs_block = self.builder.create_block();
         // If LHS is True, short-circuit to merge with LHS value
         self.builder
@@ -1509,7 +1548,20 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     ) -> Value {
         let scrutinee_ty = scrutinee_expr.ty.clone();
         let scr_val = self.lower_expr(scrutinee_expr);
-        let tag = self.builder.load(scr_val, 0, ScalarType::U64);
+        // Determine fieldless from the first constructor's layout — more
+        // reliable than `is_fieldless_type` since synthesized expressions
+        // (apply functions) may have placeholder types.
+        let first_con_name = match &arms[0].pattern {
+            ast::Pattern::Constructor { name, .. } => *name,
+            _ => panic!("match arms must use constructor patterns"),
+        };
+        let (_, first_max, _) = self.con_layout(first_con_name, Some(&scrutinee_ty));
+        let fieldless = first_max == 0;
+        let tag = if fieldless {
+            scr_val // already the discriminant
+        } else {
+            self.builder.load(scr_val, 0, ScalarType::U64)
+        };
         let tag_block = self.builder.current_block.unwrap();
 
         let merge = self.builder.create_block();
@@ -1540,10 +1592,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 self.con_layout(con_name, Some(&scrutinee_ty));
             let saved_vars = self.vars.clone();
 
-            for (fi, field_pat) in fields.iter().enumerate() {
-                let field_ty = field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
-                let field_val = self.builder.load(scr_val, fi + 1, field_ty);
-                self.bind_pattern_field(field_pat, field_val);
+            if !fieldless {
+                for (fi, field_pat) in fields.iter().enumerate() {
+                    let field_ty = field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
+                    let field_val = self.builder.load(scr_val, fi + 1, field_ty);
+                    self.bind_pattern_field(field_pat, field_val);
+                }
             }
 
             if !arm.guards.is_empty() {
@@ -1682,7 +1736,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 for (i, elem) in elems.iter().enumerate() {
                     let ty = elem_types
                         .get(i)
-                        .map(type_to_scalar)
+                        .map(|t| self.scalar_type(t))
                         .unwrap_or(ScalarType::Ptr);
                     let field_val = self.builder.load(val, i, ty);
                     self.lower_destructure_elem(elem, field_val);
@@ -1726,7 +1780,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     let slot = all_names.iter().position(|n| *n == name).unwrap();
                     let ty = type_fields
                         .get(slot)
-                        .map(|(_, t)| type_to_scalar(t))
+                        .map(|(_, t)| self.scalar_type(t))
                         .unwrap_or(ScalarType::Ptr);
                     let field_val = self.builder.load(val, slot, ty);
                     self.lower_destructure_elem(elem, field_val);
@@ -1869,7 +1923,11 @@ fn lower_to_ssa<'src>(
 /// Panics if `ty` isn't a closed `Type::TagUnion` or if `con_name`
 /// isn't present among its tags — both are bugs in earlier passes
 /// that should have been caught by inference/mono.
-fn structural_con_layout(ty: &Type, con_name: &str) -> (u64, usize, Vec<ScalarType>) {
+fn structural_con_layout(
+    ty: &Type,
+    con_name: &str,
+    fieldless: &HashMap<String, ScalarType>,
+) -> (u64, usize, Vec<ScalarType>) {
     let Type::TagUnion { tags, rest } = ty else {
         panic!(
             "structural constructor '{con_name}' expected TagUnion context, got {ty:?}"
@@ -1890,7 +1948,11 @@ fn structural_con_layout(ty: &Type, con_name: &str) -> (u64, usize, Vec<ScalarTy
         });
     #[allow(clippy::cast_possible_truncation, reason = "tag count fits in u64")]
     let tag_index = idx as u64;
-    let field_types: Vec<ScalarType> = sorted[idx].1.iter().map(type_to_scalar).collect();
+    let field_types: Vec<ScalarType> = sorted[idx]
+        .1
+        .iter()
+        .map(|t| resolve_scalar_type(t, fieldless))
+        .collect();
     (tag_index, max_fields, field_types)
 }
 

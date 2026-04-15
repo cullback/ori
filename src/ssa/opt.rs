@@ -1,22 +1,19 @@
 //! Simple SSA optimization passes: dead code elimination, constant
 //! folding, and no-op elimination.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BinaryOp, Inst, ScalarType, Value};
+use super::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 use super::{Function, Module};
 
-/// Run all optimization passes until no further progress is made.
+/// Run optimization passes in a single deliberate sequence.
+/// Each pass is self-sufficient — no fixpoint looping needed.
 pub fn optimize(module: &mut Module) {
     for func in module.functions.values_mut() {
-        loop {
-            let a = dce(func);
-            let b = const_fold(func);
-            let c = nop_elim(func);
-            if !(a || b || c) {
-                break;
-            }
-        }
+        const_fold(func);
+        nop_elim(func);
+        jump_threading(func);
+        dce(func);
     }
 }
 
@@ -135,16 +132,121 @@ fn nop_elim(func: &mut Function) -> bool {
         resolved.insert(from, target);
     }
 
-    // Rewrite all operand references.
+    // Rewrite all operand references and remove the now-dead no-op instructions.
     for block in &mut func.blocks {
         for inst in &mut block.insts {
             rewrite_operands(inst, &resolved);
         }
         rewrite_terminator_operands(&mut block.terminator, &resolved);
+        block.insts.retain(|inst| {
+            inst.dest().map_or(true, |d| !resolved.contains_key(&d))
+        });
     }
 
-    // Remove the no-op instructions (they're now unused after rewriting).
-    true // DCE will clean them up on the next iteration.
+    true
+}
+
+/// Jump threading: eliminate blocks that contain no instructions and
+/// just unconditionally jump to another block. Predecessors are
+/// redirected to the final target with arguments composed through
+/// the chain.
+fn jump_threading(func: &mut Function) -> bool {
+    // Build a redirect map: block → (target, param-to-arg mapping).
+    // A block qualifies if it has no instructions and terminates with Jump,
+    // and every jump argument is one of the block's own parameters.
+    let mut redirects: HashMap<BlockId, (BlockId, Vec<usize>)> = HashMap::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if !block.insts.is_empty() {
+            continue;
+        }
+        let Terminator::Jump(target, ref args) = block.terminator else {
+            continue;
+        };
+        // Check that each arg is a block param, and record the mapping.
+        let param_indices: Option<Vec<usize>> = args
+            .iter()
+            .map(|arg| block.params.iter().position(|p| p == arg))
+            .collect();
+        let Some(indices) = param_indices else {
+            continue;
+        };
+        redirects.insert(BlockId(bi), (target, indices));
+    }
+
+    if redirects.is_empty() {
+        return false;
+    }
+
+    // Resolve chains: if B→C and C→D, then B→D (compose index mappings).
+    let resolved: HashMap<BlockId, (BlockId, Vec<usize>)> = redirects
+        .keys()
+        .map(|&bid| {
+            let (mut target, mut indices) = redirects[&bid].clone();
+            while let Some((next_target, next_indices)) = redirects.get(&target) {
+                // Compose: new_indices[i] = next_indices[indices[i]]
+                indices = indices.iter().map(|&i| next_indices[i]).collect();
+                target = *next_target;
+            }
+            (bid, (target, indices))
+        })
+        .collect();
+
+    // Rewrite all terminators that reference redirected blocks.
+    let mut changed = false;
+    let remap = |bid: BlockId, args: &[Value]| -> Option<(BlockId, Vec<Value>)> {
+        resolved.get(&bid).map(|(target, indices)| {
+            (*target, indices.iter().map(|&i| args[i]).collect())
+        })
+    };
+
+    for block in &mut func.blocks {
+        match &mut block.terminator {
+            Terminator::Jump(target, args) => {
+                if let Some((nt, na)) = remap(*target, args) {
+                    *target = nt;
+                    *args = na;
+                    changed = true;
+                }
+            }
+            Terminator::Branch {
+                then_block,
+                then_args,
+                else_block,
+                else_args,
+                ..
+            } => {
+                if let Some((nt, na)) = remap(*then_block, then_args) {
+                    *then_block = nt;
+                    *then_args = na;
+                    changed = true;
+                }
+                if let Some((ne, na)) = remap(*else_block, else_args) {
+                    *else_block = ne;
+                    *else_args = na;
+                    changed = true;
+                }
+            }
+            Terminator::SwitchInt { arms, default, .. } => {
+                for (_, bid, args) in arms.iter_mut() {
+                    if let Some((nt, na)) = remap(*bid, args) {
+                        *bid = nt;
+                        *args = na;
+                        changed = true;
+                    }
+                }
+                if let Some((bid, args)) = default {
+                    if let Some((nt, na)) = remap(*bid, args) {
+                        *bid = nt;
+                        *args = na;
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    changed
 }
 
 // ---- Helpers ----
@@ -229,7 +331,7 @@ fn detect_nop(
     }
 }
 
-fn rewrite_operands(inst: &mut Inst, map: &std::collections::HashMap<Value, Value>) {
+pub fn rewrite_operands(inst: &mut Inst, map: &std::collections::HashMap<Value, Value>) {
     match inst {
         Inst::BinOp(_, _, lhs, rhs) => {
             if let Some(&r) = map.get(lhs) { *lhs = r; }
@@ -267,7 +369,7 @@ fn rewrite_operands(inst: &mut Inst, map: &std::collections::HashMap<Value, Valu
     }
 }
 
-fn rewrite_terminator_operands(
+pub fn rewrite_terminator_operands(
     term: &mut super::instruction::Terminator,
     map: &std::collections::HashMap<Value, Value>,
 ) {

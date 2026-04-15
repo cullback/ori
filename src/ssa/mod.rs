@@ -1,6 +1,7 @@
 mod builder;
 mod display;
 pub mod eval;
+pub mod inline;
 mod instruction;
 pub mod lower;
 pub mod opt;

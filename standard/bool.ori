@@ -1,6 +1,6 @@
 exports [Bool]
 
-Bool := [True, False].(
+Bool := [False, True].(
     not : Bool -> Bool
     not = |b| if b
         : True then False

@@ -357,10 +357,11 @@ fn flatten_field<'src>(
                 }
             }
 
+            let name_span = ctx.fresh_span(span);
             let is_span = ctx.fresh_span(span);
             let is_expr = Expr::new(
                 ExprKind::Is {
-                    expr: Box::new(Expr::new(ExprKind::Name(tmp), is_span)),
+                    expr: Box::new(Expr::new(ExprKind::Name(tmp), name_span)),
                     pattern: nested,
                 },
                 is_span,
