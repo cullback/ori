@@ -15,9 +15,7 @@ part1 = |input| (
     start = { x: 0, y: 0 }
     state = input.to_utf8().walk({ pos: start, visited: Set.single(start) }, |acc, ch| (
         next = step(acc.pos, ch)
-        if acc.visited.contains(next)
-            then { pos: next, visited: acc.visited }
-            else { pos: next, visited: acc.visited.insert(next) }
+        { pos: next, visited: acc.visited.insert(next) }
     ))
     state.visited.len()
 )

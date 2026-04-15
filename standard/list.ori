@@ -124,6 +124,26 @@ List := {}.(
         )
     )
 
+    # Concatenates two lists.
+    concat : List(a), List(a) -> List(a)
+    concat = |a, b| b.walk(a, |acc, x| acc.append(x))
+
+    # Pairs each element with its index.
+    # `["a", "b", "c"].enumerate()` produces `[(0, "a"), (1, "b"), (2, "c")]`.
+    enumerate : List(a) -> List((U64, a))
+    enumerate = |xs| xs.walk({ i: 0, out: [] }, |state, x|
+        { i: state.i + 1, out: state.out.append((state.i, x)) }
+    ).out
+
+    # Splits the list into two lists: elements satisfying the predicate
+    # go into the first, the rest into the second.
+    # `[1, 2, 3, 4, 5].partition(|x| x % 2 == 0)` produces `([2, 4], [1, 3, 5])`.
+    partition : List(a), (a -> Bool) -> (List(a), List(a))
+    partition = |xs, pred| xs.walk(([], []), |(yes, no), x|
+        if pred(x) then (yes.append(x), no)
+        else (yes, no.append(x))
+    )
+
     # Returns the sum of all elements.
     sum : List(a) -> a where [a.add]
     sum = |xs| xs.walk(0, |acc, x| acc + x)
