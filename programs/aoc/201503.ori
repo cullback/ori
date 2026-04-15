@@ -13,7 +13,7 @@ step = |pos, ch|
 part1 : Str -> U64
 part1 = |input| (
     start = { x: 0, y: 0 }
-    state = input.to_utf8().walk({ pos: start, visited: Set.from_list([start]) }, |acc, ch| (
+    state = input.to_utf8().walk({ pos: start, visited: Set.single(start) }, |acc, ch| (
         next = step(acc.pos, ch)
         if acc.visited.contains(next)
             then { pos: next, visited: acc.visited }
@@ -26,7 +26,7 @@ part2 : Str -> U64
 part2 = |input| (
     start = { x: 0, y: 0 }
     state = input.to_utf8().chunks_of(2).walk(
-        { santa: start, robo: start, visited: Set.from_list([start]) },
+        { santa: start, robo: start, visited: Set.single(start) },
         |s, pair| (
             santa_next = step(s.santa, pair.get(0))
             v = s.visited.insert(santa_next)

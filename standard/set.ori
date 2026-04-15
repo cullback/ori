@@ -60,9 +60,13 @@ Set(k) := { len: U64, entries: List(SetSlot(k)) }.(
           }
     )
 
+    # Creates a Set with a single value.
+    single : k -> Set(k) where [k.equals, k.hash]
+    single = |key| Set.empty({}).insert(key)
+
     # Create a Set from a List of values.
     from_list : List(k) -> Set(k) where [k.equals, k.hash]
-    from_list = |xs| xs.walk(Set.empty({}), |s, x| Set.insert(s, x))
+    from_list = |xs| xs.walk(Set.empty({}), |s, x| s.insert(x))
 
     # Retrieve all values as a List (unspecified order).
     to_list : Set(k) -> List(k)
