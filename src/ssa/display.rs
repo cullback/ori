@@ -179,7 +179,6 @@ impl fmt::Display for BinaryOp {
 impl fmt::Display for Terminator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::None => write!(f, "<incomplete>"),
             Self::Return(v) => write!(f, "ret {v}"),
             Self::Jump(target, args) => {
                 write!(f, "jump {target}")?;

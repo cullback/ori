@@ -2,13 +2,20 @@ use super::{Block, Function, Module};
 use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 use std::collections::{BTreeMap, HashMap};
 
+/// Block under construction — terminator is set later.
+pub struct BuilderBlock {
+    params: Vec<Value>,
+    insts: Vec<Inst>,
+    terminator: Option<Terminator>,
+}
+
 /// Builds SSA functions and modules incrementally.
 ///
 /// Blocks are accumulated in a Vec during construction (for fast
 /// append) and converted to a BTreeMap when `finish_function` is called.
 pub struct Builder {
     next_value: usize,
-    pub blocks: Vec<Block>,
+    pub blocks: Vec<BuilderBlock>,
     pub current_block: Option<BlockId>,
     functions: HashMap<String, Function>,
     pub value_types: HashMap<Value, ScalarType>,
@@ -37,10 +44,10 @@ impl Builder {
 
     pub fn create_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len());
-        self.blocks.push(Block {
+        self.blocks.push(BuilderBlock {
             params: Vec::new(),
             insts: Vec::new(),
-            terminator: Terminator::None,
+            terminator: None,
         });
         id
     }
@@ -241,12 +248,21 @@ impl Builder {
         param_types: Vec<ScalarType>,
         return_type: ScalarType,
     ) {
-        let vec_blocks = std::mem::take(&mut self.blocks);
-        let next_block = vec_blocks.len();
-        let blocks: BTreeMap<BlockId, Block> = vec_blocks
+        let builder_blocks = std::mem::take(&mut self.blocks);
+        let next_block = builder_blocks.len();
+        let blocks: BTreeMap<BlockId, Block> = builder_blocks
             .into_iter()
             .enumerate()
-            .map(|(i, b)| (BlockId(i), b))
+            .map(|(i, bb)| {
+                let block = Block {
+                    params: bb.params,
+                    insts: bb.insts,
+                    terminator: bb.terminator.unwrap_or_else(|| {
+                        panic!("block b{i} in {name} has no terminator")
+                    }),
+                };
+                (BlockId(i), block)
+            })
             .collect();
         let value_types = std::mem::take(&mut self.value_types);
         self.functions.insert(
@@ -282,6 +298,6 @@ impl Builder {
 
     fn set_terminator(&mut self, term: Terminator) {
         let block = self.current_block.expect("no current block");
-        self.blocks[block.0].terminator = term;
+        self.blocks[block.0].terminator = Some(term);
     }
 }

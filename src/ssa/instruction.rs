@@ -131,7 +131,6 @@ impl Terminator {
     /// All values used as operands in the terminator.
     pub fn operands(&self) -> Vec<Value> {
         match self {
-            Self::None => vec![],
             Self::Return(v) => vec![*v],
             Self::Jump(_, args) => args.clone(),
             Self::Branch {
@@ -165,7 +164,7 @@ impl Terminator {
     /// Successor blocks and the values passed to each.
     pub fn successors(&self) -> Vec<(BlockId, &[Value])> {
         match self {
-            Self::None | Self::Return(_) => vec![],
+            Self::Return(_) => vec![],
             Self::Jump(target, args) => vec![(*target, args)],
             Self::Branch {
                 then_block,
@@ -189,8 +188,6 @@ impl Terminator {
 /// How a basic block ends.
 #[derive(Debug, Clone)]
 pub enum Terminator {
-    /// Block is incomplete.
-    None,
     /// Return a value from the function.
     Return(Value),
     /// Unconditional jump with block arguments.

@@ -475,6 +475,5 @@ pub fn rewrite_terminator_operands(
             for (_, _, args) in arms { for a in args { if let Some(&r) = map.get(a) { *a = r; } } }
             if let Some((_, args)) = default { for a in args { if let Some(&r) = map.get(a) { *a = r; } } }
         }
-        Terminator::None => {}
     }
 }

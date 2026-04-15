@@ -220,7 +220,6 @@ fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) 
                 }
             }
 
-            Terminator::None => panic!("reached incomplete block"),
         }
     }
 }

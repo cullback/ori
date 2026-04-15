@@ -166,19 +166,25 @@ fn perform_inline(
     caller.next_block += 1;
     let cont_param = Value(next_val);
 
-    // Map call_dest → cont_param so later instructions use the right value.
     // Split the caller block: instructions after the call go into the continuation.
     let remaining_insts: Vec<Inst> = caller.blocks.get_mut(&block_id).unwrap()
         .insts
         .split_off(inst_idx + 1);
     // Remove the Call instruction itself.
     caller.blocks.get_mut(&block_id).unwrap().insts.pop();
-    let original_terminator =
-        std::mem::replace(&mut caller.blocks.get_mut(&block_id).unwrap().terminator, Terminator::None);
 
     // --- Step 3: copy callee entry block instructions into caller block ---
 
     let callee_entry = &callee.blocks[&callee.entry];
+
+    // Compute the new terminator first so we can swap in one step.
+    let new_terminator =
+        remap_terminator(&callee_entry.terminator, &val_map, &remap_block, cont_block_id);
+    let original_terminator = std::mem::replace(
+        &mut caller.blocks.get_mut(&block_id).unwrap().terminator,
+        new_terminator,
+    );
+
     for inst in &callee_entry.insts {
         let remapped = remap_inst(inst, &val_map);
         if let Some(d) = inst.dest() {
@@ -189,19 +195,6 @@ fn perform_inline(
         caller.blocks.get_mut(&block_id).unwrap().insts.push(remapped);
     }
 
-    // Copy callee param types into caller's value_types.
-    for (cp, ca) in callee.params.iter().zip(&call_args) {
-        if let Some(ty) = callee.value_types.get(cp) {
-            // The call arg already has a type, but record the callee's
-            // expected type for any fresh values.
-            let _ = (ca, ty);
-        }
-    }
-
-    // Set the caller block's terminator to the remapped callee entry terminator.
-    caller.blocks.get_mut(&block_id).unwrap().terminator =
-        remap_terminator(&callee_entry.terminator, &val_map, &remap_block, cont_block_id);
-
     // --- Step 4: copy non-entry callee blocks ---
 
     for (&callee_bid, callee_block) in &callee.blocks {
@@ -209,21 +202,13 @@ fn perform_inline(
             continue;
         }
         let new_bid = block_map[&callee_bid];
-        let mut new_block = Block {
-            params: callee_block
-                .params
-                .iter()
-                .map(|p| val_map[p])
-                .collect(),
-            insts: Vec::new(),
-            terminator: Terminator::None,
-        };
         // Copy param types.
         for &p in &callee_block.params {
             if let Some(ty) = callee.value_types.get(&p) {
                 caller.value_types.insert(val_map[&p], *ty);
             }
         }
+        let mut insts = Vec::new();
         for inst in &callee_block.insts {
             let remapped = remap_inst(inst, &val_map);
             if let Some(d) = inst.dest() {
@@ -231,14 +216,22 @@ fn perform_inline(
                     caller.value_types.insert(val_map[&d], *ty);
                 }
             }
-            new_block.insts.push(remapped);
+            insts.push(remapped);
         }
-        new_block.terminator = remap_terminator(
-            &callee_block.terminator,
-            &val_map,
-            &remap_block,
-            cont_block_id,
-        );
+        let new_block = Block {
+            params: callee_block
+                .params
+                .iter()
+                .map(|p| val_map[p])
+                .collect(),
+            insts,
+            terminator: remap_terminator(
+                &callee_block.terminator,
+                &val_map,
+                &remap_block,
+                cont_block_id,
+            ),
+        };
         caller.blocks.insert(new_bid, new_block);
     }
 
@@ -321,7 +314,6 @@ fn remap_terminator(
     cont_block: BlockId,
 ) -> Terminator {
     match term {
-        Terminator::None => Terminator::None,
         Terminator::Return(v) => {
             // Return becomes a jump to the continuation block.
             Terminator::Jump(cont_block, vec![remap_value(*v, val_map)])
