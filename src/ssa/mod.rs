@@ -8,6 +8,7 @@ pub mod lower;
 pub mod opt;
 pub mod rc;
 pub mod static_promote;
+pub mod validate;
 
 #[allow(unused_imports)]
 pub use builder::Builder;

@@ -13,6 +13,9 @@ pub struct FuncBuilder {
     pub pending: BTreeMap<BlockId, PendingBlock>,
     pub finished: BTreeMap<BlockId, Block>,
     pub next_block: usize,
+    /// Function parameters, in declaration order. Types live in
+    /// `Builder::value_types`. Populated via `add_func_param`.
+    pub params: Vec<Value>,
 }
 
 impl FuncBuilder {
@@ -21,6 +24,7 @@ impl FuncBuilder {
             pending: BTreeMap::new(),
             finished: BTreeMap::new(),
             next_block: 0,
+            params: Vec::new(),
         }
     }
 }
@@ -45,14 +49,22 @@ impl Builder {
         }
     }
 
-    pub const fn fresh_value(&mut self) -> Value {
+    /// Allocate a fresh typed SSA value. Every value must have a type
+    /// — pass it at creation so the invariant holds by construction.
+    fn fresh_value(&mut self, ty: ScalarType) -> Value {
         let v = Value(self.next_value);
         self.next_value += 1;
+        self.value_types.insert(v, ty);
         v
     }
 
-    pub fn set_type(&mut self, v: Value, ty: ScalarType) {
-        self.value_types.insert(v, ty);
+    /// Add a function parameter with the given type. Returns the
+    /// Value. The builder tracks params so `finish_function` doesn't
+    /// need the caller to pass them in separately.
+    pub fn add_func_param(&mut self, ty: ScalarType) -> Value {
+        let v = self.fresh_value(ty);
+        self.func.params.push(v);
+        v
     }
 
     pub fn create_block(&mut self) -> BlockId {
@@ -70,117 +82,102 @@ impl Builder {
     }
 
     pub fn add_block_param(&mut self, block: BlockId, ty: ScalarType) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ty);
         self.func.pending.get_mut(&block)
             .expect("add_block_param on non-pending block")
             .params.push(v);
-        self.set_type(v, ty);
         v
     }
 
     // ---- Constants ----
 
     pub fn const_i64(&mut self, n: i64) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::I64);
         self.push(Inst::Const(v, ScalarType::I64, n as u64));
-        self.set_type(v, ScalarType::I64);
         v
     }
 
     pub fn const_u64(&mut self, n: u64) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::U64);
         self.push(Inst::Const(v, ScalarType::U64, n));
-        self.set_type(v, ScalarType::U64);
         v
     }
 
     pub fn const_f64(&mut self, n: f64) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::F64);
         self.push(Inst::Const(v, ScalarType::F64, n.to_bits()));
-        self.set_type(v, ScalarType::F64);
         v
     }
 
     pub fn const_u8(&mut self, n: u8) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::U8);
         self.push(Inst::Const(v, ScalarType::U8, u64::from(n)));
-        self.set_type(v, ScalarType::U8);
         v
     }
 
     pub fn const_i8(&mut self, n: i8) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::I8);
         self.push(Inst::Const(v, ScalarType::I8, n as u64));
-        self.set_type(v, ScalarType::I8);
         v
     }
 
     pub fn const_u16(&mut self, n: u16) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::U16);
         self.push(Inst::Const(v, ScalarType::U16, u64::from(n)));
-        self.set_type(v, ScalarType::U16);
         v
     }
 
     pub fn const_i16(&mut self, n: i16) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::I16);
         self.push(Inst::Const(v, ScalarType::I16, n as u64));
-        self.set_type(v, ScalarType::I16);
         v
     }
 
     pub fn const_u32(&mut self, n: u32) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::U32);
         self.push(Inst::Const(v, ScalarType::U32, u64::from(n)));
-        self.set_type(v, ScalarType::U32);
         v
     }
 
     pub fn const_i32(&mut self, n: i32) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::I32);
         self.push(Inst::Const(v, ScalarType::I32, n as u64));
-        self.set_type(v, ScalarType::I32);
         v
     }
 
     pub fn const_ptr_null(&mut self) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::Ptr);
         self.push(Inst::Const(v, ScalarType::Ptr, 0));
-        self.set_type(v, ScalarType::Ptr);
         v
     }
 
     // ---- Arithmetic ----
 
     pub fn binop(&mut self, op: BinaryOp, lhs: Value, rhs: Value, ty: ScalarType) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ty);
         self.push(Inst::BinOp(v, op, lhs, rhs));
-        self.set_type(v, ty);
         v
     }
 
     // ---- Calls ----
 
     pub fn call(&mut self, func: &str, args: Vec<Value>, ret_ty: ScalarType) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ret_ty);
         self.push(Inst::Call(v, func.to_owned(), args));
-        self.set_type(v, ret_ty);
         v
     }
 
     // ---- Memory ----
 
     pub fn alloc(&mut self, size: usize) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ScalarType::Ptr);
         self.push(Inst::Alloc(v, size));
-        self.set_type(v, ScalarType::Ptr);
         v
     }
 
     pub fn load(&mut self, ptr: Value, offset: usize, ty: ScalarType) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ty);
         self.push(Inst::Load(v, ptr, offset));
-        self.set_type(v, ty);
         v
     }
 
@@ -189,9 +186,8 @@ impl Builder {
     }
 
     pub fn load_dyn(&mut self, ptr: Value, idx: Value, ty: ScalarType) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ty);
         self.push(Inst::LoadDyn(v, ptr, idx));
-        self.set_type(v, ty);
         v
     }
 
@@ -210,25 +206,22 @@ impl Builder {
     // ---- Aggregates ----
 
     pub fn pack(&mut self, fields: Vec<Value>) -> Value {
-        let v = self.fresh_value();
         let n = fields.len();
+        let v = self.fresh_value(ScalarType::Agg(n));
         self.push(Inst::Pack(v, fields));
-        self.set_type(v, ScalarType::Agg(n));
         v
     }
 
     pub fn extract(&mut self, agg: Value, index: usize, ty: ScalarType) -> Value {
-        let v = self.fresh_value();
+        let v = self.fresh_value(ty);
         self.push(Inst::Extract(v, agg, index));
-        self.set_type(v, ty);
         v
     }
 
     pub fn insert(&mut self, agg: Value, index: usize, val: Value) -> Value {
-        let v = self.fresh_value();
         let agg_ty = self.value_types.get(&agg).copied().unwrap_or(ScalarType::Ptr);
+        let v = self.fresh_value(agg_ty);
         self.push(Inst::Insert(v, agg, index, val));
-        self.set_type(v, agg_ty);
         v
     }
 
@@ -278,13 +271,10 @@ impl Builder {
 
     // ---- Function building ----
 
-    pub fn finish_function(
-        &mut self,
-        name: &str,
-        params: Vec<Value>,
-        param_types: Vec<ScalarType>,
-        return_type: ScalarType,
-    ) {
+    /// Finalize the current function. Params are the ones added via
+    /// `add_func_param` (in order); their types come from
+    /// `value_types`. The caller only supplies the return type.
+    pub fn finish_function(&mut self, name: &str, return_type: ScalarType) {
         assert!(
             self.func.pending.is_empty(),
             "finish_function({name}): {} blocks still pending terminators",
@@ -292,11 +282,19 @@ impl Builder {
         );
         let fb = std::mem::replace(&mut self.func, FuncBuilder::new());
         let value_types = std::mem::take(&mut self.value_types);
+        let param_types = fb.params
+            .iter()
+            .map(|v| {
+                *value_types.get(v).unwrap_or_else(|| {
+                    panic!("finish_function({name}): param {v:?} has no type")
+                })
+            })
+            .collect();
         self.functions.insert(
             name.to_owned(),
             Function {
                 name: name.to_owned(),
-                params,
+                params: fb.params,
                 blocks: fb.finished,
                 param_types,
                 return_type,

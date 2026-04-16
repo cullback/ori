@@ -260,19 +260,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let saved_func = std::mem::replace(&mut self.builder.func, crate::ssa::builder::FuncBuilder::new());
         let saved_current = self.builder.current_block.take();
 
-        let ssa_params: Vec<Value> = param_syms
-            .iter()
-            .map(|p| {
-                let v = self.builder.fresh_value();
-                self.vars.insert(*p, v);
-                v
-            })
-            .collect();
-
-        let entry = self.builder.create_block();
-        self.builder.switch_to(entry);
-        let result = self.lower_expr(body);
-        self.builder.ret(result);
         // Parameter scalar types come from the function's inferred
         // scheme when available. Synthesized `__apply_K` functions
         // don't have schemes — they default to all-`Ptr`, which is
@@ -287,12 +274,21 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 Type::Arrow(params, _) => {
                     params.iter().map(|t| resolve_scalar_type(t, fieldless)).collect()
                 }
-                _ => vec![ScalarType::Ptr; ssa_params.len()],
+                _ => vec![ScalarType::Ptr; param_syms.len()],
             })
-            .unwrap_or_else(|| vec![ScalarType::Ptr; ssa_params.len()]);
+            .unwrap_or_else(|| vec![ScalarType::Ptr; param_syms.len()]);
+
+        for (p, ty) in param_syms.iter().zip(&param_types) {
+            let v = self.builder.add_func_param(*ty);
+            self.vars.insert(*p, v);
+        }
+
+        let entry = self.builder.create_block();
+        self.builder.switch_to(entry);
+        let result = self.lower_expr(body);
+        self.builder.ret(result);
         let return_type = self.func_ret_type(name);
-        self.builder
-            .finish_function(name, ssa_params, param_types, return_type);
+        self.builder.finish_function(name, return_type);
 
         self.builder.func = saved_func;
         self.builder.current_block = saved_current;
@@ -2212,7 +2208,7 @@ fn lower_to_ssa<'src>(
     let main_ssa_params: Vec<Value> = params
         .iter()
         .map(|p| {
-            let v = ctx.builder.fresh_value();
+            let v = ctx.builder.add_func_param(ScalarType::Ptr);
             ctx.vars.insert(*p, v);
             v
         })
@@ -2221,14 +2217,8 @@ fn lower_to_ssa<'src>(
     ctx.builder.switch_to(entry);
     let result = ctx.lower_expr(&body);
     ctx.builder.ret(result);
-    let main_param_types = vec![ScalarType::Ptr; main_ssa_params.len()];
     let main_ret_ty = ctx.func_ret_type("main");
-    ctx.builder.finish_function(
-        "__main",
-        main_ssa_params.clone(),
-        main_param_types,
-        main_ret_ty,
-    );
+    ctx.builder.finish_function("__main", main_ret_ty);
 
     let ssa_module = ctx.builder.build("__main");
     Ok((ssa_module, main_ssa_params))

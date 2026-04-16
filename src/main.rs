@@ -50,18 +50,44 @@ fn compile(
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = ssa::lower::lower(&mono, &resolved.fields)?;
+    let validate = std::env::var_os("ORI_VALIDATE").is_some();
+    let check = |m: &ssa::Module, pass: &str| {
+        if validate {
+            let r = ssa::validate::validate(m);
+            if !r.is_clean() {
+                eprintln!("SSA validation failed after '{pass}':\n{}", r.error_summary());
+                process::exit(1);
+            }
+            if std::env::var_os("ORI_VALIDATE_WARN").is_some() {
+                for w in &r.warnings {
+                    eprintln!("[validate warn after {pass}] {w}");
+                }
+            }
+        }
+    };
+    check(&ssa_module, "lower");
     ssa::static_promote::promote(&mut ssa_module);
+    check(&ssa_module, "static_promote");
     ssa::opt::optimize(&mut ssa_module);
+    check(&ssa_module, "optimize");
     ssa::inline::inline(&mut ssa_module);
+    check(&ssa_module, "inline");
     ssa::opt::optimize(&mut ssa_module);
+    check(&ssa_module, "optimize (post-inline)");
     ssa::opt::optimize(&mut ssa_module);
     ssa::const_eval::evaluate(&mut ssa_module);
+    check(&ssa_module, "const_eval");
     ssa::opt::optimize(&mut ssa_module);
     ssa::rc::insert_rc(&mut ssa_module);
+    check(&ssa_module, "insert_rc");
     ssa::rc::elide_static_rc(&mut ssa_module);
+    check(&ssa_module, "elide_static_rc");
     ssa::rc::insert_reuse(&mut ssa_module);
+    check(&ssa_module, "insert_reuse");
     ssa::rc::fuse_inc_dec(&mut ssa_module);
+    check(&ssa_module, "fuse_inc_dec");
     ssa::opt::optimize(&mut ssa_module);
+    check(&ssa_module, "optimize (final)");
     for func in ssa_module.functions.values_mut() {
         func.compute_num_values();
     }

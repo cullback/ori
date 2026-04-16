@@ -241,16 +241,13 @@ fn insert_rc_function(func: &mut Function) {
 
     let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
 
-    // Function params are borrowed — they're NOT in value_types so
-    // is_ptr returns false, meaning liveness/death tracking ignores
-    // them (no spurious rc_dec). But we need rc_inc when a param is
-    // stored to the heap (Store/StoreDyn), so collect Ptr-typed
-    // params separately for the Store check below.
-    let func_param_ptrs: HashSet<Value> = func.params.iter()
-        .zip(&func.param_types)
-        .filter(|(_, ty)| **ty == ScalarType::Ptr)
-        .map(|(v, _)| *v)
-        .collect();
+    // Function params are borrowed from the caller. We emit rc_inc
+    // on Store of a param (the heap needs its own reference), but
+    // we must not emit rc_dec on param death — the caller owns the
+    // token and will release it. Excluding params from dies_in_block
+    // and edge_decs preserves this invariant.
+    let func_param_ptrs: HashSet<Value> =
+        func.params.iter().copied().filter(|v| is_ptr(*v)).collect();
 
     // Phase 1: compute liveness.
     let (live_in, _live_out) = compute_liveness(func);
@@ -322,9 +319,10 @@ fn insert_rc_function(func: &mut Function) {
         }
 
         // For values alive but only needed on SOME edges, we need
-        // RcDec on the edges where they're NOT needed. Collect
-        // per-edge decs and create trampoline blocks later.
+        // RcDec on the edges where they're NOT needed. Skip function
+        // params — the caller owns their tokens.
         for &v in &alive {
+            if func_param_ptrs.contains(&v) { continue; }
             let total = successor_tokens.get(&v).copied().unwrap_or(0);
             if total > 0 && total < num_succ {
                 for (ei, (_succ_id, _)) in successors.iter().enumerate() {
@@ -361,7 +359,7 @@ fn insert_rc_function(func: &mut Function) {
         let mut dies_in_block: HashSet<Value> = HashSet::new();
         for &v in &alive {
             let tokens = successor_tokens.get(&v).copied().unwrap_or(0);
-            if tokens == 0 && !term_operands.contains(&v) {
+            if tokens == 0 && !term_operands.contains(&v) && !func_param_ptrs.contains(&v) {
                 dies_in_block.insert(v);
             }
         }
@@ -372,9 +370,7 @@ fn insert_rc_function(func: &mut Function) {
 
         for (idx, inst) in old_insts.iter().enumerate() {
             match inst {
-                Inst::Store(_, _, val) | Inst::StoreDyn(_, _, val)
-                    if is_ptr(*val) || func_param_ptrs.contains(val) =>
-                {
+                Inst::Store(_, _, val) | Inst::StoreDyn(_, _, val) if is_ptr(*val) => {
                     new_insts.push(Inst::RcInc(*val));
                 }
                 _ => {}

@@ -28,6 +28,11 @@ fn through_infer(
 }
 
 /// Full compile: through infer, then mono + lambda passes + lower → SSA.
+///
+/// Every SSA pass is followed by a `validate` check. If a pass
+/// produces structurally-broken SSA the test fails here with the
+/// pass name, rather than later during eval with a confusing
+/// runtime panic.
 fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
     let infer_result = through_infer(&mut resolved);
@@ -39,14 +44,39 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
+    validate_after(&ssa_module, "lower");
     crate::ssa::static_promote::promote(&mut ssa_module);
+    validate_after(&ssa_module, "static_promote");
     crate::ssa::opt::optimize(&mut ssa_module);
+    validate_after(&ssa_module, "optimize");
     crate::ssa::rc::insert_rc(&mut ssa_module);
+    validate_after(&ssa_module, "insert_rc");
     crate::ssa::rc::elide_static_rc(&mut ssa_module);
+    validate_after(&ssa_module, "elide_static_rc");
     crate::ssa::rc::insert_reuse(&mut ssa_module);
+    validate_after(&ssa_module, "insert_reuse");
     crate::ssa::rc::fuse_inc_dec(&mut ssa_module);
+    validate_after(&ssa_module, "fuse_inc_dec");
     crate::ssa::opt::optimize(&mut ssa_module);
+    validate_after(&ssa_module, "optimize (post-rc)");
     (ssa_module, input_vals)
+}
+
+fn validate_after(module: &crate::ssa::Module, pass: &str) {
+    let report = crate::ssa::validate::validate(module);
+    if !report.is_clean() {
+        panic!(
+            "SSA structural validation failed after pass '{pass}':\n{}",
+            report.error_summary()
+        );
+    }
+    // Set ORI_VALIDATE_WARN=1 to see soft validation issues
+    // (type lies, orphan value_types entries, etc.) during tests.
+    if std::env::var_os("ORI_VALIDATE_WARN").is_some() {
+        for w in &report.warnings {
+            eprintln!("[validate warn after {pass}] {w}");
+        }
+    }
 }
 
 // ---- Test runners ----
