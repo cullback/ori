@@ -29,9 +29,29 @@ struct ParseCtx {
     doc_comments: HashMap<usize, String>,
     /// Counter for generating unique `__expect_N` names.
     expect_counter: std::cell::Cell<usize>,
+    /// When true, drop any user-defined `main` so the synthetic
+    /// expect-runner main is generated even for programs that have
+    /// their own `main`. Enables `ori test <prog>` to exercise the
+    /// `expect` decls sprinkled into a program.
+    test_mode: bool,
 }
 
 pub fn parse(source: &str, file: FileId) -> Result<Module<'_>, CompileError> {
+    parse_with_mode(source, file, false)
+}
+
+/// Parse with `test_mode=true` to drop any user-defined `main` decl
+/// so the synthetic expect-runner main gets generated even when a
+/// real `main` exists in the source. Used by the `test` subcommand.
+pub fn parse_test(source: &str, file: FileId) -> Result<Module<'_>, CompileError> {
+    parse_with_mode(source, file, true)
+}
+
+fn parse_with_mode(
+    source: &str,
+    file: FileId,
+    test_mode: bool,
+) -> Result<Module<'_>, CompileError> {
     let pairs =
         OriParser::parse(Rule::module, source).map_err(|e| CompileError::new(e.to_string()))?;
     let module_pair = pairs.into_iter().next().unwrap();
@@ -40,6 +60,7 @@ pub fn parse(source: &str, file: FileId) -> Result<Module<'_>, CompileError> {
         file,
         doc_comments,
         expect_counter: std::cell::Cell::new(0),
+        test_mode,
     };
     Ok(ctx.parse_module(module_pair))
 }
@@ -111,6 +132,15 @@ impl ParseCtx {
                 Rule::decl => decls.push(self.parse_decl(inner)),
                 _ => {}
             }
+        }
+        // In test mode, drop any user-defined `main` (both the
+        // `FuncDef` and its `TypeAnno`) so the synthetic
+        // expect-runner below replaces it cleanly.
+        if self.test_mode {
+            decls.retain(|d| !matches!(d,
+                Decl::FuncDef { name: "main", .. } |
+                Decl::TypeAnno { name: "main", .. }
+            ));
         }
         // If there are `expect` declarations but no user-defined `main`,
         // generate a synthetic main that evaluates all expects.

@@ -31,8 +31,13 @@ fn resolve(
     arena: &mut SourceArena,
     main_file: source::FileId,
     source_dir: Option<&std::path::Path>,
+    test_mode: bool,
 ) -> Result<passes::resolve::Resolved<'static>, CompileError> {
-    let parsed = syntax::parse::parse(arena.content(main_file), main_file)?;
+    let parsed = if test_mode {
+        syntax::parse::parse_test(arena.content(main_file), main_file)?
+    } else {
+        syntax::parse::parse(arena.content(main_file), main_file)?
+    };
     passes::resolve::resolve_imports(parsed, arena, source_dir)
 }
 
@@ -142,13 +147,19 @@ fn scalar_str_to_bytes(heap: &ssa::eval::Heap, str_ptr: ssa::eval::Scalar) -> Ve
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dump_ssa = args.iter().any(|a| a == "--dump-ssa");
-    let file_args: Vec<&String> = args
+    let positional: Vec<&String> = args
         .iter()
         .skip(1)
         .filter(|a| !a.starts_with("--"))
         .collect();
+    // `ori test <file.ori>` runs all `expect` decls; otherwise the
+    // first positional is the source path and the rest are program args.
+    let (test_mode, file_args): (bool, Vec<&String>) = match positional.first() {
+        Some(first) if first.as_str() == "test" => (true, positional[1..].to_vec()),
+        _ => (false, positional),
+    };
     if file_args.is_empty() {
-        eprintln!("usage: ori [--dump-ssa] <file.ori> [args...]");
+        eprintln!("usage: ori [--dump-ssa] [test] <file.ori> [args...]");
         process::exit(1);
     }
     let source_path = file_args[0];
@@ -161,7 +172,7 @@ fn main() {
     let main_file = arena.add(source_path.clone(), content);
 
     let source_dir = std::path::Path::new(source_path).parent();
-    let resolved = match resolve(&mut arena, main_file, source_dir) {
+    let resolved = match resolve(&mut arena, main_file, source_dir, test_mode) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{}", e.format(&arena));

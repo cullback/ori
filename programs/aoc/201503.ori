@@ -24,5 +24,12 @@ part2 = |input| (
     Set.from_list(santa_trail.concat(robo_trail)).insert(start).len()
 )
 
+expect part1(">") == 2
+expect part1("^>v<") == 4
+expect part1("^v^v^v^v^v") == 2
+expect part2("^v") == 3
+expect part2("^>v<") == 3
+expect part2("^v^v^v^v^v") == 11
+
 main : List(Str), Str -> Result(Str, Str)
 main = |args, input| Ok(part2(input).to_str())
