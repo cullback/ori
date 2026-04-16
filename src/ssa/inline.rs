@@ -227,8 +227,11 @@ fn perform_inline(
     let remaining_insts: Vec<Inst> = caller.blocks.get_mut(&block_id).unwrap()
         .insts
         .split_off(inst_idx + 1);
-    // Remove the Call instruction itself.
+    // Remove the Call instruction itself. Its dest (`call_dest`) is
+    // about to be replaced by `cont_param` everywhere, so drop its
+    // stale type entry to keep `value_types` in sync.
     caller.blocks.get_mut(&block_id).unwrap().insts.pop();
+    caller.value_types.remove(&call_dest);
 
     // --- Step 3: copy callee entry block instructions into caller block ---
 

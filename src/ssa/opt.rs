@@ -65,7 +65,15 @@ fn dce(func: &mut Function) -> bool {
             .filter(|bid| !reachable.contains(bid))
             .collect();
         for bid in dead {
-            func.blocks.remove(&bid);
+            let block = func.blocks.remove(&bid).unwrap();
+            for p in &block.params {
+                func.value_types.remove(p);
+            }
+            for inst in &block.insts {
+                if let Some(d) = inst.dest() {
+                    func.value_types.remove(&d);
+                }
+            }
             changed = true;
         }
     }
@@ -83,6 +91,7 @@ fn dce(func: &mut Function) -> bool {
         }
     }
 
+    let mut removed_dests: Vec<Value> = Vec::new();
     for block in func.blocks.values_mut() {
         let before = block.insts.len();
         block.insts.retain(|inst| {
@@ -90,14 +99,20 @@ fn dce(func: &mut Function) -> bool {
                 if is_side_effect(inst) {
                     return true;
                 }
-                used.contains(&dest)
-            } else {
-                true
+                if used.contains(&dest) {
+                    return true;
+                }
+                removed_dests.push(dest);
+                return false;
             }
+            true
         });
         if block.insts.len() != before {
             changed = true;
         }
+    }
+    for d in removed_dests {
+        func.value_types.remove(&d);
     }
     changed
 }
@@ -186,6 +201,9 @@ fn nop_elim(func: &mut Function) -> bool {
         block.insts.retain(|inst| {
             inst.dest().map_or(true, |d| !resolved.contains_key(&d))
         });
+    }
+    for d in resolved.keys() {
+        func.value_types.remove(d);
     }
 
     true

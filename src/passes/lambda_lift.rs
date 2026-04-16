@@ -13,23 +13,29 @@
 //! Every former lambda is a named `FuncDef` with signature
 //! `(cap0, cap1, ..., param0, param1, ...) -> ret`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Decl, Expr, ExprKind, Module, Span, Stmt};
 use crate::passes::mono::Monomorphized;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
+use crate::types::engine::{Scheme, Type};
 
 /// Lift all lambdas in the module to top-level FuncDefs.
 pub fn lift(mono: &mut Monomorphized<'_>) {
     let module = std::mem::take(&mut mono.module);
-    mono.module = lift_module(module, &mut mono.symbols);
+    mono.module = lift_module(module, &mut mono.symbols, &mut mono.infer.func_schemes);
 }
 
-fn lift_module<'src>(module: Module<'src>, symbols: &mut SymbolTable) -> Module<'src> {
+fn lift_module<'src>(
+    module: Module<'src>,
+    symbols: &mut SymbolTable,
+    func_schemes: &mut HashMap<String, Scheme>,
+) -> Module<'src> {
     let mut ctx = LiftCtx {
         symbols,
         lifted: Vec::new(),
         counter: 0,
+        func_schemes,
     };
 
     // Process each decl. Lifted functions created during a decl's
@@ -55,6 +61,10 @@ struct LiftCtx<'a, 'src> {
     symbols: &'a mut SymbolTable,
     lifted: Vec<Decl<'src>>,
     counter: usize,
+    /// Schemes for lifted functions, inserted as we create them.
+    /// Downstream (`decl_info`, `ssa::lower`) reads these to pick up
+    /// accurate param/return types for `__lifted_N`.
+    func_schemes: &'a mut HashMap<String, Scheme>,
 }
 
 impl<'src> LiftCtx<'_, 'src> {
@@ -241,13 +251,23 @@ impl<'src> LiftCtx<'_, 'src> {
         params: Vec<SymbolId>,
         body: Expr<'src>,
         span: Span,
-        ty: crate::types::engine::Type,
+        ty: Type,
     ) -> Expr<'src> {
         // Compute free variables of the body w.r.t. the lambda params.
         let bound: HashSet<SymbolId> = params.iter().copied().collect();
         let captures = ast::free_names(&body, &bound, &mut HashSet::new(), &|sym| {
             !matches!(self.symbols.get(sym).kind, SymbolKind::Local)
         });
+
+        // Extract each capture's type by scanning the body for a
+        // reference. Falls back to the lambda's full type on misses
+        // (should not happen for well-typed programs).
+        let mut sym_types: HashMap<SymbolId, Type> = HashMap::new();
+        collect_sym_types(&body, &mut sym_types);
+        let capture_types: Vec<Type> = captures
+            .iter()
+            .map(|c| sym_types.get(c).cloned().unwrap_or_else(|| ty.clone()))
+            .collect();
 
         // Create capture parameter symbols for the lifted function.
         let capture_params: Vec<SymbolId> = captures
@@ -261,11 +281,26 @@ impl<'src> LiftCtx<'_, 'src> {
         // Rewrite the body: replace each captured variable reference
         // with the corresponding capture parameter.
         let body = substitute_captures(&body, &captures, &capture_params);
+        let body_ty = body.ty.clone();
 
         // Build the lifted function: captures first, then original params.
         let func_sym = self.fresh_name(span);
         let mut all_params = capture_params.clone();
         all_params.extend(params);
+
+        // Param types = capture types followed by the lambda's own param types.
+        // The lambda's `ty` is `Arrow(param_tys, ret_ty)`; destructure to
+        // get `param_tys`. A non-Arrow type would mean inference mis-typed
+        // the lambda — fall back to body.ty uniformly rather than panic.
+        let lambda_param_tys: Vec<Type> = match &ty {
+            Type::Arrow(ps, _) => ps.clone(),
+            _ => all_params.iter().skip(capture_params.len()).map(|_| body_ty.clone()).collect(),
+        };
+        let mut all_param_tys = capture_types.clone();
+        all_param_tys.extend(lambda_param_tys);
+        let lifted_scheme = Scheme::mono(Type::Arrow(all_param_tys, Box::new(body_ty)));
+        let lifted_name = self.symbols.display(func_sym).to_owned();
+        self.func_schemes.insert(lifted_name, lifted_scheme);
 
         self.lifted.push(Decl::FuncDef {
             span,
@@ -275,10 +310,17 @@ impl<'src> LiftCtx<'_, 'src> {
             doc: None,
         });
 
-        // Return a Closure node that packs the captured values.
+        // Return a Closure node that packs the captured values. Tag each
+        // capture expression with the captured symbol's type so
+        // downstream passes (specialize, lower) don't fall back to Ptr.
         let capture_exprs: Vec<Expr<'src>> = captures
             .iter()
-            .map(|&cap| Expr::new(ExprKind::Name(cap), span))
+            .zip(&capture_types)
+            .map(|(&cap, ty)| {
+                let mut e = Expr::new(ExprKind::Name(cap), span);
+                e.ty = ty.clone();
+                e
+            })
             .collect();
 
         let mut closure = Expr::new(
@@ -291,6 +333,117 @@ impl<'src> LiftCtx<'_, 'src> {
         closure.ty = ty;
         closure
     }
+}
+
+/// Walk `expr` and record `Name(sym) → ty` mappings. For captured
+/// variables used only as `Call` targets, synthesize an `Arrow` type
+/// from the call's arg and result types so function captures are
+/// covered too.
+fn collect_sym_types(expr: &Expr<'_>, out: &mut HashMap<SymbolId, Type>) {
+    match &expr.kind {
+        ExprKind::Name(sym) => {
+            out.entry(*sym).or_insert_with(|| expr.ty.clone());
+        }
+        ExprKind::Call { target, args } => {
+            out.entry(*target).or_insert_with(|| {
+                let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                Type::Arrow(arg_tys, Box::new(expr.ty.clone()))
+            });
+            for a in args {
+                collect_sym_types(a, out);
+            }
+        }
+        _ => {}
+    }
+    for child in expr_children(expr) {
+        collect_sym_types(child, out);
+    }
+}
+
+/// Iterate direct sub-expressions of `expr`. Mirrors the recursion
+/// shape of the AST walkers below.
+fn expr_children<'a, 'src>(expr: &'a Expr<'src>) -> Vec<&'a Expr<'src>> {
+    let mut out = Vec::new();
+    match &expr.kind {
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            out.push(lhs.as_ref());
+            out.push(rhs.as_ref());
+        }
+        ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
+            for a in args {
+                out.push(a);
+            }
+        }
+        ExprKind::Block(stmts, result) => {
+            for s in stmts {
+                match s {
+                    Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => out.push(val),
+                    Stmt::Guard { condition, return_val } => {
+                        out.push(condition);
+                        out.push(return_val);
+                    }
+                    Stmt::TypeHint { .. } => {}
+                }
+            }
+            out.push(result.as_ref());
+        }
+        ExprKind::If { expr: scr, arms, else_body } => {
+            out.push(scr.as_ref());
+            for arm in arms {
+                for g in &arm.guards {
+                    out.push(g);
+                }
+                out.push(&arm.body);
+            }
+            if let Some(eb) = else_body {
+                out.push(eb.as_ref());
+            }
+        }
+        ExprKind::Fold { expr: scr, arms } => {
+            out.push(scr.as_ref());
+            for arm in arms {
+                for g in &arm.guards {
+                    out.push(g);
+                }
+                out.push(&arm.body);
+            }
+        }
+        ExprKind::Is { expr, .. } => out.push(expr.as_ref()),
+        ExprKind::Lambda { body, .. } => out.push(body.as_ref()),
+        ExprKind::Record { fields, .. } => {
+            for (_, v) in fields {
+                out.push(v);
+            }
+        }
+        ExprKind::RecordUpdate { base, updates } => {
+            out.push(base.as_ref());
+            for (_, v) in updates {
+                out.push(v);
+            }
+        }
+        ExprKind::FieldAccess { record, .. } => out.push(record.as_ref()),
+        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
+            for e in elems {
+                out.push(e);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            out.push(receiver.as_ref());
+            for a in args {
+                out.push(a);
+            }
+        }
+        ExprKind::Closure { captures, .. } => {
+            for c in captures {
+                out.push(c);
+            }
+        }
+        ExprKind::Name(_)
+        | ExprKind::IntLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::StrLit(_) => {}
+    }
+    out
 }
 
 /// Replace references to captured variables with their corresponding

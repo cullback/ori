@@ -856,7 +856,7 @@ fn mangle(orig: &str, args: &[Type]) -> String {
     out
 }
 
-fn append_type_mangling(out: &mut String, ty: &Type) {
+pub(crate) fn append_type_mangling(out: &mut String, ty: &Type) {
     match ty {
         Type::Var(_) => out.push('?'),
         Type::Con(name) => out.push_str(name),

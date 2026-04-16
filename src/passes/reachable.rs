@@ -155,13 +155,28 @@ pub fn compute(
 }
 
 fn is_list_walk(name: &str) -> bool {
-    let base = name
+    // Strip the walk-apply acc-type mangle (`__<sig>`) so specialized
+    // walk callee names still classify. Kept in sync with
+    // `lambda_solve::is_list_walk` and `ssa::lower::classify_walk`.
+    let core = name.split("__").next().unwrap_or(name);
+    let base = core
         .strip_prefix("List.")
-        .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest));
+        .or_else(|| core.rsplit_once(".List.").map(|(_, rest)| rest));
     matches!(
         base,
         Some("walk" | "walk_until")
     )
+}
+
+/// Build the same apply-function name that `lambda_solve` /
+/// `ssa::lower::walk_apply_name` produce so reachability marks the
+/// per-step-type apply variant as live. Keyed on the step function's
+/// full `Arrow` type to match `walk_call_key`.
+fn walk_apply_ref(callee: &str, step_ty: &crate::types::engine::Type) -> String {
+    let mut key = callee.to_owned();
+    key.push_str("__");
+    crate::passes::mono::append_type_mangling(&mut key, step_ty);
+    format!("__apply_{key}_2")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -189,14 +204,16 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) 
             // corresponding `__apply_{mangled}_2` function that
             // defunc synthesized. That call doesn't show up in the
             // AST — it's emitted directly at lower time — so reachable
-            // has to be told explicitly.
-            if is_list_walk(&joined) {
-                refs.push(format!("__apply_{joined}_2"));
+            // has to be told explicitly. The apply name embeds the
+            // step function's type, which is args[2] in the
+            // qualified form `List.walk(xs, init, f)`.
+            if is_list_walk(&joined) && args.len() >= 3 {
+                refs.push(walk_apply_ref(&joined, &args[2].ty));
             }
             refs.push(joined);
             if let Some(r) = resolved {
-                if is_list_walk(r) {
-                    refs.push(format!("__apply_{r}_2"));
+                if is_list_walk(r) && args.len() >= 3 {
+                    refs.push(walk_apply_ref(r, &args[2].ty));
                 }
                 refs.push(r.clone());
             }
@@ -266,8 +283,9 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) 
         } => {
             collect_refs(receiver, refs, symbols);
             if let Some(r) = resolved {
-                if is_list_walk(r) {
-                    refs.push(format!("__apply_{r}_2"));
+                // Method form: `xs.walk(init, f)` — `f` at args[1].
+                if is_list_walk(r) && args.len() >= 2 {
+                    refs.push(walk_apply_ref(r, &args[1].ty));
                 }
                 refs.push(r.clone());
             }

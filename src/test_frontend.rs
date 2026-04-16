@@ -70,12 +70,11 @@ fn validate_after(module: &crate::ssa::Module, pass: &str) {
             report.error_summary()
         );
     }
-    // Set ORI_VALIDATE_WARN=1 to see soft validation issues
-    // (type lies, orphan value_types entries, etc.) during tests.
-    if std::env::var_os("ORI_VALIDATE_WARN").is_some() {
-        for w in &report.warnings {
-            eprintln!("[validate warn after {pass}] {w}");
-        }
+    if !report.warnings.is_empty() {
+        panic!(
+            "SSA soft-validation warnings after pass '{pass}':\n{}",
+            report.warnings.join("\n")
+        );
     }
 }
 

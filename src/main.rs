@@ -50,19 +50,22 @@ fn compile(
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = ssa::lower::lower(&mono, &resolved.fields)?;
-    let validate = std::env::var_os("ORI_VALIDATE").is_some();
+    // Validate unconditionally between passes. The IR is clean across
+    // every pass now (0 structural errors, 0 soft warnings), and we
+    // want any regression to surface immediately. Can be revisited
+    // far later to trade off compile time once the IR stabilizes.
     let check = |m: &ssa::Module, pass: &str| {
-        if validate {
-            let r = ssa::validate::validate(m);
-            if !r.is_clean() {
-                eprintln!("SSA validation failed after '{pass}':\n{}", r.error_summary());
-                process::exit(1);
-            }
-            if std::env::var_os("ORI_VALIDATE_WARN").is_some() {
-                for w in &r.warnings {
-                    eprintln!("[validate warn after {pass}] {w}");
-                }
-            }
+        let r = ssa::validate::validate(m);
+        if !r.is_clean() {
+            eprintln!("SSA validation failed after '{pass}':\n{}", r.error_summary());
+            process::exit(1);
+        }
+        if !r.warnings.is_empty() {
+            eprintln!(
+                "SSA soft-validation warnings after '{pass}':\n{}",
+                r.warnings.join("\n")
+            );
+            process::exit(1);
         }
     };
     check(&ssa_module, "lower");

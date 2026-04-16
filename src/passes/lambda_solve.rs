@@ -21,9 +21,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Decl, Expr, ExprKind, Stmt};
 use crate::passes::decl_info::{self, method_key};
-use crate::passes::mono::Monomorphized;
+use crate::passes::mono::{append_type_mangling, Monomorphized};
 use crate::passes::reachable;
 use crate::symbol::{SymbolId, SymbolTable};
+use crate::types::engine::Type;
 
 // ---- Public types ----
 
@@ -298,10 +299,18 @@ fn scan_expr(ctx: &mut Ctx<'_>, expr: &Expr<'_>) {
             }
             for a in args { scan_expr(ctx, a); }
         }
-        ExprKind::QualifiedCall { segments, args, .. } => {
-            let mangled = segments.join(".");
+        ExprKind::QualifiedCall { segments, args, resolved } => {
+            // Prefer the monomorphized `resolved` name over the
+            // unmangled segments: mono rewrites each call to a
+            // specific monomorph, and keying lambda sets by the
+            // mono'd name keeps sets type-coherent. Two walks at
+            // different element types get separate dispatchers
+            // instead of sharing one apply with mixed returns.
+            let mangled = resolved.clone().unwrap_or_else(|| segments.join("."));
+            // Qualified form: `List.walk(xs, init, f)` — `f` at args[2].
+            let key = walk_call_key(&mangled, args.get(2).map(|a| &a.ty));
             if is_list_walk(&mangled) || ctx.funcs.contains(&mangled) {
-                scan_call_args(ctx, &mangled, args, 0);
+                scan_call_args(ctx, &key, args, 0);
             } else {
                 for a in args { scan_expr(ctx, a); }
             }
@@ -310,9 +319,16 @@ fn scan_expr(ctx: &mut Ctx<'_>, expr: &Expr<'_>) {
             scan_expr(ctx, receiver);
             if let Some(target) = resolved.as_deref() {
                 if is_list_walk(target) || ctx.funcs.contains(target) {
-                    // Check receiver at position 0.
-                    scan_call_args(ctx, target, std::slice::from_ref(receiver.as_ref()), 0);
-                    scan_call_args(ctx, target, args, 1);
+                    // `List.walk` is a compiler intrinsic with no
+                    // body, so mono can't specialize it — all walks
+                    // share the unmangled callee name by default.
+                    // Disambiguate by the step function's full type
+                    // (`(acc, elem) -> acc`) so walks at different
+                    // acc OR elem types land in separate lambda sets.
+                    // Method form: `xs.walk(init, f)` — `f` at args[1].
+                    let key = walk_call_key(target, args.get(1).map(|a| &a.ty));
+                    scan_call_args(ctx, &key, std::slice::from_ref(receiver.as_ref()), 0);
+                    scan_call_args(ctx, &key, args, 1);
                 } else {
                     for a in args { scan_expr(ctx, a); }
                 }
@@ -609,7 +625,29 @@ fn find_missing(ctx: &Ctx<'_>, expr: &Expr<'_>, out: &mut Vec<(SymbolId, Vec<Sym
 }
 
 fn is_list_walk(name: &str) -> bool {
-    let base = name.strip_prefix("List.")
-        .or_else(|| name.rsplit_once(".List.").map(|(_, r)| r));
+    // Monomorphization appends `__<type-signature>` to the base name,
+    // e.g. `List.walk__I64_I64`. Strip that suffix before matching.
+    let core = name.split("__").next().unwrap_or(name);
+    let base = core.strip_prefix("List.")
+        .or_else(|| core.rsplit_once(".List.").map(|(_, r)| r));
     matches!(base, Some("walk" | "walk_until"))
+}
+
+/// Build a lambda-set key for a walk call. Appends the step
+/// function's full type (`(acc, elem) -> acc`) to the callee name
+/// when the callee is a list walk, keeping different-typed walks in
+/// separate lambda sets. Keying on the step's whole `Arrow` discriminates
+/// both accumulator type AND element type — two walks with the same
+/// acc but different elem types would otherwise collide.
+fn walk_call_key(callee: &str, step_ty: Option<&Type>) -> String {
+    if !is_list_walk(callee) {
+        return callee.to_owned();
+    }
+    let Some(ty) = step_ty else {
+        return callee.to_owned();
+    };
+    let mut key = callee.to_owned();
+    key.push_str("__");
+    append_type_mangling(&mut key, ty);
+    key
 }

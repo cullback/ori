@@ -120,9 +120,24 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.scalar_type(&expr.ty)
     }
 
-    /// Resolve a type to its SSA scalar type, aware of fieldless tag unions.
+    /// Resolve a type to its SSA scalar type, aware of fieldless tag
+    /// unions and transparent aliases. Transparent resolution matters
+    /// for `Foo := I64`-style declarations, where `Foo` must lower to
+    /// `I64`, not `Ptr`, to keep merge/return types honest.
+    ///
+    /// Composite types (records/tuples/packable tag unions) are NOT
+    /// reported as `Agg(n)` here even when `lower_constructor_call`
+    /// emits a `Pack` for a freshly-built value. A type `{val: I64}`
+    /// loaded out of a heap slot is actually a `Ptr` at runtime (the
+    /// store boxed it), so declaring it `Agg` would mislead consumers
+    /// that emit `Extract` based on the declared type. The freshly-
+    /// packed register representation is handled locally by callers
+    /// that observe `can_pack`; the `Agg→Ptr` mismatches that result
+    /// at terminator boundaries are boxed inline by the builder so
+    /// the emitted IR is already type-honest.
     fn scalar_type(&self, ty: &Type) -> ScalarType {
-        resolve_scalar_type(ty, &self.decls.fieldless_tags)
+        let unwrapped = self.resolve_transparent(ty);
+        resolve_scalar_type(&unwrapped, &self.decls.fieldless_tags)
     }
 
     /// Emit a constant for a fieldless tag index using the appropriate discriminant type.
@@ -140,6 +155,28 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .get(name)
             .copied()
             .unwrap_or(ScalarType::Ptr)
+    }
+
+    /// Emit a dummy value of the given scalar type for statically
+    /// unreachable merge paths. The IR needs a well-typed arg at the
+    /// terminator even when the path can't execute.
+    fn dummy_of(&mut self, ty: ScalarType) -> Value {
+        match ty {
+            ScalarType::I8 => self.builder.const_i8(0),
+            ScalarType::U8 => self.builder.const_u8(0),
+            ScalarType::I16 => self.builder.const_i16(0),
+            ScalarType::U16 => self.builder.const_u16(0),
+            ScalarType::I32 => self.builder.const_i32(0),
+            ScalarType::U32 => self.builder.const_u32(0),
+            ScalarType::I64 => self.builder.const_i64(0),
+            ScalarType::U64 => self.builder.const_u64(0),
+            ScalarType::F64 => self.builder.const_f64(0.0),
+            ScalarType::Ptr => self.builder.const_ptr_null(),
+            ScalarType::Agg(n) => {
+                let fields: Vec<Value> = (0..n).map(|_| self.builder.const_u64(0)).collect();
+                self.builder.pack(fields)
+            }
+        }
     }
 
     // ---- Field slot computation ----
@@ -265,14 +302,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         // don't have schemes — they default to all-`Ptr`, which is
         // correct since closures carry type-erased captures and
         // arguments.
-        let fieldless = &self.decls.fieldless_tags;
         let param_types: Vec<ScalarType> = self
             .infer
             .func_schemes
             .get(name)
             .map(|scheme| match &scheme.ty {
                 Type::Arrow(params, _) => {
-                    params.iter().map(|t| resolve_scalar_type(t, fieldless)).collect()
+                    params.iter().map(|t| self.scalar_type(t)).collect()
                 }
                 _ => vec![ScalarType::Ptr; param_syms.len()],
             })
@@ -283,11 +319,33 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             self.vars.insert(*p, v);
         }
 
+        // Set the return type BEFORE lowering the body so `ret` can
+        // coerce its operand (e.g. Agg→Ptr) when it fires from inside
+        // nested expressions (`if ... then return ... else ...`).
+        // Synthesized functions without schemes fall back to Ptr here;
+        // we patch to the actual produced value's type once the body
+        // is lowered.
+        let scheme_ret_ty = self.func_ret_type(name);
+        let has_scheme = self.infer.func_schemes.contains_key(name);
+        self.builder.set_return_type(scheme_ret_ty);
+
         let entry = self.builder.create_block();
         self.builder.switch_to(entry);
         let result = self.lower_expr(body);
+        let return_type = if has_scheme {
+            scheme_ret_ty
+        } else {
+            self.builder
+                .value_types
+                .get(&result)
+                .copied()
+                .unwrap_or(ScalarType::Ptr)
+        };
+        // Refine the declared return type for scheme-less synth
+        // functions before emitting the final `ret`, so `ret`'s
+        // coercion check uses the same type the function claims.
+        self.builder.set_return_type(return_type);
         self.builder.ret(result);
-        let return_type = self.func_ret_type(name);
         self.builder.finish_function(name, return_type);
 
         self.builder.func = saved_func;
@@ -733,11 +791,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let ret_ty = self.func_ret_type(resolved_name);
             return self.builder.call(resolved_name, arg_vals, ret_ty);
         }
-        // Plain static qualified call: treat segments.join(".") as
-        // the callable name and route through `lower_call`. Pass the
-        // outer expression's type so any structural constructor at
-        // the tail of the call gets the right layout.
-        let mangled = segments.join(".");
+        // Plain static qualified call: prefer the mono'd `resolved`
+        // name so apply-function dispatch and walk classification see
+        // the per-monomorphization callable name (e.g.
+        // `List.walk__I64_I64`). Falling back to segments keeps pre-
+        // mono shapes working.
+        let mangled = resolved.clone().unwrap_or_else(|| segments.join("."));
         self.lower_call(&mangled, args, &outer.ty)
     }
 
@@ -768,7 +827,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let acc_ty = self.expr_scalar_type(&args[0]);
                 let direct = self.resolve_closure_target(&args[1]);
                 let closure_val = self.lower_expr(&args[1]);
-                let apply_name = format!("__apply_{mangled}_2");
+                let apply_name = walk_apply_name(&mangled, &args[1].ty);
                 return self.lower_range_walk(
                     start, end, init_val, closure_val, &apply_name,
                     walk.until, acc_ty, direct,
@@ -827,7 +886,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let acc_ty = self.expr_scalar_type(&args[0]);
             let direct = self.resolve_closure_target(&args[1]);
             let closure_val = self.lower_expr(&args[1]);
-            let apply_name = format!("__apply_{mangled}_2");
+            let apply_name = walk_apply_name(&mangled, &args[1].ty);
             return self.lower_list_walk(
                 recv_val,
                 init_val,
@@ -868,7 +927,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let acc_ty = self.expr_scalar_type(&args[1]);
             let direct = self.resolve_closure_target(&args[2]);
             let closure_val = self.lower_expr(&args[2]);
-            let apply_name = format!("__apply_{func}_2");
+            let apply_name = walk_apply_name(func, &args[2].ty);
             // Deforestation: List.walk(List.range(a, b), init, f) → counter loop.
             if let Some((start, end)) = self.as_range_call(&args[0]) {
                 return self.lower_range_walk(
@@ -888,10 +947,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             );
         }
         if func == "crash" {
+            // Crash diverges, so its return is never observed at
+            // runtime. Typing it as the caller's expected result type
+            // keeps merge/return type agreement honest in the IR.
             let msg_val = self.lower_expr(&args[0]);
-            return self
-                .builder
-                .call("__crash", vec![msg_val], ScalarType::Ptr);
+            let ret_ty = self.scalar_type(result_ty);
+            return self.builder.call("__crash", vec![msg_val], ret_ty);
         }
         if Self::is_list_builtin(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -1008,13 +1069,58 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// declaration) compute layout from the provided `ctx_ty`, which
     /// must be a closed `Type::TagUnion`. Tag index is the
     /// constructor's position in the sorted tag list.
+    /// Given a constructor name and a concrete scrutinee type, derive
+    /// the specialized payload types by matching the constructor
+    /// scheme's return type against `ctx_ty` and substituting type
+    /// variables. Returns `None` when the scrutinee's shape doesn't
+    /// match the scheme (should not happen for type-correct programs,
+    /// but we fall back to the declared meta in that case).
+    fn specialize_con_fields(&self, con_name: &str, ctx_ty: &Type) -> Option<Vec<ScalarType>> {
+        let scheme = self.decls.constructor_schemes.get(con_name)?;
+        let Type::Arrow(params, ret) = &scheme.ty else {
+            return None;
+        };
+        let resolved_ctx = self.resolve_transparent(ctx_ty);
+        let (scheme_args, ctx_args) = match (ret.as_ref(), &resolved_ctx) {
+            (Type::App(sn, sa), Type::App(cn, ca)) if sn == cn && sa.len() == ca.len() => {
+                (sa, ca)
+            }
+            (Type::Con(sn), Type::Con(cn)) if sn == cn => {
+                return Some(
+                    params.iter().map(|p| self.scalar_type(p)).collect(),
+                );
+            }
+            // Scheme's return is a bare TagUnion (unusual) or shapes
+            // don't line up — punt to the caller's fallback.
+            _ => return None,
+        };
+        let mut specialized_params: Vec<Type> = params.to_vec();
+        for (sa, ca) in scheme_args.iter().zip(ctx_args) {
+            if let Type::Var(v) = sa {
+                specialized_params = specialized_params
+                    .iter()
+                    .map(|p| substitute_type_var(p, *v, ca))
+                    .collect();
+            }
+        }
+        Some(specialized_params.iter().map(|p| self.scalar_type(p)).collect())
+    }
+
     fn con_layout(
         &self,
         name: &str,
         ctx_ty: Option<&Type>,
     ) -> (u64, usize, Vec<ScalarType>) {
+        // Field types stored in `decl_info.constructors` come from the
+        // polymorphic declared scheme, so a generic parameter like `ok`
+        // in `Ok : ok -> Result(ok, err)` resolves to `Ptr`. The
+        // monomorphized call site knows the concrete payload types via
+        // `ctx_ty`; use them to override, while keeping the declared
+        // meta's tag_index (declaration order) and max_fields.
+        let specialized = ctx_ty.and_then(|ty| self.specialize_con_fields(name, ty));
         if let Some(meta) = self.decls.constructors.get(name) {
-            return (meta.tag_index, meta.max_fields, meta.field_types.clone());
+            let fields = specialized.unwrap_or_else(|| meta.field_types.clone());
+            return (meta.tag_index, meta.max_fields, fields);
         }
         let ty = ctx_ty.unwrap_or_else(|| {
             panic!("structural constructor '{name}' without context type")
@@ -1742,8 +1848,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let else_val = self.lower_expr(eb);
             self.builder.jump(merge, vec![else_val]);
         } else {
-            // No else — unreachable. Jump with a dummy value.
-            let dummy = self.builder.const_i64(0);
+            // No else — unreachable. Jump with a dummy value of the
+            // right type so the merge param types stay honest.
+            let dummy = self.dummy_of(result_ty);
             self.builder.jump(merge, vec![dummy]);
         }
 
@@ -1795,6 +1902,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder
             .switch_int(tag, switch_arms, else_block.map(|b| (b, vec![])));
 
+        // Dead-fallthrough sink: when there's no `else` body but some
+        // arm has guards, the last guard-chain needs a well-typed
+        // target to fall through to. That target is statically
+        // unreachable (the match is exhaustive), but the IR still
+        // needs a valid block with the right arg count to merge.
+        // Created lazily since matches without guards don't need it.
+        let mut unreachable_sink: Option<BlockId> = None;
+
         for (i, arm) in arms.iter().enumerate() {
             let ast::Pattern::Constructor {
                 name: con_name,
@@ -1822,7 +1937,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
 
             if !arm.guards.is_empty() {
-                let default_fail = else_block.unwrap_or(merge);
+                let default_fail = if let Some(eb) = else_block {
+                    eb
+                } else {
+                    *unreachable_sink.get_or_insert_with(|| {
+                        let saved = self.builder.current_block;
+                        let sink = self.builder.create_block();
+                        self.builder.switch_to(sink);
+                        let dummy = self.dummy_of(result_ty);
+                        self.builder.jump(merge, vec![dummy]);
+                        self.builder.current_block = saved;
+                        sink
+                    })
+                };
                 self.lower_guards(
                     &arm.guards,
                     i,
@@ -1930,9 +2057,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
             call_args.push(acc_param);
             call_args.push(elem);
-            self.builder.call(&st.target_func, call_args, ScalarType::Ptr)
+            let ret_ty = self.func_ret_type(&st.target_func);
+            self.builder.call(&st.target_func, call_args, ret_ty)
         } else {
-            self.builder.call(apply_name, vec![step_val, acc_param, elem], ScalarType::Ptr)
+            let ret_ty = self.func_ret_type(apply_name);
+            self.builder.call(apply_name, vec![step_val, acc_param, elem], ret_ty)
         };
 
         let one = self.builder.const_u64(1);
@@ -2000,10 +2129,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
             call_args.push(acc_param);
             call_args.push(elem);
-            self.builder.call(&st.target_func, call_args, ScalarType::Ptr)
+            let ret_ty = self.func_ret_type(&st.target_func);
+            self.builder.call(&st.target_func, call_args, ret_ty)
         } else {
-            self.builder
-                .call(apply_name, vec![step_val, acc_param, elem], ScalarType::Ptr)
+            let ret_ty = self.func_ret_type(apply_name);
+            self.builder.call(apply_name, vec![step_val, acc_param, elem], ret_ty)
         };
 
         let one = self.builder.const_u64(1);
@@ -2205,19 +2335,36 @@ fn lower_to_ssa<'src>(
     let params = main_params.ok_or_else(|| CompileError::new("no 'main' function defined"))?;
     let body = main_body.unwrap();
 
+    // Declared param types from the scheme, falling back to Ptr for
+    // synthesized mains without schemes. Using the scheme keeps the
+    // declared param types honest for scalar `main : I64 -> I64`
+    // tests; runtime callers that pass `Ptr` (e.g. the CLI harness
+    // for `List(List(U8)) -> ...` mains) already match the declared
+    // types for their common case.
+    let main_param_tys: Vec<ScalarType> = ctx
+        .infer
+        .func_schemes
+        .get("main")
+        .and_then(|s| match &s.ty {
+            Type::Arrow(ps, _) => Some(ps.iter().map(|t| ctx.scalar_type(t)).collect()),
+            _ => None,
+        })
+        .unwrap_or_else(|| vec![ScalarType::Ptr; params.len()]);
     let main_ssa_params: Vec<Value> = params
         .iter()
-        .map(|p| {
-            let v = ctx.builder.add_func_param(ScalarType::Ptr);
+        .zip(&main_param_tys)
+        .map(|(p, &ty)| {
+            let v = ctx.builder.add_func_param(ty);
             ctx.vars.insert(*p, v);
             v
         })
         .collect();
+    let main_ret_ty = ctx.func_ret_type("main");
+    ctx.builder.set_return_type(main_ret_ty);
     let entry = ctx.builder.create_block();
     ctx.builder.switch_to(entry);
     let result = ctx.lower_expr(&body);
     ctx.builder.ret(result);
-    let main_ret_ty = ctx.func_ret_type("main");
     ctx.builder.finish_function("__main", main_ret_ty);
 
     let ssa_module = ctx.builder.build("__main");
@@ -2274,14 +2421,30 @@ fn structural_con_layout(
 }
 
 fn classify_walk(name: &str) -> Option<WalkKind> {
-    let base = name
+    // Strip the mono suffix (`__<sig>`) so specialized walks like
+    // `List.walk__I64_I64` still classify as `walk`.
+    let core = name.split("__").next().unwrap_or(name);
+    let base = core
         .strip_prefix("List.")
-        .or_else(|| name.rsplit_once(".List.").map(|(_, rest)| rest))?;
+        .or_else(|| core.rsplit_once(".List.").map(|(_, rest)| rest))?;
     match base {
         "walk" => Some(WalkKind { until: false }),
         "walk_until" => Some(WalkKind { until: true }),
         _ => None,
     }
+}
+
+/// Build the apply-function name for a walk call. Mirrors the
+/// `walk_call_key` logic in `lambda_solve`: appends the step
+/// function's full `Arrow` type to the callee so specialized walks
+/// get their own per-type apply dispatchers. `List.walk` is an
+/// intrinsic (no body to monomorphize), so without this all walks
+/// would share a single apply with type-incoherent arm returns.
+fn walk_apply_name(callee: &str, step_ty: &Type) -> String {
+    let mut key = callee.to_owned();
+    key.push_str("__");
+    crate::passes::mono::append_type_mangling(&mut key, step_ty);
+    format!("__apply_{key}_2")
 }
 
 /// Emit a call to one of the built-in list intrinsics

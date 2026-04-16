@@ -2,6 +2,25 @@ use super::{Block, Function, Module};
 use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 use std::collections::{BTreeMap, HashMap};
 
+/// `jump`/`branch`/`switch_int`/`ret` coerce `Agg(n)` arguments flowing
+/// to `Ptr`-typed sinks by boxing them here. Keeping the boxing at the
+/// terminator site means the emitted IR is already type-honest — no
+/// separate post-lowering coerce pass needed.
+///
+/// Only Agg→Ptr is handled: the runtime's pack side-table already
+/// tolerates the mismatch, so boxing is behavior-preserving. Scalar
+/// mismatches (Ptr↔I64 etc.) indicate upstream type lies and are
+/// surfaced by the validator rather than silently papered over.
+fn coerce_kind(src: ScalarType, dst: ScalarType) -> Option<usize> {
+    if dst != ScalarType::Ptr {
+        return None;
+    }
+    match src {
+        ScalarType::Agg(n) => Some(n),
+        _ => None,
+    }
+}
+
 /// Block under construction — no terminator yet.
 pub struct PendingBlock {
     pub params: Vec<Value>,
@@ -16,6 +35,10 @@ pub struct FuncBuilder {
     /// Function parameters, in declaration order. Types live in
     /// `Builder::value_types`. Populated via `add_func_param`.
     pub params: Vec<Value>,
+    /// Function return type, set before lowering the body so `ret`
+    /// can coerce the returned value if its type doesn't match.
+    /// `None` during the brief window between `new` and `start_function`.
+    pub return_type: Option<ScalarType>,
 }
 
 impl FuncBuilder {
@@ -25,6 +48,7 @@ impl FuncBuilder {
             finished: BTreeMap::new(),
             next_block: 0,
             params: Vec::new(),
+            return_type: None,
         }
     }
 }
@@ -229,13 +253,25 @@ impl Builder {
     //
     // Each terminator method finalizes the current block: it takes the
     // pending block, combines it with the terminator to produce a
-    // complete Block, and moves it into the finished map.
+    // complete Block, and moves it into the finished map. Args are
+    // coerced in-line for `Agg→Ptr` edges so the emitted IR matches
+    // declared types without needing a later cleanup pass.
+
+    pub fn set_return_type(&mut self, ty: ScalarType) {
+        self.func.return_type = Some(ty);
+    }
 
     pub fn ret(&mut self, value: Value) {
-        self.seal(Terminator::Return(value));
+        let ret_ty = self.func.return_type;
+        let coerced = match ret_ty {
+            Some(ty) => self.coerce_to(value, ty),
+            None => value,
+        };
+        self.seal(Terminator::Return(coerced));
     }
 
     pub fn jump(&mut self, target: BlockId, args: Vec<Value>) {
+        let args = self.coerce_args(target, args);
         self.seal(Terminator::Jump(target, args));
     }
 
@@ -247,6 +283,8 @@ impl Builder {
         else_block: BlockId,
         else_args: Vec<Value>,
     ) {
+        let then_args = self.coerce_args(then_block, then_args);
+        let else_args = self.coerce_args(else_block, else_args);
         self.seal(Terminator::Branch {
             cond,
             then_block,
@@ -262,11 +300,65 @@ impl Builder {
         arms: Vec<(u64, BlockId, Vec<Value>)>,
         default: Option<(BlockId, Vec<Value>)>,
     ) {
+        let arms = arms
+            .into_iter()
+            .map(|(v, bid, args)| (v, bid, self.coerce_args(bid, args)))
+            .collect();
+        let default = default.map(|(bid, args)| (bid, self.coerce_args(bid, args)));
         self.seal(Terminator::SwitchInt {
             scrutinee,
             arms,
             default,
         });
+    }
+
+    fn coerce_args(&mut self, target: BlockId, args: Vec<Value>) -> Vec<Value> {
+        let param_tys = self.block_param_types(target);
+        if param_tys.len() != args.len() {
+            // Dead fallthrough in match lowering passes mismatched
+            // counts on purpose. Let the validator flag it rather
+            // than guessing which positions to coerce.
+            return args;
+        }
+        args.into_iter()
+            .zip(param_tys)
+            .map(|(v, ty)| self.coerce_to(v, ty))
+            .collect()
+    }
+
+    fn block_param_types(&self, bid: BlockId) -> Vec<ScalarType> {
+        let params: &[Value] = if let Some(b) = self.func.pending.get(&bid) {
+            &b.params
+        } else if let Some(b) = self.func.finished.get(&bid) {
+            &b.params
+        } else {
+            return Vec::new();
+        };
+        params
+            .iter()
+            .map(|p| *self.value_types.get(p).unwrap_or(&ScalarType::Ptr))
+            .collect()
+    }
+
+    fn coerce_to(&mut self, value: Value, dst_ty: ScalarType) -> Value {
+        let src_ty = match self.value_types.get(&value) {
+            Some(t) => *t,
+            None => return value,
+        };
+        let Some(n) = coerce_kind(src_ty, dst_ty) else {
+            return value;
+        };
+        // Box the Agg(n) into a heap Ptr via Alloc + Extracts + Stores.
+        // The extracted field types don't affect runtime — Extract
+        // reads the pack side-table — so use U64 as a placeholder.
+        let ptr = self.fresh_value(ScalarType::Ptr);
+        self.push(Inst::Alloc(ptr, n));
+        for i in 0..n {
+            let field = self.fresh_value(ScalarType::U64);
+            self.push(Inst::Extract(field, value, i));
+            self.push(Inst::Store(ptr, i, field));
+        }
+        ptr
     }
 
     // ---- Function building ----
@@ -281,6 +373,11 @@ impl Builder {
             self.func.pending.len(),
         );
         let fb = std::mem::replace(&mut self.func, FuncBuilder::new());
+        let declared_ret = fb.return_type.unwrap_or(return_type);
+        debug_assert!(
+            declared_ret == return_type,
+            "finish_function({name}): return type mismatch (set_return_type={declared_ret:?}, finish_function arg={return_type:?})"
+        );
         let value_types = std::mem::take(&mut self.value_types);
         let param_types = fb.params
             .iter()
@@ -297,7 +394,7 @@ impl Builder {
                 params: fb.params,
                 blocks: fb.finished,
                 param_types,
-                return_type,
+                return_type: declared_ret,
                 value_types,
                 entry: BlockId(0),
                 next_block: fb.next_block,

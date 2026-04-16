@@ -765,7 +765,14 @@ impl ParseCtx {
         let final_body = if destructures.is_empty() {
             body
         } else {
-            Expr::new(ExprKind::Block(destructures, Box::new(body)), span)
+            // Use the body's own span (not the lambda's) so the
+            // synthesized Block doesn't collide with the Lambda in the
+            // span-keyed `expr_types` map. Without this, the Block
+            // inherits the Arrow-typed Lambda entry and lambda_lift
+            // then synthesizes a garbage `Arrow(...) -> Arrow(...)`
+            // scheme for the lifted function.
+            let body_span = body.span;
+            Expr::new(ExprKind::Block(destructures, Box::new(body)), body_span)
         };
 
         Expr::new(
@@ -825,14 +832,21 @@ impl ParseCtx {
             .unwrap_or_default();
         let param: &'static str =
             Box::leak(format!("__dot_{}", span.start).into_boxed_str());
-        let receiver = Expr::new(ExprKind::Name(param), span);
+        // Bump the inner spans so the synthesized receiver, body, and
+        // outer Lambda don't all share the same span key in
+        // `expr_types` — a collision makes the MethodCall body inherit
+        // the Lambda's Arrow type, which then poisons the lifted
+        // function's scheme.
+        let receiver_span = Span { start: span.start + 1, ..span };
+        let body_span = Span { start: span.start + 2, ..span };
+        let receiver = Expr::new(ExprKind::Name(param), receiver_span);
         let body = Expr::new(
             ExprKind::MethodCall {
                 receiver: Box::new(receiver),
                 method,
                 args,
             },
-            span,
+            body_span,
         );
         Expr::new(
             ExprKind::Lambda {

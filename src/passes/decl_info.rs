@@ -16,7 +16,7 @@ use crate::ast::{self, Decl, TypeExpr};
 use crate::passes::mono::Monomorphized;
 use crate::ssa::ScalarType;
 use crate::symbol::SymbolTable;
-use crate::types::engine::{Scheme, Type};
+use crate::types::engine::{Scheme, Type, TypeVar};
 use crate::types::infer::InferResult;
 
 /// Build a mangled key for a method on a type, e.g. `method_key("List", "sum")` -> `"List.sum"`.
@@ -74,11 +74,72 @@ pub fn discriminant_type(num_variants: usize) -> ScalarType {
     }
 }
 
-/// Extract the return type from a function type scheme.
-fn scheme_return_type(scheme: &Scheme, fieldless: &HashMap<String, ScalarType>) -> ScalarType {
-    match &scheme.ty {
-        Type::Arrow(_, ret) => resolve_scalar_type(ret, fieldless),
-        other => resolve_scalar_type(other, fieldless),
+/// Extract the return type from a function type scheme, unwrapping
+/// transparent aliases so a `Foo := I64`-declared return surfaces as
+/// `I64` rather than `Ptr`.
+fn scheme_return_type(
+    scheme: &Scheme,
+    fieldless: &HashMap<String, ScalarType>,
+    transparent: &HashMap<String, (Vec<TypeVar>, Type)>,
+) -> ScalarType {
+    let ret = match &scheme.ty {
+        Type::Arrow(_, ret) => ret.as_ref().clone(),
+        other => other.clone(),
+    };
+    let unwrapped = unwrap_transparent(&ret, transparent);
+    resolve_scalar_type(&unwrapped, fieldless)
+}
+
+/// Resolve transparent type aliases (types declared with `:=`) to
+/// their underlying representation. Mirrors `LowerCtx::resolve_transparent`.
+fn unwrap_transparent(
+    ty: &Type,
+    transparent: &HashMap<String, (Vec<TypeVar>, Type)>,
+) -> Type {
+    match ty {
+        Type::App(name, args) => {
+            if let Some((params, underlying)) = transparent.get(name) {
+                let mut result = underlying.clone();
+                for (p, a) in params.iter().zip(args) {
+                    result = substitute_type_var(&result, *p, a);
+                }
+                unwrap_transparent(&result, transparent)
+            } else {
+                ty.clone()
+            }
+        }
+        Type::Con(name) => transparent
+            .get(name)
+            .map_or_else(|| ty.clone(), |(_, under)| unwrap_transparent(under, transparent)),
+        _ => ty.clone(),
+    }
+}
+
+fn substitute_type_var(ty: &Type, var: TypeVar, replacement: &Type) -> Type {
+    match ty {
+        Type::Var(v) if *v == var => replacement.clone(),
+        Type::App(name, args) => Type::App(
+            name.clone(),
+            args.iter().map(|a| substitute_type_var(a, var, replacement)).collect(),
+        ),
+        Type::Arrow(params, ret) => Type::Arrow(
+            params.iter().map(|p| substitute_type_var(p, var, replacement)).collect(),
+            Box::new(substitute_type_var(ret, var, replacement)),
+        ),
+        Type::Tuple(elems) => Type::Tuple(
+            elems.iter().map(|e| substitute_type_var(e, var, replacement)).collect(),
+        ),
+        Type::Record { fields, rest } => Type::Record {
+            fields: fields.iter().map(|(n, t)| (n.clone(), substitute_type_var(t, var, replacement))).collect(),
+            rest: rest.clone(),
+        },
+        Type::TagUnion { tags, rest } => Type::TagUnion {
+            tags: tags.iter().map(|(n, ps)| {
+                (n.clone(), ps.iter().map(|p| substitute_type_var(p, var, replacement)).collect())
+            }).collect(),
+            rest: rest.clone(),
+        },
+        _ => ty.clone(),
     }
 }
 
@@ -195,7 +256,7 @@ fn register_decl(
             info.funcs.insert(name_str.to_owned());
             info.func_arities.insert(name_str.to_owned(), params.len());
             if let Some(scheme) = infer_result.func_schemes.get(name_str) {
-                let ret = scheme_return_type(scheme, &info.fieldless_tags);
+                let ret = scheme_return_type(scheme, &info.fieldless_tags, &infer_result.transparent);
                 info.func_return_types.insert(name_str.to_owned(), ret);
             }
         }
@@ -220,7 +281,7 @@ fn register_method(
         info.funcs.insert(mangled.clone());
         info.func_arities.insert(mangled.clone(), params.len());
         if let Some(scheme) = infer_result.func_schemes.get(&mangled) {
-            let ret = scheme_return_type(scheme, &info.fieldless_tags);
+            let ret = scheme_return_type(scheme, &info.fieldless_tags, &infer_result.transparent);
             info.func_return_types.insert(mangled, ret);
         }
     }

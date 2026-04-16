@@ -32,6 +32,7 @@ use crate::passes::lambda_solve::{LambdaEntry, LambdaSet, LambdaSolution};
 use crate::passes::mono::Monomorphized;
 use crate::source::SourceArena;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
+use crate::types::engine::{Scheme, Type};
 
 /// Direct-call info for a singleton lambda set.
 pub struct SingletonTarget {
@@ -44,7 +45,12 @@ pub struct SingletonTarget {
 /// Specialize the module using the lambda set solution.
 pub fn specialize(mono: &mut Monomorphized<'_>, solution: &LambdaSolution) {
     let module = std::mem::take(&mut mono.module);
-    let (new_module, singletons, tag_targets) = specialize_module(module, solution, &mut mono.symbols);
+    let (new_module, singletons, tag_targets) = specialize_module(
+        module,
+        solution,
+        &mut mono.symbols,
+        &mut mono.infer.func_schemes,
+    );
     mono.module = new_module;
     mono.singletons = singletons;
     mono.tag_targets = tag_targets;
@@ -54,6 +60,7 @@ fn specialize_module<'src>(
     module: Module<'src>,
     solution: &LambdaSolution,
     symbols: &mut SymbolTable,
+    func_schemes: &mut HashMap<String, Scheme>,
 ) -> (Module<'src>, HashMap<String, SingletonTarget>, HashMap<String, SingletonTarget>) {
     // Allocate SymbolIds for all synthesized names.
     let alloc = allocate_symbols(solution, symbols);
@@ -81,7 +88,17 @@ fn specialize_module<'src>(
     let mut tag_targets = HashMap::new();
     for (ls_idx, ls) in solution.sets.iter().enumerate() {
         new_decls.push(build_closure_type(ls, &alloc, ls_idx));
-        new_decls.push(build_apply_function(ls, &alloc, ls_idx, symbols));
+        // Register the apply's scheme before building its body so
+        // `build_apply_function` can read back the concrete return
+        // type and tag the synthesized `If`/arm expressions with it.
+        register_apply_scheme(ls, symbols, func_schemes);
+        let apply_ret_ty = func_schemes
+            .get(&ls.apply_name)
+            .and_then(|s| match &s.ty {
+                Type::Arrow(_, r) => Some(r.as_ref().clone()),
+                _ => None,
+            });
+        new_decls.push(build_apply_function(ls, &alloc, ls_idx, symbols, apply_ret_ty));
         for entry in &ls.entries {
             let target_func = entry.func_ref.clone().unwrap_or_else(|| {
                 symbols.display(entry.lifted_func).to_owned()
@@ -184,11 +201,73 @@ fn build_closure_type<'src>(
 
 // ---- Apply function synthesis ----
 
+/// Register an `infer.func_schemes` entry for the synthesized apply
+/// dispatcher so downstream passes (`decl_info`, `ssa::lower`) pick up
+/// the real return and arg types instead of defaulting to `Ptr`.
+///
+/// The apply's shape is `(closure, arg0..argK-1) -> ret`, where
+/// `arg0..argK-1` and `ret` come from any entry's lifted scheme
+/// (stripping the capture-prefix params). Lambda sets are keyed by the
+/// unmangled callee name (`List.walk_2`), so a single set can collect
+/// entries from different monomorphizations with incompatible types
+/// (e.g. `List.walk__I64` expects `(I64, I64) -> I64` while
+/// `List.walk__List(I64)` expects `(List(I64), I64) -> List(I64)`). If
+/// entries disagree we punt — the apply's return stays `Ptr` (current
+/// default) and the runtime's dynamic `Scalar` tag keeps things going.
+fn register_apply_scheme(
+    ls: &LambdaSet,
+    symbols: &SymbolTable,
+    func_schemes: &mut HashMap<String, Scheme>,
+) {
+    let mut uniform: Option<(Vec<Type>, Type)> = None;
+    for entry in &ls.entries {
+        let lifted_name = entry
+            .func_ref
+            .clone()
+            .unwrap_or_else(|| symbols.display(entry.lifted_func).to_owned());
+        let Some(lifted_scheme) = func_schemes.get(&lifted_name) else {
+            return;
+        };
+        let Type::Arrow(lifted_params, lifted_ret) = &lifted_scheme.ty else {
+            return;
+        };
+        let num_captures = entry.captures.len();
+        if lifted_params.len() < num_captures {
+            return;
+        }
+        let arg_tys: Vec<Type> = lifted_params[num_captures..].to_vec();
+        let ret_ty = lifted_ret.as_ref().clone();
+        match &uniform {
+            None => uniform = Some((arg_tys, ret_ty)),
+            Some((a, r)) if a == &arg_tys && r == &ret_ty => {}
+            _ => return,
+        }
+    }
+    let Some((arg_tys, ret_ty)) = uniform else {
+        return;
+    };
+
+    // Closure param: reference the synthesized tag-union type by name.
+    // `scalar_type` will resolve it to `Ptr` (or the appropriate Agg/
+    // discriminant representation if packable) at lower time.
+    let closure_ty = Type::Con(ls.closure_type_name.clone());
+
+    let mut params = Vec::with_capacity(1 + arg_tys.len());
+    params.push(closure_ty);
+    params.extend(arg_tys);
+
+    func_schemes.insert(
+        ls.apply_name.clone(),
+        Scheme::mono(Type::Arrow(params, Box::new(ret_ty))),
+    );
+}
+
 fn build_apply_function<'src>(
     ls: &LambdaSet,
     alloc: &AllocatedSymbols,
     ls_idx: usize,
     symbols: &mut SymbolTable,
+    ret_ty: Option<Type>,
 ) -> Decl<'src> {
     let span = synth_span();
     let closure_param = symbols.fresh("__closure", span, SymbolKind::Local);
@@ -200,15 +279,24 @@ fn build_apply_function<'src>(
     all_params.push(closure_param);
     all_params.extend_from_slice(&arg_params);
 
-    let arms: Vec<MatchArm<'src>> = ls
+    let mut arms: Vec<MatchArm<'src>> = ls
         .entries
         .iter()
         .enumerate()
         .map(|(entry_idx, entry)| build_apply_arm(entry, &arg_params, alloc, ls_idx, entry_idx, symbols))
         .collect();
 
+    // Tag arm bodies and the If expression with the apply's declared
+    // return type so `ssa::lower` reads `result_ty` as the concrete
+    // scalar type instead of the placeholder `TypeVar(0) → Ptr`.
+    if let Some(ret) = &ret_ty {
+        for arm in &mut arms {
+            arm.body.ty = ret.clone();
+        }
+    }
+
     let scrutinee = Expr::new(ExprKind::Name(closure_param), span);
-    let body = Expr::new(
+    let mut body = Expr::new(
         ExprKind::If {
             expr: Box::new(scrutinee),
             arms,
@@ -216,6 +304,9 @@ fn build_apply_function<'src>(
         },
         span,
     );
+    if let Some(ret) = ret_ty {
+        body.ty = ret;
+    }
 
     Decl::FuncDef {
         span,
