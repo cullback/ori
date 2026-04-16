@@ -350,6 +350,9 @@ fn remap_inst(inst: &Inst, map: &HashMap<Value, Value>) -> Inst {
             args.iter().map(|v| remap_value(*v, map)).collect(),
         ),
         Inst::Alloc(d, sz) => Inst::Alloc(remap_value(*d, map), *sz),
+        Inst::AllocDyn(d, sz) => {
+            Inst::AllocDyn(remap_value(*d, map), remap_value(*sz, map))
+        }
         Inst::Load(d, ptr, off) => {
             Inst::Load(remap_value(*d, map), remap_value(*ptr, map), *off)
         }
@@ -374,6 +377,11 @@ fn remap_inst(inst: &Inst, map: &HashMap<Value, Value>) -> Inst {
         Inst::Reuse(d, tok, sz) => {
             Inst::Reuse(remap_value(*d, map), remap_value(*tok, map), *sz)
         }
+        Inst::ReuseDyn(d, tok, sz) => Inst::ReuseDyn(
+            remap_value(*d, map),
+            remap_value(*tok, map),
+            remap_value(*sz, map),
+        ),
         Inst::StaticRef(d, id) => Inst::StaticRef(remap_value(*d, map), *id),
         Inst::Pack(d, fields) => Inst::Pack(
             remap_value(*d, map),

@@ -150,6 +150,10 @@ impl fmt::Display for FmtInst<'_> {
                 let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
                 write!(f, "{d}: {dt} = alloc {size}")
             }
+            Inst::AllocDyn(d, size_val) => {
+                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                write!(f, "{d}: {dt} = alloc_dyn {}", fmt_val(*size_val, consts))
+            }
             Inst::Load(d, ptr, off) => {
                 let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
                 write!(f, "{d}: {dt} = load {}[{off}]", fmt_val(*ptr, consts))
@@ -169,6 +173,7 @@ impl fmt::Display for FmtInst<'_> {
             Inst::RcDec(ptr) => write!(f, "rc_dec {}", fmt_val(*ptr, consts)),
             Inst::Reset(d, ptr, _) => write!(f, "{d}: ptr = reset {}", fmt_val(*ptr, consts)),
             Inst::Reuse(d, tok, n) => write!(f, "{d}: ptr = reuse {}, {n}", fmt_val(*tok, consts)),
+            Inst::ReuseDyn(d, tok, n) => write!(f, "{d}: ptr = reuse_dyn {}, {}", fmt_val(*tok, consts), fmt_val(*n, consts)),
             Inst::StaticRef(d, id) => write!(f, "{d}: ptr = static_ref @{id}"),
             Inst::Pack(d, fields) => {
                 write!(f, "{d} = pack({})", fmt_args(fields, consts))

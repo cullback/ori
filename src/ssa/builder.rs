@@ -199,6 +199,12 @@ impl Builder {
         v
     }
 
+    pub fn alloc_dyn(&mut self, size_val: Value) -> Value {
+        let v = self.fresh_value(ScalarType::Ptr);
+        self.push(Inst::AllocDyn(v, size_val));
+        v
+    }
+
     pub fn load(&mut self, ptr: Value, offset: usize, ty: ScalarType) -> Value {
         let v = self.fresh_value(ty);
         self.push(Inst::Load(v, ptr, offset));

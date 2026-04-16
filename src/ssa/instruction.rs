@@ -74,6 +74,11 @@ pub enum Inst {
     Call(Value, String, Vec<Value>),
     /// dest = heap allocate `num_slots` scalar slots (refcount starts at 1).
     Alloc(Value, usize),
+    /// dest = heap allocate `num_slots_val` scalar slots (runtime size).
+    /// Used for `List` and other data whose size isn't known at lower time.
+    /// `insert_reuse` pairs this with a preceding `RcDec` the same way it
+    /// pairs `Alloc`, emitting `Reset` + `Reuse` when the reuse is safe.
+    AllocDyn(Value, Value),
     /// dest = read from `ptr` at static slot `offset`.
     Load(Value, Value, usize),
     /// Write `val` to `ptr` at static slot `offset`. No result.
@@ -93,6 +98,10 @@ pub enum Inst {
     /// dest = if token is non-null, reuse that memory. Otherwise
     /// allocate `num_slots` fresh slots.
     Reuse(Value, Value, usize),
+    /// dest = if token is non-null, reuse that memory (resized to
+    /// `num_slots_val`). Otherwise allocate fresh. Parallel to `Reuse`
+    /// but with a dynamic size.
+    ReuseDyn(Value, Value, Value),
     /// dest = pointer to a pre-allocated static object by index.
     /// The object lives in `Module::statics` and is never freed.
     StaticRef(Value, usize),
@@ -112,10 +121,12 @@ impl Inst {
             | Self::BinOp(v, _, _, _)
             | Self::Call(v, _, _)
             | Self::Alloc(v, _)
+            | Self::AllocDyn(v, _)
             | Self::Load(v, _, _)
             | Self::LoadDyn(v, _, _)
             | Self::Reset(v, _, _)
             | Self::Reuse(v, _, _)
+            | Self::ReuseDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
@@ -128,6 +139,7 @@ impl Inst {
     pub fn operands(&self) -> Vec<Value> {
         match self {
             Self::Const(..) | Self::Alloc(..) => vec![],
+            Self::AllocDyn(_, size) => vec![*size],
             Self::BinOp(_, _, lhs, rhs) => vec![*lhs, *rhs],
             Self::Call(_, _, args) => args.clone(),
             Self::Load(_, ptr, _) => vec![*ptr],
@@ -137,6 +149,7 @@ impl Inst {
             Self::RcInc(v) | Self::RcDec(v) => vec![*v],
             Self::Reset(_, ptr, _) => vec![*ptr],
             Self::Reuse(_, token, _) => vec![*token],
+            Self::ReuseDyn(_, token, size) => vec![*token, *size],
             Self::StaticRef(..) => vec![],
             Self::Pack(_, fields) => fields.clone(),
             Self::Extract(_, agg, _) => vec![*agg],

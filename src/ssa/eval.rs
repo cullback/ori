@@ -369,6 +369,12 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(idx))
         }
 
+        Inst::AllocDyn(_, size_val) => {
+            let size = scalar_to_usize(env[size_val.0]);
+            let idx = heap.alloc(size);
+            Some(Scalar::Ptr(idx))
+        }
+
         Inst::Load(_, ptr, offset) => {
             let Scalar::Ptr(idx) = env[ptr.0] else {
                 panic!("load from non-ptr: {:?}", env[ptr.0]);
@@ -447,21 +453,12 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
         }
 
         Inst::Reuse(_dest, token, num_slots) => {
-            if let Scalar::Ptr(idx) = env[token.0] {
-                if idx != 0 {
-                    // Reuse the existing allocation. Reset refcount to 1.
-                    heap.objects[idx].0 = 1;
-                    // Ensure enough slots (may already be the right size).
-                    let slots = &mut heap.objects[idx].1;
-                    slots.resize(*num_slots, Scalar::I64(0));
-                    Some(Scalar::Ptr(idx))
-                } else {
-                    // Token was null — allocate fresh.
-                    Some(Scalar::Ptr(heap.alloc(*num_slots)))
-                }
-            } else {
-                Some(Scalar::Ptr(heap.alloc(*num_slots)))
-            }
+            Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.0], *num_slots)))
+        }
+
+        Inst::ReuseDyn(_dest, token, size_val) => {
+            let size = scalar_to_usize(env[size_val.0]);
+            Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.0], size)))
         }
 
         Inst::Pack(dest, fields) => {
@@ -823,6 +820,19 @@ fn scalar_to_u64(s: Scalar) -> u64 {
         Scalar::Ptr(p) => p as u64,
         Scalar::F64(_) => panic!("switch on float"),
     }
+}
+
+/// Reuse a Reset-produced token for a new allocation, or allocate
+/// fresh when the token is null (shared object, reuse unsafe).
+fn reuse_or_alloc(heap: &mut Heap, token: Scalar, num_slots: usize) -> usize {
+    if let Scalar::Ptr(idx) = token {
+        if idx != 0 {
+            heap.objects[idx].0 = 1;
+            heap.objects[idx].1.resize(num_slots, Scalar::I64(0));
+            return idx;
+        }
+    }
+    heap.alloc(num_slots)
 }
 
 fn scalar_to_usize(s: Scalar) -> usize {

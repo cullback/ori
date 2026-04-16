@@ -588,12 +588,14 @@ fn is_side_effect(inst: &Inst) -> bool {
         inst,
         Inst::Call(..)
             | Inst::Alloc(..)
+            | Inst::AllocDyn(..)
             | Inst::Store(..)
             | Inst::StoreDyn(..)
             | Inst::RcInc(..)
             | Inst::RcDec(..)
             | Inst::Reset(..)
             | Inst::Reuse(..)
+            | Inst::ReuseDyn(..)
     )
 }
 
@@ -810,6 +812,13 @@ pub fn rewrite_operands(inst: &mut Inst, map: &std::collections::HashMap<Value, 
         }
         Inst::Reuse(_, tok, _) => {
             if let Some(&r) = map.get(tok) { *tok = r; }
+        }
+        Inst::ReuseDyn(_, tok, sz) => {
+            if let Some(&r) = map.get(tok) { *tok = r; }
+            if let Some(&r) = map.get(sz) { *sz = r; }
+        }
+        Inst::AllocDyn(_, sz) => {
+            if let Some(&r) = map.get(sz) { *sz = r; }
         }
         Inst::Pack(_, fields) => {
             for f in fields { if let Some(&r) = map.get(f) { *f = r; } }

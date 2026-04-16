@@ -147,83 +147,89 @@ fn insert_reuse_function(func: &mut Function) {
         .max()
         .unwrap_or(0);
 
+    // Track allocated values (static-size `Alloc` and dynamic-size
+    // `AllocDyn`) so a later `RcDec` can look them up for pairing.
+    // `Reuse` resizes the reused memory at runtime, so we don't need
+    // the dec'd object's size to match the new alloc's size — any
+    // Alloc/AllocDyn can pair with any RcDec of a heap-allocated value.
     for (_, block) in &func.blocks {
         for inst in &block.insts {
-            if let Inst::Alloc(dest, size) = inst {
-                alloc_sizes.insert(*dest, *size);
-                alloc_slot_types.insert(*dest, vec![ScalarType::Ptr; *size]);
-            }
-            if let Inst::Store(ptr, offset, val) = inst {
-                if let Some(slots) = alloc_slot_types.get_mut(ptr) {
-                    if let Some(ty) = func.value_types.get(val) {
-                        if *offset < slots.len() {
-                            slots[*offset] = *ty;
-                        }
-                    }
+            match inst {
+                Inst::Alloc(dest, size) => {
+                    alloc_sizes.insert(*dest, *size);
+                    alloc_slot_types.insert(*dest, vec![ScalarType::Ptr; *size]);
                 }
-            }
-            if let Inst::Call(_, _, args) = inst {
-                for arg in args {
-                    call_args.insert(*arg);
+                Inst::AllocDyn(dest, _) => {
+                    alloc_sizes.insert(*dest, 0);
+                    alloc_slot_types.insert(*dest, Vec::new());
                 }
-            }
-        }
-    }
-
-    // For each block, find RcDec(v) → Alloc(dest, size) patterns.
-    for (_, block) in &mut func.blocks {
-        let mut new_insts: Vec<Inst> = Vec::with_capacity(block.insts.len());
-        // Track which allocs have been claimed by a reset.
-
-        // First pass: find RcDec+Alloc pairs.
-        let mut reset_for_dec: HashMap<usize, (Value, Vec<ScalarType>)> = HashMap::new();
-        let mut reuse_for_alloc: HashMap<usize, Value> = HashMap::new();
-
-        // Find each RcDec and look for a matching Alloc after it.
-        for (i, inst) in block.insts.iter().enumerate() {
-            if let Inst::RcDec(ptr) = inst {
-                // Skip if this value was passed to a call — the callee
-                // may have stored it, creating hidden heap references
-                // that make the uniqueness check unreliable.
-                if call_args.contains(ptr) {
-                    continue;
-                }
-                let dec_size = alloc_sizes.get(ptr).copied();
-                if let Some(size) = dec_size {
-                    // Look for the first unclaimed Alloc of the same size.
-                    for (j, later) in block.insts[i + 1..].iter().enumerate() {
-                        let j = i + 1 + j;
-                        if let Inst::Alloc(_dest, alloc_size) = later {
-                            if *alloc_size == size && !reuse_for_alloc.contains_key(&j) {
-                                // Found a match. Create a fresh value for the token.
-                                let token = Value(next_value);
-                                next_value += 1;
-                                func.value_types.insert(token, ScalarType::Ptr);
-                                let slot_types = alloc_slot_types
-                                    .get(ptr)
-                                    .cloned()
-                                    .unwrap_or_else(|| vec![ScalarType::Ptr; size]);
-                                reset_for_dec.insert(i, (token, slot_types));
-                                reuse_for_alloc.insert(j, token);
-                                break;
+                Inst::Store(ptr, offset, val) => {
+                    if let Some(slots) = alloc_slot_types.get_mut(ptr) {
+                        if let Some(ty) = func.value_types.get(val) {
+                            if *offset < slots.len() {
+                                slots[*offset] = *ty;
                             }
                         }
                     }
                 }
+                Inst::Call(_, _, args) => {
+                    for arg in args {
+                        call_args.insert(*arg);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // For each block, find RcDec(v) → Alloc/AllocDyn patterns and
+    // rewrite to Reset/Reuse pairs.
+    for (_, block) in &mut func.blocks {
+        let mut new_insts: Vec<Inst> = Vec::with_capacity(block.insts.len());
+        let mut reset_for_dec: HashMap<usize, (Value, Vec<ScalarType>)> = HashMap::new();
+        let mut reuse_for_alloc: HashMap<usize, Value> = HashMap::new();
+
+        for (i, inst) in block.insts.iter().enumerate() {
+            if let Inst::RcDec(ptr) = inst {
+                if call_args.contains(ptr) {
+                    continue;
+                }
+                if !alloc_sizes.contains_key(ptr) {
+                    continue;
+                }
+                for (j, later) in block.insts[i + 1..].iter().enumerate() {
+                    let j = i + 1 + j;
+                    let is_alloc = matches!(later, Inst::Alloc(..) | Inst::AllocDyn(..));
+                    if is_alloc && !reuse_for_alloc.contains_key(&j) {
+                        let token = Value(next_value);
+                        next_value += 1;
+                        func.value_types.insert(token, ScalarType::Ptr);
+                        let slot_types = alloc_slot_types
+                            .get(ptr)
+                            .cloned()
+                            .unwrap_or_default();
+                        reset_for_dec.insert(i, (token, slot_types));
+                        reuse_for_alloc.insert(j, token);
+                        break;
+                    }
+                }
             }
         }
 
-        // Second pass: rewrite instructions.
         for (i, inst) in block.insts.iter().enumerate() {
             if let Some((token, slot_types)) = reset_for_dec.get(&i) {
-                // Replace RcDec with Reset.
                 if let Inst::RcDec(ptr) = inst {
                     new_insts.push(Inst::Reset(*token, *ptr, slot_types.clone()));
                 }
             } else if let Some(token) = reuse_for_alloc.get(&i) {
-                // Replace Alloc with Reuse.
-                if let Inst::Alloc(dest, size) = inst {
-                    new_insts.push(Inst::Reuse(*dest, *token, *size));
+                match inst {
+                    Inst::Alloc(dest, size) => {
+                        new_insts.push(Inst::Reuse(*dest, *token, *size));
+                    }
+                    Inst::AllocDyn(dest, size_val) => {
+                        new_insts.push(Inst::ReuseDyn(*dest, *token, *size_val));
+                    }
+                    _ => new_insts.push(inst.clone()),
                 }
             } else {
                 new_insts.push(inst.clone());
