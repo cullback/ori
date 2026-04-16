@@ -170,6 +170,16 @@ impl fmt::Display for FmtInst<'_> {
             Inst::Reset(d, ptr, _) => write!(f, "{d}: ptr = reset {}", fmt_val(*ptr, consts)),
             Inst::Reuse(d, tok, n) => write!(f, "{d}: ptr = reuse {}, {n}", fmt_val(*tok, consts)),
             Inst::StaticRef(d, id) => write!(f, "{d}: ptr = static_ref @{id}"),
+            Inst::Pack(d, fields) => {
+                write!(f, "{d} = pack({})", fmt_args(fields, consts))
+            }
+            Inst::Extract(d, agg, idx) => {
+                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                write!(f, "{d}: {dt} = extract {}, {idx}", fmt_val(*agg, consts))
+            }
+            Inst::Insert(d, agg, idx, val) => {
+                write!(f, "{d} = insert {}, {idx}, {}", fmt_val(*agg, consts), fmt_val(*val, consts))
+            }
         }
     }
 }
@@ -243,6 +253,7 @@ impl fmt::Display for ScalarType {
             Self::U64 => write!(f, "u64"),
             Self::F64 => write!(f, "f64"),
             Self::Ptr => write!(f, "ptr"),
+            Self::Agg(n) => write!(f, "agg{n}"),
         }
     }
 }

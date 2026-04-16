@@ -332,6 +332,21 @@ fn remap_inst(inst: &Inst, map: &HashMap<Value, Value>) -> Inst {
             Inst::Reuse(remap_value(*d, map), remap_value(*tok, map), *sz)
         }
         Inst::StaticRef(d, id) => Inst::StaticRef(remap_value(*d, map), *id),
+        Inst::Pack(d, fields) => Inst::Pack(
+            remap_value(*d, map),
+            fields.iter().map(|v| remap_value(*v, map)).collect(),
+        ),
+        Inst::Extract(d, agg, idx) => Inst::Extract(
+            remap_value(*d, map),
+            remap_value(*agg, map),
+            *idx,
+        ),
+        Inst::Insert(d, agg, idx, val) => Inst::Insert(
+            remap_value(*d, map),
+            remap_value(*agg, map),
+            *idx,
+            remap_value(*val, map),
+        ),
     }
 }
 

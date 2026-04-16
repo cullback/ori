@@ -207,6 +207,31 @@ impl Builder {
         self.push(Inst::RcDec(ptr));
     }
 
+    // ---- Aggregates ----
+
+    pub fn pack(&mut self, fields: Vec<Value>) -> Value {
+        let v = self.fresh_value();
+        let n = fields.len();
+        self.push(Inst::Pack(v, fields));
+        self.set_type(v, ScalarType::Agg(n));
+        v
+    }
+
+    pub fn extract(&mut self, agg: Value, index: usize, ty: ScalarType) -> Value {
+        let v = self.fresh_value();
+        self.push(Inst::Extract(v, agg, index));
+        self.set_type(v, ty);
+        v
+    }
+
+    pub fn insert(&mut self, agg: Value, index: usize, val: Value) -> Value {
+        let v = self.fresh_value();
+        let agg_ty = self.value_types.get(&agg).copied().unwrap_or(ScalarType::Ptr);
+        self.push(Inst::Insert(v, agg, index, val));
+        self.set_type(v, agg_ty);
+        v
+    }
+
     // ---- Terminators ----
     //
     // Each terminator method finalizes the current block: it takes the

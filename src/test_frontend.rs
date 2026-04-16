@@ -3296,6 +3296,21 @@ main = |_| (
 }
 
 #[test]
+fn pack_trail_set_grow() {
+    // Regression: record packing + trail + Set.grow interaction.
+    let source = "\
+import set
+main : I64 -> U64
+main = |_| (
+    start = { x: 0, y: 0 }
+    moves = [1, 1, 1, 1, 1, 1]
+    trail_result = moves.trail(start, |pos, _| { x: pos.x + 1, y: 0 })
+    trail_result.walk(Set.single(start), |s, pos| s.insert(pos)).len()
+)";
+    assert_eq!(run_u64(source, 0), 7);
+}
+
+#[test]
 fn bare_polymorphic_function_reference() {
     // Regression: passing a polymorphic function as a bare name (not
     // wrapped in a lambda) would crash with "undefined name" because

@@ -12,6 +12,7 @@ pub fn optimize(module: &mut Module) {
     for func in module.functions.values_mut() {
         const_fold(func);
         nop_elim(func);
+        extract_of_pack(func);
         jump_threading(func);
         branch_switch_fold(func);
         jump_threading(func);
@@ -562,6 +563,47 @@ fn is_side_effect(inst: &Inst) -> bool {
     )
 }
 
+/// Peephole: `extract(pack(a, b, c), i)` → `source[i]`.
+fn extract_of_pack(func: &mut Function) -> bool {
+    // Map Pack dest → source operands.
+    let mut packs: HashMap<Value, Vec<Value>> = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Pack(dest, fields) = inst {
+                packs.insert(*dest, fields.clone());
+            }
+        }
+    }
+    if packs.is_empty() {
+        return false;
+    }
+
+    let mut replacements: HashMap<Value, Value> = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Extract(dest, agg, idx) = inst {
+                if let Some(sources) = packs.get(agg) {
+                    if let Some(&src) = sources.get(*idx) {
+                        replacements.insert(*dest, src);
+                    }
+                }
+            }
+        }
+    }
+
+    if replacements.is_empty() {
+        return false;
+    }
+
+    for block in func.blocks.values_mut() {
+        for inst in &mut block.insts {
+            rewrite_operands(inst, &replacements);
+        }
+        rewrite_terminator_operands(&mut block.terminator, &replacements);
+    }
+    true
+}
+
 #[expect(clippy::cast_possible_wrap, reason = "integer arithmetic folding")]
 fn fold_binop(op: BinaryOp, ty: ScalarType, lbits: u64, rbits: u64) -> Option<(ScalarType, u64)> {
     match ty {
@@ -734,6 +776,16 @@ pub fn rewrite_operands(inst: &mut Inst, map: &std::collections::HashMap<Value, 
         }
         Inst::Reuse(_, tok, _) => {
             if let Some(&r) = map.get(tok) { *tok = r; }
+        }
+        Inst::Pack(_, fields) => {
+            for f in fields { if let Some(&r) = map.get(f) { *f = r; } }
+        }
+        Inst::Extract(_, agg, _) => {
+            if let Some(&r) = map.get(agg) { *agg = r; }
+        }
+        Inst::Insert(_, agg, _, val) => {
+            if let Some(&r) = map.get(agg) { *agg = r; }
+            if let Some(&r) = map.get(val) { *val = r; }
         }
         Inst::Const(..) | Inst::Alloc(..) | Inst::StaticRef(..) => {}
     }

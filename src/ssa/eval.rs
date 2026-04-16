@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use crate::ssa::Module;
-use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator};
+use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
 
 /// A scalar runtime value that fits in a register.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -245,6 +247,9 @@ fn eval_function_inner(
 
     let mut current = func.entry;
     let mut block_args: Vec<Scalar> = vec![];
+    // Side table: Pack dest → source Value IDs. Extract reads through
+    // this to find the original scalars without changing the Scalar enum.
+    let mut pack_map: HashMap<usize, Vec<Value>> = HashMap::new();
 
     loop {
         let block = &func.blocks[&current];
@@ -254,7 +259,7 @@ fn eval_function_inner(
         }
 
         for inst in &block.insts {
-            let val = eval_inst(module, heap, scratch, &env, inst);
+            let val = eval_inst(module, heap, scratch, &env, &mut pack_map, inst);
             if let Some(dest) = inst.dest() {
                 if let Some(v) = val {
                     env[dest.0] = v;
@@ -264,12 +269,13 @@ fn eval_function_inner(
 
         match &block.terminator {
             Terminator::Return(v) => {
-                let result = env[v.0];
+                let result = resolve_or_box(&env, &pack_map, heap, *v);
                 scratch.release(env);
                 return result;
             }
 
             Terminator::Jump(target, args) => {
+                propagate_packs(&mut pack_map, &func.blocks[target].params, args);
                 block_args = args.iter().map(|v| env[v.0]).collect();
                 current = *target;
             }
@@ -282,9 +288,11 @@ fn eval_function_inner(
                 else_args,
             } => {
                 if scalar_to_u64(env[cond.0]) != 0 {
+                    propagate_packs(&mut pack_map, &func.blocks[then_block].params, then_args);
                     block_args = then_args.iter().map(|v| env[v.0]).collect();
                     current = *then_block;
                 } else {
+                    propagate_packs(&mut pack_map, &func.blocks[else_block].params, else_args);
                     block_args = else_args.iter().map(|v| env[v.0]).collect();
                     current = *else_block;
                 }
@@ -297,9 +305,11 @@ fn eval_function_inner(
             } => {
                 let tag = scalar_to_u64(env[scrutinee.0]);
                 if let Some((_, block, args)) = arms.iter().find(|(v, _, _)| *v == tag) {
+                    propagate_packs(&mut pack_map, &func.blocks[block].params, args);
                     block_args = args.iter().map(|v| env[v.0]).collect();
                     current = *block;
                 } else if let Some((block, args)) = default {
+                    propagate_packs(&mut pack_map, &func.blocks[block].params, args);
                     block_args = args.iter().map(|v| env[v.0]).collect();
                     current = *block;
                 } else {
@@ -311,14 +321,46 @@ fn eval_function_inner(
     }
 }
 
-fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env, inst: &Inst) -> Option<Scalar> {
+/// Resolve a value: if it's a pack, box it to a heap object. Otherwise return the scalar.
+fn resolve_or_box(env: &Env, pack_map: &HashMap<usize, Vec<Value>>, heap: &mut Heap, v: Value) -> Scalar {
+    if let Some(sources) = pack_map.get(&v.0) {
+        let vals: Vec<Scalar> = sources.iter()
+            .map(|src| resolve_or_box(env, pack_map, heap, *src))
+            .collect();
+        let idx = heap.alloc(vals.len());
+        for (i, val) in vals.into_iter().enumerate() {
+            heap.store(idx, i, val);
+        }
+        Scalar::Ptr(idx)
+    } else {
+        env[v.0]
+    }
+}
+
+/// Copy pack_map entries from jump/branch args to the target block's params.
+/// Clears stale entries when a param receives a non-pack value.
+fn propagate_packs(
+    pack_map: &mut HashMap<usize, Vec<Value>>,
+    target_params: &[Value],
+    arg_values: &[Value],
+) {
+    for (param, arg) in target_params.iter().zip(arg_values) {
+        if let Some(sources) = pack_map.get(&arg.0).cloned() {
+            pack_map.insert(param.0, sources);
+        } else {
+            pack_map.remove(&param.0);
+        }
+    }
+}
+
+fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env, pack_map: &mut HashMap<usize, Vec<Value>>, inst: &Inst) -> Option<Scalar> {
     match inst {
         Inst::Const(_, ty, bits) => Some(bits_to_scalar(*ty, *bits)),
 
         Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs.0], env[rhs.0])),
 
         Inst::Call(_, name, args) => {
-            let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.0]).collect();
+            let arg_vals: Vec<Scalar> = args.iter().map(|v| resolve_or_box(env, pack_map, heap, *v)).collect();
             Some(eval_function_inner(module, heap, scratch, name, &arg_vals))
         }
 
@@ -338,7 +380,8 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             let Scalar::Ptr(idx) = env[ptr.0] else {
                 panic!("store to non-ptr: {:?}", env[ptr.0]);
             };
-            heap.store(idx, *offset, env[val.0]);
+            let scalar = resolve_or_box(env, pack_map, heap, *val);
+            heap.store(idx, *offset, scalar);
             None
         }
 
@@ -355,7 +398,8 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                 panic!("store_dyn to non-ptr: {:?}", env[ptr.0]);
             };
             let slot = scalar_to_usize(env[idx_val.0]);
-            heap.store_dyn(heap_idx, slot, env[val.0]);
+            let scalar = resolve_or_box(env, pack_map, heap, *val);
+            heap.store_dyn(heap_idx, slot, scalar);
             None
         }
 
@@ -418,6 +462,27 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             } else {
                 Some(Scalar::Ptr(heap.alloc(*num_slots)))
             }
+        }
+
+        Inst::Pack(dest, fields) => {
+            // Record source Value IDs — no Scalar produced.
+            pack_map.insert(dest.0, fields.clone());
+            None
+        }
+
+        Inst::Extract(_, agg, idx) => {
+            let sources = pack_map.get(&agg.0)
+                .unwrap_or_else(|| panic!("extract from non-pack value v{}", agg.0));
+            Some(env[sources[*idx].0])
+        }
+
+        Inst::Insert(dest, agg, idx, val) => {
+            let sources = pack_map.get(&agg.0)
+                .unwrap_or_else(|| panic!("insert into non-pack value v{}", agg.0));
+            let mut new_sources = sources.clone();
+            new_sources[*idx] = *val;
+            pack_map.insert(dest.0, new_sources);
+            None
         }
     }
 }
@@ -484,6 +549,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             };
             let new_len = len + 1;
             let new_data = heap.clone_object(old_data);
+            if let Scalar::Ptr(p) = args[1] { heap.rc_inc(p); }
             heap.store_dyn(new_data, len as usize, args[1]);
             let new_list = heap.alloc(3);
             heap.store(new_list, 0, Scalar::U64(new_len));
@@ -728,6 +794,7 @@ fn bits_to_scalar(ty: ScalarType, bits: u64) -> Scalar {
         ScalarType::U64 => Scalar::U64(bits),
         ScalarType::F64 => Scalar::F64(f64::from_bits(bits)),
         ScalarType::Ptr => Scalar::Ptr(bits as usize),
+        ScalarType::Agg(_) => panic!("cannot create scalar from aggregate type"),
     }
 }
 
@@ -905,6 +972,10 @@ fn eval_binop(op: BinaryOp, lhs: Scalar, rhs: Scalar) -> Scalar {
         (BinaryOp::Le, Scalar::F64(a), Scalar::F64(b)) => Scalar::U8(u8::from(a <= b)),
         (BinaryOp::Gt, Scalar::F64(a), Scalar::F64(b)) => Scalar::U8(u8::from(a > b)),
         (BinaryOp::Ge, Scalar::F64(a), Scalar::F64(b)) => Scalar::U8(u8::from(a >= b)),
+
+        // Pointer identity comparison (e.g., interned values, same object).
+        (BinaryOp::Eq, Scalar::Ptr(a), Scalar::Ptr(b)) => Scalar::U8(u8::from(a == b)),
+        (BinaryOp::Neq, Scalar::Ptr(a), Scalar::Ptr(b)) => Scalar::U8(u8::from(a != b)),
 
         _ => panic!("unsupported binop {op:?} on {lhs:?}, {rhs:?}"),
     }

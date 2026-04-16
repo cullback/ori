@@ -1,0 +1,10 @@
+import md5
+
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| (
+    result = List.repeat(0, 100).walk(0, |acc, _| (
+        hash = Md5.hash("test".to_utf8())
+        acc + hash.len()
+    ))
+    Ok(result.to_str())
+)

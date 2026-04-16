@@ -1,8 +1,4 @@
-import foo exposing [Foo]
-
-main : I64 -> Foo
-main = |arg| (
-    a = Foo.new(3)
-    b = Foo.new(4)
-    a.add(b)
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| (
+    Ok("hi")
 )

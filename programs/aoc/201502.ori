@@ -16,7 +16,9 @@ part1 = |bs| bs.walk(0, |acc, { l, w, h }| (
 
 part2 : List({ l: U64, w: U64, h: U64 }) -> U64
 part2 = |bs| bs.walk(0, |acc, { l, w, h }| (
-    smallest_perimeter = (2 * l + 2 * w).min(2 * w + 2 * h).min(2 * h + 2 * l)
+    smallest_perimeter = (2 * l + 2 * w)
+        .min(2 * w + 2 * h)
+        .min(2 * h + 2 * l)
     acc + smallest_perimeter + l * w * h
 ))
 

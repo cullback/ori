@@ -33,6 +33,9 @@ pub enum ScalarType {
     U64,
     F64,
     Ptr,
+    /// Value-type aggregate with this many fields. Lives in registers,
+    /// not on the heap. Only used for ≤8-field records/tuples/tags.
+    Agg(usize),
 }
 
 /// Binary operations on scalars.
@@ -93,6 +96,12 @@ pub enum Inst {
     /// dest = pointer to a pre-allocated static object by index.
     /// The object lives in `Module::statics` and is never freed.
     StaticRef(Value, usize),
+    /// dest = group N values into one aggregate (register-level, no heap).
+    Pack(Value, Vec<Value>),
+    /// dest = extract field at `index` from aggregate value.
+    Extract(Value, Value, usize),
+    /// dest = copy aggregate with field at `index` replaced by `val`.
+    Insert(Value, Value, usize, Value),
 }
 
 impl Inst {
@@ -107,7 +116,10 @@ impl Inst {
             | Self::LoadDyn(v, _, _)
             | Self::Reset(v, _, _)
             | Self::Reuse(v, _, _)
-            | Self::StaticRef(v, _) => Some(*v),
+            | Self::StaticRef(v, _)
+            | Self::Pack(v, _)
+            | Self::Extract(v, _, _)
+            | Self::Insert(v, _, _, _) => Some(*v),
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
         }
     }
@@ -126,6 +138,9 @@ impl Inst {
             Self::Reset(_, ptr, _) => vec![*ptr],
             Self::Reuse(_, token, _) => vec![*token],
             Self::StaticRef(..) => vec![],
+            Self::Pack(_, fields) => fields.clone(),
+            Self::Extract(_, agg, _) => vec![*agg],
+            Self::Insert(_, agg, _, val) => vec![*agg, *val],
         }
     }
 }

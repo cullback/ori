@@ -7,7 +7,6 @@ mod instruction;
 pub mod lower;
 pub mod opt;
 pub mod rc;
-pub mod sroa;
 pub mod static_promote;
 
 #[allow(unused_imports)]

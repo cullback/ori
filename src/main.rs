@@ -54,7 +54,6 @@ fn compile(
     ssa::opt::optimize(&mut ssa_module);
     ssa::inline::inline(&mut ssa_module);
     ssa::opt::optimize(&mut ssa_module);
-    ssa::sroa::run(&mut ssa_module);
     ssa::opt::optimize(&mut ssa_module);
     ssa::const_eval::evaluate(&mut ssa_module);
     ssa::opt::optimize(&mut ssa_module);
