@@ -12,7 +12,7 @@ step = |(x, y), ch|
 
 part1 : Str -> U64
 part1 = |input|
-    Set.from_list(input.to_utf8().trail((0, 0), step)).len()
+    Set.from_list(input.to_utf8().trail((0, 0), step)).insert((0, 0)).len()
 
 part2 : Str -> U64
 part2 = |input| (
@@ -21,7 +21,7 @@ part2 = |input| (
         .partition(|(i, _)| i % 2 == 0)
     santa_trail = santa_moves.map(|(_, ch)| ch).trail(start, step)
     robo_trail = robo_moves.map(|(_, ch)| ch).trail(start, step)
-    Set.from_list(santa_trail.concat(robo_trail)).len()
+    Set.from_list(santa_trail.concat(robo_trail)).insert(start).len()
 )
 
 main : List(Str), Str -> Result(Str, Str)
