@@ -345,28 +345,44 @@ fn jump_threading(func: &mut Function) -> bool {
     }
 
     // Merge trivial entry block: if the entry block has no instructions
-    // and jumps to a target, substitute jump args for the target's block
-    // params and splice the target's content into the entry block.
+    // and jumps to a target, and the target has no OTHER predecessors,
+    // splice the target's content into the entry block and drop the
+    // now-redundant target block. Checking for other predecessors
+    // avoids duplicating instruction dests across two blocks — a
+    // duplication that would later leave stale `value_types` entries
+    // once DCE reaped the (still-referenced!) target.
     if func.blocks[&func.entry].insts.is_empty() {
         if let Terminator::Jump(target, ref args) = func.blocks[&func.entry].terminator {
+            let target = target;
             if target != func.entry && func.blocks.contains_key(&target) {
-                let target_block = func.blocks[&target].clone();
-                let arg_map: HashMap<Value, Value> = target_block
-                    .params
+                // Count how many blocks (other than entry) jump to target.
+                let other_preds = func
+                    .blocks
                     .iter()
-                    .zip(args.iter())
-                    .map(|(&p, &a)| (p, a))
-                    .collect();
-                let entry = func.entry;
-                func.blocks.get_mut(&entry).unwrap().insts = target_block.insts;
-                func.blocks.get_mut(&entry).unwrap().terminator = target_block.terminator;
-                // Rewrite entry block's new content to use the jump args.
-                let entry_block = func.blocks.get_mut(&entry).unwrap();
-                for inst in &mut entry_block.insts {
-                    rewrite_operands(inst, &arg_map);
+                    .filter(|(bid, _)| **bid != func.entry)
+                    .any(|(_, b)| b.terminator.successors().into_iter().any(|(t, _)| t == target));
+                if !other_preds {
+                    let args = args.clone();
+                    let target_block = func.blocks.remove(&target).unwrap();
+                    let arg_map: HashMap<Value, Value> = target_block
+                        .params
+                        .iter()
+                        .zip(args.iter())
+                        .map(|(&p, &a)| (p, a))
+                        .collect();
+                    let entry = func.entry;
+                    let entry_block = func.blocks.get_mut(&entry).unwrap();
+                    entry_block.insts = target_block.insts;
+                    entry_block.terminator = target_block.terminator;
+                    for inst in &mut entry_block.insts {
+                        rewrite_operands(inst, &arg_map);
+                    }
+                    rewrite_terminator_operands(&mut entry_block.terminator, &arg_map);
+                    for p in &target_block.params {
+                        func.value_types.remove(p);
+                    }
+                    changed = true;
                 }
-                rewrite_terminator_operands(&mut entry_block.terminator, &arg_map);
-                changed = true;
             }
         }
     }

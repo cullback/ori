@@ -508,7 +508,19 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let Scalar::Ptr(data_idx) = heap.load(list_idx, 2) else {
                 panic!("__list_get: data slot is not Ptr");
             };
-            Some(heap.load_dyn(data_idx, idx))
+            // Per Perceus, loading a `Ptr` from heap creates a new
+            // alias and needs an extra reference. The RC pass inserts
+            // `rc_inc` after `Load`/`LoadDyn` instructions; intrinsics
+            // that do an implicit load (like this one) must do the
+            // same internally, otherwise the caller's later `rc_dec`
+            // on the returned value underflows the heap slot's
+            // actual reference count and the original list's element
+            // is freed while still in use.
+            let elem = heap.load_dyn(data_idx, idx);
+            if let Scalar::Ptr(p) = elem {
+                heap.rc_inc(p);
+            }
+            Some(elem)
         }
         "__list_set" => {
             // args: [list_ptr, index_u64, new_val] → new_list_ptr
