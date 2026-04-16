@@ -2483,10 +2483,10 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
         ("__list_len", ScalarType::U64)
     } else if name.ends_with(".get") || name == "List.get" {
         return emit_list_get_checked(builder, args);
+    } else if name.ends_with(".append") || name == "List.append" {
+        return emit_list_append(builder, args);
     } else if name.ends_with(".set") || name == "List.set" {
         ("__list_set", ScalarType::Ptr)
-    } else if name.ends_with(".append") || name == "List.append" {
-        ("__list_append", ScalarType::Ptr)
     } else if name.ends_with(".reverse") || name == "List.reverse" {
         ("__list_reverse", ScalarType::Ptr)
     } else if name.ends_with(".sublist") || name == "List.sublist" {
@@ -2499,6 +2499,31 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
         panic!("unknown list builtin: {name}");
     };
     builder.call(intrinsic, args, ret_ty)
+}
+
+/// Lower `list.append(val)` as SSA-level `load + alloc_dyn +
+/// copy_into + store + alloc 3 + stores`. Exposing the allocations
+/// at SSA level lets `insert_reuse` pair them with the caller's
+/// `rc_dec list` and mutate in place when the list is unique.
+fn emit_list_append(builder: &mut Builder, args: Vec<Value>) -> Value {
+    use crate::ssa::instruction::BinaryOp;
+    let list = args[0];
+    let val = args[1];
+
+    let len = builder.load(list, 0, ScalarType::U64);
+    let data = builder.load(list, 2, ScalarType::Ptr);
+    let one = builder.const_u64(1);
+    let new_len = builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
+
+    let new_data = builder.alloc_dyn(new_len);
+    builder.call("__list_copy_into", vec![data, new_data, len], ScalarType::I64);
+    builder.store_dyn(new_data, len, val);
+
+    let new_list = builder.alloc(3);
+    builder.store(new_list, 0, new_len);
+    builder.store(new_list, 1, new_len);
+    builder.store(new_list, 2, new_data);
+    new_list
 }
 
 /// Emit a bounds-checked List.get that returns Result(a, [OutOfBounds]).

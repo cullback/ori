@@ -545,6 +545,29 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(new_list, 2, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
+        "__list_copy_into" => {
+            // args: [src_ptr, dst_ptr, count] → I64(0). Copies `count`
+            // slots from src to dst, bumping rc on any `Ptr` children.
+            // Self-copy is a no-op (same heap index).
+            let Scalar::Ptr(src) = args[0] else {
+                panic!("__list_copy_into: expected Ptr for src");
+            };
+            let Scalar::Ptr(dst) = args[1] else {
+                panic!("__list_copy_into: expected Ptr for dst");
+            };
+            if src == dst {
+                return Some(Scalar::I64(0));
+            }
+            let n = scalar_to_usize(args[2]);
+            for i in 0..n {
+                let slot = heap.objects[src].1[i];
+                if let Scalar::Ptr(p) = slot {
+                    heap.rc_inc(p);
+                }
+                heap.objects[dst].1[i] = slot;
+            }
+            Some(Scalar::I64(0))
+        }
         "__list_append" => {
             // args: [list_ptr, val] → new_list_ptr
             let Scalar::Ptr(list_idx) = args[0] else {
@@ -738,13 +761,13 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
         "__u64_from_u8" => {
             // args: [u8] → u64 (widening conversion)
             let Scalar::U8(n) = args[0] else {
-                panic!("__u64_from_u8: expected U8");
+                panic!("__u64_from_u8: expected U8, got {:?}", args[0]);
             };
             Some(Scalar::U64(u64::from(n)))
         }
         "__u32_from_u8" => {
             let Scalar::U8(n) = args[0] else {
-                panic!("__u32_from_u8: expected U8");
+                panic!("__u32_from_u8: expected U8, got {:?}", args[0]);
             };
             Some(Scalar::U32(u32::from(n)))
         }

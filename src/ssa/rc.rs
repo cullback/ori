@@ -38,8 +38,15 @@ pub fn insert_rc(module: &mut Module) {
 }
 
 /// Cancel `rc_inc(v)` / `rc_dec(v)` pairs within the same block
-/// where the refcount elevation isn't observed between them
-/// (no `Reset` on v, which checks uniqueness).
+/// where the refcount elevation isn't observed between them.
+///
+/// The rc_inc/rc_dec bracket around a use of `v` exists to keep
+/// `v` alive even if a parent object gets decremented in between
+/// (Perceus-style "keep loaded child alive across parent's death").
+/// Removing the bracket is only safe if nothing between them can
+/// drop `v`'s refcount — specifically, no `Reset` or `RcDec` of
+/// *any* value (either could cascade-free `v` via a child slot),
+/// and no matching op on `v` itself (another observation).
 pub fn fuse_inc_dec(module: &mut Module) {
     for func in module.functions.values_mut() {
         for (_, block) in &mut func.blocks {
@@ -55,38 +62,31 @@ pub fn fuse_inc_dec(module: &mut Module) {
 /// Find and remove one rc_inc/rc_dec pair. Returns true if a pair
 /// was removed.
 fn fuse_one_pair(insts: &mut Vec<Inst>) -> bool {
-    // Look for rc_inc(v) followed by rc_dec(v) (or vice versa).
     for i in 0..insts.len() {
         let (is_inc, v) = match &insts[i] {
             Inst::RcInc(v) => (true, *v),
             Inst::RcDec(v) => (false, *v),
             _ => continue,
         };
-        // Scan forward for the matching opposite.
         let target = if is_inc { Inst::RcDec(v) } else { Inst::RcInc(v) };
-        let mut safe = true;
         for j in (i + 1)..insts.len() {
-            // Check if this is the matching op.
             let is_match = match (&insts[j], &target) {
                 (Inst::RcInc(a), Inst::RcInc(b)) | (Inst::RcDec(a), Inst::RcDec(b)) => a == b,
                 _ => false,
             };
             if is_match {
-                // Found a canceling pair — remove both.
                 insts.remove(j);
                 insts.remove(i);
                 return true;
             }
-            // If v's refcount is observed (Reset checks uniqueness),
-            // or if there's another inc/dec on v, stop searching.
+            // Any op that can lower v's refcount (directly or via a
+            // parent's child-slot cascade) invalidates the bracket.
+            // Another inc/dec on v also counts as an observation.
             match &insts[j] {
-                Inst::Reset(_, ptr, _) if *ptr == v => { safe = false; break; }
-                Inst::RcInc(w) | Inst::RcDec(w) if *w == v => break,
+                Inst::Reset(..) | Inst::RcDec(_) => break,
+                Inst::RcInc(w) if *w == v => break,
                 _ => {}
             }
-        }
-        if !safe {
-            continue;
         }
     }
     false
@@ -132,7 +132,6 @@ pub fn insert_reuse(module: &mut Module) {
 
 fn insert_reuse_function(func: &mut Function) {
     // Build a map: Value → alloc size, for values defined by Alloc.
-    let mut alloc_sizes: HashMap<Value, usize> = HashMap::new();
     // Build a map: Value → slot types, for computing Reset field decs.
     let mut alloc_slot_types: HashMap<Value, Vec<ScalarType>> = HashMap::new();
     // Values passed as arguments to calls — these may have been stored
@@ -147,20 +146,22 @@ fn insert_reuse_function(func: &mut Function) {
         .max()
         .unwrap_or(0);
 
-    // Track allocated values (static-size `Alloc` and dynamic-size
-    // `AllocDyn`) so a later `RcDec` can look them up for pairing.
-    // `Reuse` resizes the reused memory at runtime, so we don't need
-    // the dec'd object's size to match the new alloc's size — any
-    // Alloc/AllocDyn can pair with any RcDec of a heap-allocated value.
+    // Track where each `Ptr` value was allocated. `Some(n)` means it
+    // came from a static-size `Alloc(size=n)`; `None` means
+    // `AllocDyn`. The pairing prefers same-kind matches: static decs
+    // pair with same-size static allocs; dynamic decs pair with
+    // dynamic allocs. This avoids wasting a same-size reuse on a
+    // differently-sized alloc.
+    let mut alloc_kind: HashMap<Value, Option<usize>> = HashMap::new();
     for (_, block) in &func.blocks {
         for inst in &block.insts {
             match inst {
                 Inst::Alloc(dest, size) => {
-                    alloc_sizes.insert(*dest, *size);
+                    alloc_kind.insert(*dest, Some(*size));
                     alloc_slot_types.insert(*dest, vec![ScalarType::Ptr; *size]);
                 }
                 Inst::AllocDyn(dest, _) => {
-                    alloc_sizes.insert(*dest, 0);
+                    alloc_kind.insert(*dest, None);
                     alloc_slot_types.insert(*dest, Vec::new());
                 }
                 Inst::Store(ptr, offset, val) => {
@@ -182,8 +183,6 @@ fn insert_reuse_function(func: &mut Function) {
         }
     }
 
-    // For each block, find RcDec(v) → Alloc/AllocDyn patterns and
-    // rewrite to Reset/Reuse pairs.
     for (_, block) in &mut func.blocks {
         let mut new_insts: Vec<Inst> = Vec::with_capacity(block.insts.len());
         let mut reset_for_dec: HashMap<usize, (Value, Vec<ScalarType>)> = HashMap::new();
@@ -194,13 +193,20 @@ fn insert_reuse_function(func: &mut Function) {
                 if call_args.contains(ptr) {
                     continue;
                 }
-                if !alloc_sizes.contains_key(ptr) {
+                let Some(dec_kind) = alloc_kind.get(ptr).copied() else {
                     continue;
-                }
+                };
                 for (j, later) in block.insts[i + 1..].iter().enumerate() {
                     let j = i + 1 + j;
-                    let is_alloc = matches!(later, Inst::Alloc(..) | Inst::AllocDyn(..));
-                    if is_alloc && !reuse_for_alloc.contains_key(&j) {
+                    if reuse_for_alloc.contains_key(&j) {
+                        continue;
+                    }
+                    let compatible = match (dec_kind, later) {
+                        (Some(dec_n), Inst::Alloc(_, alloc_n)) => dec_n == *alloc_n,
+                        (None, Inst::AllocDyn(..)) => true,
+                        _ => false,
+                    };
+                    if compatible {
                         let token = Value(next_value);
                         next_value += 1;
                         func.value_types.insert(token, ScalarType::Ptr);
