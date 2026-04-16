@@ -14,7 +14,7 @@ use super::instruction::{BlockId, Inst, Terminator, Value};
 use super::{Block, Function, Module};
 
 /// Maximum number of instructions in a callee for it to be inlined.
-pub const MAX_INLINE_INSTS: usize = 80;
+pub const MAX_INLINE_INSTS: usize = 12;
 
 /// Run inlining on all functions in the module.
 pub fn inline(module: &mut Module) {
@@ -35,17 +35,20 @@ pub fn inline(module: &mut Module) {
 }
 
 /// Identify functions small enough to inline.
+///
+/// Excludes functions involved in any call cycle (direct or mutual
+/// recursion). Inlining a member of a cycle would produce unbounded
+/// expansion, since each inlined body reintroduces a call that maps
+/// back to another inlineable cycle member.
 fn find_candidates(module: &Module) -> HashSet<String> {
+    let recursive = cyclic_functions(module);
     let mut candidates = HashSet::new();
     for (name, func) in &module.functions {
         // Skip the entry point.
         if name == &module.entry {
             continue;
         }
-        // Skip recursive functions — inlining them would produce an
-        // infinite expansion since the recursive call would immediately
-        // become a new inline site.
-        if calls_self(func) {
+        if recursive.contains(name) {
             continue;
         }
         let inst_count: usize = func.blocks.values().map(|b| b.insts.len()).sum();
@@ -56,11 +59,48 @@ fn find_candidates(module: &Module) -> HashSet<String> {
     candidates
 }
 
-/// True if the function contains any `Call` to itself.
-fn calls_self(func: &Function) -> bool {
-    func.blocks.values().any(|block| {
-        block.insts.iter().any(|inst| matches!(inst, Inst::Call(_, name, _) if name == &func.name))
-    })
+/// Find all functions that participate in any call cycle.
+/// Uses Tarjan-style reachability: a function f is in a cycle if
+/// f is reachable from one of its callees.
+fn cyclic_functions(module: &Module) -> HashSet<String> {
+    // Build call graph: caller → set of callees.
+    let mut callees: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (name, func) in &module.functions {
+        let mut cs = HashSet::new();
+        for block in func.blocks.values() {
+            for inst in &block.insts {
+                if let Inst::Call(_, callee, _) = inst {
+                    if module.functions.contains_key(callee) {
+                        cs.insert(callee.as_str());
+                    }
+                }
+            }
+        }
+        callees.insert(name.as_str(), cs);
+    }
+
+    // A function is cyclic if it's reachable from any of its callees.
+    let mut cyclic = HashSet::new();
+    for name in module.functions.keys() {
+        if reaches(&callees, name, name) {
+            cyclic.insert(name.clone());
+        }
+    }
+    cyclic
+}
+
+/// True if `target` is reachable from `start` by following callee edges.
+fn reaches(callees: &HashMap<&str, HashSet<&str>>, start: &str, target: &str) -> bool {
+    let mut stack: Vec<&str> = callees.get(start).map(|s| s.iter().copied().collect()).unwrap_or_default();
+    let mut seen: HashSet<&str> = HashSet::new();
+    while let Some(n) = stack.pop() {
+        if n == target { return true; }
+        if !seen.insert(n) { continue; }
+        if let Some(next) = callees.get(n) {
+            stack.extend(next.iter().copied());
+        }
+    }
+    false
 }
 
 /// Inline all eligible calls within a single function.
