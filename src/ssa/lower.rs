@@ -515,7 +515,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 arms,
                 else_body,
             } => {
-                let result_ty = self.expr_scalar_type(expr);
+                let result_ty = self.expr_repr_type(expr);
                 if Self::is_bool_if_with_is(scrutinee_expr, arms) {
                     self.lower_bool_if_with_is(scrutinee_expr, arms, result_ty)
                 } else if Self::is_literal_match(arms) {
@@ -587,12 +587,21 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             } => self.lower_method_call(receiver, method, args, expr),
 
             ExprKind::Tuple(elems) => {
-                let ptr = self.builder.alloc(elems.len());
-                for (i, e) in elems.iter().enumerate() {
-                    let val = self.lower_expr(e);
-                    self.builder.store(ptr, i, val);
+                let field_types: Vec<ScalarType> = elems.iter()
+                    .map(|e| self.expr_scalar_type(e))
+                    .collect();
+                let vals: Vec<Value> = elems.iter()
+                    .map(|e| self.lower_expr(e))
+                    .collect();
+                if Self::can_pack(&field_types) {
+                    self.builder.pack(vals)
+                } else {
+                    let ptr = self.builder.alloc(elems.len());
+                    for (i, val) in vals.into_iter().enumerate() {
+                        self.builder.store(ptr, i, val);
+                    }
+                    ptr
                 }
-                ptr
             }
 
             ExprKind::Lambda { .. } => {

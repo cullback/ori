@@ -13,7 +13,7 @@ pub fn optimize(module: &mut Module) {
         const_fold(func);
         nop_elim(func);
         load_of_agg(func);
-        //split_agg_params(func);
+        split_agg_params(func);
         extract_of_pack(func);
         jump_threading(func);
         branch_switch_fold(func);
@@ -645,16 +645,64 @@ fn split_agg_params(func: &mut Function) {
         for (pi, &p) in params.iter().enumerate() {
             if let Some(ScalarType::Agg(n)) = func.value_types.get(&p) {
                 // Only split if ALL predecessors provide a visible Pack.
-                let all_packs = pred_args
-                    .get(&(*bid, pi))
+                let pred_vals = pred_args.get(&(*bid, pi));
+                let all_packs = pred_vals
                     .map(|args| args.iter().all(|v| packs.contains_key(v)))
                     .unwrap_or(false);
                 if all_packs {
-                    let new_ps: Vec<Value> = (0..*n)
-                        .map(|_| {
+                    // Only split if param is exclusively used by Extract
+                    // instructions. Other uses (terminator args, Store
+                    // operands) would need a re-Pack and complicate things.
+                    let only_extract_uses = func.blocks.values().all(|b| {
+                        let inst_ok = b.insts.iter().all(|inst| {
+                            if let Inst::Extract(_, agg, _) = inst {
+                                return true;
+                            }
+                            !inst.operands().contains(&p)
+                        });
+                        let term_ok = !b.terminator.operands().contains(&p);
+                        inst_ok && term_ok
+                    });
+                    if !only_extract_uses {
+                        splits.push(None);
+                        continue;
+                    }
+                    // Compute agreed field types: all predecessors' Packs
+                    // must have the same type at each position.
+                    let all_pred_packs: Vec<&Vec<Value>> = pred_vals
+                        .unwrap()
+                        .iter()
+                        .filter_map(|v| packs.get(v))
+                        .collect();
+                    let mut field_types: Vec<ScalarType> = Vec::with_capacity(*n);
+                    let mut types_agree = true;
+                    for i in 0..*n {
+                        let first_ty = all_pred_packs.first()
+                            .and_then(|fs| fs.get(i))
+                            .and_then(|fv| func.value_types.get(fv).copied())
+                            .unwrap_or(ScalarType::U64);
+                        if all_pred_packs.iter().all(|fs| {
+                            fs.get(i)
+                                .and_then(|fv| func.value_types.get(fv).copied())
+                                .unwrap_or(ScalarType::U64)
+                                == first_ty
+                        }) {
+                            field_types.push(first_ty);
+                        } else {
+                            types_agree = false;
+                            break;
+                        }
+                    }
+                    if !types_agree {
+                        splits.push(None);
+                        continue;
+                    }
+                    let new_ps: Vec<Value> = field_types
+                        .iter()
+                        .map(|&ty| {
                             let v = Value(next_val);
                             next_val += 1;
-                            func.value_types.insert(v, ScalarType::U64);
+                            func.value_types.insert(v, ty);
                             v
                         })
                         .collect();
@@ -689,12 +737,18 @@ fn split_agg_params(func: &mut Function) {
             }
         }
 
-        // Rebuild block params.
+        // Rebuild block params and prepend re-Pack instructions.
         let mut new_params = Vec::new();
         for (pi, &p) in params.iter().enumerate() {
             match &splits[pi] {
                 Some(new_ps) => new_params.extend_from_slice(new_ps),
                 None => new_params.push(p),
+            }
+        }
+        // Remove old Agg params from value_types.
+        for (pi, &p) in params.iter().enumerate() {
+            if splits[pi].is_some() {
+                func.value_types.remove(&p);
             }
         }
         func.blocks.get_mut(bid).unwrap().params = new_params;
