@@ -247,9 +247,6 @@ fn eval_function_inner(
 
     let mut current = func.entry;
     let mut block_args: Vec<Scalar> = vec![];
-    // Side table: Pack dest → source Value IDs. Extract reads through
-    // this to find the original scalars without changing the Scalar enum.
-    let mut pack_map: HashMap<usize, Vec<Value>> = HashMap::new();
 
     loop {
         let block = &func.blocks[&current];
@@ -259,7 +256,7 @@ fn eval_function_inner(
         }
 
         for inst in &block.insts {
-            let val = eval_inst(module, heap, scratch, &env, &mut pack_map, inst);
+            let val = eval_inst(module, heap, scratch, &env, inst);
             if let Some(dest) = inst.dest() {
                 if let Some(v) = val {
                     env[dest.0] = v;
@@ -269,13 +266,12 @@ fn eval_function_inner(
 
         match &block.terminator {
             Terminator::Return(v) => {
-                let result = resolve_or_box(&env, &pack_map, heap, *v);
+                let result = env[v.0];
                 scratch.release(env);
                 return result;
             }
 
             Terminator::Jump(target, args) => {
-                propagate_packs(&mut pack_map, &func.blocks[target].params, args);
                 block_args = args.iter().map(|v| env[v.0]).collect();
                 current = *target;
             }
@@ -288,11 +284,9 @@ fn eval_function_inner(
                 else_args,
             } => {
                 if scalar_to_u64(env[cond.0]) != 0 {
-                    propagate_packs(&mut pack_map, &func.blocks[then_block].params, then_args);
                     block_args = then_args.iter().map(|v| env[v.0]).collect();
                     current = *then_block;
                 } else {
-                    propagate_packs(&mut pack_map, &func.blocks[else_block].params, else_args);
                     block_args = else_args.iter().map(|v| env[v.0]).collect();
                     current = *else_block;
                 }
@@ -305,11 +299,9 @@ fn eval_function_inner(
             } => {
                 let tag = scalar_to_u64(env[scrutinee.0]);
                 if let Some((_, block, args)) = arms.iter().find(|(v, _, _)| *v == tag) {
-                    propagate_packs(&mut pack_map, &func.blocks[block].params, args);
                     block_args = args.iter().map(|v| env[v.0]).collect();
                     current = *block;
                 } else if let Some((block, args)) = default {
-                    propagate_packs(&mut pack_map, &func.blocks[block].params, args);
                     block_args = args.iter().map(|v| env[v.0]).collect();
                     current = *block;
                 } else {
@@ -321,46 +313,14 @@ fn eval_function_inner(
     }
 }
 
-/// Resolve a value: if it's a pack, box it to a heap object. Otherwise return the scalar.
-fn resolve_or_box(env: &Env, pack_map: &HashMap<usize, Vec<Value>>, heap: &mut Heap, v: Value) -> Scalar {
-    if let Some(sources) = pack_map.get(&v.0) {
-        let vals: Vec<Scalar> = sources.iter()
-            .map(|src| resolve_or_box(env, pack_map, heap, *src))
-            .collect();
-        let idx = heap.alloc(vals.len());
-        for (i, val) in vals.into_iter().enumerate() {
-            heap.store(idx, i, val);
-        }
-        Scalar::Ptr(idx)
-    } else {
-        env[v.0]
-    }
-}
-
-/// Copy pack_map entries from jump/branch args to the target block's params.
-/// Clears stale entries when a param receives a non-pack value.
-fn propagate_packs(
-    pack_map: &mut HashMap<usize, Vec<Value>>,
-    target_params: &[Value],
-    arg_values: &[Value],
-) {
-    for (param, arg) in target_params.iter().zip(arg_values) {
-        if let Some(sources) = pack_map.get(&arg.0).cloned() {
-            pack_map.insert(param.0, sources);
-        } else {
-            pack_map.remove(&param.0);
-        }
-    }
-}
-
-fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env, pack_map: &mut HashMap<usize, Vec<Value>>, inst: &Inst) -> Option<Scalar> {
+fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env, inst: &Inst) -> Option<Scalar> {
     match inst {
         Inst::Const(_, ty, bits) => Some(bits_to_scalar(*ty, *bits)),
 
         Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs.0], env[rhs.0])),
 
         Inst::Call(_, name, args) => {
-            let arg_vals: Vec<Scalar> = args.iter().map(|v| resolve_or_box(env, pack_map, heap, *v)).collect();
+            let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.0]).collect();
             Some(eval_function_inner(module, heap, scratch, name, &arg_vals))
         }
 
@@ -386,8 +346,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             let Scalar::Ptr(idx) = env[ptr.0] else {
                 panic!("store to non-ptr: {:?}", env[ptr.0]);
             };
-            let scalar = resolve_or_box(env, pack_map, heap, *val);
-            heap.store(idx, *offset, scalar);
+            heap.store(idx, *offset, env[val.0]);
             None
         }
 
@@ -404,8 +363,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                 panic!("store_dyn to non-ptr: {:?}", env[ptr.0]);
             };
             let slot = scalar_to_usize(env[idx_val.0]);
-            let scalar = resolve_or_box(env, pack_map, heap, *val);
-            heap.store_dyn(heap_idx, slot, scalar);
+            heap.store_dyn(heap_idx, slot, env[val.0]);
             None
         }
 
@@ -461,24 +419,31 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.0], size)))
         }
 
-        Inst::Pack(dest, fields) => {
-            pack_map.insert(dest.0, fields.clone());
-            None
+        Inst::Pack(_dest, fields) => {
+            let n = fields.len();
+            let idx = heap.alloc(n);
+            for (i, f) in fields.iter().enumerate() {
+                heap.store(idx, i, env[f.0]);
+            }
+            Some(Scalar::Ptr(idx))
         }
 
         Inst::Extract(_, agg, idx) => {
-            let sources = pack_map.get(&agg.0)
-                .unwrap_or_else(|| panic!("extract from non-pack value v{}", agg.0));
-            Some(env[sources[*idx].0])
+            if let Scalar::Ptr(p) = env[agg.0] {
+                Some(heap.load(p, *idx))
+            } else {
+                panic!("extract from non-Ptr value v{}: {:?}", agg.0, env[agg.0])
+            }
         }
 
-        Inst::Insert(dest, agg, idx, val) => {
-            let sources = pack_map.get(&agg.0)
-                .unwrap_or_else(|| panic!("insert into non-pack value v{}", agg.0));
-            let mut new_sources = sources.clone();
-            new_sources[*idx] = *val;
-            pack_map.insert(dest.0, new_sources);
-            None
+        Inst::Insert(_dest, agg, idx, val) => {
+            if let Scalar::Ptr(p) = env[agg.0] {
+                let new_idx = heap.clone_object(p);
+                heap.store(new_idx, *idx, env[val.0]);
+                Some(Scalar::Ptr(new_idx))
+            } else {
+                panic!("insert into non-Ptr value v{}: {:?}", agg.0, env[agg.0])
+            }
         }
     }
 }

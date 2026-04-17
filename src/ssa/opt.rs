@@ -655,7 +655,7 @@ fn split_agg_params(func: &mut Function) {
                     // operands) would need a re-Pack and complicate things.
                     let only_extract_uses = func.blocks.values().all(|b| {
                         let inst_ok = b.insts.iter().all(|inst| {
-                            if let Inst::Extract(_, agg, _) = inst {
+                            if let Inst::Extract(_, _agg, _) = inst {
                                 return true;
                             }
                             !inst.operands().contains(&p)
