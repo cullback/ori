@@ -2,21 +2,22 @@ use super::{Block, Function, Module};
 use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
 use std::collections::{BTreeMap, HashMap};
 
-/// `jump`/`branch`/`switch_int`/`ret` coerce `Agg(n)` arguments flowing
-/// to `Ptr`-typed sinks by boxing them here. Keeping the boxing at the
-/// terminator site means the emitted IR is already type-honest — no
-/// separate post-lowering coerce pass needed.
-///
-/// Only Agg→Ptr is handled: the runtime's pack side-table already
-/// tolerates the mismatch, so boxing is behavior-preserving. Scalar
-/// mismatches (Ptr↔I64 etc.) indicate upstream type lies and are
-/// surfaced by the validator rather than silently papered over.
-fn coerce_kind(src: ScalarType, dst: ScalarType) -> Option<usize> {
-    if dst != ScalarType::Ptr {
-        return None;
-    }
-    match src {
-        ScalarType::Agg(n) => Some(n),
+/// Coercion direction between Agg(n) and Ptr at terminator edges.
+enum CoerceDir {
+    /// Pack register values into a heap object.
+    AggToPtr(usize),
+    /// Load heap object fields into a pack.
+    PtrToAgg(usize),
+}
+
+/// `jump`/`branch`/`switch_int`/`ret` coerce arguments flowing
+/// between `Agg(n)` and `Ptr` representations. Boxing (Agg→Ptr)
+/// allocates a heap object and stores fields. Unboxing (Ptr→Agg)
+/// loads fields from a heap object into a Pack.
+fn coerce_kind(src: ScalarType, dst: ScalarType) -> Option<CoerceDir> {
+    match (src, dst) {
+        (ScalarType::Agg(n), ScalarType::Ptr) => Some(CoerceDir::AggToPtr(n)),
+        (ScalarType::Ptr, ScalarType::Agg(n)) => Some(CoerceDir::PtrToAgg(n)),
         _ => None,
     }
 }
@@ -351,20 +352,30 @@ impl Builder {
             Some(t) => *t,
             None => return value,
         };
-        let Some(n) = coerce_kind(src_ty, dst_ty) else {
+        let Some(dir) = coerce_kind(src_ty, dst_ty) else {
             return value;
         };
-        // Box the Agg(n) into a heap Ptr via Alloc + Extracts + Stores.
-        // The extracted field types don't affect runtime — Extract
-        // reads the pack side-table — so use U64 as a placeholder.
-        let ptr = self.fresh_value(ScalarType::Ptr);
-        self.push(Inst::Alloc(ptr, n));
-        for i in 0..n {
-            let field = self.fresh_value(ScalarType::U64);
-            self.push(Inst::Extract(field, value, i));
-            self.push(Inst::Store(ptr, i, field));
+        match dir {
+            CoerceDir::AggToPtr(n) => {
+                let ptr = self.fresh_value(ScalarType::Ptr);
+                self.push(Inst::Alloc(ptr, n));
+                for i in 0..n {
+                    let field = self.fresh_value(ScalarType::U64);
+                    self.push(Inst::Extract(field, value, i));
+                    self.push(Inst::Store(ptr, i, field));
+                }
+                ptr
+            }
+            CoerceDir::PtrToAgg(n) => {
+                let mut fields = Vec::with_capacity(n);
+                for i in 0..n {
+                    let field = self.fresh_value(ScalarType::U64);
+                    self.push(Inst::Load(field, value, i));
+                    fields.push(field);
+                }
+                self.pack(fields)
+            }
         }
-        ptr
     }
 
     // ---- Function building ----

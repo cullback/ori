@@ -121,23 +121,76 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     /// Resolve a type to its SSA scalar type, aware of fieldless tag
-    /// unions and transparent aliases. Transparent resolution matters
-    /// for `Foo := I64`-style declarations, where `Foo` must lower to
-    /// `I64`, not `Ptr`, to keep merge/return types honest.
-    ///
-    /// Composite types (records/tuples/packable tag unions) are NOT
-    /// reported as `Agg(n)` here even when `lower_constructor_call`
-    /// emits a `Pack` for a freshly-built value. A type `{val: I64}`
-    /// loaded out of a heap slot is actually a `Ptr` at runtime (the
-    /// store boxed it), so declaring it `Agg` would mislead consumers
-    /// that emit `Extract` based on the declared type. The freshly-
-    /// packed register representation is handled locally by callers
-    /// that observe `can_pack`; the `Agg→Ptr` mismatches that result
-    /// at terminator boundaries are boxed inline by the builder so
-    /// the emitted IR is already type-honest.
+    /// unions and transparent aliases. Returns `Ptr` for composite
+    /// types — use `repr_type` when the value is known to be freshly
+    /// produced (record/tuple/constructor literal) and could stay
+    /// packed as `Agg(n)`.
     fn scalar_type(&self, ty: &Type) -> ScalarType {
         let unwrapped = self.resolve_transparent(ty);
         resolve_scalar_type(&unwrapped, &self.decls.fieldless_tags)
+    }
+
+    /// Like `scalar_type` but returns `Agg(n)` for packable composite
+    /// types. Used at merge-point block params so that freshly packed
+    /// values flow through without heap boxing.
+    fn repr_type(&self, ty: &Type) -> ScalarType {
+        let base = self.scalar_type(ty);
+        if base == ScalarType::Ptr {
+            if let Some(n) = self.packable_field_count(ty) {
+                return ScalarType::Agg(n);
+            }
+        }
+        base
+    }
+
+    fn expr_repr_type(&self, expr: &Expr<'src>) -> ScalarType {
+        self.repr_type(&expr.ty)
+    }
+
+    /// If `ty` is a composite that `can_pack` would accept, return
+    /// its field count. Records and tuples return their field count
+    /// directly; tag unions return 1 + max_fields (tag slot + payload).
+    fn packable_field_count(&self, ty: &Type) -> Option<usize> {
+        let resolved = self.resolve_transparent(ty);
+        match &resolved {
+            Type::Record { fields, .. } => {
+                let mut sorted: Vec<(&str, &Type)> =
+                    fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                sorted.sort_unstable_by_key(|(n, _)| *n);
+                let field_types: Vec<ScalarType> =
+                    sorted.iter().map(|(_, t)| self.scalar_type(t)).collect();
+                if Self::can_pack(&field_types) {
+                    Some(field_types.len())
+                } else {
+                    None
+                }
+            }
+            Type::Tuple(elems) => {
+                let field_types: Vec<ScalarType> =
+                    elems.iter().map(|t| self.scalar_type(t)).collect();
+                if Self::can_pack(&field_types) {
+                    Some(field_types.len())
+                } else {
+                    None
+                }
+            }
+            Type::TagUnion { tags, .. } => {
+                if tags.iter().all(|(_, fs)| fs.is_empty()) {
+                    return None;
+                }
+                let max_fields = tags.iter().map(|(_, fs)| fs.len()).max().unwrap_or(0);
+                let all_non_ptr = tags.iter().all(|(_, fs)| {
+                    fs.iter()
+                        .all(|t| !matches!(self.scalar_type(t), ScalarType::Ptr | ScalarType::Agg(_)))
+                });
+                if all_non_ptr && 1 + max_fields <= 8 {
+                    Some(1 + max_fields)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Emit a constant for a fieldless tag index using the appropriate discriminant type.
@@ -537,10 +590,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             } => self.lower_method_call(receiver, method, args, expr),
 
             ExprKind::Tuple(elems) => {
-                // Tuples stay heap-allocated for now. Tuple equality/hash
-                // functions receive values as Ptr and the auto-boxing
-                // path has edge cases with set operations. Records and
-                // constructors are the primary Pack targets.
                 let ptr = self.builder.alloc(elems.len());
                 for (i, e) in elems.iter().enumerate() {
                     let val = self.lower_expr(e);
