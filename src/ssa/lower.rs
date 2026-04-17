@@ -2118,7 +2118,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         if until {
             let tag = self.builder.load(result, 0, ScalarType::U64);
-            let payload = self.builder.load(result, 1, acc_ty);
+            // The Step wrapper is a heap object; its payload slot holds
+            // the accumulator in its STORAGE representation (Ptr even when
+            // acc_ty is Agg). coerce_args at the branch/jump handles the
+            // Ptr→Agg conversion if the target block param is Agg.
+            let payload_load_ty = match acc_ty {
+                ScalarType::Agg(_) => ScalarType::Ptr,
+                other => other,
+            };
+            let payload = self.builder.load(result, 1, payload_load_ty);
             let break_tag = self.decls.constructors["Break"].tag_index;
             let break_val = self.builder.const_u64(break_tag);
             let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
@@ -2130,12 +2138,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.switch_to(done);
         done_param
     }
-
-    // ---- List walk lowering ----
-    //
-    // Fold lowering used to live here; it now runs as an AST → AST
-    // rewrite in `src/fold_lift.rs`. The lowerer panics on `Fold`
-    // expressions because fold_lift eliminates them before SSA.
 
     fn lower_list_walk(
         &mut self,
@@ -2191,9 +2193,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .binop(BinaryOp::Add, i_param, one, ScalarType::U64);
 
         if until {
-            // result is Step(b): slot 0 = tag, slot 1 = payload
             let tag = self.builder.load(result, 0, ScalarType::U64);
-            let payload = self.builder.load(result, 1, acc_ty);
+            let payload_load_ty = match acc_ty {
+                ScalarType::Agg(_) => ScalarType::Ptr,
+                other => other,
+            };
+            let payload = self.builder.load(result, 1, payload_load_ty);
             let break_tag = self.decls.constructors["Break"].tag_index;
             let break_val = self.builder.const_u64(break_tag);
             let is_break = self

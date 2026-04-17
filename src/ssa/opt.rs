@@ -12,6 +12,7 @@ pub fn optimize(module: &mut Module) {
     for func in module.functions.values_mut() {
         const_fold(func);
         nop_elim(func);
+        load_of_agg(func);
         extract_of_pack(func);
         jump_threading(func);
         branch_switch_fold(func);
@@ -600,6 +601,23 @@ fn is_side_effect(inst: &Inst) -> bool {
 }
 
 /// Peephole: `extract(pack(a, b, c), i)` → `source[i]`.
+/// Convert `Load(d, v, offset)` to `Extract(d, v, offset)` when `v` is
+/// Agg-typed. After inlining, a callee that returns an Agg may feed a
+/// continuation param whose original consumers used Load (because the
+/// call result was Ptr-typed). Converting to Extract enables the
+/// subsequent `extract_of_pack` pass to fold Extract(Pack(...), i) → vi.
+fn load_of_agg(func: &mut Function) {
+    for block in func.blocks.values_mut() {
+        for inst in &mut block.insts {
+            if let Inst::Load(dest, ptr, offset) = inst {
+                if matches!(func.value_types.get(ptr), Some(ScalarType::Agg(_))) {
+                    *inst = Inst::Extract(*dest, *ptr, *offset);
+                }
+            }
+        }
+    }
+}
+
 fn extract_of_pack(func: &mut Function) -> bool {
     // Map Pack dest → source operands.
     let mut packs: HashMap<Value, Vec<Value>> = HashMap::new();
