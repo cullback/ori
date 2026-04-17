@@ -676,6 +676,7 @@ fn build_new_infer_result(
         func_schemes,
         constructor_schemes: old.constructor_schemes.clone(),
         transparent: old.transparent.clone(),
+        binop_method: old.binop_method.clone(),
     }
 }
 

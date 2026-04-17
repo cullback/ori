@@ -509,6 +509,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             self.lower_tag_union_eq(l, r, &resolved_ty, negate)
                         } else if self.is_list_type(&lhs.ty) || self.is_list_type(&rhs.ty) {
                             self.lower_list_eq(l, r, negate)
+                        } else if let Some(method) = self.infer.binop_method.get(&expr.span).cloned() {
+                            self.lower_method_eq(l, r, &lhs.ty, &method, negate)
                         } else if let Some(n) = self.agg_field_count(l).or_else(|| self.agg_field_count(r)) {
                             self.lower_agg_eq(l, r, n, negate)
                         } else {
@@ -1254,6 +1256,33 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// ptr) from a raw SSA boolean comparison. Used by `==`/`!=`
     /// lowering and by `x is Con(..)` expressions. Pass `negate =
     /// true` to flip which branch emits `True`.
+    fn lower_method_eq(&mut self, lhs: Value, rhs: Value, lhs_ty: &Type, method: &str, negate: bool) -> Value {
+        if method == "__builtin.equals" {
+            return self.lower_eq(lhs, rhs, negate);
+        }
+        // Compiler-generated inline equality — emit field-by-field SSA
+        // using the source type to determine field count and types.
+        if method == "__record_equals" {
+            let resolved = self.resolve_transparent(lhs_ty);
+            return self.lower_record_eq(lhs, rhs, &resolved, negate);
+        }
+        if method == "__tuple_equals" {
+            let resolved = self.resolve_transparent(lhs_ty);
+            return self.lower_tuple_eq(lhs, rhs, &resolved, negate);
+        }
+        let ret_ty = self.func_ret_type(method);
+        let result = self.builder.call(method, vec![lhs, rhs], ret_ty);
+        if negate {
+            let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
+            let true_tag = self.decls.constructors["True"].tag_index;
+            let true_val = self.const_tag(true_tag, disc_ty);
+            let is_true = self.builder.binop(BinaryOp::Eq, result, true_val, ScalarType::U8);
+            self.lower_bool_from_cmp_neg(is_true, true)
+        } else {
+            result
+        }
+    }
+
     fn lower_eq(&mut self, lhs: Value, rhs: Value, negate: bool) -> Value {
         let cmp = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::U8);
         self.lower_bool_from_cmp_neg(cmp, negate)

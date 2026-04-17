@@ -35,6 +35,10 @@ pub struct InferResult {
     /// Transparent type definitions: name → (type param vars, underlying type).
     /// Used by the lowerer to unwrap nominal types to their underlying representation.
     pub transparent: HashMap<String, (Vec<TypeVar>, Type)>,
+    /// Resolved method names for `==`/`!=` on concrete types (keyed by
+    /// the BinOp expression's span). Populated when the type checker
+    /// resolves equality to an `equals` method.
+    pub binop_method: HashMap<crate::syntax::raw::Span, String>,
 }
 
 // ---- Inference context ----
@@ -69,6 +73,8 @@ struct InferCtx<'a, 'src> {
     is_bindings: HashMap<Span, Vec<(String, Type)>>,
     /// Resolved method calls: span → mangled method name.
     method_resolutions: HashMap<Span, String>,
+    /// Resolved `==`/`!=` on concrete types: span → equals method name.
+    binop_equals: HashMap<Span, String>,
     /// Constructor references to eta-expand in post-inference rewrite.
     eta_expansions: HashMap<Span, EtaInfo>,
 
@@ -103,6 +109,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             expr_types: HashMap::new(),
             is_bindings: HashMap::new(),
             method_resolutions: HashMap::new(),
+            binop_equals: HashMap::new(),
             eta_expansions: HashMap::new(),
             symbols,
             fields,
@@ -1190,6 +1197,18 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 },
                 span,
             );
+        } else if is_eq {
+            // For concrete types, resolve `==` / `!=` through the
+            // `equals` method so user-defined types work uniformly.
+            // Scalar primitives resolve via __builtin.equals; records,
+            // tuples, lists, etc. resolve via their type's method.
+            // Store in binop_equals (not method_resolutions) since
+            // BinOp has no `resolved` AST field.
+            if self.resolve_method(resolved, "equals", vec![rt], span).is_ok() {
+                if let Some(resolution) = self.method_resolutions.remove(&span) {
+                    self.binop_equals.insert(span, resolution);
+                }
+            }
         }
 
         if is_eq || is_ord {
@@ -2146,6 +2165,9 @@ pub fn check(
 
     let transparent = ctx.engine.transparent.clone();
 
+    // Extract binop method resolutions BEFORE rewrite borrows symbols.
+    let binop_method = ctx.binop_equals.clone();
+
     // Single combined post-inference walk: write resolved types onto
     // Expr::ty, write method resolutions onto MethodCall/QualifiedCall
     // nodes, and eta-expand constructor/method references.
@@ -2161,6 +2183,7 @@ pub fn check(
         func_schemes,
         constructor_schemes,
         transparent,
+        binop_method,
     })
 }
 
