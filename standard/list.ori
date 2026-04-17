@@ -7,65 +7,114 @@ Step(a) := [Continue(a), Break(a)]
 # Methods without bodies are compiler builtins.
 List := {}.(
     # Returns the number of elements in the list.
+    # ```ori
+    # expect [].len() == 0
+    # expect [1, 2, 3].len() == 3
+    # ```
     len : List(a) -> U64
 
     # Returns the element at the given index, or Err(OutOfBounds).
+    # ```ori
+    # expect [10, 20, 30].get(0).unwrap() == 10
+    # expect [10, 20, 30].get(2).unwrap() == 30
+    # ```
     get : List(a), U64 -> Result(a, [OutOfBounds])
 
     # Returns a new list with the element at the given index replaced.
+    # ```ori
+    # expect [1, 2, 3].set(1, 99).get(1).unwrap() == 99
+    # expect [1, 2, 3].set(1, 99).len() == 3
+    # ```
     set : List(a), U64, a -> List(a)
 
     # Returns a new list with the element appended to the end.
+    # ```ori
+    # expect [1, 2].append(3).len() == 3
+    # expect [1, 2].append(3).get(2).unwrap() == 3
+    # expect [].append(1).get(0).unwrap() == 1
+    # ```
     append : List(a), a -> List(a)
 
     # Returns a new list with the elements in reverse order.
-    # For right-to-left iteration, chain through reverse:
-    # `xs.reverse().walk(init, f)`.
+    # ```ori
+    # expect [1, 2, 3].reverse().get(0).unwrap() == 3
+    # expect [1, 2, 3].reverse().get(2).unwrap() == 1
+    # expect [].reverse().len() == 0
+    # ```
     reverse : List(a) -> List(a)
 
     # Reduces the list from left to right, threading an accumulator
     # through each element.
+    # ```ori
+    # expect [1, 2, 3].walk(0, |acc, x| acc + x) == 6
+    # expect [].walk(100, |acc, x| acc + x) == 100
+    # ```
     walk : List(a), b, (b, a -> b) -> b
 
     # Returns a sub-list starting at index `start` with `count` elements.
-    # Panics if `start + count > len`.
+    # ```ori
+    # expect [10, 20, 30, 40, 50].sublist(1, 3).len() == 3
+    # expect [10, 20, 30, 40, 50].sublist(1, 3).get(0).unwrap() == 20
+    # ```
     sublist : List(a), U64, U64 -> List(a)
 
     # Creates a list of `n` copies of `val`.
+    # ```ori
+    # expect List.repeat(7, 3).len() == 3
+    # expect List.repeat(7, 3).get(2).unwrap() == 7
+    # expect List.repeat(0, 0).len() == 0
+    # ```
     repeat : a, U64 -> List(a)
 
     # Returns a list of integers from `start` (inclusive) to `end` (exclusive).
-    # `List.range(0, 5)` produces `[0, 1, 2, 3, 4]`.
+    # ```ori
+    # expect List.range(0, 5).len() == 5
+    # expect List.range(0, 5).get(3).unwrap() == 3
+    # expect List.range(3, 3).len() == 0
+    # ```
     range : U64, U64 -> List(U64)
 
     # Same as walk, except the callback can stop iteration early.
+    # ```ori
+    # expect [1, 2, 3, 4, 5].walk_until(0, |acc, x| if x == 4 then Break(acc) else Continue(acc + x)) == 6
+    # ```
     walk_until : List(a), b, (b, a -> Step(b)) -> b
 
     # Returns True if the list has no elements.
+    # ```ori
+    # expect [].is_empty() == True
+    # expect [1].is_empty() == False
+    # ```
     is_empty : List(a) -> Bool
     is_empty = |xs| xs.len() == 0
 
     # Returns the first element, or Err(Empty) if the list is empty.
+    # ```ori
+    # expect [10, 20].first().unwrap() == 10
+    # ```
     first : List(a) -> Result(a, [Empty])
     first = |xs| if xs.is_empty() then Err(Empty) else Ok(xs.get(0).unwrap())
 
     # Returns a new list with the element added to the front.
+    # ```ori
+    # expect [2, 3].prepend(1).get(0).unwrap() == 1
+    # expect [2, 3].prepend(1).len() == 3
+    # ```
     prepend : List(a), a -> List(a)
     prepend = |xs, x| xs.walk([x], |acc, elem| acc.append(elem))
 
     # Applies a function to every element, returning a new list.
+    # ```ori
+    # expect [1, 2, 3].map(|x| x * 10).get(1).unwrap() == 20
+    # expect [].map(|x| x + 1).len() == 0
+    # ```
     map : List(a), (a -> b) -> List(b)
     map = |xs, f| xs.walk([], |acc, x| acc.append(f(x)))
 
-    # Like walk, but yields every intermediate accumulator value as
-    # a list. Output length equals input length — the initial value
-    # is threaded through but NOT included in the result. Example:
-    # `[1, 2, 3, 4].trail(0, |acc, x| acc + x)` produces
-    # `[1, 3, 6, 10]` (running totals).
-    #
-    # The accumulator type `b` can differ from the element type `a`,
-    # so trail handles state machines and type-transforming folds as
-    # naturally as plain running aggregates.
+    # Yields every intermediate accumulator value as a list.
+    # ```ori
+    # expect [1, 2, 3, 4].trail(0, |acc, x| acc + x).get(2).unwrap() == 6
+    # ```
     trail : List(a), b, (b, a -> b) -> List(b)
     trail = |xs, init, f| (
         final = xs.walk({ acc: init, out: [] }, |state, x| (
@@ -77,6 +126,9 @@ List := {}.(
 
     # Returns the index of the first element satisfying the predicate,
     # or `Err(NotFound)` if no element matches.
+    # ```ori
+    # expect [10, 20, 30].find_index(|x| x == 20).unwrap() == 1
+    # ```
     find_index : List(a), (a -> Bool) -> Result(U64, [NotFound])
     find_index = |xs, pred| (
         result = xs.walk_until({ i: 0, found: Err(NotFound) }, |state, x|
@@ -86,10 +138,10 @@ List := {}.(
         result.found
     )
 
-    # Splits the list on every occurrence of the delimiter,
-    # returning a list of sub-lists. The delimiter itself is
-    # not included in any sub-list.
-    # `[1, 2, 3, 2, 4].split_on(2)` produces `[[1], [3], [4]]`.
+    # Splits the list on every occurrence of the delimiter.
+    # ```ori
+    # expect [1, 2, 3, 2, 4].split_on(2).len() == 3
+    # ```
     split_on : List(a), a -> List(List(a)) where [a.equals]
     split_on = |xs, delim| (
         state = xs.walk({ chunks: [], current: [] }, |s, x|
@@ -101,15 +153,20 @@ List := {}.(
     )
 
     # Returns True if the list contains an element equal to `target`.
+    # ```ori
+    # expect [1, 2, 3].contains(2) == True
+    # expect [1, 2, 3].contains(9) == False
+    # ```
     contains : List(a), a -> Bool where [a.equals]
     contains = |xs, target|
         xs.walk_until(False, |_, x|
             if x == target then Break(True) else Continue(False))
 
-    # Splits the list into chunks of the given size. The last chunk
-    # may be shorter if the list doesn't divide evenly. Returns an
-    # empty list if the input is empty or chunk_size is 0.
-    # `[1, 2, 3, 4, 5].chunks_of(2)` produces `[[1, 2], [3, 4], [5]]`.
+    # Splits the list into chunks of the given size.
+    # ```ori
+    # expect [1, 2, 3, 4, 5].chunks_of(2).len() == 3
+    # expect [].chunks_of(3).len() == 0
+    # ```
     chunks_of : List(a), U64 -> List(List(a))
     chunks_of = |xs, chunk_size| (
         if chunk_size == 0 then []
@@ -129,19 +186,23 @@ List := {}.(
     )
 
     # Concatenates two lists.
+    # ```ori
+    # expect [1, 2].concat([3, 4]).len() == 4
+    # expect [1, 2].concat([3, 4]).get(2).unwrap() == 3
+    # ```
     concat : List(a), List(a) -> List(a)
     concat = |a, b| b.walk(a, |acc, x| acc.append(x))
 
     # Pairs each element with its index.
-    # `["a", "b", "c"].enumerate()` produces `[(0, "a"), (1, "b"), (2, "c")]`.
+    # ```ori
+    # expect [10, 20, 30].enumerate().len() == 3
+    # ```
     enumerate : List(a) -> List((U64, a))
     enumerate = |xs| xs.walk({ i: 0, out: [] }, |state, x|
         { i: state.i + 1, out: state.out.append((state.i, x)) }
     ).out
 
-    # Splits the list into two lists: elements satisfying the predicate
-    # go into the first, the rest into the second.
-    # `[1, 2, 3, 4, 5].partition(|x| x % 2 == 0)` produces `([2, 4], [1, 3, 5])`.
+    # Splits the list into two: matches go first, rest go second.
     partition : List(a), (a -> Bool) -> (List(a), List(a))
     partition = |xs, pred| xs.walk(([], []), |(yes, no), x|
         if pred(x) then (yes.append(x), no)
@@ -149,6 +210,10 @@ List := {}.(
     )
 
     # Returns the sum of all elements.
+    # ```ori
+    # expect [1, 2, 3, 4].sum() == 10
+    # expect [].sum() == 0
+    # ```
     sum : List(a) -> a where [a.add]
     sum = |xs| xs.walk(0, |acc, x| acc + x)
 )

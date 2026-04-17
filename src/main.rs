@@ -170,7 +170,22 @@ fn main() {
 
     if test_mode {
         let doctests = crate::syntax::parse::extract_doctest_expects(&content);
-        if !doctests.is_empty() {
+        let is_lib = content.lines().any(|l| l.trim().starts_with("exports "));
+        if is_lib {
+            // Lib files can't be tested directly (builtins have no
+            // bodies). Generate a wrapper that imports the module and
+            // includes its doctests.
+            let module_name = std::path::Path::new(source_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("lib");
+            let mut wrapper = format!("import {module_name}\n");
+            for dt in &doctests {
+                wrapper.push_str(dt);
+                wrapper.push('\n');
+            }
+            content = wrapper;
+        } else if !doctests.is_empty() {
             content.push('\n');
             content.push_str(&doctests.join("\n"));
         }
