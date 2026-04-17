@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};
 use crate::passes::decl_info::{self, DeclInfo, method_key, resolve_scalar_type};
@@ -30,6 +30,11 @@ struct LowerCtx<'a, 'src> {
     /// parameters, let-bound names, lambda params, and pattern
     /// bindings all enter/exit this map as their scopes open and close.
     vars: HashMap<SymbolId, Value>,
+    /// Generated equality functions, keyed by canonical name.
+    /// Each entry is a real SSA function that compares two values
+    /// of a concrete type field-by-field. Generated on first use
+    /// by `ensure_eq_func`.
+    eq_func_cache: HashSet<String>,
     // Immutable references:
     decls: &'a DeclInfo,
     infer: &'a InferResult,
@@ -52,6 +57,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         Self {
             builder: Builder::new(),
             vars: HashMap::new(),
+            eq_func_cache: HashSet::new(),
             decls,
             infer,
             symbols,
@@ -501,20 +507,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     BinOp::Eq | BinOp::Neq => {
                         let negate = matches!(op, BinOp::Neq);
                         let resolved_ty = self.resolve_transparent(&lhs.ty);
-                        if let Type::Record { .. } = &resolved_ty {
-                            self.lower_record_eq(l, r, &resolved_ty, negate)
-                        } else if let Type::Tuple(_) = &resolved_ty {
-                            self.lower_tuple_eq(l, r, &resolved_ty, negate)
-                        } else if let Type::TagUnion { .. } = &resolved_ty {
-                            self.lower_tag_union_eq(l, r, &resolved_ty, negate)
-                        } else if self.is_list_type(&lhs.ty) || self.is_list_type(&rhs.ty) {
-                            self.lower_list_eq(l, r, negate)
-                        } else if let Some(method) = self.infer.binop_method.get(&expr.span).cloned() {
-                            self.lower_method_eq(l, r, &lhs.ty, &method, negate)
-                        } else if let Some(n) = self.agg_field_count(l).or_else(|| self.agg_field_count(r)) {
-                            self.lower_agg_eq(l, r, n, negate)
-                        } else {
+                        if self.is_scalar_eq_type(&resolved_ty) {
                             self.lower_eq(l, r, negate)
+                        } else {
+                            let eq_name = self.ensure_eq_func(&resolved_ty);
+                            let result = self.builder.call(&eq_name, vec![l, r], ScalarType::U8);
+                            self.lower_bool_from_cmp_neg(result, negate)
                         }
                     }
                     BinOp::Lt => self.lower_cmp(l, r, BinaryOp::Lt),
@@ -911,19 +909,18 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
         }
         let recv_val = self.lower_expr(receiver);
-        if mangled == "__record_equals" {
+        if mangled == "__record_equals" || mangled == "__tuple_equals" {
             let rhs = self.lower_expr(&args[0]);
-            return self.lower_record_eq(recv_val, rhs, &receiver.ty, false);
+            let resolved = self.resolve_transparent(&receiver.ty);
+            let eq_name = self.ensure_eq_func(&resolved);
+            let result = self.builder.call(&eq_name, vec![recv_val, rhs], ScalarType::U8);
+            return self.lower_bool_from_cmp(result);
         }
         if mangled == "__record_to_str" {
             return self.lower_record_to_str(recv_val, &receiver.ty);
         }
         if mangled == "__record_hash" {
             return self.lower_record_hash(recv_val, &receiver.ty);
-        }
-        if mangled == "__tuple_equals" {
-            let rhs = self.lower_expr(&args[0]);
-            return self.lower_tuple_eq(recv_val, rhs, &receiver.ty, false);
         }
         if mangled == "__tuple_hash" {
             return self.lower_tuple_hash(recv_val, &receiver.ty);
@@ -1256,79 +1253,198 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// ptr) from a raw SSA boolean comparison. Used by `==`/`!=`
     /// lowering and by `x is Con(..)` expressions. Pass `negate =
     /// true` to flip which branch emits `True`.
-    fn lower_method_eq(&mut self, lhs: Value, rhs: Value, lhs_ty: &Type, method: &str, negate: bool) -> Value {
-        if method == "__builtin.equals" {
-            return self.lower_eq(lhs, rhs, negate);
-        }
-        // Compiler-generated inline equality — emit field-by-field SSA
-        // using the source type to determine field count and types.
-        if method == "__record_equals" {
-            let resolved = self.resolve_transparent(lhs_ty);
-            return self.lower_record_eq(lhs, rhs, &resolved, negate);
-        }
-        if method == "__tuple_equals" {
-            let resolved = self.resolve_transparent(lhs_ty);
-            return self.lower_tuple_eq(lhs, rhs, &resolved, negate);
-        }
-        let ret_ty = self.func_ret_type(method);
-        let result = self.builder.call(method, vec![lhs, rhs], ret_ty);
-        if negate {
-            let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
-            let true_tag = self.decls.constructors["True"].tag_index;
-            let true_val = self.const_tag(true_tag, disc_ty);
-            let is_true = self.builder.binop(BinaryOp::Eq, result, true_val, ScalarType::U8);
-            self.lower_bool_from_cmp_neg(is_true, true)
-        } else {
-            result
-        }
-    }
-
     fn lower_eq(&mut self, lhs: Value, rhs: Value, negate: bool) -> Value {
         let cmp = self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::U8);
         self.lower_bool_from_cmp_neg(cmp, negate)
     }
 
-    /// Field-by-field record equality with short-circuit branching.
-    /// Each field comparison branches: if not equal, jump to the
-    /// "false" merge; otherwise check the next field.
-    fn lower_record_eq(&mut self, lhs: Value, rhs: Value, ty: &Type, negate: bool) -> Value {
-        let Type::Record { fields, .. } = ty else {
-            panic!("lower_record_eq called on non-record type");
-        };
-        let mut sorted: Vec<(&str, &Type)> = fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
-        sorted.sort_by_key(|(n, _)| *n);
-
-        if sorted.is_empty() {
-            // Empty records are always equal.
-            let cmp = self.builder.const_u8(1);
-            return self.lower_bool_from_cmp_neg(cmp, negate);
+    /// True for types where `==` is a single scalar comparison.
+    fn is_scalar_eq_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Con(name) => {
+                crate::numeric::NumericType::from_name(name).is_some()
+                    || self.decls.fieldless_tags.contains_key(name.as_str())
+            }
+            Type::TagUnion { tags, .. } => tags.iter().all(|(_, fs)| fs.is_empty()),
+            _ => false,
         }
+    }
 
+    // ---- Generated equality functions ----
+    //
+    // Instead of inlining equality SSA at every `==` site, generate
+    // one named function per concrete type. The BinOp::Eq dispatch
+    // just calls it. Cached in `eq_func_cache` so each type gets
+    // one function.
+
+    /// True if `ensure_eq_func` would generate a meaningful equality
+    /// function (not just scalar eq).
+    fn has_eq_func(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Record { .. } | Type::Tuple(_) | Type::TagUnion { .. })
+            || matches!(ty, Type::App(n, _) if n == "List")
+            || self.packable_field_count(ty).is_some()
+    }
+
+    /// For a nominal type like Result or Step, find the slot count
+    /// (1 + max_fields) by looking up its constructors.
+    fn nominal_slot_count(&self, type_name: &str) -> Option<usize> {
+        for (con_name, scheme) in &self.infer.constructor_schemes {
+            let ret_ty = match &scheme.ty {
+                Type::Arrow(_, ret) => ret.as_ref(),
+                other => other,
+            };
+            if let Type::App(ret_name, _) = ret_ty {
+                if ret_name == type_name {
+                    if let Some(meta) = self.decls.constructors.get(con_name) {
+                        if meta.max_fields > 0 && 1 + meta.max_fields <= 8 {
+                            return Some(1 + meta.max_fields);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn mangle_type(ty: &Type) -> String {
+        match ty {
+            Type::Con(n) => n.clone(),
+            Type::App(n, args) => {
+                let inner: Vec<String> = args.iter().map(Self::mangle_type).collect();
+                format!("{n}({})", inner.join(","))
+            }
+            Type::Tuple(elems) => {
+                let inner: Vec<String> = elems.iter().map(Self::mangle_type).collect();
+                format!("({})", inner.join(","))
+            }
+            Type::Record { fields, .. } => {
+                let mut sorted: Vec<(&str, &Type)> =
+                    fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                sorted.sort_by_key(|(n, _)| *n);
+                let inner: Vec<String> = sorted
+                    .iter()
+                    .map(|(n, t)| format!("{n}:{}", Self::mangle_type(t)))
+                    .collect();
+                format!("{{{}}}", inner.join(","))
+            }
+            Type::TagUnion { tags, .. } => {
+                let inner: Vec<String> = tags
+                    .iter()
+                    .map(|(n, fs)| {
+                        if fs.is_empty() {
+                            n.clone()
+                        } else {
+                            let fstrs: Vec<String> = fs.iter().map(Self::mangle_type).collect();
+                            format!("{n}({})", fstrs.join(","))
+                        }
+                    })
+                    .collect();
+                format!("[{}]", inner.join(","))
+            }
+            _ => format!("{ty:?}"),
+        }
+    }
+
+    fn ensure_eq_func(&mut self, ty: &Type) -> String {
+        let name = format!("__eq__{}", Self::mangle_type(ty));
+        if self.eq_func_cache.contains(&name) {
+            return name;
+        }
+        // Mark as generated BEFORE emitting body (handles recursive types).
+        self.eq_func_cache.insert(name.clone());
+
+        let saved_vars = std::mem::take(&mut self.vars);
+        let saved_func = std::mem::replace(
+            &mut self.builder.func,
+            crate::ssa::builder::FuncBuilder::new(),
+        );
+        let saved_current = self.builder.current_block.take();
+        let saved_types = std::mem::take(&mut self.builder.value_types);
+
+        let param_ty = self.scalar_type(ty);
+        let lhs = self.builder.add_func_param(param_ty);
+        let rhs = self.builder.add_func_param(param_ty);
+        self.builder.set_return_type(ScalarType::U8);
+
+        let entry = self.builder.create_block();
+        self.builder.switch_to(entry);
+        let result = self.emit_eq_body(lhs, rhs, ty);
+        self.builder.ret(result);
+        self.builder.finish_function(&name, ScalarType::U8);
+
+        self.builder.func = saved_func;
+        self.builder.current_block = saved_current;
+        self.builder.value_types = saved_types;
+        self.vars = saved_vars;
+
+        name
+    }
+
+    fn emit_eq_body(&mut self, lhs: Value, rhs: Value, ty: &Type) -> Value {
+        let resolved = self.resolve_transparent(ty);
+        let ty = &resolved;
+        match ty {
+            Type::Record { fields, .. } => {
+                let mut sorted: Vec<(&str, &Type)> =
+                    fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                sorted.sort_by_key(|(n, _)| *n);
+                let field_types: Vec<&Type> = sorted.iter().map(|(_, t)| *t).collect();
+                self.emit_fields_eq(lhs, rhs, &field_types)
+            }
+            Type::Tuple(elems) => {
+                let field_types: Vec<&Type> = elems.iter().collect();
+                self.emit_fields_eq(lhs, rhs, &field_types)
+            }
+            Type::TagUnion { tags, .. } => {
+                let max_fields = tags.iter().map(|(_, fs)| fs.len()).max().unwrap_or(0);
+                // Tag + payload slots — compare all as U64.
+                let n = 1 + max_fields;
+                self.emit_slots_eq(lhs, rhs, n)
+            }
+            Type::App(name, args) if name == "List" => {
+                let elem_ty = args.first();
+                self.emit_list_eq(lhs, rhs, elem_ty)
+            }
+            Type::App(name, _) | Type::Con(name) => {
+                // Nominal types (Result, Step, etc.): find the
+                // constructor slot count and compare structurally.
+                if let Some(n) = self.nominal_slot_count(name) {
+                    self.emit_slots_eq(lhs, rhs, n)
+                } else {
+                    self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::U8)
+                }
+            }
+            _ => self.builder.binop(BinaryOp::Eq, lhs, rhs, ScalarType::U8),
+        }
+    }
+
+    /// Compare a fixed number of typed fields, recursing into sub-types.
+    fn emit_fields_eq(&mut self, lhs: Value, rhs: Value, field_types: &[&Type]) -> Value {
+        if field_types.is_empty() {
+            return self.builder.const_u8(1);
+        }
         let false_block = self.builder.create_block();
         let true_block = self.builder.create_block();
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
 
-        for (slot, (_name, field_ty)) in sorted.iter().enumerate() {
-            let l = self.load_field(lhs, slot, self.scalar_type(field_ty));
-            let r = self.load_field(rhs, slot, self.scalar_type(field_ty));
-            let field_eq = if let Type::Record { .. } = field_ty {
-                // Nested record: recurse, compare unboxed Bool tag.
-                let bool_val = self.lower_record_eq(l, r, field_ty, false);
-                let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
-                let true_tag = self.decls.constructors["True"].tag_index;
-                let true_val = self.const_tag(true_tag, disc_ty);
-                self.builder.binop(BinaryOp::Eq, bool_val, true_val, ScalarType::U8)
-            } else {
+        for (slot, field_ty) in field_types.iter().enumerate() {
+            let sty = self.scalar_type(field_ty);
+            let l = self.load_field(lhs, slot, sty);
+            let r = self.load_field(rhs, slot, sty);
+            let field_eq = if self.is_scalar_eq_type(field_ty) {
                 self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8)
+            } else {
+                let sub_eq = self.ensure_eq_func(field_ty);
+                self.builder.call(&sub_eq, vec![l, r], ScalarType::U8)
             };
-            let next = if slot + 1 < sorted.len() {
+            let next = if slot + 1 < field_types.len() {
                 self.builder.create_block()
             } else {
                 true_block
             };
             self.builder.branch(field_eq, next, vec![], false_block, vec![]);
-            if slot + 1 < sorted.len() {
+            if slot + 1 < field_types.len() {
                 self.builder.switch_to(next);
             }
         }
@@ -1336,77 +1452,44 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.switch_to(true_block);
         let t = self.builder.const_u8(1);
         self.builder.jump(merge, vec![t]);
-
         self.builder.switch_to(false_block);
         let f = self.builder.const_u8(0);
         self.builder.jump(merge, vec![f]);
-
         self.builder.switch_to(merge);
-        self.lower_bool_from_cmp_neg(merge_param, negate)
+        merge_param
     }
 
-    /// Tuple structural equality: short-circuit AND of element comparisons.
-    fn lower_tuple_eq(&mut self, lhs: Value, rhs: Value, ty: &Type, negate: bool) -> Value {
-        let Type::Tuple(elem_types) = ty else {
-            panic!("lower_tuple_eq called on non-tuple type");
-        };
-
-        if elem_types.is_empty() {
-            let cmp = self.builder.const_u8(1);
-            return self.lower_bool_from_cmp_neg(cmp, negate);
+    /// Compare n slots as raw U64 values (for packed tag unions / Agg).
+    fn emit_slots_eq(&mut self, lhs: Value, rhs: Value, n: usize) -> Value {
+        if n == 0 {
+            return self.builder.const_u8(1);
         }
-
         let false_block = self.builder.create_block();
         let true_block = self.builder.create_block();
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
 
-        for (slot, elem_ty) in elem_types.iter().enumerate() {
-            let l = self.load_field(lhs, slot, self.scalar_type(elem_ty));
-            let r = self.load_field(rhs, slot, self.scalar_type(elem_ty));
-            let elem_eq = if let Type::Record { .. } = elem_ty {
-                let bool_val = self.lower_record_eq(l, r, elem_ty, false);
-                let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
-                let true_tag = self.decls.constructors["True"].tag_index;
-                let true_val = self.const_tag(true_tag, disc_ty);
-                self.builder.binop(BinaryOp::Eq, bool_val, true_val, ScalarType::U8)
-            } else if let Type::Tuple(_) = elem_ty {
-                let bool_val = self.lower_tuple_eq(l, r, elem_ty, false);
-                let disc_ty = self.decls.fieldless_tags.get("Bool").copied().unwrap_or(ScalarType::U8);
-                let true_tag = self.decls.constructors["True"].tag_index;
-                let true_val = self.const_tag(true_tag, disc_ty);
-                self.builder.binop(BinaryOp::Eq, bool_val, true_val, ScalarType::U8)
-            } else {
-                self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8)
-            };
-            let next = if slot + 1 < elem_types.len() {
-                self.builder.create_block()
-            } else {
-                true_block
-            };
-            self.builder.branch(elem_eq, next, vec![], false_block, vec![]);
-            if slot + 1 < elem_types.len() {
-                self.builder.switch_to(next);
-            }
+        for slot in 0..n {
+            let l = self.load_field(lhs, slot, ScalarType::U64);
+            let r = self.load_field(rhs, slot, ScalarType::U64);
+            let eq = self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8);
+            let next = if slot + 1 < n { self.builder.create_block() } else { true_block };
+            self.builder.branch(eq, next, vec![], false_block, vec![]);
+            if slot + 1 < n { self.builder.switch_to(next); }
         }
 
         self.builder.switch_to(true_block);
         let t = self.builder.const_u8(1);
         self.builder.jump(merge, vec![t]);
-
         self.builder.switch_to(false_block);
         let f = self.builder.const_u8(0);
         self.builder.jump(merge, vec![f]);
-
         self.builder.switch_to(merge);
-        self.lower_bool_from_cmp_neg(merge_param, negate)
+        merge_param
     }
 
-    fn is_list_type(&self, ty: &Type) -> bool {
-        matches!(ty, Type::App(name, _) if name == "List")
-    }
-
-    fn lower_list_eq(&mut self, lhs: Value, rhs: Value, negate: bool) -> Value {
+    /// List equality: compare lengths, then element-by-element.
+    fn emit_list_eq(&mut self, lhs: Value, rhs: Value, elem_ty: Option<&Type>) -> Value {
         let len_a = self.builder.call("__list_len", vec![lhs], ScalarType::U64);
         let len_b = self.builder.call("__list_len", vec![rhs], ScalarType::U64);
         let len_eq = self.builder.binop(BinaryOp::Eq, len_a, len_b, ScalarType::U8);
@@ -1415,7 +1498,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let false_block = self.builder.create_block();
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
-
         self.builder.branch(len_eq, check_elems, vec![], false_block, vec![]);
 
         self.builder.switch_to(check_elems);
@@ -1426,14 +1508,23 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.jump(header, vec![zero]);
 
         self.builder.switch_to(header);
-        let done_cmp = self.builder.binop(BinaryOp::Eq, i_param, len_a, ScalarType::U8);
+        let done = self.builder.binop(BinaryOp::Eq, i_param, len_a, ScalarType::U8);
         let true_val = self.builder.const_u8(1);
-        self.builder.branch(done_cmp, merge, vec![true_val], body, vec![]);
+        self.builder.branch(done, merge, vec![true_val], body, vec![]);
 
         self.builder.switch_to(body);
         let elem_a = self.builder.call("__list_get", vec![lhs, i_param], ScalarType::Ptr);
         let elem_b = self.builder.call("__list_get", vec![rhs, i_param], ScalarType::Ptr);
-        let elem_eq = self.builder.binop(BinaryOp::Eq, elem_a, elem_b, ScalarType::U8);
+        let elem_eq = if let Some(et) = elem_ty {
+            if self.is_scalar_eq_type(et) {
+                self.builder.binop(BinaryOp::Eq, elem_a, elem_b, ScalarType::U8)
+            } else {
+                let sub_eq = self.ensure_eq_func(et);
+                self.builder.call(&sub_eq, vec![elem_a, elem_b], ScalarType::U8)
+            }
+        } else {
+            self.builder.binop(BinaryOp::Eq, elem_a, elem_b, ScalarType::U8)
+        };
         let one = self.builder.const_u64(1);
         let next_i = self.builder.binop(BinaryOp::Add, i_param, one, ScalarType::U64);
         self.builder.branch(elem_eq, header, vec![next_i], false_block, vec![]);
@@ -1443,93 +1534,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.jump(merge, vec![false_val]);
 
         self.builder.switch_to(merge);
-        self.lower_bool_from_cmp_neg(merge_param, negate)
-    }
-
-    fn agg_field_count(&self, v: Value) -> Option<usize> {
-        match self.builder.value_types.get(&v) {
-            Some(ScalarType::Agg(n)) => Some(*n),
-            _ => None,
-        }
-    }
-
-    fn lower_agg_eq(&mut self, lhs: Value, rhs: Value, n: usize, negate: bool) -> Value {
-        let false_block = self.builder.create_block();
-        let true_block = self.builder.create_block();
-        let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
-
-        for slot in 0..n {
-            let l = self.load_field(lhs, slot, ScalarType::U64);
-            let r = self.load_field(rhs, slot, ScalarType::U64);
-            let eq = self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8);
-            let next = if slot + 1 < n {
-                self.builder.create_block()
-            } else {
-                true_block
-            };
-            self.builder.branch(eq, next, vec![], false_block, vec![]);
-            if slot + 1 < n {
-                self.builder.switch_to(next);
-            }
-        }
-
-        self.builder.switch_to(true_block);
-        let t = self.builder.const_u8(1);
-        self.builder.jump(merge, vec![t]);
-        self.builder.switch_to(false_block);
-        let f = self.builder.const_u8(0);
-        self.builder.jump(merge, vec![f]);
-        self.builder.switch_to(merge);
-        self.lower_bool_from_cmp_neg(merge_param, negate)
-    }
-
-    fn lower_tag_union_eq(&mut self, lhs: Value, rhs: Value, ty: &Type, negate: bool) -> Value {
-        let Type::TagUnion { tags, .. } = ty else {
-            panic!("lower_tag_union_eq called on non-tag-union type");
-        };
-        if tags.iter().all(|(_, fs)| fs.is_empty()) {
-            return self.lower_eq(lhs, rhs, negate);
-        }
-        let max_fields = tags.iter().map(|(_, fs)| fs.len()).max().unwrap_or(0);
-        let all_non_ptr = tags.iter().all(|(_, fs)| {
-            fs.iter().all(|t| !matches!(self.scalar_type(t), ScalarType::Ptr | ScalarType::Agg(_)))
-        });
-        if !all_non_ptr || 1 + max_fields > 8 {
-            return self.lower_eq(lhs, rhs, negate);
-        }
-        // Packed tag union: compare tag + payload slots structurally.
-        let num_slots = 1 + max_fields;
-        let false_block = self.builder.create_block();
-        let true_block = self.builder.create_block();
-        let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
-
-        for slot in 0..num_slots {
-            let l = self.load_field(lhs, slot, ScalarType::U64);
-            let r = self.load_field(rhs, slot, ScalarType::U64);
-            let eq = self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8);
-            let next = if slot + 1 < num_slots {
-                self.builder.create_block()
-            } else {
-                true_block
-            };
-            self.builder.branch(eq, next, vec![], false_block, vec![]);
-            if slot + 1 < num_slots {
-                self.builder.switch_to(next);
-            }
-        }
-
-        self.builder.switch_to(true_block);
-        let t = self.builder.const_u8(1);
-        self.builder.jump(merge, vec![t]);
-
-        self.builder.switch_to(false_block);
-        let f = self.builder.const_u8(0);
-        self.builder.jump(merge, vec![f]);
-
-        self.builder.switch_to(merge);
-        self.lower_bool_from_cmp_neg(merge_param, negate)
+        merge_param
     }
 
     /// Record hash: FNV-1a over each field in sorted order.
