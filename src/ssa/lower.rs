@@ -507,6 +507,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             self.lower_tuple_eq(l, r, &resolved_ty, negate)
                         } else if let Type::TagUnion { .. } = &resolved_ty {
                             self.lower_tag_union_eq(l, r, &resolved_ty, negate)
+                        } else if self.is_list_type(&lhs.ty) || self.is_list_type(&rhs.ty) {
+                            self.lower_list_eq(l, r, negate)
                         } else if let Some(n) = self.agg_field_count(l).or_else(|| self.agg_field_count(r)) {
                             self.lower_agg_eq(l, r, n, negate)
                         } else {
@@ -1366,6 +1368,50 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.switch_to(false_block);
         let f = self.builder.const_u8(0);
         self.builder.jump(merge, vec![f]);
+
+        self.builder.switch_to(merge);
+        self.lower_bool_from_cmp_neg(merge_param, negate)
+    }
+
+    fn is_list_type(&self, ty: &Type) -> bool {
+        matches!(ty, Type::App(name, _) if name == "List")
+    }
+
+    fn lower_list_eq(&mut self, lhs: Value, rhs: Value, negate: bool) -> Value {
+        let len_a = self.builder.call("__list_len", vec![lhs], ScalarType::U64);
+        let len_b = self.builder.call("__list_len", vec![rhs], ScalarType::U64);
+        let len_eq = self.builder.binop(BinaryOp::Eq, len_a, len_b, ScalarType::U8);
+
+        let check_elems = self.builder.create_block();
+        let false_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
+
+        self.builder.branch(len_eq, check_elems, vec![], false_block, vec![]);
+
+        self.builder.switch_to(check_elems);
+        let header = self.builder.create_block();
+        let i_param = self.builder.add_block_param(header, ScalarType::U64);
+        let body = self.builder.create_block();
+        let zero = self.builder.const_u64(0);
+        self.builder.jump(header, vec![zero]);
+
+        self.builder.switch_to(header);
+        let done_cmp = self.builder.binop(BinaryOp::Eq, i_param, len_a, ScalarType::U8);
+        let true_val = self.builder.const_u8(1);
+        self.builder.branch(done_cmp, merge, vec![true_val], body, vec![]);
+
+        self.builder.switch_to(body);
+        let elem_a = self.builder.call("__list_get", vec![lhs, i_param], ScalarType::Ptr);
+        let elem_b = self.builder.call("__list_get", vec![rhs, i_param], ScalarType::Ptr);
+        let elem_eq = self.builder.binop(BinaryOp::Eq, elem_a, elem_b, ScalarType::U8);
+        let one = self.builder.const_u64(1);
+        let next_i = self.builder.binop(BinaryOp::Add, i_param, one, ScalarType::U64);
+        self.builder.branch(elem_eq, header, vec![next_i], false_block, vec![]);
+
+        self.builder.switch_to(false_block);
+        let false_val = self.builder.const_u8(0);
+        self.builder.jump(merge, vec![false_val]);
 
         self.builder.switch_to(merge);
         self.lower_bool_from_cmp_neg(merge_param, negate)
