@@ -65,6 +65,24 @@ fn parse_with_mode(
     Ok(ctx.parse_module(module_pair))
 }
 
+/// Extract `expect` statements from comment lines for doctest support.
+/// Any comment line whose content starts with `expect ` is extracted
+/// as a top-level expect declaration. Called before parsing so the
+/// expects can be appended to the source text.
+pub fn extract_doctest_expects(source: &str) -> Vec<String> {
+    let mut expects = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let content = rest.strip_prefix(' ').unwrap_or(rest);
+            if content.starts_with("expect ") {
+                expects.push(content.to_string());
+            }
+        }
+    }
+    expects
+}
+
 /// Pre-pass: collect `#` comment blocks and map them to the byte offset of
 /// the next non-blank, non-comment line. The parser attaches these as doc
 /// comments to any `Decl` whose span starts at that offset.

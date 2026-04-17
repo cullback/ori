@@ -163,10 +163,18 @@ fn main() {
         process::exit(1);
     }
     let source_path = file_args[0];
-    let content = std::fs::read_to_string(source_path).unwrap_or_else(|e| {
+    let mut content = std::fs::read_to_string(source_path).unwrap_or_else(|e| {
         eprintln!("error reading {source_path}: {e}");
         process::exit(1);
     });
+
+    if test_mode {
+        let doctests = crate::syntax::parse::extract_doctest_expects(&content);
+        if !doctests.is_empty() {
+            content.push('\n');
+            content.push_str(&doctests.join("\n"));
+        }
+    }
 
     let mut arena = SourceArena::new();
     let main_file = arena.add(source_path.clone(), content);
