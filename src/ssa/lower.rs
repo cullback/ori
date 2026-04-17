@@ -500,10 +500,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     BinOp::BitXor => self.builder.binop(BinaryOp::Xor, l, r, ty),
                     BinOp::Eq | BinOp::Neq => {
                         let negate = matches!(op, BinOp::Neq);
-                        if let Type::Record { .. } = &lhs.ty {
-                            self.lower_record_eq(l, r, &lhs.ty, negate)
-                        } else if let Type::Tuple(_) = &lhs.ty {
-                            self.lower_tuple_eq(l, r, &lhs.ty, negate)
+                        let resolved_ty = self.resolve_transparent(&lhs.ty);
+                        if let Type::Record { .. } = &resolved_ty {
+                            self.lower_record_eq(l, r, &resolved_ty, negate)
+                        } else if let Type::Tuple(_) = &resolved_ty {
+                            self.lower_tuple_eq(l, r, &resolved_ty, negate)
+                        } else if let Type::TagUnion { .. } = &resolved_ty {
+                            self.lower_tag_union_eq(l, r, &resolved_ty, negate)
+                        } else if let Some(n) = self.agg_field_count(l).or_else(|| self.agg_field_count(r)) {
+                            self.lower_agg_eq(l, r, n, negate)
                         } else {
                             self.lower_eq(l, r, negate)
                         }
@@ -1350,6 +1355,92 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             };
             self.builder.branch(elem_eq, next, vec![], false_block, vec![]);
             if slot + 1 < elem_types.len() {
+                self.builder.switch_to(next);
+            }
+        }
+
+        self.builder.switch_to(true_block);
+        let t = self.builder.const_u8(1);
+        self.builder.jump(merge, vec![t]);
+
+        self.builder.switch_to(false_block);
+        let f = self.builder.const_u8(0);
+        self.builder.jump(merge, vec![f]);
+
+        self.builder.switch_to(merge);
+        self.lower_bool_from_cmp_neg(merge_param, negate)
+    }
+
+    fn agg_field_count(&self, v: Value) -> Option<usize> {
+        match self.builder.value_types.get(&v) {
+            Some(ScalarType::Agg(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn lower_agg_eq(&mut self, lhs: Value, rhs: Value, n: usize, negate: bool) -> Value {
+        let false_block = self.builder.create_block();
+        let true_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
+
+        for slot in 0..n {
+            let l = self.load_field(lhs, slot, ScalarType::U64);
+            let r = self.load_field(rhs, slot, ScalarType::U64);
+            let eq = self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8);
+            let next = if slot + 1 < n {
+                self.builder.create_block()
+            } else {
+                true_block
+            };
+            self.builder.branch(eq, next, vec![], false_block, vec![]);
+            if slot + 1 < n {
+                self.builder.switch_to(next);
+            }
+        }
+
+        self.builder.switch_to(true_block);
+        let t = self.builder.const_u8(1);
+        self.builder.jump(merge, vec![t]);
+        self.builder.switch_to(false_block);
+        let f = self.builder.const_u8(0);
+        self.builder.jump(merge, vec![f]);
+        self.builder.switch_to(merge);
+        self.lower_bool_from_cmp_neg(merge_param, negate)
+    }
+
+    fn lower_tag_union_eq(&mut self, lhs: Value, rhs: Value, ty: &Type, negate: bool) -> Value {
+        let Type::TagUnion { tags, .. } = ty else {
+            panic!("lower_tag_union_eq called on non-tag-union type");
+        };
+        if tags.iter().all(|(_, fs)| fs.is_empty()) {
+            return self.lower_eq(lhs, rhs, negate);
+        }
+        let max_fields = tags.iter().map(|(_, fs)| fs.len()).max().unwrap_or(0);
+        let all_non_ptr = tags.iter().all(|(_, fs)| {
+            fs.iter().all(|t| !matches!(self.scalar_type(t), ScalarType::Ptr | ScalarType::Agg(_)))
+        });
+        if !all_non_ptr || 1 + max_fields > 8 {
+            return self.lower_eq(lhs, rhs, negate);
+        }
+        // Packed tag union: compare tag + payload slots structurally.
+        let num_slots = 1 + max_fields;
+        let false_block = self.builder.create_block();
+        let true_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
+
+        for slot in 0..num_slots {
+            let l = self.load_field(lhs, slot, ScalarType::U64);
+            let r = self.load_field(rhs, slot, ScalarType::U64);
+            let eq = self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8);
+            let next = if slot + 1 < num_slots {
+                self.builder.create_block()
+            } else {
+                true_block
+            };
+            self.builder.branch(eq, next, vec![], false_block, vec![]);
+            if slot + 1 < num_slots {
                 self.builder.switch_to(next);
             }
         }
