@@ -203,11 +203,22 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     fn func_ret_type(&self, name: &str) -> ScalarType {
-        self.decls
+        let base = self.decls
             .func_return_types
             .get(name)
             .copied()
-            .unwrap_or(ScalarType::Ptr)
+            .unwrap_or(ScalarType::Ptr);
+        if base != ScalarType::Ptr {
+            return base;
+        }
+        if let Some(scheme) = self.infer.func_schemes.get(name) {
+            let ret = match &scheme.ty {
+                Type::Arrow(_, ret) => ret.as_ref(),
+                other => other,
+            };
+            return self.repr_type(ret);
+        }
+        base
     }
 
     /// Emit a dummy value of the given scalar type for statically
@@ -373,9 +384,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
 
         // Set the return type BEFORE lowering the body so `ret` can
-        // coerce its operand (e.g. Agg→Ptr) when it fires from inside
-        // nested expressions.
-        let scheme_ret_ty = self.func_ret_type(name);
+        // coerce its operand when it fires from inside nested
+        // expressions. Use repr_type so packable composites stay as
+        // Agg through returns — Pack is first-class at runtime.
+        let scheme_ret_ty = self.repr_type(&body.ty);
         let has_scheme = self.infer.func_schemes.contains_key(name);
         self.builder.set_return_type(scheme_ret_ty);
 

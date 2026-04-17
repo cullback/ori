@@ -1,7 +1,5 @@
-use std::collections::HashMap;
-
 use crate::ssa::Module;
-use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
+use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator};
 
 /// A scalar runtime value that fits in a register.
 #[derive(Debug, Clone, Copy, PartialEq)]
