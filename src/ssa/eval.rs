@@ -462,7 +462,6 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
         }
 
         Inst::Pack(dest, fields) => {
-            // Record source Value IDs — no Scalar produced.
             pack_map.insert(dest.0, fields.clone());
             None
         }

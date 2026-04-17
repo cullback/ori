@@ -374,10 +374,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         // Set the return type BEFORE lowering the body so `ret` can
         // coerce its operand (e.g. Agg→Ptr) when it fires from inside
-        // nested expressions (`if ... then return ... else ...`).
-        // Synthesized functions without schemes fall back to Ptr here;
-        // we patch to the actual produced value's type once the body
-        // is lowered.
+        // nested expressions.
         let scheme_ret_ty = self.func_ret_type(name);
         let has_scheme = self.infer.func_schemes.contains_key(name);
         self.builder.set_return_type(scheme_ret_ty);

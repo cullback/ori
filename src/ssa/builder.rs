@@ -187,6 +187,14 @@ impl Builder {
     // ---- Calls ----
 
     pub fn call(&mut self, func: &str, args: Vec<Value>, ret_ty: ScalarType) -> Value {
+        let has_agg = args.iter().any(|a| matches!(self.value_types.get(a), Some(ScalarType::Agg(_))));
+        let args = if has_agg {
+            args.into_iter()
+                .map(|a| self.coerce_to(a, ScalarType::Ptr))
+                .collect()
+        } else {
+            args
+        };
         let v = self.fresh_value(ret_ty);
         self.push(Inst::Call(v, func.to_owned(), args));
         v

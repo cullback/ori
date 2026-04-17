@@ -13,6 +13,7 @@ pub fn optimize(module: &mut Module) {
         const_fold(func);
         nop_elim(func);
         load_of_agg(func);
+        //split_agg_params(func);
         extract_of_pack(func);
         jump_threading(func);
         branch_switch_fold(func);
@@ -606,6 +607,199 @@ fn is_side_effect(inst: &Inst) -> bool {
 /// continuation param whose original consumers used Load (because the
 /// call result was Ptr-typed). Converting to Extract enables the
 /// subsequent `extract_of_pack` pass to fold Extract(Pack(...), i) → vi.
+/// Split Agg(n) block params into n individual scalar params.
+/// Each predecessor's Pack arg is expanded into its field values.
+/// Extracts from the original param become references to the new
+/// scalar params. After DCE the Pack and Extract instructions vanish.
+fn split_agg_params(func: &mut Function) {
+    // Build a map: Value → Pack fields, so we can look through Packs
+    // when expanding terminator args.
+    let mut packs: HashMap<Value, Vec<Value>> = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Pack(dest, fields) = inst {
+                packs.insert(*dest, fields.clone());
+            }
+        }
+    }
+
+    // Collect all args flowing to each (block, param_index).
+    let mut pred_args: HashMap<(BlockId, usize), Vec<Value>> = HashMap::new();
+    for block in func.blocks.values() {
+        for (succ, args) in block.terminator.successors() {
+            for (i, &v) in args.iter().enumerate() {
+                pred_args.entry((succ, i)).or_default().push(v);
+            }
+        }
+    }
+
+    let mut next_val = func.value_types.keys().map(|v| v.0 + 1).max().unwrap_or(0);
+    let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
+
+    for bid in &block_ids {
+        if *bid == func.entry { continue; }
+        let params: Vec<Value> = func.blocks[bid].params.clone();
+        let mut splits: Vec<Option<Vec<Value>>> = Vec::new();
+        let mut any_split = false;
+
+        for (pi, &p) in params.iter().enumerate() {
+            if let Some(ScalarType::Agg(n)) = func.value_types.get(&p) {
+                // Only split if ALL predecessors provide a visible Pack.
+                let all_packs = pred_args
+                    .get(&(*bid, pi))
+                    .map(|args| args.iter().all(|v| packs.contains_key(v)))
+                    .unwrap_or(false);
+                if all_packs {
+                    let new_ps: Vec<Value> = (0..*n)
+                        .map(|_| {
+                            let v = Value(next_val);
+                            next_val += 1;
+                            func.value_types.insert(v, ScalarType::U64);
+                            v
+                        })
+                        .collect();
+                    splits.push(Some(new_ps));
+                    any_split = true;
+                } else {
+                    splits.push(None);
+                }
+            } else {
+                splits.push(None);
+            }
+        }
+        if !any_split {
+            continue;
+        }
+
+        // Replace Extract(param, i) → new_params[i].
+        let mut replacements: HashMap<Value, Value> = HashMap::new();
+        for block in func.blocks.values() {
+            for inst in &block.insts {
+                if let Inst::Extract(dest, agg, idx) = inst {
+                    for (pi, &p) in params.iter().enumerate() {
+                        if *agg == p {
+                            if let Some(Some(new_ps)) = splits.get(pi) {
+                                if let Some(&nv) = new_ps.get(*idx) {
+                                    replacements.insert(*dest, nv);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rebuild block params.
+        let mut new_params = Vec::new();
+        for (pi, &p) in params.iter().enumerate() {
+            match &splits[pi] {
+                Some(new_ps) => new_params.extend_from_slice(new_ps),
+                None => new_params.push(p),
+            }
+        }
+        func.blocks.get_mut(bid).unwrap().params = new_params;
+
+        // Expand args in all terminators targeting this block.
+        for src_bid in &block_ids {
+            let term = &func.blocks[src_bid].terminator;
+            if let Some(t) = expand_term_args(term, *bid, &splits, &packs) {
+                func.blocks.get_mut(src_bid).unwrap().terminator = t;
+            }
+        }
+
+        // Apply replacements.
+        if !replacements.is_empty() {
+            for block in func.blocks.values_mut() {
+                for inst in &mut block.insts {
+                    rewrite_operands(inst, &replacements);
+                }
+                rewrite_terminator_operands(&mut block.terminator, &replacements);
+            }
+        }
+    }
+}
+
+/// Expand Pack arguments in a terminator edge targeting `target`.
+fn expand_term_args(
+    term: &Terminator,
+    target: BlockId,
+    splits: &[Option<Vec<Value>>],
+    packs: &HashMap<Value, Vec<Value>>,
+) -> Option<Terminator> {
+    fn expand(
+        args: &[Value],
+        bid: BlockId,
+        target: BlockId,
+        splits: &[Option<Vec<Value>>],
+        packs: &HashMap<Value, Vec<Value>>,
+    ) -> Option<Vec<Value>> {
+        if bid != target { return None; }
+        let mut out = Vec::new();
+        let mut changed = false;
+        for (i, &v) in args.iter().enumerate() {
+            match splits.get(i) {
+                Some(Some(new_ps)) => {
+                    if let Some(fields) = packs.get(&v) {
+                        out.extend_from_slice(fields);
+                    } else {
+                        // Not a visible Pack — can't split. This
+                        // shouldn't happen if all predecessors produce
+                        // Packs, but be safe.
+                        for _ in 0..new_ps.len() {
+                            out.push(v);
+                        }
+                    }
+                    changed = true;
+                }
+                _ => out.push(v),
+            }
+        }
+        if changed { Some(out) } else { None }
+    }
+
+    match term {
+        Terminator::Jump(bid, args) => {
+            expand(args, *bid, target, splits, packs)
+                .map(|a| Terminator::Jump(*bid, a))
+        }
+        Terminator::Branch { cond, then_block, then_args, else_block, else_args } => {
+            let t = expand(then_args, *then_block, target, splits, packs);
+            let e = expand(else_args, *else_block, target, splits, packs);
+            if t.is_some() || e.is_some() {
+                Some(Terminator::Branch {
+                    cond: *cond,
+                    then_block: *then_block,
+                    then_args: t.unwrap_or_else(|| then_args.clone()),
+                    else_block: *else_block,
+                    else_args: e.unwrap_or_else(|| else_args.clone()),
+                })
+            } else { None }
+        }
+        Terminator::SwitchInt { scrutinee, arms, default } => {
+            let mut changed = false;
+            let new_arms: Vec<_> = arms.iter().map(|(tag, bid, args)| {
+                if let Some(a) = expand(args, *bid, target, splits, packs) {
+                    changed = true;
+                    (*tag, *bid, a)
+                } else {
+                    (*tag, *bid, args.clone())
+                }
+            }).collect();
+            let new_def = default.as_ref().and_then(|(bid, args)| {
+                expand(args, *bid, target, splits, packs).map(|a| { changed = true; (*bid, a) })
+            });
+            if changed {
+                Some(Terminator::SwitchInt {
+                    scrutinee: *scrutinee,
+                    arms: new_arms,
+                    default: new_def.or_else(|| default.clone()),
+                })
+            } else { None }
+        }
+        Terminator::Return(_) => None,
+    }
+}
+
 fn load_of_agg(func: &mut Function) {
     for block in func.blocks.values_mut() {
         for inst in &mut block.insts {
