@@ -69,6 +69,28 @@ impl ScalarType {
     }
 }
 
+/// Compute a packed field layout sorted by size descending (stable).
+/// Returns byte offsets indexed by original field position.
+///
+/// Fields of equal size keep their original order. Larger fields
+/// come first, so no alignment padding is needed.
+pub fn compute_layout(field_types: &[ScalarType]) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..field_types.len()).collect();
+    indices.sort_by(|&a, &b| field_types[b].byte_width().cmp(&field_types[a].byte_width()));
+    let mut offsets = vec![0usize; field_types.len()];
+    let mut pos = 0;
+    for &i in &indices {
+        offsets[i] = pos;
+        pos += field_types[i].byte_width();
+    }
+    offsets
+}
+
+/// Total byte size of a packed layout.
+pub fn total_byte_size(field_types: &[ScalarType]) -> usize {
+    field_types.iter().map(|t| t.byte_width()).sum()
+}
+
 /// Binary operations on scalars.
 #[derive(Debug, Clone, Copy)]
 pub enum BinaryOp {

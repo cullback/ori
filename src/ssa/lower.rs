@@ -251,27 +251,20 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     // ---- Field slot computation ----
 
-    fn field_slot(&self, ty: &Type, field: &str) -> usize {
-        // Unwrap transparent types to their underlying representation.
+    /// Get the alphabetically-sorted field index.
+    fn field_index(&self, ty: &Type, field: &str) -> usize {
         let resolved = self.resolve_transparent(ty);
         match &resolved {
             Type::Record { fields, .. } => {
                 let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
                 names.sort_unstable();
-                names
-                    .iter()
-                    .position(|n| *n == field)
+                names.iter().position(|n| *n == field)
                     .unwrap_or_else(|| panic!("field '{field}' not found in record type"))
             }
-            Type::Tuple(elems) => {
-                let mut names: Vec<String> = (0..elems.len()).map(|i| i.to_string()).collect();
-                names.sort_unstable();
-                names
-                    .iter()
-                    .position(|n| n == field)
-                    .unwrap_or_else(|| panic!("field '{field}' not found in tuple type"))
-            }
-            _ => panic!("field access on non-record type: {resolved:?} (original: {ty:?})"),
+            Type::Tuple(_) => field.parse().unwrap_or_else(|_| {
+                panic!("field '{field}' not found in tuple type")
+            }),
+            _ => panic!("field_index on non-record type: {resolved:?}"),
         }
     }
 
@@ -575,8 +568,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     self.builder.pack(vals)
                 } else {
                     let ptr = self.builder.alloc(fields.len() * 8);
-                    for (slot, val) in vals.into_iter().enumerate() {
-                        self.builder.store(ptr, slot * 8, val);
+                    for (i, val) in vals.into_iter().enumerate() {
+                        self.builder.store(ptr, i * 8, val);
                     }
                     ptr
                 }
@@ -585,7 +578,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ExprKind::FieldAccess { record, field } => {
                 let val = self.lower_expr(record);
                 let field_name = self.fields.get(*field);
-                let slot = self.field_slot(&record.ty, field_name);
+                let slot = self.field_index(&record.ty, field_name);
                 let ty = self.expr_scalar_type(expr);
                 if self.is_agg(val) {
                     self.builder.extract(val, slot, ty)
@@ -636,7 +629,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     }
                     _ => panic!("RecordUpdate base is not a record type"),
                 };
-                let num_fields = all_fields.len();
                 // Build a map of update field name → expression.
                 let update_map: HashMap<String, &Expr> = updates
                     .iter()
@@ -652,6 +644,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     }
                     _ => vec![],
                 };
+                let num_fields = all_fields.len();
                 // Collect all field values.
                 let vals: Vec<Value> = all_fields
                     .iter()
