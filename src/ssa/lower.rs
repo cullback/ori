@@ -729,7 +729,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         // Use and-chain lowering for Is binding flow
                         let cont_block = self.builder.create_block();
                         let saved_vars = self.vars.clone();
-                        self.lower_and_chain(condition, cont_block);
+                        self.lower_and_chain(condition, cont_block, &[]);
                         // We're in the success path — return
                         let ret_v = self.lower_expr(return_val);
                         self.builder.ret(ret_v);
@@ -1100,12 +1100,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         let lt_block = self.builder.create_block();
         let not_lt_block = self.builder.create_block();
+        let is_eq_param = self.builder.add_block_param(not_lt_block, ScalarType::U8);
         let eq_block = self.builder.create_block();
         let gt_block = self.builder.create_block();
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
 
-        self.builder.branch(is_lt, lt_block, vec![], not_lt_block, vec![]);
+        self.builder.branch(is_lt, lt_block, vec![], not_lt_block, vec![is_eq]);
 
         self.builder.switch_to(lt_block);
         let lt_ptr = self.builder.alloc(alloc_size);
@@ -1114,7 +1115,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.jump(merge, vec![lt_ptr]);
 
         self.builder.switch_to(not_lt_block);
-        self.builder.branch(is_eq, eq_block, vec![], gt_block, vec![]);
+        self.builder.branch(is_eq_param, eq_block, vec![], gt_block, vec![]);
 
         self.builder.switch_to(eq_block);
         let eq_ptr = self.builder.alloc(alloc_size);
@@ -1495,26 +1496,30 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let len_eq = self.builder.binop(BinaryOp::Eq, len_a, len_b, ScalarType::U8);
 
         let check_elems = self.builder.create_block();
+        let check_len_param = self.builder.add_block_param(check_elems, ScalarType::U64);
         let false_block = self.builder.create_block();
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
-        self.builder.branch(len_eq, check_elems, vec![], false_block, vec![]);
+        self.builder.branch(len_eq, check_elems, vec![len_a], false_block, vec![]);
 
         self.builder.switch_to(check_elems);
         let header = self.builder.create_block();
         let i_param = self.builder.add_block_param(header, ScalarType::U64);
+        let header_len_param = self.builder.add_block_param(header, ScalarType::U64);
         let body = self.builder.create_block();
+        let body_i_param = self.builder.add_block_param(body, ScalarType::U64);
+        let body_len_param = self.builder.add_block_param(body, ScalarType::U64);
         let zero = self.builder.const_u64(0);
-        self.builder.jump(header, vec![zero]);
+        self.builder.jump(header, vec![zero, check_len_param]);
 
         self.builder.switch_to(header);
-        let done = self.builder.binop(BinaryOp::Eq, i_param, len_a, ScalarType::U8);
+        let done = self.builder.binop(BinaryOp::Eq, i_param, header_len_param, ScalarType::U8);
         let true_val = self.builder.const_u8(1);
-        self.builder.branch(done, merge, vec![true_val], body, vec![]);
+        self.builder.branch(done, merge, vec![true_val], body, vec![i_param, header_len_param]);
 
         self.builder.switch_to(body);
-        let elem_a = self.builder.call("__list_get", vec![lhs, i_param], ScalarType::Ptr);
-        let elem_b = self.builder.call("__list_get", vec![rhs, i_param], ScalarType::Ptr);
+        let elem_a = self.builder.call("__list_get", vec![lhs, body_i_param], ScalarType::Ptr);
+        let elem_b = self.builder.call("__list_get", vec![rhs, body_i_param], ScalarType::Ptr);
         let elem_eq = if let Some(et) = elem_ty {
             if self.is_scalar_eq_type(et) {
                 self.builder.binop(BinaryOp::Eq, elem_a, elem_b, ScalarType::U8)
@@ -1526,8 +1531,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             self.builder.binop(BinaryOp::Eq, elem_a, elem_b, ScalarType::U8)
         };
         let one = self.builder.const_u64(1);
-        let next_i = self.builder.binop(BinaryOp::Add, i_param, one, ScalarType::U64);
-        self.builder.branch(elem_eq, header, vec![next_i], false_block, vec![]);
+        let next_i = self.builder.binop(BinaryOp::Add, body_i_param, one, ScalarType::U64);
+        self.builder.branch(elem_eq, header, vec![next_i, body_len_param], false_block, vec![]);
 
         self.builder.switch_to(false_block);
         let false_val = self.builder.const_u8(0);
@@ -1771,7 +1776,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let saved_vars = self.vars.clone();
 
         // Lower LHS chain — may emit branches to false_block, accumulating bindings
-        self.lower_and_chain(lhs, false_block);
+        self.lower_and_chain(lhs, false_block, &[]);
 
         // We're in the success path — all Is bindings from lhs are in scope
         let rhs_val = self.lower_expr(rhs);
@@ -1790,7 +1795,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     /// Recursively process an And chain, branching to `false_block` on failure
     /// and accumulating Is bindings in `self.vars` on success.
-    fn lower_and_chain(&mut self, expr: &Expr<'src>, false_block: BlockId) {
+    fn lower_and_chain(&mut self, expr: &Expr<'src>, false_block: BlockId, false_args: &[Value]) {
         match &expr.kind {
             ExprKind::Is {
                 expr: inner,
@@ -1821,17 +1826,27 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             self.builder
                                 .binop(BinaryOp::Eq, tag, expected_tag, ScalarType::U8);
                         let match_block = self.builder.create_block();
-                        self.builder
-                            .branch(matches, match_block, vec![], false_block, vec![]);
+                        let scr_is_func_param = self.builder.func.params.contains(&scr);
+                        let scr_in_match = if scr_is_func_param {
+                            self.builder
+                                .branch(matches, match_block, vec![], false_block, false_args.to_vec());
+                            scr
+                        } else {
+                            let scr_ty = self.builder.value_types.get(&scr).copied().unwrap_or(ScalarType::Ptr);
+                            let scr_param = self.builder.add_block_param(match_block, scr_ty);
+                            self.builder
+                                .branch(matches, match_block, vec![scr], false_block, false_args.to_vec());
+                            scr_param
+                        };
                         self.builder.switch_to(match_block);
                         // Bind pattern fields (empty for fieldless tags)
                         for (fi, field_pat) in fields.iter().enumerate() {
                             let field_ty =
                                 field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
                             let field_val = if scr_is_agg {
-                                self.builder.extract(scr, fi + 1, field_ty)
+                                self.builder.extract(scr_in_match, fi + 1, field_ty)
                             } else {
-                                self.builder.load(scr, fi + 1, field_ty)
+                                self.builder.load(scr_in_match, fi + 1, field_ty)
                             };
                             self.bind_pattern_field(field_pat, field_val);
                         }
@@ -1852,9 +1867,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 rhs,
             } => {
                 // Process LHS first (may branch, accumulating bindings)
-                self.lower_and_chain(lhs, false_block);
+                self.lower_and_chain(lhs, false_block, false_args);
                 // Then process RHS (we're in the LHS success path)
-                self.lower_and_chain(rhs, false_block);
+                self.lower_and_chain(rhs, false_block, false_args);
             }
             _ => {
                 // Regular boolean expression — evaluate, compare unboxed tag, branch
@@ -1867,7 +1882,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .binop(BinaryOp::Eq, val, true_val, ScalarType::U8);
                 let continue_block = self.builder.create_block();
                 self.builder
-                    .branch(is_true, continue_block, vec![], false_block, vec![]);
+                    .branch(is_true, continue_block, vec![], false_block, false_args.to_vec());
                 self.builder.switch_to(continue_block);
             }
         }
@@ -1945,7 +1960,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let saved_vars = self.vars.clone();
 
         // Use and-chain lowering for the scrutinee — bindings flow into self.vars
-        self.lower_and_chain(scrutinee, false_block);
+        self.lower_and_chain(scrutinee, false_block, &[]);
 
         // True arm: bindings from Is are in scope
         let true_result = self.lower_expr(&arms[0].body);
@@ -2003,13 +2018,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         tag_groups: &[(u64, Vec<usize>)],
         arm_blocks: &[BlockId],
         default_fail: BlockId,
+        fail_args: &[Value],
     ) {
         let group = &tag_groups.iter().find(|(t, _)| *t == tag_idx).unwrap().1;
         let pos_in_group = group.iter().position(|&idx| idx == arm_idx).unwrap();
-        let fail_target = if pos_in_group + 1 < group.len() {
-            arm_blocks[group[pos_in_group + 1]]
+        let (fail_target, target_args) = if pos_in_group + 1 < group.len() {
+            (arm_blocks[group[pos_in_group + 1]], fail_args.to_vec())
         } else {
-            default_fail
+            (default_fail, vec![])
         };
 
         // Route every guard through `lower_and_chain` so that any `is`
@@ -2020,7 +2036,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         // branch-on-True path. Fall-through to the next arm in the
         // same tag group is wired via `fail_target`.
         for guard_expr in guards {
-            self.lower_and_chain(guard_expr, fail_target);
+            self.lower_and_chain(guard_expr, fail_target, &target_args);
         }
     }
 
@@ -2047,11 +2063,18 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     ) -> Value {
         let scr_val = self.lower_expr(scrutinee_expr);
         let scr_ty = self.expr_scalar_type(scrutinee_expr);
+        let scr_is_func_param = self.builder.func.params.contains(&scr_val);
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, result_ty);
 
+        let mut current_scr = scr_val;
         for arm in arms {
             let next_block = self.builder.create_block();
+            let next_scr_param = if scr_is_func_param {
+                scr_val // function params don't need threading
+            } else {
+                self.builder.add_block_param(next_block, scr_ty)
+            };
             let body_block = self.builder.create_block();
             let lit_val = match &arm.pattern {
                 ast::Pattern::IntLit(n) => match scr_ty {
@@ -2071,14 +2094,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             };
             let eq = self
                 .builder
-                .binop(BinaryOp::Eq, scr_val, lit_val, ScalarType::U8);
-            self.builder.branch(eq, body_block, vec![], next_block, vec![]);
+                .binop(BinaryOp::Eq, current_scr, lit_val, ScalarType::U8);
+            let next_args = if scr_is_func_param { vec![] } else { vec![current_scr] };
+            self.builder.branch(eq, body_block, vec![], next_block, next_args);
 
             self.builder.switch_to(body_block);
             let body_val = self.lower_expr(&arm.body);
             self.builder.jump(merge, vec![body_val]);
 
             self.builder.switch_to(next_block);
+            current_scr = next_scr_param;
         }
 
         // Else / unreachable fallthrough
@@ -2126,15 +2151,25 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         };
         let tag_block = self.builder.current_block.unwrap();
 
+        // Thread scr_val through block params only when it's NOT a
+        // function param (function params are always accessible).
+        let scr_is_func_param = self.builder.func.params.contains(&scr_val);
+        let scr_val_ty = self.builder.value_types.get(&scr_val).copied().unwrap_or(ScalarType::Ptr);
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, result_ty);
         let else_block = else_body.map(|_| self.builder.create_block());
         let arm_blocks: Vec<_> = arms.iter().map(|_| self.builder.create_block()).collect();
+        let arm_scr_params: Vec<_> = if scr_is_func_param {
+            vec![]
+        } else {
+            arm_blocks.iter().map(|&b| self.builder.add_block_param(b, scr_val_ty)).collect()
+        };
         let tag_groups = self.group_arms_by_tag(arms, &scrutinee_ty);
 
+        let switch_args = if scr_is_func_param { vec![] } else { vec![scr_val] };
         let switch_arms: Vec<_> = tag_groups
             .iter()
-            .map(|(tag_idx, arm_indices)| (*tag_idx, arm_blocks[arm_indices[0]], vec![]))
+            .map(|(tag_idx, arm_indices)| (*tag_idx, arm_blocks[arm_indices[0]], switch_args.clone()))
             .collect();
         self.builder.switch_to(tag_block);
         self.builder
@@ -2157,6 +2192,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 panic!("match arms must use constructor patterns");
             };
             self.builder.switch_to(arm_blocks[i]);
+            let arm_scr = if scr_is_func_param {
+                scr_val
+            } else {
+                arm_scr_params[i]
+            };
 
             let (arm_tag_idx, _, field_types) =
                 self.con_layout(con_name, Some(&scrutinee_ty));
@@ -2166,9 +2206,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 for (fi, field_pat) in fields.iter().enumerate() {
                     let field_ty = field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
                     let field_val = if scr_is_agg {
-                        self.builder.extract(scr_val, fi + 1, field_ty)
+                        self.builder.extract(arm_scr, fi + 1, field_ty)
                     } else {
-                        self.builder.load(scr_val, fi + 1, field_ty)
+                        self.builder.load(arm_scr, fi + 1, field_ty)
                     };
                     self.bind_pattern_field(field_pat, field_val);
                 }
@@ -2188,6 +2228,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         sink
                     })
                 };
+                let guard_fail_args = if scr_is_func_param { vec![] } else { vec![arm_scr] };
                 self.lower_guards(
                     &arm.guards,
                     i,
@@ -2195,6 +2236,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     &tag_groups,
                     &arm_blocks,
                     default_fail,
+                    &guard_fail_args,
                 );
             }
 
@@ -2271,39 +2313,47 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         acc_ty: ScalarType,
         direct: Option<&SingletonTarget>,
     ) -> Value {
+        let step_ty = self.builder.value_types.get(&step_val).copied().unwrap_or(ScalarType::Ptr);
+
         let header = self.builder.create_block();
         let i_param = self.builder.add_block_param(header, ScalarType::U64);
         let acc_param = self.builder.add_block_param(header, acc_ty);
+        let end_param = self.builder.add_block_param(header, ScalarType::U64);
+        let step_param = self.builder.add_block_param(header, step_ty);
         let body_block = self.builder.create_block();
+        let body_i = self.builder.add_block_param(body_block, ScalarType::U64);
+        let body_acc = self.builder.add_block_param(body_block, acc_ty);
+        let body_end = self.builder.add_block_param(body_block, ScalarType::U64);
+        let body_step = self.builder.add_block_param(body_block, step_ty);
         let done = self.builder.create_block();
         let done_param = self.builder.add_block_param(done, acc_ty);
 
-        self.builder.jump(header, vec![start, init_val]);
+        self.builder.jump(header, vec![start, init_val, end, step_val]);
 
         self.builder.switch_to(header);
-        let cmp = self.builder.binop(BinaryOp::Eq, i_param, end, ScalarType::U8);
-        self.builder.branch(cmp, done, vec![acc_param], body_block, vec![]);
+        let cmp = self.builder.binop(BinaryOp::Eq, i_param, end_param, ScalarType::U8);
+        self.builder.branch(cmp, done, vec![acc_param], body_block, vec![i_param, acc_param, end_param, step_param]);
 
         self.builder.switch_to(body_block);
         // The element IS the counter — no list load needed.
-        let elem = i_param;
+        let elem = body_i;
         let resolved = direct.or_else(|| self.singletons.get(apply_name));
         let result = if let Some(st) = resolved {
             let mut call_args = Vec::with_capacity(st.num_captures + 2);
             for i in 0..st.num_captures {
-                call_args.push(self.builder.load(step_val, i + 1, ScalarType::Ptr));
+                call_args.push(self.builder.load(body_step, i + 1, ScalarType::Ptr));
             }
-            call_args.push(acc_param);
+            call_args.push(body_acc);
             call_args.push(elem);
             let ret_ty = self.func_ret_type(&st.target_func);
             self.builder.call(&st.target_func, call_args, ret_ty)
         } else {
             let ret_ty = self.func_ret_type(apply_name);
-            self.builder.call(apply_name, vec![step_val, acc_param, elem], ret_ty)
+            self.builder.call(apply_name, vec![body_step, body_acc, elem], ret_ty)
         };
 
         let one = self.builder.const_u64(1);
-        let next_i = self.builder.binop(BinaryOp::Add, i_param, one, ScalarType::U64);
+        let next_i = self.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
 
         if until {
             let tag = self.builder.load(result, 0, ScalarType::U64);
@@ -2319,9 +2369,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let break_tag = self.decls.constructors["Break"].tag_index;
             let break_val = self.builder.const_u64(break_tag);
             let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
-            self.builder.branch(is_break, done, vec![payload], header, vec![next_i, payload]);
+            self.builder.branch(is_break, done, vec![payload], header, vec![next_i, payload, body_end, body_step]);
         } else {
-            self.builder.jump(header, vec![next_i, result]);
+            self.builder.jump(header, vec![next_i, result, body_end, body_step]);
         }
 
         self.builder.switch_to(done);
@@ -2340,46 +2390,55 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     ) -> Value {
         let len_val = self.builder.load(list_val, 0, ScalarType::U64);
         let data_ptr = self.builder.load(list_val, 2, ScalarType::Ptr);
+        let step_ty = self.builder.value_types.get(&step_val).copied().unwrap_or(ScalarType::Ptr);
 
         let header = self.builder.create_block();
         let i_param = self.builder.add_block_param(header, ScalarType::U64);
         let acc_param = self.builder.add_block_param(header, acc_ty);
+        let len_param = self.builder.add_block_param(header, ScalarType::U64);
+        let data_param = self.builder.add_block_param(header, ScalarType::Ptr);
+        let step_param = self.builder.add_block_param(header, step_ty);
         let body_block = self.builder.create_block();
+        let body_i = self.builder.add_block_param(body_block, ScalarType::U64);
+        let body_acc = self.builder.add_block_param(body_block, acc_ty);
+        let body_len = self.builder.add_block_param(body_block, ScalarType::U64);
+        let body_data = self.builder.add_block_param(body_block, ScalarType::Ptr);
+        let body_step = self.builder.add_block_param(body_block, step_ty);
         let done = self.builder.create_block();
         let done_param = self.builder.add_block_param(done, acc_ty);
 
         let zero = self.builder.const_u64(0);
-        self.builder.jump(header, vec![zero, init_val]);
+        self.builder.jump(header, vec![zero, init_val, len_val, data_ptr, step_val]);
 
         self.builder.switch_to(header);
         let cmp = self
             .builder
-            .binop(BinaryOp::Eq, i_param, len_val, ScalarType::U8);
+            .binop(BinaryOp::Eq, i_param, len_param, ScalarType::U8);
         self.builder
-            .branch(cmp, done, vec![acc_param], body_block, vec![]);
+            .branch(cmp, done, vec![acc_param], body_block, vec![i_param, acc_param, len_param, data_param, step_param]);
 
         self.builder.switch_to(body_block);
-        let elem = self.builder.load_dyn(data_ptr, i_param, ScalarType::Ptr);
+        let elem = self.builder.load_dyn(body_data, body_i, ScalarType::Ptr);
         // Resolve direct call target: per-call-site tag > singleton > apply dispatch.
         let resolved = direct.or_else(|| self.singletons.get(apply_name));
         let result = if let Some(st) = resolved {
             let mut call_args = Vec::with_capacity(st.num_captures + 2);
             for i in 0..st.num_captures {
-                call_args.push(self.builder.load(step_val, i + 1, ScalarType::Ptr));
+                call_args.push(self.builder.load(body_step, i + 1, ScalarType::Ptr));
             }
-            call_args.push(acc_param);
+            call_args.push(body_acc);
             call_args.push(elem);
             let ret_ty = self.func_ret_type(&st.target_func);
             self.builder.call(&st.target_func, call_args, ret_ty)
         } else {
             let ret_ty = self.func_ret_type(apply_name);
-            self.builder.call(apply_name, vec![step_val, acc_param, elem], ret_ty)
+            self.builder.call(apply_name, vec![body_step, body_acc, elem], ret_ty)
         };
 
         let one = self.builder.const_u64(1);
         let next_i = self
             .builder
-            .binop(BinaryOp::Add, i_param, one, ScalarType::U64);
+            .binop(BinaryOp::Add, body_i, one, ScalarType::U64);
 
         if until {
             let tag = self.builder.load(result, 0, ScalarType::U64);
@@ -2394,9 +2453,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .builder
                 .binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
             self.builder
-                .branch(is_break, done, vec![payload], header, vec![next_i, payload]);
+                .branch(is_break, done, vec![payload], header, vec![next_i, payload, body_len, body_data, body_step]);
         } else {
-            self.builder.jump(header, vec![next_i, result]);
+            self.builder.jump(header, vec![next_i, result, body_len, body_data, body_step]);
         }
 
         self.builder.switch_to(done);

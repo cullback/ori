@@ -232,4 +232,41 @@ fn validate_function(
             ));
         }
     }
+
+    // Explicit block params check: every value used in a block must
+    // be defined within that block (instruction dest or block param),
+    // or be a constant defined in that block, or be a function param.
+    // This ensures all cross-block value flow goes through block
+    // params, making ownership analysis trivial.
+    let func_params: HashSet<Value> = func.params.iter().copied().collect();
+    for (bid, block) in &func.blocks {
+        // Values available in this block: block params + instruction dests.
+        let mut local: HashSet<Value> = block.params.iter().copied().collect();
+        for inst in &block.insts {
+            // Check operands before adding the dest — operands must
+            // already be local (or func params).
+            for v in inst.operands() {
+                if !local.contains(&v) && !func_params.contains(&v) {
+                    r.errors.push(format!(
+                        "{prefix}: b{} uses {v} which is not a block param, \
+                         local instruction, or function param (cross-block reference)",
+                        bid.0
+                    ));
+                }
+            }
+            if let Some(d) = inst.dest() {
+                local.insert(d);
+            }
+        }
+        // Check terminator operands too.
+        for v in block.terminator.operands() {
+            if !local.contains(&v) && !func_params.contains(&v) {
+                r.errors.push(format!(
+                    "{prefix}: b{} terminator uses {v} which is not a block param, \
+                     local instruction, or function param (cross-block reference)",
+                    bid.0
+                ));
+            }
+        }
+    }
 }
