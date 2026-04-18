@@ -253,6 +253,14 @@ fn insert_rc_function(func: &mut Function) {
 
     let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
 
+    // Fresh value counter for trampoline block params.
+    let mut next_value: usize = func
+        .value_types
+        .keys()
+        .map(|v| v.0 + 1)
+        .max()
+        .unwrap_or(0);
+
     // Function params are borrowed from the caller. We emit rc_inc
     // on Store of a param (the heap needs its own reference), but
     // we must not emit rc_dec on param death — the caller owns the
@@ -428,6 +436,9 @@ fn insert_rc_function(func: &mut Function) {
 
     // Phase 3: for each edge that needs decs, insert a trampoline
     // block that dec's the values and jumps to the original target.
+    // The trampoline receives all needed values as block params to
+    // satisfy the explicit-block-params invariant.
+    let func_param_set: HashSet<Value> = func.params.iter().copied().collect();
     let mut edges: Vec<((BlockId, usize), Vec<Value>)> = edge_decs.into_iter().collect();
     edges.sort_by(|a, b| b.0.cmp(&a.0));
     for ((block_id, edge_idx), decs) in edges {
@@ -436,29 +447,54 @@ fn insert_rc_function(func: &mut Function) {
         let target_id = *target;
         let target_args = target_args.to_vec();
 
-        // Create trampoline: dec values, then jump to original target.
+        // Collect all values the trampoline needs: dec values + target args.
+        // Exclude function params (always accessible) and deduplicate.
+        let mut needed: Vec<Value> = Vec::new();
+        let mut seen: HashSet<Value> = HashSet::new();
+        for &v in decs.iter().chain(target_args.iter()) {
+            if !func_param_set.contains(&v) && seen.insert(v) {
+                needed.push(v);
+            }
+        }
+
+        // Create block params for the trampoline, mapping originals to fresh values.
         let tramp_id = BlockId(func.next_block);
         func.next_block += 1;
-        let tramp_insts: Vec<Inst> = decs.into_iter().map(Inst::RcDec).collect();
+        let mut tramp_remap: HashMap<Value, Value> = HashMap::new();
+        let mut tramp_params: Vec<Value> = Vec::new();
+        for &v in &needed {
+            let fresh = Value(next_value);
+            next_value += 1;
+            func.value_types.insert(fresh, *func.value_types.get(&v).unwrap_or(&ScalarType::Ptr));
+            tramp_remap.insert(v, fresh);
+            tramp_params.push(fresh);
+        }
+
+        let remap = |v: Value| -> Value {
+            tramp_remap.get(&v).copied().unwrap_or(v)
+        };
+
+        let tramp_insts: Vec<Inst> = decs.into_iter().map(|v| Inst::RcDec(remap(v))).collect();
+        let tramp_target_args: Vec<Value> = target_args.iter().map(|v| remap(*v)).collect();
         func.blocks.insert(tramp_id, super::Block {
-            params: vec![],
+            params: tramp_params,
             insts: tramp_insts,
-            terminator: Terminator::Jump(target_id, target_args.clone()),
+            terminator: Terminator::Jump(target_id, tramp_target_args),
         });
 
-        // Rewrite the edge in the original terminator to point at the trampoline.
-        rewrite_edge(&mut func.blocks.get_mut(&block_id).unwrap().terminator, edge_idx, tramp_id, target_args);
+        // Rewrite the edge to pass the needed values as args.
+        rewrite_edge(&mut func.blocks.get_mut(&block_id).unwrap().terminator, edge_idx, tramp_id, needed);
     }
 }
 
 /// Rewrite the `edge_idx`-th successor of a terminator to point at
-/// `new_target` with no block args (the trampoline handles them).
-fn rewrite_edge(term: &mut Terminator, edge_idx: usize, new_target: BlockId, _original_args: Vec<Value>) {
+/// `new_target` with the given block args.
+fn rewrite_edge(term: &mut Terminator, edge_idx: usize, new_target: BlockId, new_args: Vec<Value>) {
     match term {
         Terminator::Jump(target, args) => {
             assert_eq!(edge_idx, 0);
             *target = new_target;
-            args.clear();
+            *args = new_args;
         }
         Terminator::Branch {
             then_block,
@@ -469,21 +505,21 @@ fn rewrite_edge(term: &mut Terminator, edge_idx: usize, new_target: BlockId, _or
         } => match edge_idx {
             0 => {
                 *then_block = new_target;
-                then_args.clear();
+                *then_args = new_args;
             }
             1 => {
                 *else_block = new_target;
-                else_args.clear();
+                *else_args = new_args;
             }
             _ => unreachable!(),
         },
         Terminator::SwitchInt { arms, default, .. } => {
             if edge_idx < arms.len() {
                 arms[edge_idx].1 = new_target;
-                arms[edge_idx].2.clear();
+                arms[edge_idx].2 = new_args;
             } else if let Some((target, args)) = default {
                 *target = new_target;
-                args.clear();
+                *args = new_args;
             }
         }
         _ => unreachable!(),

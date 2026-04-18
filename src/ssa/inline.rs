@@ -112,6 +112,10 @@ fn inline_calls_in_function(caller: &mut Function, snapshots: &HashMap<String, F
         let callee = &snapshots[&callee_name];
         perform_inline(caller, block_id, inst_idx, callee);
     }
+    // After inlining, callee function params that mapped to caller-local
+    // values may have become cross-block references. Repair them by
+    // threading through block params.
+    repair_cross_block_refs(caller);
 }
 
 /// Find the first Call instruction that targets an inlineable callee.
@@ -462,4 +466,107 @@ fn rewrite_operands(inst: &mut Inst, map: &HashMap<Value, Value>) {
 
 fn rewrite_terminator_operands(term: &mut Terminator, map: &HashMap<Value, Value>) {
     super::opt::rewrite_terminator_operands(term, map);
+}
+
+/// Repair cross-block references by threading values through block
+/// params. After inlining, callee function params that were remapped
+/// to caller-local values may appear as cross-block references.
+/// This pass iteratively adds block params until every block is
+/// self-contained.
+fn repair_cross_block_refs(func: &mut Function) {
+    let func_param_set: HashSet<Value> = func.params.iter().copied().collect();
+    let mut next_val: usize = func
+        .value_types
+        .keys()
+        .map(|v| v.0 + 1)
+        .max()
+        .unwrap_or(0);
+
+    loop {
+        // Find the first cross-block reference.
+        let mut violation: Option<(BlockId, Value)> = None;
+        'outer: for (&bid, block) in &func.blocks {
+            let mut local: HashSet<Value> = block.params.iter().copied().collect();
+            for inst in &block.insts {
+                for v in inst.operands() {
+                    if !local.contains(&v) && !func_param_set.contains(&v) {
+                        violation = Some((bid, v));
+                        break 'outer;
+                    }
+                }
+                if let Some(d) = inst.dest() {
+                    local.insert(d);
+                }
+            }
+            for v in block.terminator.operands() {
+                if !local.contains(&v) && !func_param_set.contains(&v) {
+                    violation = Some((bid, v));
+                    break 'outer;
+                }
+            }
+        }
+
+        let Some((bid, val)) = violation else {
+            break;
+        };
+
+        // Create a fresh block param for `val` in block `bid`.
+        let val_ty = func
+            .value_types
+            .get(&val)
+            .copied()
+            .unwrap_or(super::instruction::ScalarType::Ptr);
+        let new_param = Value(next_val);
+        next_val += 1;
+        func.value_types.insert(new_param, val_ty);
+        func.blocks.get_mut(&bid).unwrap().params.push(new_param);
+
+        // Rewrite uses of `val` in this block to `new_param`.
+        let remap: HashMap<Value, Value> = [(val, new_param)].into();
+        let block = func.blocks.get_mut(&bid).unwrap();
+        for inst in &mut block.insts {
+            super::opt::rewrite_operands(inst, &remap);
+        }
+        super::opt::rewrite_terminator_operands(&mut block.terminator, &remap);
+
+        // Update every edge that targets `bid` to pass `val` as an
+        // extra arg. If `val` isn't available in the predecessor,
+        // it'll be caught as a violation on the next iteration.
+        let all_bids: Vec<BlockId> = func.blocks.keys().copied().collect();
+        for pred_bid in all_bids {
+            let block = func.blocks.get_mut(&pred_bid).unwrap();
+            match &mut block.terminator {
+                Terminator::Jump(target, args) if *target == bid => {
+                    args.push(val);
+                }
+                Terminator::Branch {
+                    then_block,
+                    then_args,
+                    else_block,
+                    else_args,
+                    ..
+                } => {
+                    if *then_block == bid {
+                        then_args.push(val);
+                    }
+                    if *else_block == bid {
+                        else_args.push(val);
+                    }
+                }
+                Terminator::SwitchInt { arms, default, .. } => {
+                    for (_, target, args) in arms.iter_mut() {
+                        if *target == bid {
+                            args.push(val);
+                        }
+                    }
+                    if let Some((target, args)) = default {
+                        if *target == bid {
+                            args.push(val);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
