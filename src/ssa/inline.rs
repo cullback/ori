@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BlockId, Inst, Terminator, Value};
+use super::instruction::{BlockEdge, BlockId, Inst, Terminator, Value};
 use super::{Block, Function, Module};
 
 /// Maximum number of instructions in a callee for it to be inlined.
@@ -151,24 +151,19 @@ fn perform_inline(
     // --- Step 1: compute remapping for Values and BlockIds ---
 
     // Find the max Value index in the caller to avoid collisions.
-    // Check blocks, params, AND value_types (which may contain values
-    // from previous inlines that aren't in any block yet).
     let mut max_val = 0_usize;
     for block in caller.blocks.values() {
         for &p in &block.params {
-            max_val = max_val.max(p.0 + 1);
+            max_val = max_val.max(p.id + 1);
         }
         for inst in &block.insts {
             if let Some(d) = inst.dest() {
-                max_val = max_val.max(d.0 + 1);
+                max_val = max_val.max(d.id + 1);
             }
         }
     }
     for &p in &caller.params {
-        max_val = max_val.max(p.0 + 1);
-    }
-    for &v in caller.value_types.keys() {
-        max_val = max_val.max(v.0 + 1);
+        max_val = max_val.max(p.id + 1);
     }
 
     // Build Value remap: callee params → call args, callee locals → fresh values.
@@ -183,7 +178,7 @@ fn perform_inline(
         if let Some(&mapped) = map.get(&v) {
             return mapped;
         }
-        let new_v = Value(next_val);
+        let new_v = Value { id: next_val, ty: v.ty };
         next_val += 1;
         map.insert(v, new_v);
         new_v
@@ -225,17 +220,14 @@ fn perform_inline(
     // The continuation block receives the return value as a parameter.
     let cont_block_id = BlockId(caller.next_block);
     caller.next_block += 1;
-    let cont_param = Value(next_val);
+    let cont_param = Value { id: next_val, ty: callee.return_type };
 
     // Split the caller block: instructions after the call go into the continuation.
     let remaining_insts: Vec<Inst> = caller.blocks.get_mut(&block_id).unwrap()
         .insts
         .split_off(inst_idx + 1);
-    // Remove the Call instruction itself. Its dest (`call_dest`) is
-    // about to be replaced by `cont_param` everywhere, so drop its
-    // stale type entry to keep `value_types` in sync.
+    // Remove the Call instruction itself.
     caller.blocks.get_mut(&block_id).unwrap().insts.pop();
-    caller.value_types.remove(&call_dest);
 
     // --- Step 3: copy callee entry block instructions into caller block ---
 
@@ -251,11 +243,6 @@ fn perform_inline(
 
     for inst in &callee_entry.insts {
         let remapped = remap_inst(inst, &val_map);
-        if let Some(d) = inst.dest() {
-            if let Some(ty) = callee.value_types.get(&d) {
-                caller.value_types.insert(val_map[&d], *ty);
-            }
-        }
         caller.blocks.get_mut(&block_id).unwrap().insts.push(remapped);
     }
 
@@ -266,20 +253,9 @@ fn perform_inline(
             continue;
         }
         let new_bid = block_map[&callee_bid];
-        // Copy param types.
-        for &p in &callee_block.params {
-            if let Some(ty) = callee.value_types.get(&p) {
-                caller.value_types.insert(val_map[&p], *ty);
-            }
-        }
         let mut insts = Vec::new();
         for inst in &callee_block.insts {
             let remapped = remap_inst(inst, &val_map);
-            if let Some(d) = inst.dest() {
-                if let Some(ty) = callee.value_types.get(&d) {
-                    caller.value_types.insert(val_map[&d], *ty);
-                }
-            }
             insts.push(remapped);
         }
         let new_block = Block {
@@ -301,8 +277,6 @@ fn perform_inline(
 
     // --- Step 5: create continuation block with remaining instructions ---
 
-    let ret_ty = callee.return_type;
-    caller.value_types.insert(cont_param, ret_ty);
     // Map the original call destination to the continuation parameter
     // in remaining instructions and the original terminator.
     let dest_map: HashMap<Value, Value> = [(call_dest, cont_param)].into();
@@ -343,66 +317,16 @@ fn remap_value(v: Value, map: &HashMap<Value, Value>) -> Value {
 }
 
 fn remap_inst(inst: &Inst, map: &HashMap<Value, Value>) -> Inst {
-    match inst {
-        Inst::Const(d, ty, bits) => Inst::Const(remap_value(*d, map), *ty, *bits),
-        Inst::BinOp(d, op, l, r) => {
-            Inst::BinOp(remap_value(*d, map), *op, remap_value(*l, map), remap_value(*r, map))
+    let mut remapped = inst.clone();
+    // Remap destination.
+    if let Some(d) = remapped.dest_mut() {
+        if let Some(&new_d) = map.get(d) {
+            *d = new_d;
         }
-        Inst::Call(d, name, args) => Inst::Call(
-            remap_value(*d, map),
-            name.clone(),
-            args.iter().map(|v| remap_value(*v, map)).collect(),
-        ),
-        Inst::Alloc(d, sz) => Inst::Alloc(remap_value(*d, map), *sz),
-        Inst::AllocDyn(d, sz) => {
-            Inst::AllocDyn(remap_value(*d, map), remap_value(*sz, map))
-        }
-        Inst::Load(d, ptr, off) => {
-            Inst::Load(remap_value(*d, map), remap_value(*ptr, map), *off)
-        }
-        Inst::Store(ptr, off, val) => {
-            Inst::Store(remap_value(*ptr, map), *off, remap_value(*val, map))
-        }
-        Inst::LoadDyn(d, ptr, idx) => Inst::LoadDyn(
-            remap_value(*d, map),
-            remap_value(*ptr, map),
-            remap_value(*idx, map),
-        ),
-        Inst::StoreDyn(ptr, idx, val) => Inst::StoreDyn(
-            remap_value(*ptr, map),
-            remap_value(*idx, map),
-            remap_value(*val, map),
-        ),
-        Inst::RcInc(v) => Inst::RcInc(remap_value(*v, map)),
-        Inst::RcDec(v) => Inst::RcDec(remap_value(*v, map)),
-        Inst::Reset(d, ptr, slots) => {
-            Inst::Reset(remap_value(*d, map), remap_value(*ptr, map), slots.clone())
-        }
-        Inst::Reuse(d, tok, sz) => {
-            Inst::Reuse(remap_value(*d, map), remap_value(*tok, map), *sz)
-        }
-        Inst::ReuseDyn(d, tok, sz) => Inst::ReuseDyn(
-            remap_value(*d, map),
-            remap_value(*tok, map),
-            remap_value(*sz, map),
-        ),
-        Inst::StaticRef(d, id) => Inst::StaticRef(remap_value(*d, map), *id),
-        Inst::Pack(d, fields) => Inst::Pack(
-            remap_value(*d, map),
-            fields.iter().map(|v| remap_value(*v, map)).collect(),
-        ),
-        Inst::Extract(d, agg, idx) => Inst::Extract(
-            remap_value(*d, map),
-            remap_value(*agg, map),
-            *idx,
-        ),
-        Inst::Insert(d, agg, idx, val) => Inst::Insert(
-            remap_value(*d, map),
-            remap_value(*agg, map),
-            *idx,
-            remap_value(*val, map),
-        ),
     }
+    // Remap operands.
+    remapped.map_operands_mut(|v| { if let Some(&r) = map.get(v) { *v = r; } });
+    remapped
 }
 
 fn remap_terminator(
@@ -414,24 +338,29 @@ fn remap_terminator(
     match term {
         Terminator::Return(v) => {
             // Return becomes a jump to the continuation block.
-            Terminator::Jump(cont_block, vec![remap_value(*v, val_map)])
+            Terminator::Jump(BlockEdge {
+                target: cont_block,
+                args: vec![remap_value(*v, val_map)],
+            })
         }
-        Terminator::Jump(target, args) => Terminator::Jump(
-            remap_block(*target),
-            args.iter().map(|v| remap_value(*v, val_map)).collect(),
-        ),
+        Terminator::Jump(edge) => Terminator::Jump(BlockEdge {
+            target: remap_block(edge.target),
+            args: edge.args.iter().map(|v| remap_value(*v, val_map)).collect(),
+        }),
         Terminator::Branch {
             cond,
-            then_block,
-            then_args,
-            else_block,
-            else_args,
+            then_edge,
+            else_edge,
         } => Terminator::Branch {
             cond: remap_value(*cond, val_map),
-            then_block: remap_block(*then_block),
-            then_args: then_args.iter().map(|v| remap_value(*v, val_map)).collect(),
-            else_block: remap_block(*else_block),
-            else_args: else_args.iter().map(|v| remap_value(*v, val_map)).collect(),
+            then_edge: BlockEdge {
+                target: remap_block(then_edge.target),
+                args: then_edge.args.iter().map(|v| remap_value(*v, val_map)).collect(),
+            },
+            else_edge: BlockEdge {
+                target: remap_block(else_edge.target),
+                args: else_edge.args.iter().map(|v| remap_value(*v, val_map)).collect(),
+            },
         },
         Terminator::SwitchInt {
             scrutinee,
@@ -441,19 +370,21 @@ fn remap_terminator(
             scrutinee: remap_value(*scrutinee, val_map),
             arms: arms
                 .iter()
-                .map(|(tag, bid, args)| {
+                .map(|(tag, edge)| {
                     (
                         *tag,
-                        remap_block(*bid),
-                        args.iter().map(|v| remap_value(*v, val_map)).collect(),
+                        BlockEdge {
+                            target: remap_block(edge.target),
+                            args: edge.args.iter().map(|v| remap_value(*v, val_map)).collect(),
+                        },
                     )
                 })
                 .collect(),
-            default: default.as_ref().map(|(bid, args)| {
-                (
-                    remap_block(*bid),
-                    args.iter().map(|v| remap_value(*v, val_map)).collect(),
-                )
+            default: default.as_ref().map(|edge| {
+                BlockEdge {
+                    target: remap_block(edge.target),
+                    args: edge.args.iter().map(|v| remap_value(*v, val_map)).collect(),
+                }
             }),
         },
     }
@@ -475,12 +406,23 @@ fn rewrite_terminator_operands(term: &mut Terminator, map: &HashMap<Value, Value
 /// self-contained.
 fn repair_cross_block_refs(func: &mut Function) {
     let func_param_set: HashSet<Value> = func.params.iter().copied().collect();
-    let mut next_val: usize = func
-        .value_types
-        .keys()
-        .map(|v| v.0 + 1)
-        .max()
-        .unwrap_or(0);
+    let mut next_val: usize = {
+        let mut m = 0_usize;
+        for &p in &func.params {
+            m = m.max(p.id + 1);
+        }
+        for block in func.blocks.values() {
+            for &p in &block.params {
+                m = m.max(p.id + 1);
+            }
+            for inst in &block.insts {
+                if let Some(d) = inst.dest() {
+                    m = m.max(d.id + 1);
+                }
+            }
+        }
+        m
+    };
 
     loop {
         // Find the first cross-block reference.
@@ -511,14 +453,8 @@ fn repair_cross_block_refs(func: &mut Function) {
         };
 
         // Create a fresh block param for `val` in block `bid`.
-        let val_ty = func
-            .value_types
-            .get(&val)
-            .copied()
-            .unwrap_or(super::instruction::ScalarType::Ptr);
-        let new_param = Value(next_val);
+        let new_param = Value { id: next_val, ty: val.ty };
         next_val += 1;
-        func.value_types.insert(new_param, val_ty);
         func.blocks.get_mut(&bid).unwrap().params.push(new_param);
 
         // Rewrite uses of `val` in this block to `new_param`.
@@ -536,32 +472,30 @@ fn repair_cross_block_refs(func: &mut Function) {
         for pred_bid in all_bids {
             let block = func.blocks.get_mut(&pred_bid).unwrap();
             match &mut block.terminator {
-                Terminator::Jump(target, args) if *target == bid => {
-                    args.push(val);
+                Terminator::Jump(edge) if edge.target == bid => {
+                    edge.args.push(val);
                 }
                 Terminator::Branch {
-                    then_block,
-                    then_args,
-                    else_block,
-                    else_args,
+                    then_edge,
+                    else_edge,
                     ..
                 } => {
-                    if *then_block == bid {
-                        then_args.push(val);
+                    if then_edge.target == bid {
+                        then_edge.args.push(val);
                     }
-                    if *else_block == bid {
-                        else_args.push(val);
+                    if else_edge.target == bid {
+                        else_edge.args.push(val);
                     }
                 }
                 Terminator::SwitchInt { arms, default, .. } => {
-                    for (_, target, args) in arms.iter_mut() {
-                        if *target == bid {
-                            args.push(val);
+                    for (_, edge) in arms.iter_mut() {
+                        if edge.target == bid {
+                            edge.args.push(val);
                         }
                     }
-                    if let Some((target, args)) = default {
-                        if *target == bid {
-                            args.push(val);
+                    if let Some(edge) = default {
+                        if edge.target == bid {
+                            edge.args.push(val);
                         }
                     }
                 }

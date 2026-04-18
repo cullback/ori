@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
+use super::instruction::{BinaryOp, BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
 use super::{Function, Module};
 
 /// Run optimization passes in a single deliberate sequence.
@@ -55,8 +55,8 @@ fn dce(func: &mut Function) -> bool {
         if !reachable.insert(bid) {
             continue;
         }
-        for (succ, _) in func.blocks[&bid].terminator.successors() {
-            worklist.push(succ);
+        for edge in func.blocks[&bid].terminator.successors() {
+            worklist.push(edge.target);
         }
     }
     if reachable.len() < func.blocks.len() {
@@ -67,15 +67,7 @@ fn dce(func: &mut Function) -> bool {
             .filter(|bid| !reachable.contains(bid))
             .collect();
         for bid in dead {
-            let block = func.blocks.remove(&bid).unwrap();
-            for p in &block.params {
-                func.value_types.remove(p);
-            }
-            for inst in &block.insts {
-                if let Some(d) = inst.dest() {
-                    func.value_types.remove(&d);
-                }
-            }
+            func.blocks.remove(&bid).unwrap();
             changed = true;
         }
     }
@@ -93,7 +85,6 @@ fn dce(func: &mut Function) -> bool {
         }
     }
 
-    let mut removed_dests: Vec<Value> = Vec::new();
     for block in func.blocks.values_mut() {
         let before = block.insts.len();
         block.insts.retain(|inst| {
@@ -104,7 +95,6 @@ fn dce(func: &mut Function) -> bool {
                 if used.contains(&dest) {
                     return true;
                 }
-                removed_dests.push(dest);
                 return false;
             }
             true
@@ -112,9 +102,6 @@ fn dce(func: &mut Function) -> bool {
         if block.insts.len() != before {
             changed = true;
         }
-    }
-    for d in removed_dests {
-        func.value_types.remove(&d);
     }
     changed
 }
@@ -130,8 +117,8 @@ fn const_fold(func: &mut Function) -> bool {
     let mut consts: HashMap<Value, (ScalarType, u64)> = HashMap::new();
     for block in func.blocks.values() {
         for inst in &block.insts {
-            if let Inst::Const(dest, ty, bits) = inst {
-                consts.insert(*dest, (*ty, *bits));
+            if let Inst::Const(dest, bits) = inst {
+                consts.insert(*dest, (dest.ty, *bits));
             }
         }
     }
@@ -145,7 +132,7 @@ fn const_fold(func: &mut Function) -> bool {
                 if let (Some((lty, lbits)), Some((_, rbits))) = (lc, rc) {
                     if let Some(result) = fold_binop(*op, lty, lbits, rbits) {
                         consts.insert(*dest, (result.0, result.1));
-                        *inst = Inst::Const(*dest, result.0, result.1);
+                        *inst = Inst::Const(*dest, result.1);
                         changed = true;
                     }
                 }
@@ -169,8 +156,8 @@ fn nop_elim(func: &mut Function) -> bool {
 
     for block in func.blocks.values() {
         for inst in &block.insts {
-            if let Inst::Const(dest, ty, bits) = inst {
-                consts.insert(*dest, (*ty, *bits));
+            if let Inst::Const(dest, bits) = inst {
+                consts.insert(*dest, (dest.ty, *bits));
             }
             if let Inst::BinOp(dest, op, lhs, rhs) = inst {
                 if let Some(replacement) = detect_nop(*op, *lhs, *rhs, &consts) {
@@ -204,10 +191,6 @@ fn nop_elim(func: &mut Function) -> bool {
             inst.dest().map_or(true, |d| !resolved.contains_key(&d))
         });
     }
-    for d in resolved.keys() {
-        func.value_types.remove(d);
-    }
-
     true
 }
 
@@ -233,20 +216,20 @@ fn jump_threading(func: &mut Function) -> bool {
         if !block.insts.is_empty() {
             continue;
         }
-        let Terminator::Jump(target, ref args) = block.terminator else {
+        let Terminator::Jump(ref edge) = block.terminator else {
             continue;
         };
         if block.params.is_empty() {
             // Fixed-arg: no params, just forwards constant args.
-            redirects.insert(bid, Redirect::FixedArgs(target, args.clone()));
+            redirects.insert(bid, Redirect::FixedArgs(edge.target, edge.args.clone()));
         } else {
             // Param-forwarding: each arg must be a block param.
-            let param_indices: Option<Vec<usize>> = args
+            let param_indices: Option<Vec<usize>> = edge.args
                 .iter()
                 .map(|arg| block.params.iter().position(|p| p == arg))
                 .collect();
             if let Some(indices) = param_indices {
-                redirects.insert(bid, Redirect::ParamForward(target, indices));
+                redirects.insert(bid, Redirect::ParamForward(edge.target, indices));
             }
         }
     }
@@ -290,54 +273,49 @@ fn jump_threading(func: &mut Function) -> bool {
 
     // Rewrite all terminators that reference redirected blocks.
     let mut changed = false;
-    let remap = |bid: BlockId, args: &[Value]| -> Option<(BlockId, Vec<Value>)> {
-        resolved.get(&bid).map(|redirect| match redirect {
+    let remap = |edge: &BlockEdge| -> Option<BlockEdge> {
+        resolved.get(&edge.target).map(|redirect| match redirect {
             Redirect::ParamForward(target, indices) => {
-                (*target, indices.iter().map(|&i| args[i]).collect())
+                BlockEdge { target: *target, args: indices.iter().map(|&i| edge.args[i]).collect() }
             }
-            Redirect::FixedArgs(target, fixed_args) => (*target, fixed_args.clone()),
+            Redirect::FixedArgs(target, fixed_args) => {
+                BlockEdge { target: *target, args: fixed_args.clone() }
+            }
         })
     };
 
     for block in func.blocks.values_mut() {
         match &mut block.terminator {
-            Terminator::Jump(target, args) => {
-                if let Some((nt, na)) = remap(*target, args) {
-                    *target = nt;
-                    *args = na;
+            Terminator::Jump(edge) => {
+                if let Some(ne) = remap(edge) {
+                    *edge = ne;
                     changed = true;
                 }
             }
             Terminator::Branch {
-                then_block,
-                then_args,
-                else_block,
-                else_args,
+                then_edge,
+                else_edge,
                 ..
             } => {
-                if let Some((nt, na)) = remap(*then_block, then_args) {
-                    *then_block = nt;
-                    *then_args = na;
+                if let Some(ne) = remap(then_edge) {
+                    *then_edge = ne;
                     changed = true;
                 }
-                if let Some((ne, na)) = remap(*else_block, else_args) {
-                    *else_block = ne;
-                    *else_args = na;
+                if let Some(ne) = remap(else_edge) {
+                    *else_edge = ne;
                     changed = true;
                 }
             }
             Terminator::SwitchInt { arms, default, .. } => {
-                for (_, bid, args) in arms.iter_mut() {
-                    if let Some((nt, na)) = remap(*bid, args) {
-                        *bid = nt;
-                        *args = na;
+                for (_, edge) in arms.iter_mut() {
+                    if let Some(ne) = remap(edge) {
+                        *edge = ne;
                         changed = true;
                     }
                 }
-                if let Some((bid, args)) = default {
-                    if let Some((nt, na)) = remap(*bid, args) {
-                        *bid = nt;
-                        *args = na;
+                if let Some(edge) = default {
+                    if let Some(ne) = remap(edge) {
+                        *edge = ne;
                         changed = true;
                     }
                 }
@@ -351,20 +329,20 @@ fn jump_threading(func: &mut Function) -> bool {
     // splice the target's content into the entry block and drop the
     // now-redundant target block. Checking for other predecessors
     // avoids duplicating instruction dests across two blocks — a
-    // duplication that would later leave stale `value_types` entries
-    // once DCE reaped the (still-referenced!) target.
+    // duplication that would cause issues once DCE reaped the
+    // (still-referenced!) target.
     if func.blocks[&func.entry].insts.is_empty() {
-        if let Terminator::Jump(target, ref args) = func.blocks[&func.entry].terminator {
-            let target = target;
+        if let Terminator::Jump(ref edge) = func.blocks[&func.entry].terminator {
+            let target = edge.target;
             if target != func.entry && func.blocks.contains_key(&target) {
                 // Count how many blocks (other than entry) jump to target.
                 let other_preds = func
                     .blocks
                     .iter()
                     .filter(|(bid, _)| **bid != func.entry)
-                    .any(|(_, b)| b.terminator.successors().into_iter().any(|(t, _)| t == target));
+                    .any(|(_, b)| b.terminator.successors().into_iter().any(|e| e.target == target));
                 if !other_preds {
-                    let args = args.clone();
+                    let args = edge.args.clone();
                     let target_block = func.blocks.remove(&target).unwrap();
                     let arg_map: HashMap<Value, Value> = target_block
                         .params
@@ -380,9 +358,6 @@ fn jump_threading(func: &mut Function) -> bool {
                         rewrite_operands(inst, &arg_map);
                     }
                     rewrite_terminator_operands(&mut entry_block.terminator, &arg_map);
-                    for p in &target_block.params {
-                        func.value_types.remove(p);
-                    }
                     changed = true;
                 }
             }
@@ -411,7 +386,7 @@ fn branch_switch_fold(func: &mut Function) {
     for (&bid, block) in &func.blocks {
         let mut consts = HashMap::new();
         for inst in &block.insts {
-            if let Inst::Const(d, _, bits) = inst {
+            if let Inst::Const(d, bits) = inst {
                 consts.insert(*d, *bits);
             }
         }
@@ -423,10 +398,8 @@ fn branch_switch_fold(func: &mut Function) {
         let block = &func.blocks[&bid];
         let Terminator::Branch {
             cond,
-            then_block,
-            then_args,
-            else_block,
-            else_args,
+            then_edge,
+            else_edge,
             ..
         } = &block.terminator
         else {
@@ -434,30 +407,30 @@ fn branch_switch_fold(func: &mut Function) {
         };
 
         // Both targets must be blocks that just jump to the same merge.
-        let then_b = &func.blocks[then_block];
-        let else_b = &func.blocks[else_block];
-        let (Terminator::Jump(then_target, then_jargs), Terminator::Jump(else_target, else_jargs)) =
+        let then_b = &func.blocks[&then_edge.target];
+        let else_b = &func.blocks[&else_edge.target];
+        let (Terminator::Jump(then_jedge), Terminator::Jump(else_jedge)) =
             (&then_b.terminator, &else_b.terminator)
         else {
             continue;
         };
-        if then_target != else_target {
+        if then_jedge.target != else_jedge.target {
             continue;
         }
-        let merge_id = *then_target;
+        let merge_id = then_jedge.target;
 
         // Both must pass exactly one arg.
-        if then_jargs.len() != 1 || else_jargs.len() != 1 {
+        if then_jedge.args.len() != 1 || else_jedge.args.len() != 1 {
             continue;
         }
 
         // Resolve the constant values of the jump args.
-        let then_consts = &block_consts[then_block];
-        let else_consts = &block_consts[else_block];
-        let Some(&then_val) = then_jargs.first().and_then(|v| then_consts.get(v)) else {
+        let then_consts = &block_consts[&then_edge.target];
+        let else_consts = &block_consts[&else_edge.target];
+        let Some(&then_val) = then_jedge.args.first().and_then(|v| then_consts.get(v)) else {
             continue;
         };
-        let Some(&else_val) = else_jargs.first().and_then(|v| else_consts.get(v)) else {
+        let Some(&else_val) = else_jedge.args.first().and_then(|v| else_consts.get(v)) else {
             continue;
         };
 
@@ -482,31 +455,29 @@ fn branch_switch_fold(func: &mut Function) {
         }
 
         // Find where each constant goes in the switch.
-        let resolve = |val: u64| -> Option<(BlockId, Vec<Value>)> {
-            for (arm_val, target, args) in arms {
+        let resolve = |val: u64| -> Option<BlockEdge> {
+            for (arm_val, edge) in arms {
                 if *arm_val == val {
-                    return Some((*target, args.clone()));
+                    return Some(edge.clone());
                 }
             }
             default.clone()
         };
-        let Some((true_target, true_args)) = resolve(then_val) else {
+        let Some(true_edge) = resolve(then_val) else {
             continue;
         };
-        let Some((false_target, false_args)) = resolve(else_val) else {
+        let Some(false_edge) = resolve(else_val) else {
             continue;
         };
 
         let cond = *cond;
-        let new_then_args = [then_args.clone(), true_args].concat();
-        let new_else_args = [else_args.clone(), false_args].concat();
+        let new_then_args = [then_edge.args.clone(), true_edge.args].concat();
+        let new_else_args = [else_edge.args.clone(), false_edge.args].concat();
 
         func.blocks.get_mut(&bid).unwrap().terminator = Terminator::Branch {
             cond,
-            then_block: true_target,
-            then_args: new_then_args,
-            else_block: false_target,
-            else_args: new_else_args,
+            then_edge: BlockEdge { target: true_edge.target, args: new_then_args },
+            else_edge: BlockEdge { target: false_edge.target, args: new_else_args },
         };
     }
 }
@@ -522,24 +493,24 @@ fn merge_blocks(func: &mut Function) {
 
     for (&src, block) in &func.blocks {
         match &block.terminator {
-            Terminator::Jump(target, _) => {
-                if multi_pred.contains(target) {
+            Terminator::Jump(edge) => {
+                if multi_pred.contains(&edge.target) {
                     // already has multiple predecessors
-                } else if jump_preds.contains_key(target) {
+                } else if jump_preds.contains_key(&edge.target) {
                     // second predecessor — no longer mergeable
-                    jump_preds.remove(target);
-                    multi_pred.insert(*target);
+                    jump_preds.remove(&edge.target);
+                    multi_pred.insert(edge.target);
                 } else {
-                    jump_preds.insert(*target, src);
+                    jump_preds.insert(edge.target, src);
                 }
             }
             term => {
                 // Branch/SwitchInt — all successors get marked as multi-pred
                 // (the predecessor has multiple outgoing edges, so the
                 // successor can't be merged back into it).
-                for (succ, _) in term.successors() {
-                    jump_preds.remove(&succ);
-                    multi_pred.insert(succ);
+                for edge in term.successors() {
+                    jump_preds.remove(&edge.target);
+                    multi_pred.insert(edge.target);
                 }
             }
         }
@@ -560,9 +531,10 @@ fn merge_blocks(func: &mut Function) {
         };
 
         // Build param→arg substitution from the Jump.
-        let Terminator::Jump(_, ref args) = pred_block.terminator else {
+        let Terminator::Jump(ref edge) = pred_block.terminator else {
             continue;
         };
+        let args = &edge.args;
         let arg_map: HashMap<Value, Value> = target_block
             .params
             .iter()
@@ -626,14 +598,25 @@ fn split_agg_params(func: &mut Function) {
     // Collect all args flowing to each (block, param_index).
     let mut pred_args: HashMap<(BlockId, usize), Vec<Value>> = HashMap::new();
     for block in func.blocks.values() {
-        for (succ, args) in block.terminator.successors() {
-            for (i, &v) in args.iter().enumerate() {
-                pred_args.entry((succ, i)).or_default().push(v);
+        for edge in block.terminator.successors() {
+            for (i, &v) in edge.args.iter().enumerate() {
+                pred_args.entry((edge.target, i)).or_default().push(v);
             }
         }
     }
 
-    let mut next_val = func.value_types.keys().map(|v| v.0 + 1).max().unwrap_or(0);
+    let mut next_val = func
+        .params
+        .iter()
+        .map(|v| v.id + 1)
+        .chain(func.blocks.values().flat_map(|b| {
+            b.params
+                .iter()
+                .map(|v| v.id + 1)
+                .chain(b.insts.iter().filter_map(|i| i.dest().map(|d| d.id + 1)))
+        }))
+        .max()
+        .unwrap_or(0);
     let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
 
     for bid in &block_ids {
@@ -643,7 +626,7 @@ fn split_agg_params(func: &mut Function) {
         let mut any_split = false;
 
         for (pi, &p) in params.iter().enumerate() {
-            if let Some(ScalarType::Agg(n)) = func.value_types.get(&p) {
+            if let ScalarType::Agg(n) = p.ty {
                 // Only split if ALL predecessors provide a visible Pack.
                 let pred_vals = pred_args.get(&(*bid, pi));
                 let all_packs = pred_vals
@@ -674,16 +657,16 @@ fn split_agg_params(func: &mut Function) {
                         .iter()
                         .filter_map(|v| packs.get(v))
                         .collect();
-                    let mut field_types: Vec<ScalarType> = Vec::with_capacity(*n);
+                    let mut field_types: Vec<ScalarType> = Vec::with_capacity(n);
                     let mut types_agree = true;
-                    for i in 0..*n {
+                    for i in 0..n {
                         let first_ty = all_pred_packs.first()
                             .and_then(|fs| fs.get(i))
-                            .and_then(|fv| func.value_types.get(fv).copied())
+                            .map(|fv| fv.ty)
                             .unwrap_or(ScalarType::U64);
                         if all_pred_packs.iter().all(|fs| {
                             fs.get(i)
-                                .and_then(|fv| func.value_types.get(fv).copied())
+                                .map(|fv| fv.ty)
                                 .unwrap_or(ScalarType::U64)
                                 == first_ty
                         }) {
@@ -700,9 +683,8 @@ fn split_agg_params(func: &mut Function) {
                     let new_ps: Vec<Value> = field_types
                         .iter()
                         .map(|&ty| {
-                            let v = Value(next_val);
+                            let v = Value { id: next_val, ty };
                             next_val += 1;
-                            func.value_types.insert(v, ty);
                             v
                         })
                         .collect();
@@ -743,12 +725,6 @@ fn split_agg_params(func: &mut Function) {
             match &splits[pi] {
                 Some(new_ps) => new_params.extend_from_slice(new_ps),
                 None => new_params.push(p),
-            }
-        }
-        // Remove old Agg params from value_types.
-        for (pi, &p) in params.iter().enumerate() {
-            if splits[pi].is_some() {
-                func.value_types.remove(&p);
             }
         }
         func.blocks.get_mut(bid).unwrap().params = new_params;
@@ -812,35 +788,39 @@ fn expand_term_args(
     }
 
     match term {
-        Terminator::Jump(bid, args) => {
-            expand(args, *bid, target, splits, packs)
-                .map(|a| Terminator::Jump(*bid, a))
+        Terminator::Jump(edge) => {
+            expand(&edge.args, edge.target, target, splits, packs)
+                .map(|a| Terminator::Jump(BlockEdge { target: edge.target, args: a }))
         }
-        Terminator::Branch { cond, then_block, then_args, else_block, else_args } => {
-            let t = expand(then_args, *then_block, target, splits, packs);
-            let e = expand(else_args, *else_block, target, splits, packs);
+        Terminator::Branch { cond, then_edge, else_edge } => {
+            let t = expand(&then_edge.args, then_edge.target, target, splits, packs);
+            let e = expand(&else_edge.args, else_edge.target, target, splits, packs);
             if t.is_some() || e.is_some() {
                 Some(Terminator::Branch {
                     cond: *cond,
-                    then_block: *then_block,
-                    then_args: t.unwrap_or_else(|| then_args.clone()),
-                    else_block: *else_block,
-                    else_args: e.unwrap_or_else(|| else_args.clone()),
+                    then_edge: BlockEdge {
+                        target: then_edge.target,
+                        args: t.unwrap_or_else(|| then_edge.args.clone()),
+                    },
+                    else_edge: BlockEdge {
+                        target: else_edge.target,
+                        args: e.unwrap_or_else(|| else_edge.args.clone()),
+                    },
                 })
             } else { None }
         }
         Terminator::SwitchInt { scrutinee, arms, default } => {
             let mut changed = false;
-            let new_arms: Vec<_> = arms.iter().map(|(tag, bid, args)| {
-                if let Some(a) = expand(args, *bid, target, splits, packs) {
+            let new_arms: Vec<_> = arms.iter().map(|(tag, edge)| {
+                if let Some(a) = expand(&edge.args, edge.target, target, splits, packs) {
                     changed = true;
-                    (*tag, *bid, a)
+                    (*tag, BlockEdge { target: edge.target, args: a })
                 } else {
-                    (*tag, *bid, args.clone())
+                    (*tag, edge.clone())
                 }
             }).collect();
-            let new_def = default.as_ref().and_then(|(bid, args)| {
-                expand(args, *bid, target, splits, packs).map(|a| { changed = true; (*bid, a) })
+            let new_def = default.as_ref().and_then(|edge| {
+                expand(&edge.args, edge.target, target, splits, packs).map(|a| { changed = true; BlockEdge { target: edge.target, args: a } })
             });
             if changed {
                 Some(Terminator::SwitchInt {
@@ -858,7 +838,7 @@ fn load_of_agg(func: &mut Function) {
     for block in func.blocks.values_mut() {
         for inst in &mut block.insts {
             if let Inst::Load(dest, ptr, offset) = inst {
-                if matches!(func.value_types.get(ptr), Some(ScalarType::Agg(_))) {
+                if matches!(ptr.ty, ScalarType::Agg(_)) {
                     *inst = Inst::Extract(*dest, *ptr, *offset);
                 }
             }
@@ -1046,81 +1026,12 @@ fn detect_nop(
 }
 
 pub fn rewrite_operands(inst: &mut Inst, map: &std::collections::HashMap<Value, Value>) {
-    match inst {
-        Inst::BinOp(_, _, lhs, rhs) => {
-            if let Some(&r) = map.get(lhs) { *lhs = r; }
-            if let Some(&r) = map.get(rhs) { *rhs = r; }
-        }
-        Inst::Call(_, _, args) => {
-            for a in args { if let Some(&r) = map.get(a) { *a = r; } }
-        }
-        Inst::Load(_, ptr, _) => {
-            if let Some(&r) = map.get(ptr) { *ptr = r; }
-        }
-        Inst::Store(ptr, _, val) => {
-            if let Some(&r) = map.get(ptr) { *ptr = r; }
-            if let Some(&r) = map.get(val) { *val = r; }
-        }
-        Inst::LoadDyn(_, ptr, idx) => {
-            if let Some(&r) = map.get(ptr) { *ptr = r; }
-            if let Some(&r) = map.get(idx) { *idx = r; }
-        }
-        Inst::StoreDyn(ptr, idx, val) => {
-            if let Some(&r) = map.get(ptr) { *ptr = r; }
-            if let Some(&r) = map.get(idx) { *idx = r; }
-            if let Some(&r) = map.get(val) { *val = r; }
-        }
-        Inst::RcInc(v) | Inst::RcDec(v) => {
-            if let Some(&r) = map.get(v) { *v = r; }
-        }
-        Inst::Reset(_, ptr, _) => {
-            if let Some(&r) = map.get(ptr) { *ptr = r; }
-        }
-        Inst::Reuse(_, tok, _) => {
-            if let Some(&r) = map.get(tok) { *tok = r; }
-        }
-        Inst::ReuseDyn(_, tok, sz) => {
-            if let Some(&r) = map.get(tok) { *tok = r; }
-            if let Some(&r) = map.get(sz) { *sz = r; }
-        }
-        Inst::AllocDyn(_, sz) => {
-            if let Some(&r) = map.get(sz) { *sz = r; }
-        }
-        Inst::Pack(_, fields) => {
-            for f in fields { if let Some(&r) = map.get(f) { *f = r; } }
-        }
-        Inst::Extract(_, agg, _) => {
-            if let Some(&r) = map.get(agg) { *agg = r; }
-        }
-        Inst::Insert(_, agg, _, val) => {
-            if let Some(&r) = map.get(agg) { *agg = r; }
-            if let Some(&r) = map.get(val) { *val = r; }
-        }
-        Inst::Const(..) | Inst::Alloc(..) | Inst::StaticRef(..) => {}
-    }
+    inst.map_operands_mut(|v| { if let Some(&r) = map.get(v) { *v = r; } });
 }
 
 pub fn rewrite_terminator_operands(
     term: &mut super::instruction::Terminator,
     map: &std::collections::HashMap<Value, Value>,
 ) {
-    use super::instruction::Terminator;
-    match term {
-        Terminator::Return(v) => {
-            if let Some(&r) = map.get(v) { *v = r; }
-        }
-        Terminator::Jump(_, args) => {
-            for a in args { if let Some(&r) = map.get(a) { *a = r; } }
-        }
-        Terminator::Branch { cond, then_args, else_args, .. } => {
-            if let Some(&r) = map.get(cond) { *cond = r; }
-            for a in then_args { if let Some(&r) = map.get(a) { *a = r; } }
-            for a in else_args { if let Some(&r) = map.get(a) { *a = r; } }
-        }
-        Terminator::SwitchInt { scrutinee, arms, default, .. } => {
-            if let Some(&r) = map.get(scrutinee) { *scrutinee = r; }
-            for (_, _, args) in arms { for a in args { if let Some(&r) = map.get(a) { *a = r; } } }
-            if let Some((_, args)) = default { for a in args { if let Some(&r) = map.get(a) { *a = r; } } }
-        }
-    }
+    term.map_operands_mut(|v| { if let Some(&r) = map.get(v) { *v = r; } });
 }

@@ -96,9 +96,6 @@ fn compile(
     check(&ssa_module, "fuse_inc_dec");
     ssa::opt::optimize(&mut ssa_module);
     check(&ssa_module, "optimize (final)");
-    for func in ssa_module.functions.values_mut() {
-        func.compute_num_values();
-    }
     Ok((ssa_module, input_vals))
 }
 

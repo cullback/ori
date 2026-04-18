@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BlockId, Inst, ScalarType, Terminator, Value};
+use super::instruction::{BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
 use super::{Function, Module};
 
 /// Insert reference counting operations into every function.
@@ -140,9 +140,14 @@ fn insert_reuse_function(func: &mut Function) {
     let mut call_args: HashSet<Value> = HashSet::new();
     // Track the next available Value ID for fresh tokens.
     let mut next_value: usize = func
-        .value_types
-        .keys()
-        .map(|v| v.0 + 1)
+        .params
+        .iter()
+        .map(|v| v.id + 1)
+        .chain(func.blocks.values().flat_map(|b| {
+            b.params.iter().map(|v| v.id + 1).chain(
+                b.insts.iter().filter_map(|i| i.dest().map(|v| v.id + 1)),
+            )
+        }))
         .max()
         .unwrap_or(0);
 
@@ -166,10 +171,8 @@ fn insert_reuse_function(func: &mut Function) {
                 }
                 Inst::Store(ptr, offset, val) => {
                     if let Some(slots) = alloc_slot_types.get_mut(ptr) {
-                        if let Some(ty) = func.value_types.get(val) {
-                            if *offset < slots.len() {
-                                slots[*offset] = *ty;
-                            }
+                        if *offset < slots.len() {
+                            slots[*offset] = val.ty;
                         }
                     }
                 }
@@ -207,9 +210,8 @@ fn insert_reuse_function(func: &mut Function) {
                         _ => false,
                     };
                     if compatible {
-                        let token = Value(next_value);
+                        let token = Value { id: next_value, ty: ScalarType::Ptr };
                         next_value += 1;
-                        func.value_types.insert(token, ScalarType::Ptr);
                         let slot_types = alloc_slot_types
                             .get(ptr)
                             .cloned()
@@ -251,13 +253,18 @@ fn insert_rc_function(func: &mut Function) {
         return;
     }
 
-    let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
+    let is_ptr = |v: Value| v.ty == ScalarType::Ptr;
 
     // Fresh value counter for trampoline block params.
     let mut next_value: usize = func
-        .value_types
-        .keys()
-        .map(|v| v.0 + 1)
+        .params
+        .iter()
+        .map(|v| v.id + 1)
+        .chain(func.blocks.values().flat_map(|b| {
+            b.params.iter().map(|v| v.id + 1).chain(
+                b.insts.iter().filter_map(|i| i.dest().map(|v| v.id + 1)),
+            )
+        }))
         .max()
         .unwrap_or(0);
 
@@ -308,16 +315,16 @@ fn insert_rc_function(func: &mut Function) {
 
         // Per-edge token needs for each value.
         let mut edge_needs: Vec<HashSet<Value>> = Vec::with_capacity(num_succ);
-        for (succ_id, edge_args) in &successors {
+        for edge in &successors {
             let mut needs: HashSet<Value> = HashSet::new();
-            for &v in *edge_args {
+            for &v in &edge.args {
                 if is_ptr(v) {
                     needs.insert(v);
                 }
             }
             let succ_params: HashSet<Value> =
-                func.blocks[succ_id].params.iter().copied().collect();
-            for &v in &live_in[succ_id] {
+                func.blocks[&edge.target].params.iter().copied().collect();
+            for &v in &live_in[&edge.target] {
                 if is_ptr(v) && !succ_params.contains(&v) && alive.contains(&v) {
                     needs.insert(v);
                 }
@@ -345,7 +352,7 @@ fn insert_rc_function(func: &mut Function) {
             if func_param_ptrs.contains(&v) { continue; }
             let total = successor_tokens.get(&v).copied().unwrap_or(0);
             if total > 0 && total < num_succ {
-                for (ei, (_succ_id, _)) in successors.iter().enumerate() {
+                for (ei, _edge) in successors.iter().enumerate() {
                     if !edge_needs[ei].contains(&v) {
                         edge_decs
                             .entry((*bid, ei))
@@ -443,9 +450,9 @@ fn insert_rc_function(func: &mut Function) {
     edges.sort_by(|a, b| b.0.cmp(&a.0));
     for ((block_id, edge_idx), decs) in edges {
         let successors = func.blocks[&block_id].terminator.successors();
-        let (target, target_args) = &successors[edge_idx];
-        let target_id = *target;
-        let target_args = target_args.to_vec();
+        let edge = &successors[edge_idx];
+        let target_id = edge.target;
+        let target_args = edge.args.clone();
 
         // Collect all values the trampoline needs: dec values + target args.
         // Exclude function params (always accessible) and deduplicate.
@@ -463,9 +470,8 @@ fn insert_rc_function(func: &mut Function) {
         let mut tramp_remap: HashMap<Value, Value> = HashMap::new();
         let mut tramp_params: Vec<Value> = Vec::new();
         for &v in &needed {
-            let fresh = Value(next_value);
+            let fresh = Value { id: next_value, ty: v.ty };
             next_value += 1;
-            func.value_types.insert(fresh, *func.value_types.get(&v).unwrap_or(&ScalarType::Ptr));
             tramp_remap.insert(v, fresh);
             tramp_params.push(fresh);
         }
@@ -479,7 +485,7 @@ fn insert_rc_function(func: &mut Function) {
         func.blocks.insert(tramp_id, super::Block {
             params: tramp_params,
             insts: tramp_insts,
-            terminator: Terminator::Jump(target_id, tramp_target_args),
+            terminator: Terminator::Jump(BlockEdge { target: target_id, args: tramp_target_args }),
         });
 
         // Rewrite the edge to pass the needed values as args.
@@ -490,36 +496,26 @@ fn insert_rc_function(func: &mut Function) {
 /// Rewrite the `edge_idx`-th successor of a terminator to point at
 /// `new_target` with the given block args.
 fn rewrite_edge(term: &mut Terminator, edge_idx: usize, new_target: BlockId, new_args: Vec<Value>) {
+    let new_edge = BlockEdge { target: new_target, args: new_args };
     match term {
-        Terminator::Jump(target, args) => {
+        Terminator::Jump(edge) => {
             assert_eq!(edge_idx, 0);
-            *target = new_target;
-            *args = new_args;
+            *edge = new_edge;
         }
         Terminator::Branch {
-            then_block,
-            then_args,
-            else_block,
-            else_args,
+            then_edge,
+            else_edge,
             ..
         } => match edge_idx {
-            0 => {
-                *then_block = new_target;
-                *then_args = new_args;
-            }
-            1 => {
-                *else_block = new_target;
-                *else_args = new_args;
-            }
+            0 => *then_edge = new_edge,
+            1 => *else_edge = new_edge,
             _ => unreachable!(),
         },
         Terminator::SwitchInt { arms, default, .. } => {
             if edge_idx < arms.len() {
-                arms[edge_idx].1 = new_target;
-                arms[edge_idx].2 = new_args;
-            } else if let Some((target, args)) = default {
-                *target = new_target;
-                *args = new_args;
+                arms[edge_idx].1 = new_edge;
+            } else if let Some(def_edge) = default {
+                *def_edge = new_edge;
             }
         }
         _ => unreachable!(),
@@ -531,7 +527,7 @@ fn rewrite_edge(term: &mut Terminator, edge_idx: usize, new_target: BlockId, new
 /// Compute live-in and live-out sets for each block. Only tracks
 /// Ptr-typed values since those are the only ones needing RC.
 fn compute_liveness(func: &Function) -> (HashMap<BlockId, HashSet<Value>>, HashMap<BlockId, HashSet<Value>>) {
-    let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
+    let is_ptr = |v: Value| v.ty == ScalarType::Ptr;
 
     // Compute defs and upward-exposed uses per block.
     let mut defs: HashMap<BlockId, HashSet<Value>> = HashMap::new();
@@ -578,8 +574,8 @@ fn compute_liveness(func: &Function) -> (HashMap<BlockId, HashSet<Value>>, HashM
         for &bid in block_ids.iter().rev() {
             // live_out = union of live_in of all successors.
             let mut new_out: HashSet<Value> = HashSet::new();
-            for (succ, _) in func.blocks[&bid].terminator.successors() {
-                new_out.extend(&live_in[&succ]);
+            for edge in func.blocks[&bid].terminator.successors() {
+                new_out.extend(&live_in[&edge.target]);
             }
             if new_out != live_out[&bid] {
                 live_out.insert(bid, new_out);

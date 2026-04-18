@@ -1,12 +1,30 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
-/// An SSA value — assigned exactly once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Value(pub usize);
+/// An SSA value — assigned exactly once. Carries its scalar type so
+/// every use site knows the type without a side-table lookup.
+/// Identity (Eq / Hash) is on `id` only; the type is carried data.
+#[derive(Debug, Clone, Copy)]
+pub struct Value {
+    pub id: usize,
+    pub ty: ScalarType,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for Value {}
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", self.0)
+        write!(f, "v{}", self.id)
     }
 }
 
@@ -66,8 +84,8 @@ pub enum BinaryOp {
 /// `Store`, `RcInc`, and `RcDec` are side-effecting and produce no value.
 #[derive(Debug, Clone)]
 pub enum Inst {
-    /// dest = typed constant.
-    Const(Value, ScalarType, u64),
+    /// dest = constant (type comes from dest.ty).
+    Const(Value, u64),
     /// dest = lhs op rhs (same scalar type).
     BinOp(Value, BinaryOp, Value, Value),
     /// dest = func(args...).
@@ -115,9 +133,9 @@ pub enum Inst {
 
 impl Inst {
     /// Returns the destination value, if any.
-    pub const fn dest(&self) -> Option<Value> {
+    pub fn dest(&self) -> Option<Value> {
         match self {
-            Self::Const(v, _, _)
+            Self::Const(v, _)
             | Self::BinOp(v, _, _, _)
             | Self::Call(v, _, _)
             | Self::Alloc(v, _)
@@ -131,6 +149,27 @@ impl Inst {
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(*v),
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
+        }
+    }
+
+    /// Mutable reference to the destination slot, if any.
+    pub fn dest_mut(&mut self) -> Option<&mut Value> {
+        match self {
+            Self::Const(v, _)
+            | Self::BinOp(v, _, _, _)
+            | Self::Call(v, _, _)
+            | Self::Alloc(v, _)
+            | Self::AllocDyn(v, _)
+            | Self::Load(v, _, _)
+            | Self::LoadDyn(v, _, _)
+            | Self::Reset(v, _, _)
+            | Self::Reuse(v, _, _)
+            | Self::ReuseDyn(v, _, _)
+            | Self::StaticRef(v, _)
+            | Self::Pack(v, _)
+            | Self::Extract(v, _, _)
+            | Self::Insert(v, _, _, _) => Some(v),
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
         }
     }
@@ -156,6 +195,27 @@ impl Inst {
             Self::Insert(_, agg, _, val) => vec![*agg, *val],
         }
     }
+
+    /// Apply `f` to every operand slot in place (not the destination).
+    pub fn map_operands_mut(&mut self, mut f: impl FnMut(&mut Value)) {
+        match self {
+            Self::Const(..) | Self::Alloc(..) | Self::StaticRef(..) => {}
+            Self::AllocDyn(_, size) => f(size),
+            Self::BinOp(_, _, lhs, rhs) => { f(lhs); f(rhs); }
+            Self::Call(_, _, args) => args.iter_mut().for_each(&mut f),
+            Self::Load(_, ptr, _) => f(ptr),
+            Self::Store(ptr, _, val) => { f(ptr); f(val); }
+            Self::LoadDyn(_, ptr, idx) => { f(ptr); f(idx); }
+            Self::StoreDyn(ptr, idx, val) => { f(ptr); f(idx); f(val); }
+            Self::RcInc(v) | Self::RcDec(v) => f(v),
+            Self::Reset(_, ptr, _) => f(ptr),
+            Self::Reuse(_, token, _) => f(token),
+            Self::ReuseDyn(_, token, size) => { f(token); f(size); }
+            Self::Pack(_, fields) => fields.iter_mut().for_each(&mut f),
+            Self::Extract(_, agg, _) => f(agg),
+            Self::Insert(_, agg, _, val) => { f(agg); f(val); }
+        }
+    }
 }
 
 impl Terminator {
@@ -163,16 +223,15 @@ impl Terminator {
     pub fn operands(&self) -> Vec<Value> {
         match self {
             Self::Return(v) => vec![*v],
-            Self::Jump(_, args) => args.clone(),
+            Self::Jump(edge) => edge.args.clone(),
             Self::Branch {
                 cond,
-                then_args,
-                else_args,
-                ..
+                then_edge,
+                else_edge,
             } => {
                 let mut vals = vec![*cond];
-                vals.extend(then_args);
-                vals.extend(else_args);
+                vals.extend(&then_edge.args);
+                vals.extend(&else_edge.args);
                 vals
             }
             Self::SwitchInt {
@@ -181,39 +240,64 @@ impl Terminator {
                 default,
             } => {
                 let mut vals = vec![*scrutinee];
-                for (_, _, args) in arms {
-                    vals.extend(args);
+                for (_, edge) in arms {
+                    vals.extend(&edge.args);
                 }
-                if let Some((_, args)) = default {
-                    vals.extend(args);
+                if let Some(edge) = default {
+                    vals.extend(&edge.args);
                 }
                 vals
             }
         }
     }
 
-    /// Successor blocks and the values passed to each.
-    pub fn successors(&self) -> Vec<(BlockId, &[Value])> {
+    /// Apply `f` to every value operand in place (including edge args).
+    pub fn map_operands_mut(&mut self, mut f: impl FnMut(&mut Value)) {
+        match self {
+            Self::Return(v) => f(v),
+            Self::Jump(edge) => edge.args.iter_mut().for_each(&mut f),
+            Self::Branch { cond, then_edge, else_edge } => {
+                f(cond);
+                then_edge.args.iter_mut().for_each(&mut f);
+                else_edge.args.iter_mut().for_each(&mut f);
+            }
+            Self::SwitchInt { scrutinee, arms, default } => {
+                f(scrutinee);
+                for (_, edge) in arms {
+                    edge.args.iter_mut().for_each(&mut f);
+                }
+                if let Some(edge) = default {
+                    edge.args.iter_mut().for_each(&mut f);
+                }
+            }
+        }
+    }
+
+    /// All successor edges.
+    pub fn successors(&self) -> Vec<&BlockEdge> {
         match self {
             Self::Return(_) => vec![],
-            Self::Jump(target, args) => vec![(*target, args)],
-            Self::Branch {
-                then_block,
-                then_args,
-                else_block,
-                else_args,
-                ..
-            } => vec![(*then_block, then_args), (*else_block, else_args)],
+            Self::Jump(edge) => vec![edge],
+            Self::Branch { then_edge, else_edge, .. } => {
+                vec![then_edge, else_edge]
+            }
             Self::SwitchInt { arms, default, .. } => {
-                let mut succs: Vec<(BlockId, &[Value])> =
-                    arms.iter().map(|(_, b, args)| (*b, args.as_slice())).collect();
-                if let Some((b, args)) = default {
-                    succs.push((*b, args));
+                let mut succs: Vec<&BlockEdge> =
+                    arms.iter().map(|(_, edge)| edge).collect();
+                if let Some(edge) = default {
+                    succs.push(edge);
                 }
                 succs
             }
         }
     }
+}
+
+/// A control flow edge: target block plus the values passed as block arguments.
+#[derive(Debug, Clone)]
+pub struct BlockEdge {
+    pub target: BlockId,
+    pub args: Vec<Value>,
 }
 
 /// How a basic block ends.
@@ -222,19 +306,17 @@ pub enum Terminator {
     /// Return a value from the function.
     Return(Value),
     /// Unconditional jump with block arguments.
-    Jump(BlockId, Vec<Value>),
-    /// Conditional branch: nonzero → then_block, zero → else_block.
+    Jump(BlockEdge),
+    /// Conditional branch: nonzero → then, zero → else.
     Branch {
         cond: Value,
-        then_block: BlockId,
-        then_args: Vec<Value>,
-        else_block: BlockId,
-        else_args: Vec<Value>,
+        then_edge: BlockEdge,
+        else_edge: BlockEdge,
     },
     /// Multi-way switch on an integer tag value.
     SwitchInt {
         scrutinee: Value,
-        arms: Vec<(u64, BlockId, Vec<Value>)>,
-        default: Option<(BlockId, Vec<Value>)>,
+        arms: Vec<(u64, BlockEdge)>,
+        default: Option<BlockEdge>,
     },
 }

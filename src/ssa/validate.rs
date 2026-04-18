@@ -1,9 +1,9 @@
 //! Structural validator for SSA modules.
 //!
 //! Runs after each pass in the test harness to catch pass-induced
-//! breakage immediately (missing types, dangling BlockIds, mismatched
-//! block args, etc.) rather than discovering it later via a
-//! confusing runtime crash.
+//! breakage immediately (dangling BlockIds, mismatched block args,
+//! etc.) rather than discovering it later via a confusing runtime
+//! crash.
 //!
 //! The validator distinguishes two categories of problems:
 //! - **Structural**: the module is malformed and eval would panic.
@@ -21,8 +21,8 @@ use super::Module;
 use super::instruction::{Inst, Terminator, Value};
 
 /// Structural errors make the module unsafe to eval. Warnings are
-/// soft inconsistencies (type lies, orphan entries) that don't
-/// affect correctness today but should be cleaned up.
+/// soft inconsistencies (type lies) that don't affect correctness
+/// today but should be cleaned up.
 #[derive(Default)]
 pub struct Report {
     pub errors: Vec<String>,
@@ -64,27 +64,6 @@ fn validate_function(
 ) {
     let prefix = format!("in {name}");
 
-    if func.params.len() != func.param_types.len() {
-        r.errors.push(format!(
-            "{prefix}: params ({}) and param_types ({}) have different lengths",
-            func.params.len(),
-            func.param_types.len()
-        ));
-        return;
-    }
-
-    for (i, (p, ty)) in func.params.iter().zip(&func.param_types).enumerate() {
-        match func.value_types.get(p) {
-            None => r.errors.push(format!(
-                "{prefix}: param #{i} ({p}) missing from value_types"
-            )),
-            Some(t) if t != ty => r.errors.push(format!(
-                "{prefix}: param #{i} ({p}): param_types says {ty:?} but value_types says {t:?}"
-            )),
-            _ => {}
-        }
-    }
-
     if !func.blocks.contains_key(&func.entry) {
         r.errors.push(format!(
             "{prefix}: entry block {} not in blocks map",
@@ -109,24 +88,12 @@ fn validate_function(
                     bid.0
                 ));
             }
-            if !func.value_types.contains_key(&p) {
-                r.errors.push(format!(
-                    "{prefix}: b{} param {p} missing from value_types",
-                    bid.0
-                ));
-            }
         }
         for (idx, inst) in block.insts.iter().enumerate() {
             if let Some(d) = inst.dest() {
                 if !defined.insert(d) {
                     r.errors.push(format!(
                         "{prefix}: b{}:{idx} {inst:?} redefines value {d}",
-                        bid.0
-                    ));
-                }
-                if !func.value_types.contains_key(&d) {
-                    r.errors.push(format!(
-                        "{prefix}: b{}:{idx} destination {d} missing from value_types",
                         bid.0
                     ));
                 }
@@ -164,15 +131,15 @@ fn validate_function(
         }
 
         // Successors must exist; arg counts must match param counts.
-        for (target, args) in block.terminator.successors() {
-            let Some(target_block) = func.blocks.get(&target) else {
+        for edge in block.terminator.successors() {
+            let Some(target_block) = func.blocks.get(&edge.target) else {
                 r.errors.push(format!(
                     "{prefix}: b{} jumps to unknown block b{}",
-                    bid.0, target.0
+                    bid.0, edge.target.0
                 ));
                 continue;
             };
-            if target_block.params.len() != args.len() {
+            if target_block.params.len() != edge.args.len() {
                 // Arg-count mismatches happen today on dead
                 // fallthrough paths in match lowering (exhaustive
                 // matches still emit a branch to merge without
@@ -181,23 +148,21 @@ fn validate_function(
                 r.warnings.push(format!(
                     "{prefix}: b{} → b{}: passes {} args but target has {} params",
                     bid.0,
-                    target.0,
-                    args.len(),
+                    edge.target.0,
+                    edge.args.len(),
                     target_block.params.len()
                 ));
             } else {
                 // Type agreement between arg and target param.
                 // Warning-level: the runtime tolerates type lies
                 // today but they hide real bugs.
-                for (i, (arg, param)) in args.iter().zip(&target_block.params).enumerate() {
-                    let arg_ty = func.value_types.get(arg);
-                    let param_ty = func.value_types.get(param);
-                    if arg_ty != param_ty {
+                for (i, (arg, param)) in edge.args.iter().zip(&target_block.params).enumerate() {
+                    if arg.ty != param.ty {
                         let mut msg = String::new();
                         let _ = write!(
                             msg,
-                            "{prefix}: b{} → b{}: arg #{i} {arg} has type {arg_ty:?}, target param {param} has type {param_ty:?}",
-                            bid.0, target.0
+                            "{prefix}: b{} → b{}: arg #{i} {arg} has type {:?}, target param {param} has type {:?}",
+                            bid.0, edge.target.0, arg.ty, param.ty
                         );
                         r.warnings.push(msg);
                     }
@@ -210,26 +175,12 @@ fn validate_function(
         // the body actually produces (e.g., closures typed as Ptr
         // that return raw scalars).
         if let Terminator::Return(v) = &block.terminator {
-            if let Some(ty) = func.value_types.get(v) {
-                if *ty != func.return_type {
-                    r.warnings.push(format!(
-                        "{prefix}: b{} Return({v}) has type {ty:?} but function returns {:?}",
-                        bid.0, func.return_type
-                    ));
-                }
+            if v.ty != func.return_type {
+                r.warnings.push(format!(
+                    "{prefix}: b{} Return({v}) has type {:?} but function returns {:?}",
+                    bid.0, v.ty, func.return_type
+                ));
             }
-        }
-    }
-
-    // Orphan value_types entries — values with types but no
-    // definition. Usually a pass deleting an instruction without
-    // cleaning up its type entry. Warning-level; doesn't affect
-    // eval.
-    for &v in func.value_types.keys() {
-        if !defined.contains(&v) {
-            r.warnings.push(format!(
-                "{prefix}: value_types has entry for {v} which is never defined"
-            ));
         }
     }
 

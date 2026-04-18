@@ -84,8 +84,7 @@ impl fmt::Display for Function {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            let ty = self.value_types.get(p).copied().unwrap_or(ScalarType::Ptr);
-            write!(f, "{p}: {ty}")?;
+            write!(f, "{p}: {}", p.ty)?;
         }
         write!(f, ") -> {}:", self.return_type)?;
         writeln!(f)?;
@@ -97,8 +96,7 @@ impl fmt::Display for Function {
                     if j > 0 {
                         write!(f, ", ")?;
                     }
-                    let ty = self.value_types.get(p).copied().unwrap_or(ScalarType::Ptr);
-                    write!(f, "{p}: {ty}")?;
+                    write!(f, "{p}: {}", p.ty)?;
                 }
                 write!(f, ")")?;
             }
@@ -108,7 +106,7 @@ impl fmt::Display for Function {
                 if matches!(inst, Inst::Const(..)) {
                     continue;
                 }
-                writeln!(f, "    {}", FmtInst(inst, &self.value_types, &consts))?;
+                writeln!(f, "    {}", FmtInst(inst, &consts))?;
             }
             writeln!(f, "    {}", FmtTerm(&block.terminator, &consts))?;
         }
@@ -121,8 +119,8 @@ fn collect_consts(func: &Function) -> HashMap<Value, (ScalarType, u64)> {
     let mut consts = HashMap::new();
     for block in func.blocks.values() {
         for inst in &block.insts {
-            if let Inst::Const(dest, ty, bits) = inst {
-                consts.insert(*dest, (*ty, *bits));
+            if let Inst::Const(dest, bits) = inst {
+                consts.insert(*dest, (dest.ty, *bits));
             }
         }
     }
@@ -130,39 +128,38 @@ fn collect_consts(func: &Function) -> HashMap<Value, (ScalarType, u64)> {
 }
 
 /// Display an instruction with constants inlined.
-struct FmtInst<'a>(&'a Inst, &'a HashMap<Value, ScalarType>, &'a HashMap<Value, (ScalarType, u64)>);
+struct FmtInst<'a>(&'a Inst, &'a HashMap<Value, (ScalarType, u64)>);
 
 impl fmt::Display for FmtInst<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let types = self.1;
-        let consts = self.2;
+        let consts = self.1;
         match self.0 {
             Inst::Const(..) => Ok(()), // suppressed
             Inst::BinOp(d, op, l, r) => {
-                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                let dt = d.ty;
                 write!(f, "{d}: {dt} = {op} {}, {}", fmt_val(*l, consts), fmt_val(*r, consts))
             }
             Inst::Call(d, name, args) => {
-                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                let dt = d.ty;
                 write!(f, "{d}: {dt} = call {name}({})", fmt_args(args, consts))
             }
             Inst::Alloc(d, size) => {
-                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                let dt = d.ty;
                 write!(f, "{d}: {dt} = alloc {size}")
             }
             Inst::AllocDyn(d, size_val) => {
-                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                let dt = d.ty;
                 write!(f, "{d}: {dt} = alloc_dyn {}", fmt_val(*size_val, consts))
             }
             Inst::Load(d, ptr, off) => {
-                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                let dt = d.ty;
                 write!(f, "{d}: {dt} = load {}[{off}]", fmt_val(*ptr, consts))
             }
             Inst::Store(ptr, off, val) => {
                 write!(f, "store {} -> {}[{off}]", fmt_val(*val, consts), fmt_val(*ptr, consts))
             }
             Inst::LoadDyn(d, ptr, idx) => {
-                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                let dt = d.ty;
                 write!(f, "{d}: {dt} = load_dyn {}[{}]", fmt_val(*ptr, consts), fmt_val(*idx, consts))
             }
             Inst::StoreDyn(ptr, idx, val) => {
@@ -179,7 +176,7 @@ impl fmt::Display for FmtInst<'_> {
                 write!(f, "{d} = pack({})", fmt_args(fields, consts))
             }
             Inst::Extract(d, agg, idx) => {
-                let dt = types.get(d).copied().unwrap_or(ScalarType::Ptr);
+                let dt = d.ty;
                 write!(f, "{d}: {dt} = extract {}, {idx}", fmt_val(*agg, consts))
             }
             Inst::Insert(d, agg, idx, val) => {
@@ -197,27 +194,25 @@ impl fmt::Display for FmtTerm<'_> {
         let consts = self.1;
         match self.0 {
             Terminator::Return(v) => write!(f, "ret {}", fmt_val(*v, consts)),
-            Terminator::Jump(target, args) => {
-                write!(f, "jump {target}")?;
-                if !args.is_empty() {
-                    write!(f, "({})", fmt_args(args, consts))?;
+            Terminator::Jump(edge) => {
+                write!(f, "jump {}", edge.target)?;
+                if !edge.args.is_empty() {
+                    write!(f, "({})", fmt_args(&edge.args, consts))?;
                 }
                 Ok(())
             }
             Terminator::Branch {
                 cond,
-                then_block,
-                then_args,
-                else_block,
-                else_args,
+                then_edge,
+                else_edge,
             } => {
-                write!(f, "branch {} ? {then_block}", fmt_val(*cond, consts))?;
-                if !then_args.is_empty() {
-                    write!(f, "({})", fmt_args(then_args, consts))?;
+                write!(f, "branch {} ? {}", fmt_val(*cond, consts), then_edge.target)?;
+                if !then_edge.args.is_empty() {
+                    write!(f, "({})", fmt_args(&then_edge.args, consts))?;
                 }
-                write!(f, " : {else_block}")?;
-                if !else_args.is_empty() {
-                    write!(f, "({})", fmt_args(else_args, consts))?;
+                write!(f, " : {}", else_edge.target)?;
+                if !else_edge.args.is_empty() {
+                    write!(f, "({})", fmt_args(&else_edge.args, consts))?;
                 }
                 Ok(())
             }
@@ -227,16 +222,16 @@ impl fmt::Display for FmtTerm<'_> {
                 default,
             } => {
                 write!(f, "switch {}", fmt_val(*scrutinee, consts))?;
-                for (val, block, args) in arms {
-                    write!(f, "\n      {val} -> {block}")?;
-                    if !args.is_empty() {
-                        write!(f, "({})", fmt_args(args, consts))?;
+                for (val, edge) in arms {
+                    write!(f, "\n      {val} -> {}", edge.target)?;
+                    if !edge.args.is_empty() {
+                        write!(f, "({})", fmt_args(&edge.args, consts))?;
                     }
                 }
-                if let Some((block, args)) = default {
-                    write!(f, "\n      _ -> {block}")?;
-                    if !args.is_empty() {
-                        write!(f, "({})", fmt_args(args, consts))?;
+                if let Some(edge) = default {
+                    write!(f, "\n      _ -> {}", edge.target)?;
+                    if !edge.args.is_empty() {
+                        write!(f, "({})", fmt_args(&edge.args, consts))?;
                     }
                 }
                 Ok(())

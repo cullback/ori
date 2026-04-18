@@ -223,24 +223,10 @@ fn eval_function_inner(
         .functions
         .get(name)
         .unwrap_or_else(|| panic!("undefined SSA function: {name}"));
-    let num_values = if func.num_values > 0 {
-        func.num_values
-    } else {
-        // Fallback for functions not processed by compute_num_values
-        // (e.g., in tests or const_eval).
-        let from_types = func.value_types.keys().map(|v| v.0 + 1).max().unwrap_or(0);
-        let from_params = func.params.iter().map(|v| v.0 + 1).max().unwrap_or(0);
-        let from_blocks = func.blocks.values()
-            .flat_map(|b| b.params.iter())
-            .map(|v| v.0 + 1)
-            .max()
-            .unwrap_or(0);
-        from_types.max(from_params).max(from_blocks)
-    };
-    let mut env = scratch.acquire(num_values);
+    let mut env = scratch.acquire(func.num_values());
 
     for (param, arg) in func.params.iter().zip(args) {
-        env[param.0] = *arg;
+        env[param.id] = *arg;
     }
 
     let mut current = func.entry;
@@ -250,43 +236,41 @@ fn eval_function_inner(
         let block = &func.blocks[&current];
 
         for (param, arg) in block.params.iter().zip(&block_args) {
-            env[param.0] = *arg;
+            env[param.id] = *arg;
         }
 
         for inst in &block.insts {
             let val = eval_inst(module, heap, scratch, &env, inst);
             if let Some(dest) = inst.dest() {
                 if let Some(v) = val {
-                    env[dest.0] = v;
+                    env[dest.id] = v;
                 }
             }
         }
 
         match &block.terminator {
             Terminator::Return(v) => {
-                let result = env[v.0];
+                let result = env[v.id];
                 scratch.release(env);
                 return result;
             }
 
-            Terminator::Jump(target, args) => {
-                block_args = args.iter().map(|v| env[v.0]).collect();
-                current = *target;
+            Terminator::Jump(edge) => {
+                block_args = edge.args.iter().map(|v| env[v.id]).collect();
+                current = edge.target;
             }
 
             Terminator::Branch {
                 cond,
-                then_block,
-                then_args,
-                else_block,
-                else_args,
+                then_edge,
+                else_edge,
             } => {
-                if scalar_to_u64(env[cond.0]) != 0 {
-                    block_args = then_args.iter().map(|v| env[v.0]).collect();
-                    current = *then_block;
+                if scalar_to_u64(env[cond.id]) != 0 {
+                    block_args = then_edge.args.iter().map(|v| env[v.id]).collect();
+                    current = then_edge.target;
                 } else {
-                    block_args = else_args.iter().map(|v| env[v.0]).collect();
-                    current = *else_block;
+                    block_args = else_edge.args.iter().map(|v| env[v.id]).collect();
+                    current = else_edge.target;
                 }
             }
 
@@ -295,13 +279,13 @@ fn eval_function_inner(
                 arms,
                 default,
             } => {
-                let tag = scalar_to_u64(env[scrutinee.0]);
-                if let Some((_, block, args)) = arms.iter().find(|(v, _, _)| *v == tag) {
-                    block_args = args.iter().map(|v| env[v.0]).collect();
-                    current = *block;
-                } else if let Some((block, args)) = default {
-                    block_args = args.iter().map(|v| env[v.0]).collect();
-                    current = *block;
+                let tag = scalar_to_u64(env[scrutinee.id]);
+                if let Some((_, edge)) = arms.iter().find(|(v, _)| *v == tag) {
+                    block_args = edge.args.iter().map(|v| env[v.id]).collect();
+                    current = edge.target;
+                } else if let Some(edge) = default {
+                    block_args = edge.args.iter().map(|v| env[v.id]).collect();
+                    current = edge.target;
                 } else {
                     panic!("no matching arm for tag {tag}");
                 }
@@ -313,12 +297,12 @@ fn eval_function_inner(
 
 fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env, inst: &Inst) -> Option<Scalar> {
     match inst {
-        Inst::Const(_, ty, bits) => Some(bits_to_scalar(*ty, *bits)),
+        Inst::Const(dest, bits) => Some(bits_to_scalar(dest.ty, *bits)),
 
-        Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs.0], env[rhs.0])),
+        Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs.id], env[rhs.id])),
 
         Inst::Call(_, name, args) => {
-            let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.0]).collect();
+            let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.id]).collect();
             Some(eval_function_inner(module, heap, scratch, name, &arg_vals))
         }
 
@@ -328,52 +312,52 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
         }
 
         Inst::AllocDyn(_, size_val) => {
-            let size = scalar_to_usize(env[size_val.0]);
+            let size = scalar_to_usize(env[size_val.id]);
             let idx = heap.alloc(size);
             Some(Scalar::Ptr(idx))
         }
 
         Inst::Load(_, ptr, offset) => {
-            let Scalar::Ptr(idx) = env[ptr.0] else {
-                panic!("load from non-ptr: {:?}", env[ptr.0]);
+            let Scalar::Ptr(idx) = env[ptr.id] else {
+                panic!("load from non-ptr: {:?}", env[ptr.id]);
             };
             Some(heap.load(idx, *offset))
         }
 
         Inst::Store(ptr, offset, val) => {
-            let Scalar::Ptr(idx) = env[ptr.0] else {
-                panic!("store to non-ptr: {:?}", env[ptr.0]);
+            let Scalar::Ptr(idx) = env[ptr.id] else {
+                panic!("store to non-ptr: {:?}", env[ptr.id]);
             };
-            heap.store(idx, *offset, env[val.0]);
+            heap.store(idx, *offset, env[val.id]);
             None
         }
 
         Inst::LoadDyn(_, ptr, idx_val) => {
-            let Scalar::Ptr(heap_idx) = env[ptr.0] else {
-                panic!("load_dyn from non-ptr: {:?}", env[ptr.0]);
+            let Scalar::Ptr(heap_idx) = env[ptr.id] else {
+                panic!("load_dyn from non-ptr: {:?}", env[ptr.id]);
             };
-            let slot = scalar_to_usize(env[idx_val.0]);
+            let slot = scalar_to_usize(env[idx_val.id]);
             Some(heap.load_dyn(heap_idx, slot))
         }
 
         Inst::StoreDyn(ptr, idx_val, val) => {
-            let Scalar::Ptr(heap_idx) = env[ptr.0] else {
-                panic!("store_dyn to non-ptr: {:?}", env[ptr.0]);
+            let Scalar::Ptr(heap_idx) = env[ptr.id] else {
+                panic!("store_dyn to non-ptr: {:?}", env[ptr.id]);
             };
-            let slot = scalar_to_usize(env[idx_val.0]);
-            heap.store_dyn(heap_idx, slot, env[val.0]);
+            let slot = scalar_to_usize(env[idx_val.id]);
+            heap.store_dyn(heap_idx, slot, env[val.id]);
             None
         }
 
         Inst::RcInc(ptr) => {
-            if let Scalar::Ptr(idx) = env[ptr.0] {
+            if let Scalar::Ptr(idx) = env[ptr.id] {
                 heap.rc_inc(idx);
             }
             None
         }
 
         Inst::RcDec(ptr) => {
-            if let Scalar::Ptr(idx) = env[ptr.0] {
+            if let Scalar::Ptr(idx) = env[ptr.id] {
                 heap.rc_dec(idx);
             }
             None
@@ -386,7 +370,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
         }
 
         Inst::Reset(_dest, ptr, slot_types) => {
-            if let Scalar::Ptr(idx) = env[ptr.0] {
+            if let Scalar::Ptr(idx) = env[ptr.id] {
                 if idx != 0 && heap.objects[idx].0 == 1 && heap.objects[idx].0 != RC_STATIC {
                     // Unique: dec pointer-typed fields, return address for reuse.
                     for (i, ty) in slot_types.iter().enumerate() {
@@ -409,38 +393,38 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
         }
 
         Inst::Reuse(_dest, token, num_slots) => {
-            Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.0], *num_slots)))
+            Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.id], *num_slots)))
         }
 
         Inst::ReuseDyn(_dest, token, size_val) => {
-            let size = scalar_to_usize(env[size_val.0]);
-            Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.0], size)))
+            let size = scalar_to_usize(env[size_val.id]);
+            Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.id], size)))
         }
 
         Inst::Pack(_dest, fields) => {
             let n = fields.len();
             let idx = heap.alloc(n);
             for (i, f) in fields.iter().enumerate() {
-                heap.store(idx, i, env[f.0]);
+                heap.store(idx, i, env[f.id]);
             }
             Some(Scalar::Ptr(idx))
         }
 
         Inst::Extract(_, agg, idx) => {
-            if let Scalar::Ptr(p) = env[agg.0] {
+            if let Scalar::Ptr(p) = env[agg.id] {
                 Some(heap.load(p, *idx))
             } else {
-                panic!("extract from non-Ptr value v{}: {:?}", agg.0, env[agg.0])
+                panic!("extract from non-Ptr value v{}: {:?}", agg.id, env[agg.id])
             }
         }
 
         Inst::Insert(_dest, agg, idx, val) => {
-            if let Scalar::Ptr(p) = env[agg.0] {
+            if let Scalar::Ptr(p) = env[agg.id] {
                 let new_idx = heap.clone_object(p);
-                heap.store(new_idx, *idx, env[val.0]);
+                heap.store(new_idx, *idx, env[val.id]);
                 Some(Scalar::Ptr(new_idx))
             } else {
-                panic!("insert into non-Ptr value v{}: {:?}", agg.0, env[agg.0])
+                panic!("insert into non-Ptr value v{}: {:?}", agg.id, env[agg.id])
             }
         }
     }

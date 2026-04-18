@@ -146,7 +146,7 @@ pub fn analyze(func: &Function) -> Analysis {
 // ── Phase 1: Classify ownership ────────────────────────────────
 
 fn classify_ownership(func: &Function) -> HashMap<Value, Ownership> {
-    let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
+    let is_ptr = |v: Value| v.ty == ScalarType::Ptr;
 
     let mut own: HashMap<Value, Ownership> = HashMap::new();
 
@@ -188,9 +188,9 @@ fn classify_ownership(func: &Function) -> HashMap<Value, Ownership> {
     loop {
         let mut changed = false;
         for (_, block) in &func.blocks {
-            for (succ_id, args) in block.terminator.successors() {
-                let succ_params = &func.blocks[&succ_id].params;
-                for (param, &arg) in succ_params.iter().zip(args.iter()) {
+            for edge in block.terminator.successors() {
+                let succ_params = &func.blocks[&edge.target].params;
+                for (param, &arg) in succ_params.iter().zip(edge.args.iter()) {
                     if !is_ptr(*param) {
                         continue;
                     }
@@ -239,9 +239,9 @@ fn compute_alloc_kinds(func: &Function) -> HashMap<Value, AllocKind> {
     loop {
         let mut changed = false;
         for (_, block) in &func.blocks {
-            for (succ_id, args) in block.terminator.successors() {
-                let succ_params = &func.blocks[&succ_id].params;
-                for (param, &arg) in succ_params.iter().zip(args.iter()) {
+            for edge in block.terminator.successors() {
+                let succ_params = &func.blocks[&edge.target].params;
+                for (param, &arg) in succ_params.iter().zip(edge.args.iter()) {
                     if conflict.contains(param) {
                         continue;
                     }
@@ -282,7 +282,7 @@ fn find_reuse_pairs(
     ownership: &HashMap<Value, Ownership>,
     alloc_kinds: &HashMap<Value, AllocKind>,
 ) -> Vec<ReusePair> {
-    let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
+    let is_ptr = |v: Value| v.ty == ScalarType::Ptr;
 
     let mut pairs = Vec::new();
 
@@ -307,7 +307,7 @@ fn find_reuse_pairs(
             .terminator
             .successors()
             .iter()
-            .flat_map(|(_, args)| args.iter().copied())
+            .flat_map(|edge| edge.args.iter().copied())
             .collect();
 
         // Find Unique values that die in this block.
@@ -374,7 +374,7 @@ fn find_rc_inc_sites(
     func: &Function,
     ownership: &HashMap<Value, Ownership>,
 ) -> Vec<RcIncSite> {
-    let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
+    let is_ptr = |v: Value| v.ty == ScalarType::Ptr;
 
     let mut sites = Vec::new();
 
@@ -383,7 +383,7 @@ fn find_rc_inc_sites(
             .terminator
             .successors()
             .iter()
-            .flat_map(|(_, args)| args.iter().copied())
+            .flat_map(|edge| edge.args.iter().copied())
             .collect();
 
         // Last instruction index where each Ptr value is used.
@@ -428,7 +428,7 @@ impl std::fmt::Display for Analysis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Ownership:")?;
         let mut entries: Vec<_> = self.ownership.iter().collect();
-        entries.sort_by_key(|(v, _)| v.0);
+        entries.sort_by_key(|(v, _)| v.id);
         for (v, own) in &entries {
             let kind_str = match self.alloc_kinds.get(v) {
                 Some(AllocKind::Static(n)) => format!(" [alloc {n}]"),

@@ -70,13 +70,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     /// Check if a value is a value-type aggregate (Pack result).
     fn is_agg(&self, val: Value) -> bool {
-        matches!(self.builder.value_types.get(&val), Some(ScalarType::Agg(_)))
+        matches!(val.ty, ScalarType::Agg(_))
     }
 
     /// Box a value-type aggregate into a heap-allocated Ptr.
     /// Returns the value unchanged if it's already Ptr.
     fn box_if_agg(&mut self, val: Value) -> Value {
-        let Some(ScalarType::Agg(n)) = self.builder.value_types.get(&val).copied() else {
+        let ScalarType::Agg(n) = val.ty else {
             return val;
         };
         let ptr = self.builder.alloc(n);
@@ -403,11 +403,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let return_type = if has_scheme {
             scheme_ret_ty
         } else {
-            self.builder
-                .value_types
-                .get(&result)
-                .copied()
-                .unwrap_or(ScalarType::Ptr)
+            result.ty
         };
         // Refine the declared return type for scheme-less synth
         // functions before emitting the final `ret`, so `ret`'s
@@ -1360,7 +1356,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             crate::ssa::builder::FuncBuilder::new(),
         );
         let saved_current = self.builder.current_block.take();
-        let saved_types = std::mem::take(&mut self.builder.value_types);
 
         let param_ty = self.scalar_type(ty);
         let lhs = self.builder.add_func_param(param_ty);
@@ -1375,7 +1370,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         self.builder.func = saved_func;
         self.builder.current_block = saved_current;
-        self.builder.value_types = saved_types;
         self.vars = saved_vars;
 
         name
@@ -1832,7 +1826,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                                 .branch(matches, match_block, vec![], false_block, false_args.to_vec());
                             scr
                         } else {
-                            let scr_ty = self.builder.value_types.get(&scr).copied().unwrap_or(ScalarType::Ptr);
+                            let scr_ty = scr.ty;
                             let scr_param = self.builder.add_block_param(match_block, scr_ty);
                             self.builder
                                 .branch(matches, match_block, vec![scr], false_block, false_args.to_vec());
@@ -2154,7 +2148,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         // Thread scr_val through block params only when it's NOT a
         // function param (function params are always accessible).
         let scr_is_func_param = self.builder.func.params.contains(&scr_val);
-        let scr_val_ty = self.builder.value_types.get(&scr_val).copied().unwrap_or(ScalarType::Ptr);
+        let scr_val_ty = scr_val.ty;
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, result_ty);
         let else_block = else_body.map(|_| self.builder.create_block());
@@ -2313,7 +2307,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         acc_ty: ScalarType,
         direct: Option<&SingletonTarget>,
     ) -> Value {
-        let step_ty = self.builder.value_types.get(&step_val).copied().unwrap_or(ScalarType::Ptr);
+        let step_ty = step_val.ty;
 
         let header = self.builder.create_block();
         let i_param = self.builder.add_block_param(header, ScalarType::U64);
@@ -2390,7 +2384,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     ) -> Value {
         let len_val = self.builder.load(list_val, 0, ScalarType::U64);
         let data_ptr = self.builder.load(list_val, 2, ScalarType::Ptr);
-        let step_ty = self.builder.value_types.get(&step_val).copied().unwrap_or(ScalarType::Ptr);
+        let step_ty = step_val.ty;
 
         let header = self.builder.create_block();
         let i_param = self.builder.add_block_param(header, ScalarType::U64);

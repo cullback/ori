@@ -53,8 +53,8 @@ pub fn evaluate(module: &mut Module) {
                                     *inst = Inst::StaticRef(*dest, *static_id);
                                 }
                                 Replacement::Scalar(scalar) => {
-                                    let (ty, bits) = scalar_to_bits(*scalar);
-                                    *inst = Inst::Const(*dest, ty, bits);
+                                    let (_, bits) = scalar_to_bits(*scalar);
+                                    *inst = Inst::Const(*dest, bits);
                                 }
                             }
                         }

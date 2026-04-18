@@ -1,5 +1,5 @@
 use super::{Block, Function, Module};
-use crate::ssa::instruction::{BinaryOp, BlockId, Inst, ScalarType, Terminator, Value};
+use crate::ssa::instruction::{BinaryOp, BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
 use std::collections::{BTreeMap, HashMap};
 
 /// Coercion direction between Agg(n) and Ptr at terminator edges.
@@ -33,8 +33,8 @@ pub struct FuncBuilder {
     pub pending: BTreeMap<BlockId, PendingBlock>,
     pub finished: BTreeMap<BlockId, Block>,
     pub next_block: usize,
-    /// Function parameters, in declaration order. Types live in
-    /// `Builder::value_types`. Populated via `add_func_param`.
+    /// Function parameters, in declaration order. Each Value carries
+    /// its type. Populated via `add_func_param`.
     pub params: Vec<Value>,
     /// Function return type, set before lowering the body so `ret`
     /// can coerce the returned value if its type doesn't match.
@@ -60,7 +60,6 @@ pub struct Builder {
     pub func: FuncBuilder,
     pub current_block: Option<BlockId>,
     functions: HashMap<String, Function>,
-    pub value_types: HashMap<Value, ScalarType>,
 }
 
 impl Builder {
@@ -70,16 +69,13 @@ impl Builder {
             func: FuncBuilder::new(),
             current_block: None,
             functions: HashMap::new(),
-            value_types: HashMap::new(),
         }
     }
 
-    /// Allocate a fresh typed SSA value. Every value must have a type
-    /// — pass it at creation so the invariant holds by construction.
+    /// Allocate a fresh typed SSA value.
     fn fresh_value(&mut self, ty: ScalarType) -> Value {
-        let v = Value(self.next_value);
+        let v = Value { id: self.next_value, ty };
         self.next_value += 1;
-        self.value_types.insert(v, ty);
         v
     }
 
@@ -118,61 +114,61 @@ impl Builder {
 
     pub fn const_i64(&mut self, n: i64) -> Value {
         let v = self.fresh_value(ScalarType::I64);
-        self.push(Inst::Const(v, ScalarType::I64, n as u64));
+        self.push(Inst::Const(v, n as u64));
         v
     }
 
     pub fn const_u64(&mut self, n: u64) -> Value {
         let v = self.fresh_value(ScalarType::U64);
-        self.push(Inst::Const(v, ScalarType::U64, n));
+        self.push(Inst::Const(v, n));
         v
     }
 
     pub fn const_f64(&mut self, n: f64) -> Value {
         let v = self.fresh_value(ScalarType::F64);
-        self.push(Inst::Const(v, ScalarType::F64, n.to_bits()));
+        self.push(Inst::Const(v, n.to_bits()));
         v
     }
 
     pub fn const_u8(&mut self, n: u8) -> Value {
         let v = self.fresh_value(ScalarType::U8);
-        self.push(Inst::Const(v, ScalarType::U8, u64::from(n)));
+        self.push(Inst::Const(v, u64::from(n)));
         v
     }
 
     pub fn const_i8(&mut self, n: i8) -> Value {
         let v = self.fresh_value(ScalarType::I8);
-        self.push(Inst::Const(v, ScalarType::I8, n as u64));
+        self.push(Inst::Const(v, n as u64));
         v
     }
 
     pub fn const_u16(&mut self, n: u16) -> Value {
         let v = self.fresh_value(ScalarType::U16);
-        self.push(Inst::Const(v, ScalarType::U16, u64::from(n)));
+        self.push(Inst::Const(v, u64::from(n)));
         v
     }
 
     pub fn const_i16(&mut self, n: i16) -> Value {
         let v = self.fresh_value(ScalarType::I16);
-        self.push(Inst::Const(v, ScalarType::I16, n as u64));
+        self.push(Inst::Const(v, n as u64));
         v
     }
 
     pub fn const_u32(&mut self, n: u32) -> Value {
         let v = self.fresh_value(ScalarType::U32);
-        self.push(Inst::Const(v, ScalarType::U32, u64::from(n)));
+        self.push(Inst::Const(v, u64::from(n)));
         v
     }
 
     pub fn const_i32(&mut self, n: i32) -> Value {
         let v = self.fresh_value(ScalarType::I32);
-        self.push(Inst::Const(v, ScalarType::I32, n as u64));
+        self.push(Inst::Const(v, n as u64));
         v
     }
 
     pub fn const_ptr_null(&mut self) -> Value {
         let v = self.fresh_value(ScalarType::Ptr);
-        self.push(Inst::Const(v, ScalarType::Ptr, 0));
+        self.push(Inst::Const(v, 0));
         v
     }
 
@@ -187,7 +183,7 @@ impl Builder {
     // ---- Calls ----
 
     pub fn call(&mut self, func: &str, args: Vec<Value>, ret_ty: ScalarType) -> Value {
-        let has_agg = args.iter().any(|a| matches!(self.value_types.get(a), Some(ScalarType::Agg(_))));
+        let has_agg = args.iter().any(|a| matches!(a.ty, ScalarType::Agg(_)));
         let args = if has_agg {
             args.into_iter()
                 .map(|a| self.coerce_to(a, ScalarType::Ptr))
@@ -258,8 +254,7 @@ impl Builder {
     }
 
     pub fn insert(&mut self, agg: Value, index: usize, val: Value) -> Value {
-        let agg_ty = self.value_types.get(&agg).copied().unwrap_or(ScalarType::Ptr);
-        let v = self.fresh_value(agg_ty);
+        let v = self.fresh_value(agg.ty);
         self.push(Inst::Insert(v, agg, index, val));
         v
     }
@@ -287,7 +282,7 @@ impl Builder {
 
     pub fn jump(&mut self, target: BlockId, args: Vec<Value>) {
         let args = self.coerce_args(target, args);
-        self.seal(Terminator::Jump(target, args));
+        self.seal(Terminator::Jump(BlockEdge { target, args }));
     }
 
     pub fn branch(
@@ -302,10 +297,8 @@ impl Builder {
         let else_args = self.coerce_args(else_block, else_args);
         self.seal(Terminator::Branch {
             cond,
-            then_block,
-            then_args,
-            else_block,
-            else_args,
+            then_edge: BlockEdge { target: then_block, args: then_args },
+            else_edge: BlockEdge { target: else_block, args: else_args },
         });
     }
 
@@ -317,9 +310,9 @@ impl Builder {
     ) {
         let arms = arms
             .into_iter()
-            .map(|(v, bid, args)| (v, bid, self.coerce_args(bid, args)))
+            .map(|(v, bid, args)| (v, BlockEdge { target: bid, args: self.coerce_args(bid, args) }))
             .collect();
-        let default = default.map(|(bid, args)| (bid, self.coerce_args(bid, args)));
+        let default = default.map(|(bid, args)| BlockEdge { target: bid, args: self.coerce_args(bid, args) });
         self.seal(Terminator::SwitchInt {
             scrutinee,
             arms,
@@ -349,18 +342,11 @@ impl Builder {
         } else {
             return Vec::new();
         };
-        params
-            .iter()
-            .map(|p| *self.value_types.get(p).unwrap_or(&ScalarType::Ptr))
-            .collect()
+        params.iter().map(|p| p.ty).collect()
     }
 
     fn coerce_to(&mut self, value: Value, dst_ty: ScalarType) -> Value {
-        let src_ty = match self.value_types.get(&value) {
-            Some(t) => *t,
-            None => return value,
-        };
-        let Some(dir) = coerce_kind(src_ty, dst_ty) else {
+        let Some(dir) = coerce_kind(value.ty, dst_ty) else {
             return value;
         };
         match dir {
@@ -389,8 +375,8 @@ impl Builder {
     // ---- Function building ----
 
     /// Finalize the current function. Params are the ones added via
-    /// `add_func_param` (in order); their types come from
-    /// `value_types`. The caller only supplies the return type.
+    /// `add_func_param` (in order); each carries its type.
+    /// The caller only supplies the return type.
     pub fn finish_function(&mut self, name: &str, return_type: ScalarType) {
         assert!(
             self.func.pending.is_empty(),
@@ -403,27 +389,15 @@ impl Builder {
             declared_ret == return_type,
             "finish_function({name}): return type mismatch (set_return_type={declared_ret:?}, finish_function arg={return_type:?})"
         );
-        let value_types = std::mem::take(&mut self.value_types);
-        let param_types = fb.params
-            .iter()
-            .map(|v| {
-                *value_types.get(v).unwrap_or_else(|| {
-                    panic!("finish_function({name}): param {v:?} has no type")
-                })
-            })
-            .collect();
         self.functions.insert(
             name.to_owned(),
             Function {
                 name: name.to_owned(),
                 params: fb.params,
                 blocks: fb.finished,
-                param_types,
                 return_type: declared_ret,
-                value_types,
                 entry: BlockId(0),
                 next_block: fb.next_block,
-                num_values: 0,
             },
         );
         self.current_block = None;

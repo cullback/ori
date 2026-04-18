@@ -27,8 +27,8 @@ fn promote_block(block: &mut super::Block, statics: &mut Vec<StaticObject>) {
     // Step 1: index all Const definitions.
     let mut const_vals: HashMap<Value, (ScalarType, u64)> = HashMap::new();
     for inst in &block.insts {
-        if let Inst::Const(dest, ty, bits) = inst {
-            const_vals.insert(*dest, (*ty, *bits));
+        if let Inst::Const(dest, bits) = inst {
+            const_vals.insert(*dest, (dest.ty, *bits));
         }
     }
 
