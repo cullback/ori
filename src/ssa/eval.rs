@@ -17,87 +17,213 @@ pub enum Scalar {
 }
 
 /// Simulated heap for the interpreter.
-/// Each allocation is a Vec of Scalar slots.
+/// Each allocation is a byte buffer. Ptr-typed fields are tracked
+/// by byte offset so rc_dec can cascade-free children.
 /// Sentinel refcount for static/permanent objects (never freed).
 const RC_STATIC: usize = usize::MAX;
 
+struct HeapObject {
+    rc: usize,
+    data: Vec<u8>,
+    /// Byte offsets of Ptr-typed values within `data`.
+    ptr_offsets: Vec<usize>,
+    /// (byte_offset, ScalarType) for each stored value, so loads can
+    /// recover the original type during the slot-to-byte transition.
+    type_map: Vec<(usize, ScalarType)>,
+}
+
 pub struct Heap {
-    /// Each entry: (refcount, slots).
-    objects: Vec<(usize, Vec<Scalar>)>,
+    objects: Vec<HeapObject>,
     /// Free-list of indices with refcount 0, available for reuse.
     free_list: Vec<usize>,
+}
+
+/// Get the ScalarType for a Scalar value.
+fn scalar_type_of(val: Scalar) -> ScalarType {
+    match val {
+        Scalar::I8(_) => ScalarType::I8,
+        Scalar::U8(_) => ScalarType::U8,
+        Scalar::I16(_) => ScalarType::I16,
+        Scalar::U16(_) => ScalarType::U16,
+        Scalar::I32(_) => ScalarType::I32,
+        Scalar::U32(_) => ScalarType::U32,
+        Scalar::I64(_) => ScalarType::I64,
+        Scalar::U64(_) => ScalarType::U64,
+        Scalar::F64(_) => ScalarType::F64,
+        Scalar::Ptr(_) => ScalarType::Ptr,
+    }
+}
+
+/// Write a scalar value into a byte buffer at the given offset.
+fn write_scalar(buf: &mut [u8], offset: usize, val: Scalar) {
+    match val {
+        Scalar::U8(n) => buf[offset] = n,
+        Scalar::I8(n) => buf[offset] = n as u8,
+        Scalar::U16(n) => buf[offset..offset + 2].copy_from_slice(&n.to_le_bytes()),
+        Scalar::I16(n) => buf[offset..offset + 2].copy_from_slice(&n.to_le_bytes()),
+        Scalar::U32(n) => buf[offset..offset + 4].copy_from_slice(&n.to_le_bytes()),
+        Scalar::I32(n) => buf[offset..offset + 4].copy_from_slice(&n.to_le_bytes()),
+        Scalar::U64(n) => buf[offset..offset + 8].copy_from_slice(&n.to_le_bytes()),
+        Scalar::I64(n) => buf[offset..offset + 8].copy_from_slice(&n.to_le_bytes()),
+        Scalar::F64(n) => buf[offset..offset + 8].copy_from_slice(&n.to_bits().to_le_bytes()),
+        Scalar::Ptr(p) => buf[offset..offset + 8].copy_from_slice(&(p as u64).to_le_bytes()),
+    }
+}
+
+/// Read a scalar value from a byte buffer at the given offset.
+fn read_scalar(buf: &[u8], offset: usize, ty: ScalarType) -> Scalar {
+    match ty {
+        ScalarType::U8 => Scalar::U8(buf[offset]),
+        ScalarType::I8 => Scalar::I8(buf[offset] as i8),
+        ScalarType::U16 => Scalar::U16(u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap())),
+        ScalarType::I16 => Scalar::I16(i16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap())),
+        ScalarType::U32 => Scalar::U32(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())),
+        ScalarType::I32 => Scalar::I32(i32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())),
+        ScalarType::U64 => Scalar::U64(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())),
+        ScalarType::I64 => Scalar::I64(i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())),
+        ScalarType::F64 => Scalar::F64(f64::from_bits(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()))),
+        ScalarType::Ptr => Scalar::Ptr(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()) as usize),
+        ScalarType::Agg(_) => panic!("cannot read Agg from heap"),
+    }
 }
 
 impl Heap {
     fn new() -> Self {
         // Index 0 is null
         Self {
-            objects: vec![(0, vec![])],
+            objects: vec![HeapObject { rc: 0, data: vec![], ptr_offsets: vec![], type_map: vec![] }],
             free_list: Vec::new(),
         }
     }
 
-    pub fn alloc(&mut self, num_slots: usize) -> usize {
+    pub fn alloc(&mut self, num_bytes: usize) -> usize {
         if let Some(idx) = self.free_list.pop() {
-            let entry = &mut self.objects[idx];
-            entry.0 = 1;
-            entry.1.clear();
-            entry.1.resize(num_slots, Scalar::I64(0));
+            let obj = &mut self.objects[idx];
+            obj.rc = 1;
+            obj.data.clear();
+            obj.data.resize(num_bytes, 0);
+            obj.ptr_offsets.clear();
+            obj.type_map.clear();
             idx
         } else {
             let idx = self.objects.len();
-            self.objects.push((1, vec![Scalar::I64(0); num_slots]));
+            self.objects.push(HeapObject {
+                rc: 1,
+                data: vec![0; num_bytes],
+                ptr_offsets: Vec::new(),
+                type_map: Vec::new(),
+            });
             idx
         }
     }
 
     /// Allocate a static (permanent) object that is never freed.
-    pub fn alloc_static(&mut self, slots: Vec<Scalar>) -> usize {
+    pub fn alloc_static(&mut self, data: Vec<u8>, ptr_offsets: Vec<usize>) -> usize {
         let idx = self.objects.len();
-        self.objects.push((RC_STATIC, slots));
+        self.objects.push(HeapObject { rc: RC_STATIC, data, ptr_offsets, type_map: Vec::new() });
         idx
     }
 
-    pub fn load(&self, idx: usize, slot: usize) -> Scalar {
-        self.objects[idx].1[slot]
+    pub fn load(&self, idx: usize, byte_offset: usize, ty: ScalarType) -> Scalar {
+        read_scalar(&self.objects[idx].data, byte_offset, ty)
     }
 
-    pub fn store(&mut self, idx: usize, slot: usize, val: Scalar) {
-        self.objects[idx].1[slot] = val;
-    }
-
-    fn load_dyn(&self, idx: usize, slot_val: usize) -> Scalar {
-        self.objects[idx].1[slot_val]
-    }
-
-    fn store_dyn(&mut self, idx: usize, slot_val: usize, val: Scalar) {
-        // Grow if needed (for list append)
-        let slots = &mut self.objects[idx].1;
-        if slot_val >= slots.len() {
-            slots.resize(slot_val + 1, Scalar::I64(0));
+    pub fn store(&mut self, idx: usize, byte_offset: usize, val: Scalar) {
+        let obj = &mut self.objects[idx];
+        write_scalar(&mut obj.data, byte_offset, val);
+        // Track Ptr offsets for cascade-free.
+        if matches!(val, Scalar::Ptr(_)) {
+            if !obj.ptr_offsets.contains(&byte_offset) {
+                obj.ptr_offsets.push(byte_offset);
+            }
         }
-        slots[slot_val] = val;
+        // Record the type for auto-detection loads.
+        let ty = scalar_type_of(val);
+        if let Some(entry) = obj.type_map.iter_mut().find(|(off, _)| *off == byte_offset) {
+            entry.1 = ty;
+        } else {
+            obj.type_map.push((byte_offset, ty));
+        }
+    }
+
+    /// Load from a dynamic element index (uniform element array).
+    /// Byte offset = element_index * element_type.byte_width().
+    fn load_dyn(&self, idx: usize, elem_index: usize, ty: ScalarType) -> Scalar {
+        let offset = elem_index * ty.byte_width();
+        read_scalar(&self.objects[idx].data, offset, ty)
+    }
+
+    /// Look up the stored ScalarType for a byte offset, if any.
+    fn lookup_type(&self, idx: usize, byte_offset: usize) -> Option<ScalarType> {
+        self.objects[idx]
+            .type_map
+            .iter()
+            .find(|(off, _)| *off == byte_offset)
+            .map(|(_, ty)| *ty)
+    }
+
+    /// Load a value, using the type_map to recover the original ScalarType.
+    /// Falls back to the hint when no type_map entry exists.
+    fn load_auto(&self, idx: usize, byte_offset: usize, hint: ScalarType) -> Scalar {
+        let ty = self.lookup_type(idx, byte_offset).unwrap_or(hint);
+        read_scalar(&self.objects[idx].data, byte_offset, ty)
+    }
+
+    /// Load an element by index. All elements use 8-byte stride,
+    /// matching the lowering's data buffer layout. The type_map
+    /// recovers the original ScalarType so the Scalar variant is correct.
+    fn load_dyn_auto(&self, idx: usize, elem_index: usize) -> Scalar {
+        let offset = elem_index * 8;
+        let ty = self.lookup_type(idx, offset).unwrap_or(ScalarType::I64);
+        read_scalar(&self.objects[idx].data, offset, ty)
+    }
+
+    /// Store to a dynamic element index (uniform element array).
+    /// All elements use 8-byte stride matching the lowering layout.
+    /// Grows the buffer if needed.
+    fn store_dyn(&mut self, idx: usize, elem_index: usize, val: Scalar, _elem_ty: ScalarType) {
+        let offset = elem_index * 8;
+        let needed = offset + 8;
+        let obj = &mut self.objects[idx];
+        if needed > obj.data.len() {
+            obj.data.resize(needed, 0);
+        }
+        write_scalar(&mut obj.data, offset, val);
+        if matches!(val, Scalar::Ptr(_)) {
+            if !obj.ptr_offsets.contains(&offset) {
+                obj.ptr_offsets.push(offset);
+            }
+        }
+        // Record the type for auto-detection loads.
+        let ty = scalar_type_of(val);
+        if let Some(entry) = obj.type_map.iter_mut().find(|(off, _)| *off == offset) {
+            entry.1 = ty;
+        } else {
+            obj.type_map.push((offset, ty));
+        }
     }
 
     fn rc_inc(&mut self, idx: usize) {
-        if idx != 0 && self.objects[idx].0 != RC_STATIC {
-            self.objects[idx].0 += 1;
+        if idx != 0 && self.objects[idx].rc != RC_STATIC {
+            self.objects[idx].rc += 1;
         }
     }
 
     fn rc_dec(&mut self, idx: usize) {
-        if idx == 0 || self.objects[idx].0 == RC_STATIC || self.objects[idx].0 == 0 {
+        if idx == 0 || self.objects[idx].rc == RC_STATIC || self.objects[idx].rc == 0 {
             return;
         }
-        self.objects[idx].0 -= 1;
-        if self.objects[idx].0 == 0 {
+        self.objects[idx].rc -= 1;
+        if self.objects[idx].rc == 0 {
             // Collect Ptr children before adding to free list.
             let children: Vec<usize> = self.objects[idx]
-                .1
+                .ptr_offsets
                 .iter()
-                .filter_map(|s| match s {
-                    Scalar::Ptr(p) => Some(*p),
-                    _ => None,
+                .filter_map(|&off| {
+                    match read_scalar(&self.objects[idx].data, off, ScalarType::Ptr) {
+                        Scalar::Ptr(p) if p != 0 => Some(p),
+                        _ => None,
+                    }
                 })
                 .collect();
             self.free_list.push(idx);
@@ -110,28 +236,39 @@ impl Heap {
     /// Clone a heap object, returning the new index.
     /// Increments refcounts of any Ptr children in the cloned data.
     pub fn clone_object(&mut self, idx: usize) -> usize {
-        let data = self.objects[idx].1.clone();
+        let data = self.objects[idx].data.clone();
+        let ptr_offsets = self.objects[idx].ptr_offsets.clone();
         // The clone creates new references to all Ptr children.
-        for slot in &data {
-            if let Scalar::Ptr(child) = slot {
-                self.rc_inc(*child);
+        for &off in &ptr_offsets {
+            if let Scalar::Ptr(child) = read_scalar(&data, off, ScalarType::Ptr) {
+                if child != 0 {
+                    self.rc_inc(child);
+                }
             }
         }
+        let type_map = self.objects[idx].type_map.clone();
         if let Some(new_idx) = self.free_list.pop() {
-            let entry = &mut self.objects[new_idx];
-            entry.0 = 1;
-            entry.1 = data;
+            let obj = &mut self.objects[new_idx];
+            obj.rc = 1;
+            obj.data = data;
+            obj.ptr_offsets = ptr_offsets;
+            obj.type_map = type_map;
             new_idx
         } else {
             let new_idx = self.objects.len();
-            self.objects.push((1, data));
+            self.objects.push(HeapObject { rc: 1, data, ptr_offsets, type_map });
             new_idx
         }
     }
 
-    /// Get the number of slots in an object.
+    /// Get the byte length of an object.
     pub fn object_len(&self, idx: usize) -> usize {
-        self.objects[idx].1.len()
+        self.objects[idx].data.len()
+    }
+
+    /// Get the byte offsets of Ptr-typed values in an object.
+    pub fn ptr_offsets(&self, idx: usize) -> &[usize] {
+        &self.objects[idx].ptr_offsets
     }
 }
 
@@ -175,12 +312,18 @@ impl Scratch {
 /// RC operations are no-ops.
 fn init_statics(module: &Module, heap: &mut Heap) {
     use super::StaticSlot;
-    // First pass: allocate all static objects with placeholder slots
+    // First pass: allocate all static objects with placeholder byte buffers
     // so they have stable indices for cross-references.
+    // Each slot occupies 8 bytes (all static values are stored full-width).
     let base = heap.objects.len();
     for obj in &module.statics {
-        let slots = vec![Scalar::I64(0); obj.slots.len()];
-        heap.objects.push((RC_STATIC, slots));
+        let num_bytes = obj.slots.len() * 8;
+        heap.objects.push(HeapObject {
+            rc: RC_STATIC,
+            data: vec![0; num_bytes],
+            ptr_offsets: Vec::new(),
+            type_map: Vec::new(),
+        });
     }
     // Second pass: fill in slot values now that all indices are known.
     for (i, obj) in module.statics.iter().enumerate() {
@@ -192,7 +335,8 @@ fn init_statics(module: &Module, heap: &mut Heap) {
                 StaticSlot::I64(n) => Scalar::I64(*n),
                 StaticSlot::StaticPtr(id) => Scalar::Ptr(base + id),
             };
-            heap.objects[base + i].1[si] = scalar;
+            let byte_offset = si * 8;
+            heap.store(base + i, byte_offset, scalar);
         }
     }
 }
@@ -317,11 +461,11 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(idx))
         }
 
-        Inst::Load(_, ptr, offset) => {
+        Inst::Load(dest, ptr, offset) => {
             let Scalar::Ptr(idx) = env[ptr.id] else {
                 panic!("load from non-ptr: {:?}", env[ptr.id]);
             };
-            Some(heap.load(idx, *offset))
+            Some(heap.load_auto(idx, *offset, dest.ty))
         }
 
         Inst::Store(ptr, offset, val) => {
@@ -332,12 +476,20 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             None
         }
 
-        Inst::LoadDyn(_, ptr, idx_val) => {
+        Inst::LoadDyn(dest, ptr, idx_val) => {
             let Scalar::Ptr(heap_idx) = env[ptr.id] else {
                 panic!("load_dyn from non-ptr: {:?}", env[ptr.id]);
             };
             let slot = scalar_to_usize(env[idx_val.id]);
-            Some(heap.load_dyn(heap_idx, slot))
+            // For sub-8-byte types (e.g., U8 in strings), the dest type is
+            // authoritative and determines the stride. For 8-byte types, the
+            // lowering may use Ptr generically, so use load_dyn_auto which
+            // checks the type_map to recover the actual stored type.
+            if dest.ty.byte_width() < 8 {
+                Some(heap.load_dyn(heap_idx, slot, dest.ty))
+            } else {
+                Some(heap.load_dyn_auto(heap_idx, slot))
+            }
         }
 
         Inst::StoreDyn(ptr, idx_val, val) => {
@@ -345,7 +497,21 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                 panic!("store_dyn to non-ptr: {:?}", env[ptr.id]);
             };
             let slot = scalar_to_usize(env[idx_val.id]);
-            heap.store_dyn(heap_idx, slot, env[val.id]);
+            // Detect element stride from the buffer's existing type_map.
+            // U8 buffers (strings) use 1-byte stride; all others use 8-byte stride.
+            let buf_elem_ty = heap.lookup_type(heap_idx, 0);
+            let (elem_ty, store_val) = if buf_elem_ty == Some(ScalarType::U8) {
+                // Coerce to U8 if needed (the lowering may have typed the literal as I64).
+                let v = if matches!(env[val.id], Scalar::U8(_)) {
+                    env[val.id]
+                } else {
+                    Scalar::U8(scalar_to_u64(env[val.id]) as u8)
+                };
+                (ScalarType::U8, v)
+            } else {
+                (ScalarType::I64, env[val.id])
+            };
+            heap.store_dyn(heap_idx, slot, store_val, elem_ty);
             None
         }
 
@@ -371,16 +537,17 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
 
         Inst::Reset(_dest, ptr, slot_types) => {
             if let Scalar::Ptr(idx) = env[ptr.id] {
-                if idx != 0 && heap.objects[idx].0 == 1 && heap.objects[idx].0 != RC_STATIC {
+                if idx != 0 && heap.objects[idx].rc == 1 && heap.objects[idx].rc != RC_STATIC {
                     // Unique: dec pointer-typed fields, return address for reuse.
                     for (i, ty) in slot_types.iter().enumerate() {
                         if *ty == ScalarType::Ptr {
-                            if let Scalar::Ptr(child) = heap.load(idx, i) {
+                            let offset = i * 8;
+                            if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::Ptr) {
                                 heap.rc_dec(child);
                             }
                         }
                     }
-                    heap.objects[idx].0 = 0;
+                    heap.objects[idx].rc = 0;
                     Some(Scalar::Ptr(idx))
                 } else {
                     // Shared: normal dec, return null.
@@ -403,16 +570,16 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
 
         Inst::Pack(_dest, fields) => {
             let n = fields.len();
-            let idx = heap.alloc(n);
+            let idx = heap.alloc(n * 8);
             for (i, f) in fields.iter().enumerate() {
-                heap.store(idx, i, env[f.id]);
+                heap.store(idx, i * 8, env[f.id]);
             }
             Some(Scalar::Ptr(idx))
         }
 
-        Inst::Extract(_, agg, idx) => {
+        Inst::Extract(dest, agg, idx) => {
             if let Scalar::Ptr(p) = env[agg.id] {
-                Some(heap.load(p, *idx))
+                Some(heap.load_auto(p, *idx * 8, dest.ty))
             } else {
                 panic!("extract from non-Ptr value v{}: {:?}", agg.id, env[agg.id])
             }
@@ -421,7 +588,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
         Inst::Insert(_dest, agg, idx, val) => {
             if let Scalar::Ptr(p) = env[agg.id] {
                 let new_idx = heap.clone_object(p);
-                heap.store(new_idx, *idx, env[val.id]);
+                heap.store(new_idx, *idx * 8, env[val.id]);
                 Some(Scalar::Ptr(new_idx))
             } else {
                 panic!("insert into non-Ptr value v{}: {:?}", agg.id, env[agg.id])
@@ -439,7 +606,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let Scalar::Ptr(list_idx) = args[0] else {
                 panic!("__list_len: expected Ptr");
             };
-            let len = heap.load(list_idx, 0);
+            let len = heap.load(list_idx, 0, ScalarType::U64);
             Some(len)
         }
         "__list_get" => {
@@ -448,7 +615,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
                 panic!("__list_get: expected Ptr");
             };
             let idx = scalar_to_usize(args[1]);
-            let Scalar::Ptr(data_idx) = heap.load(list_idx, 2) else {
+            let Scalar::Ptr(data_idx) = heap.load(list_idx, 16, ScalarType::Ptr) else {
                 panic!("__list_get: data slot is not Ptr");
             };
             // Per Perceus, loading a `Ptr` from heap creates a new
@@ -459,7 +626,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             // on the returned value underflows the heap slot's
             // actual reference count and the original list's element
             // is freed while still in use.
-            let elem = heap.load_dyn(data_idx, idx);
+            let elem = heap.load_dyn_auto(data_idx, idx);
             if let Scalar::Ptr(p) = elem {
                 heap.rc_inc(p);
             }
@@ -471,29 +638,36 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
                 panic!("__list_set: expected Ptr");
             };
             let idx = scalar_to_usize(args[1]);
-            let len = heap.load(list_idx, 0);
-            let cap = heap.load(list_idx, 1);
-            let Scalar::Ptr(old_data) = heap.load(list_idx, 2) else {
+            let len = heap.load(list_idx, 0, ScalarType::U64);
+            let cap = heap.load(list_idx, 8, ScalarType::U64);
+            let Scalar::Ptr(old_data) = heap.load(list_idx, 16, ScalarType::Ptr) else {
                 panic!("__list_set: data is not Ptr");
             };
             // Clone data buffer and list header
             let new_data = heap.clone_object(old_data);
             // The old element at this index was rc_inc'd by clone;
             // we're replacing it, so dec the old and inc the new.
-            let old_elem = heap.load_dyn(new_data, idx);
+            let old_elem = heap.load_dyn_auto(new_data, idx);
             if let Scalar::Ptr(p) = old_elem { heap.rc_dec(p); }
             let val = args[2];
             if let Scalar::Ptr(p) = val { heap.rc_inc(p); }
-            heap.store_dyn(new_data, idx, val);
-            let new_list = heap.alloc(3);
+            let data_elem_ty = heap.lookup_type(old_data, 0).unwrap_or(ScalarType::I64);
+            let elem_ty = if data_elem_ty == ScalarType::U8 { ScalarType::U8 } else { ScalarType::I64 };
+            let val = if elem_ty == ScalarType::U8 && !matches!(val, Scalar::U8(_)) {
+                Scalar::U8(scalar_to_u64(val) as u8)
+            } else {
+                val
+            };
+            heap.store_dyn(new_data, idx, val, elem_ty);
+            let new_list = heap.alloc(24);
             heap.store(new_list, 0, len);
-            heap.store(new_list, 1, cap);
-            heap.store(new_list, 2, Scalar::Ptr(new_data));
+            heap.store(new_list, 8, cap);
+            heap.store(new_list, 16, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
         "__list_copy_into" => {
             // args: [src_ptr, dst_ptr, count] → I64(0). Copies `count`
-            // slots from src to dst, bumping rc on any `Ptr` children.
+            // 8-byte elements from src to dst, bumping rc on any `Ptr` children.
             // Self-copy is a no-op (same heap index).
             let Scalar::Ptr(src) = args[0] else {
                 panic!("__list_copy_into: expected Ptr for src");
@@ -505,12 +679,39 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
                 return Some(Scalar::I64(0));
             }
             let n = scalar_to_usize(args[2]);
-            for i in 0..n {
-                let slot = heap.objects[src].1[i];
-                if let Scalar::Ptr(p) = slot {
-                    heap.rc_inc(p);
+            let byte_count = n * 8;
+            // Copy raw bytes
+            let src_bytes = heap.objects[src].data[..byte_count].to_vec();
+            heap.objects[dst].data[..byte_count].copy_from_slice(&src_bytes);
+            // Copy ptr_offsets from src that fall in the copied range, and rc_inc each
+            let src_ptr_offsets: Vec<usize> = heap.objects[src]
+                .ptr_offsets
+                .iter()
+                .copied()
+                .filter(|&off| off < byte_count)
+                .collect();
+            let src_type_entries: Vec<(usize, ScalarType)> = heap.objects[src]
+                .type_map
+                .iter()
+                .copied()
+                .filter(|(off, _)| *off < byte_count)
+                .collect();
+            for &off in &src_ptr_offsets {
+                if let Scalar::Ptr(p) = read_scalar(&heap.objects[dst].data, off, ScalarType::Ptr) {
+                    if p != 0 {
+                        heap.rc_inc(p);
+                    }
                 }
-                heap.objects[dst].1[i] = slot;
+                if !heap.objects[dst].ptr_offsets.contains(&off) {
+                    heap.objects[dst].ptr_offsets.push(off);
+                }
+            }
+            for (off, ty) in src_type_entries {
+                if let Some(entry) = heap.objects[dst].type_map.iter_mut().find(|(o, _)| *o == off) {
+                    entry.1 = ty;
+                } else {
+                    heap.objects[dst].type_map.push((off, ty));
+                }
             }
             Some(Scalar::I64(0))
         }
@@ -519,20 +720,29 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let Scalar::Ptr(list_idx) = args[0] else {
                 panic!("__list_append: expected Ptr");
             };
-            let Scalar::U64(len) = heap.load(list_idx, 0) else {
+            let Scalar::U64(len) = heap.load(list_idx, 0, ScalarType::U64) else {
                 panic!("__list_append: len is not U64");
             };
-            let Scalar::Ptr(old_data) = heap.load(list_idx, 2) else {
+            let Scalar::Ptr(old_data) = heap.load(list_idx, 16, ScalarType::Ptr) else {
                 panic!("__list_append: data is not Ptr");
             };
             let new_len = len + 1;
             let new_data = heap.clone_object(old_data);
             if let Scalar::Ptr(p) = args[1] { heap.rc_inc(p); }
-            heap.store_dyn(new_data, len as usize, args[1]);
-            let new_list = heap.alloc(3);
+            // Detect element stride from existing data buffer (U8 for strings, 8 otherwise).
+            let data_elem_ty = heap.lookup_type(old_data, 0).unwrap_or(ScalarType::I64);
+            let elem_ty = if data_elem_ty == ScalarType::U8 { ScalarType::U8 } else { ScalarType::I64 };
+            // Coerce value to match buffer element type if needed.
+            let val = if elem_ty == ScalarType::U8 && !matches!(args[1], Scalar::U8(_)) {
+                Scalar::U8(scalar_to_u64(args[1]) as u8)
+            } else {
+                args[1]
+            };
+            heap.store_dyn(new_data, len as usize, val, elem_ty);
+            let new_list = heap.alloc(24);
             heap.store(new_list, 0, Scalar::U64(new_len));
-            heap.store(new_list, 1, Scalar::U64(new_len));
-            heap.store(new_list, 2, Scalar::Ptr(new_data));
+            heap.store(new_list, 8, Scalar::U64(new_len));
+            heap.store(new_list, 16, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
         "__list_reverse" => {
@@ -540,24 +750,24 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let Scalar::Ptr(list_idx) = args[0] else {
                 panic!("__list_reverse: expected Ptr");
             };
-            let Scalar::U64(len) = heap.load(list_idx, 0) else {
+            let Scalar::U64(len) = heap.load(list_idx, 0, ScalarType::U64) else {
                 panic!("__list_reverse: len is not U64");
             };
-            let Scalar::Ptr(old_data) = heap.load(list_idx, 2) else {
+            let Scalar::Ptr(old_data) = heap.load(list_idx, 16, ScalarType::Ptr) else {
                 panic!("__list_reverse: data is not Ptr");
             };
             #[expect(clippy::cast_possible_truncation)]
             let len_usize = len as usize;
-            let new_data = heap.alloc(len_usize);
+            let new_data = heap.alloc(len_usize * 8);
             for i in 0..len_usize {
-                let elem = heap.load_dyn(old_data, i);
+                let elem = heap.load_dyn_auto(old_data, i);
                 if let Scalar::Ptr(p) = elem { heap.rc_inc(p); }
-                heap.store(new_data, len_usize - 1 - i, elem);
+                heap.store(new_data, (len_usize - 1 - i) * 8, elem);
             }
-            let new_list = heap.alloc(3);
+            let new_list = heap.alloc(24);
             heap.store(new_list, 0, Scalar::U64(len));
-            heap.store(new_list, 1, Scalar::U64(len));
-            heap.store(new_list, 2, Scalar::Ptr(new_data));
+            heap.store(new_list, 8, Scalar::U64(len));
+            heap.store(new_list, 16, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
         "__list_sublist" => {
@@ -567,20 +777,20 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             };
             let start = scalar_to_usize(args[1]);
             let count = scalar_to_usize(args[2]);
-            let Scalar::Ptr(old_data) = heap.load(list_idx, 2) else {
+            let Scalar::Ptr(old_data) = heap.load(list_idx, 16, ScalarType::Ptr) else {
                 panic!("__list_sublist: data is not Ptr");
             };
-            let new_data = heap.alloc(count);
+            let new_data = heap.alloc(count * 8);
             for i in 0..count {
-                let elem = heap.load_dyn(old_data, start + i);
+                let elem = heap.load_dyn_auto(old_data, start + i);
                 if let Scalar::Ptr(p) = elem { heap.rc_inc(p); }
-                heap.store(new_data, i, elem);
+                heap.store(new_data, i * 8, elem);
             }
-            let new_list = heap.alloc(3);
+            let new_list = heap.alloc(24);
             let count_u64 = count as u64;
             heap.store(new_list, 0, Scalar::U64(count_u64));
-            heap.store(new_list, 1, Scalar::U64(count_u64));
-            heap.store(new_list, 2, Scalar::Ptr(new_data));
+            heap.store(new_list, 8, Scalar::U64(count_u64));
+            heap.store(new_list, 16, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
         "__list_repeat" => {
@@ -591,15 +801,15 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             };
             #[expect(clippy::cast_possible_truncation)]
             let n = count as usize;
-            let data = heap.alloc(n);
+            let data = heap.alloc(n * 8);
             for i in 0..n {
                 if let Scalar::Ptr(p) = val { heap.rc_inc(p); }
-                heap.store(data, i, val);
+                heap.store(data, i * 8, val);
             }
-            let list = heap.alloc(3);
+            let list = heap.alloc(24);
             heap.store(list, 0, Scalar::U64(count));
-            heap.store(list, 1, Scalar::U64(count));
-            heap.store(list, 2, Scalar::Ptr(data));
+            heap.store(list, 8, Scalar::U64(count));
+            heap.store(list, 16, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
         "__list_range" => {
@@ -613,14 +823,14 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let n = if end > start { end - start } else { 0 };
             #[expect(clippy::cast_possible_truncation)]
             let n_usize = n as usize;
-            let data = heap.alloc(n_usize);
+            let data = heap.alloc(n_usize * 8);
             for i in 0..n_usize {
-                heap.store(data, i, Scalar::U64(start + i as u64));
+                heap.store(data, i * 8, Scalar::U64(start + i as u64));
             }
-            let list = heap.alloc(3);
+            let list = heap.alloc(24);
             heap.store(list, 0, Scalar::U64(n));
-            heap.store(list, 1, Scalar::U64(n));
-            heap.store(list, 2, Scalar::Ptr(data));
+            heap.store(list, 8, Scalar::U64(n));
+            heap.store(list, 16, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
         "__num_to_str" => {
@@ -639,14 +849,14 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             };
             let bytes = s.into_bytes();
             let len = bytes.len();
-            let data = heap.alloc(len);
+            let data = heap.alloc(len * 8);
             for (i, b) in bytes.into_iter().enumerate() {
-                heap.store(data, i, Scalar::U8(b));
+                heap.store(data, i * 8, Scalar::U8(b));
             }
-            let list = heap.alloc(3);
+            let list = heap.alloc(24);
             heap.store(list, 0, Scalar::U64(len as u64));
-            heap.store(list, 1, Scalar::U64(len as u64));
-            heap.store(list, 2, Scalar::Ptr(data));
+            heap.store(list, 8, Scalar::U64(len as u64));
+            heap.store(list, 16, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
         "__num_hash" => {
@@ -678,30 +888,30 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let Scalar::Ptr(b_idx) = args[1] else {
                 panic!("__str_concat: expected Ptr");
             };
-            let Scalar::U64(a_len) = heap.load(a_idx, 0) else {
+            let Scalar::U64(a_len) = heap.load(a_idx, 0, ScalarType::U64) else {
                 panic!("__str_concat: expected U64 len");
             };
-            let Scalar::U64(b_len) = heap.load(b_idx, 0) else {
+            let Scalar::U64(b_len) = heap.load(b_idx, 0, ScalarType::U64) else {
                 panic!("__str_concat: expected U64 len");
             };
-            let Scalar::Ptr(a_data) = heap.load(a_idx, 2) else {
+            let Scalar::Ptr(a_data) = heap.load(a_idx, 16, ScalarType::Ptr) else {
                 panic!("__str_concat: expected Ptr data");
             };
-            let Scalar::Ptr(b_data) = heap.load(b_idx, 2) else {
+            let Scalar::Ptr(b_data) = heap.load(b_idx, 16, ScalarType::Ptr) else {
                 panic!("__str_concat: expected Ptr data");
             };
             let total = a_len + b_len;
-            let data = heap.alloc(total as usize);
+            let data = heap.alloc(total as usize * 8);
             for i in 0..a_len as usize {
-                heap.store(data, i, heap.load(a_data, i));
+                heap.store(data, i * 8, heap.load(a_data, i * 8, ScalarType::U8));
             }
             for i in 0..b_len as usize {
-                heap.store(data, a_len as usize + i, heap.load(b_data, i));
+                heap.store(data, (a_len as usize + i) * 8, heap.load(b_data, i * 8, ScalarType::U8));
             }
-            let list = heap.alloc(3);
+            let list = heap.alloc(24);
             heap.store(list, 0, Scalar::U64(total));
-            heap.store(list, 1, Scalar::U64(total));
-            heap.store(list, 2, Scalar::Ptr(data));
+            heap.store(list, 8, Scalar::U64(total));
+            heap.store(list, 16, Scalar::Ptr(data));
             Some(Scalar::Ptr(list))
         }
         "__u64_from_u8" => {
@@ -732,11 +942,11 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
                 eprintln!("crash: <non-string argument>");
                 std::process::exit(1);
             };
-            let Scalar::U64(len) = heap.load(list_idx, 0) else {
+            let Scalar::U64(len) = heap.load(list_idx, 0, ScalarType::U64) else {
                 eprintln!("crash: <malformed string>");
                 std::process::exit(1);
             };
-            let Scalar::Ptr(data_idx) = heap.load(list_idx, 2) else {
+            let Scalar::Ptr(data_idx) = heap.load(list_idx, 16, ScalarType::Ptr) else {
                 eprintln!("crash: <malformed string>");
                 std::process::exit(1);
             };
@@ -744,7 +954,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             let len = len as usize;
             let mut bytes = Vec::with_capacity(len);
             for i in 0..len {
-                let Scalar::U8(b) = heap.load(data_idx, i) else {
+                let Scalar::U8(b) = heap.load(data_idx, i, ScalarType::U8) else {
                     bytes.push(b'?');
                     continue;
                 };
@@ -793,15 +1003,17 @@ fn scalar_to_u64(s: Scalar) -> u64 {
 
 /// Reuse a Reset-produced token for a new allocation, or allocate
 /// fresh when the token is null (shared object, reuse unsafe).
-fn reuse_or_alloc(heap: &mut Heap, token: Scalar, num_slots: usize) -> usize {
+fn reuse_or_alloc(heap: &mut Heap, token: Scalar, num_bytes: usize) -> usize {
     if let Scalar::Ptr(idx) = token {
         if idx != 0 {
-            heap.objects[idx].0 = 1;
-            heap.objects[idx].1.resize(num_slots, Scalar::I64(0));
+            heap.objects[idx].rc = 1;
+            heap.objects[idx].data.resize(num_bytes, 0);
+            heap.objects[idx].ptr_offsets.clear();
+            heap.objects[idx].type_map.clear();
             return idx;
         }
     }
-    heap.alloc(num_slots)
+    heap.alloc(num_bytes)
 }
 
 fn scalar_to_usize(s: Scalar) -> usize {

@@ -56,6 +56,19 @@ pub enum ScalarType {
     Agg(usize),
 }
 
+impl ScalarType {
+    /// Byte width of this type when stored on the heap.
+    pub fn byte_width(self) -> usize {
+        match self {
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 => 4,
+            Self::I64 | Self::U64 | Self::F64 | Self::Ptr => 8,
+            Self::Agg(_) => panic!("Agg has no byte width — not stored on heap"),
+        }
+    }
+}
+
 /// Binary operations on scalars.
 #[derive(Debug, Clone, Copy)]
 pub enum BinaryOp {

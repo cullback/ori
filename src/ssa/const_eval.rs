@@ -117,9 +117,9 @@ fn heap_to_statics(
         heap_to_static.insert(idx, usize::MAX);
         visit_order.push(idx);
 
-        // Queue child pointers.
-        for i in 0..heap.object_len(idx) {
-            if let Scalar::Ptr(child) = heap.load(idx, i) {
+        // Queue child pointers via ptr_offsets.
+        for &off in heap.ptr_offsets(idx) {
+            if let Scalar::Ptr(child) = heap.load(idx, off, ScalarType::Ptr) {
                 if child != 0 && !heap_to_static.contains_key(&child) {
                     to_visit.push(child);
                 }
@@ -135,10 +135,18 @@ fn heap_to_statics(
 
     // Build StaticObjects.
     for &heap_idx in &visit_order {
-        let len = heap.object_len(heap_idx);
-        let mut slots = Vec::with_capacity(len);
-        for i in 0..len {
-            slots.push(scalar_to_slot(heap.load(heap_idx, i), &heap_to_static));
+        let byte_len = heap.object_len(heap_idx);
+        let num_slots = byte_len / 8;
+        let ptr_offs = heap.ptr_offsets(heap_idx);
+        let mut slots = Vec::with_capacity(num_slots);
+        for i in 0..num_slots {
+            let off = i * 8;
+            let ty = if ptr_offs.contains(&off) {
+                ScalarType::Ptr
+            } else {
+                ScalarType::I64
+            };
+            slots.push(scalar_to_slot(heap.load(heap_idx, off, ty), &heap_to_static));
         }
         statics.push(StaticObject { slots });
     }

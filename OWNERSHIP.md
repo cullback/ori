@@ -1,234 +1,420 @@
-# Static Ownership Analysis
+# Memory Management Pipeline
 
-Static ownership analysis handles the common case (>95% of pointer
-operations) at compile time with zero runtime cost. For the one case
-where aliasing is data-dependent — a boxed value stored into a list a
-variable number of times — we fall back to Perceus-style runtime
-reference counting.
+## Goals
 
-## Why the current approach falls short
+1. **Unboxed when possible.** Small composites (≤8 fields) stay in
+   registers as `Agg(n)`. Heap allocation only when a value is stored
+   into a collection or escapes through a pointer.
 
-The existing pipeline: `insert_rc` adds `RcInc`/`RcDec` everywhere,
-then `insert_reuse` tries to pair `RcDec` + `Alloc` into
-`Reset`/`Reuse` (check RC=1 at runtime, reuse allocation if unique).
+2. **In-place mutation when RC=1, else clone.** When a heap object has
+   exactly one owner, reuse its memory for the next allocation of the
+   same shape. When shared, clone before mutating.
 
-`insert_reuse` only pairs within a single basic block, and only when
-the dec'd value was the direct result of an `Alloc` instruction. This
-fails for the most important case: **loop-carried accumulators**, where
-the value flows through block parameters (phis) and loses provenance.
+3. **Static reference counting.** Determine ownership, lifetimes, and
+   drop points at compile time. Only fall back to a runtime refcount
+   field when aliasing is truly data-dependent — a boxed value stored
+   into a list a variable number of times.
 
-Example: `list.map(f)` lowers to a loop that appends to an accumulator
-each iteration. The accumulator is a block param, not an alloc result,
-so `insert_reuse` never fires. The result is O(n) copy-on-every-append
-with no reuse.
+## Type-generic design
 
-## Key insight: System T gives us everything
+The analysis operates on Ptr-typed SSA values. It does not know about
+lists, tags, or closures — it sees Alloc, Store, Load, and whether
+values are Ptr-typed.
 
-Ori is based on Godel's System T:
-- **No self-recursion.** The call graph is a DAG.
-- **All functions are total.** Every call terminates.
-- **Pure, no side effects.** No hidden mutation or aliasing.
-
-This means we have **complete static visibility** into every function's
-behavior. We can analyze the whole program bottom-up (topo-sort the
-call DAG) and determine, for each function parameter, whether it's
-consumed (escapes into the return value) or borrowed (only read from).
-No fixed-point iteration, no approximation.
-
-In SSA form, every use of every value is visible. We always know
-statically *when* a value's lifetime ends (its last use). And in pure
-functional code, most values flow linearly — each intermediate result
-is consumed exactly once.
-
-## Ownership model
-
-Every `Ptr`-typed SSA value has one of two ownership statuses:
-
-- **Unique**: exactly one reference exists. The value can be dropped at
-  its last use, producing a reuse token for a subsequent allocation.
-- **Borrowed**: a reference into a living object. Someone else owns the
-  underlying memory. Do not free.
-
-Classification rules:
-
-| Definition site            | Ownership |
-|---------------------------|-----------|
-| `Alloc` / `AllocDyn`     | Unique    |
-| Function parameter        | Borrowed  |
-| `Load` of Ptr from heap  | Borrowed  |
-| `Call` result (Ptr)       | Unique    |
-| Block param (phi)         | Unique if **all** incoming values are Unique; Borrowed otherwise |
-
-## Reuse tokens
-
-When a Unique value reaches its last use, we emit a **drop** that
-produces a reuse token. The token is a first-class SSA value that
-carries the allocation's memory. A subsequent `Alloc` can consume the
-token: if the sizes are compatible, it reuses the memory; otherwise it
-frees the old and allocates fresh.
-
-Because tokens are SSA values, they flow through block params
-naturally. This solves the cross-block problem that `insert_reuse`
-can't handle.
-
-### Example: list-map accumulator
+Every heap-allocated type follows the same pattern:
 
 ```
-b_loop(i: u64, acc: ptr):        // acc is Unique (all incoming are alloc 3)
-  done = eq i, len
-  branch done ? b_exit(acc) : b_body
+ptr = Alloc(n)                // or AllocDyn(n)
+Store(ptr, 0, field_0)        // each field is Ptr or scalar
+Store(ptr, 1, field_1)
+...
+```
 
-b_body:
-  old_len = load acc[0]
-  old_data = load acc[2]          // borrowed from acc
-  token_hdr = drop_unique acc     // free header, move out slot[2]
+Ownership, reuse, and RC decisions are made per-Store:
+- Storing a scalar (U64, I32, etc.) → no memory management concern.
+- Storing a Ptr that is Unique and at its last use → ownership
+  transfer. No RC needed.
+- Storing a Ptr that is Borrowed or still used later → rc_inc.
+
+This applies identically to recursive tags (`Store(node, 1, left)`),
+closures (`Store(clos, 1, captured_x)`), and list headers
+(`Store(hdr, 2, data_ptr)`).
+
+Drop cascading is also generic: when freeing a Unique object, the
+pass needs to know which slots contain Ptrs (to cascade-free or
+move-out children). This is derived from the Store patterns — scan
+`Alloc(dest, n)` then all `Store(dest, offset, val)` to record each
+slot's type. No type metadata needed.
+
+The only pattern that produces data-dependent aliasing is `StoreDyn`
+with a loop-varying index — the same Ptr stored into a buffer an
+unknown number of times. Today this only comes from list data buffers,
+but the analysis doesn't special-case lists. Any `StoreDyn` of a Ptr
+in a loop body triggers the same rc_inc fallback.
+
+## System T properties that make this work
+
+- **No self-recursion.** The call graph is a DAG — whole-program
+  analysis bottom-up with no approximation.
+- **All functions are total.** Every call terminates — no infinite
+  loops to reason about.
+- **Pure, no side effects.** No hidden mutation or aliasing — every
+  use of every value is visible in the SSA.
+- **Explicit block params.** Every cross-block value flow goes through
+  block params. A value's scope is its defining block — no liveness
+  analysis needed.
+
+## Pass ordering
+
+After lowering and general optimization, memory management runs as a
+single pipeline. Each pass is listed with its inputs, outputs, and
+what it depends on.
+
+```
+     ┌─────────────────────┐
+     │   lower + optimize   │
+     └──────────┬──────────┘
+                │
+┌───────────────▼──────────────┐
+│  1. rc_layout_analysis       │ whole-program
+│     which types need RC?     │
+└───────────────┬──────────────┘
+                │
+┌───────────────▼──────────────┐
+│  2. ownership_analysis       │ per-function
+│     unique/borrowed, reuse   │
+│     pairs, rc_inc sites      │
+└───────────────┬──────────────┘
+                │
+┌───────────────▼──────────────┐
+│  3. emit_drops               │ per-function
+│     insert Free, Drop+Reuse, │
+│     move-out, RcInc          │
+└───────────────┬──────────────┘
+                │
+┌───────────────▼──────────────┐
+│  4. insert_rc_fallback       │ per-function
+│     runtime RC for rc_inc    │
+│     sites only               │
+└───────────────┬──────────────┘
+                │
+┌───────────────▼──────────────┐
+│  5. elide_static_rc          │ per-function
+│  6. fuse_inc_dec             │
+│  7. optimize (final)         │
+└──────────────────────────────┘
+```
+
+### 1. RC layout analysis (whole-program)
+
+**Input:** Entire module after optimization.
+**Output:** Which alloc kinds need a runtime RC field.
+
+Scans every function for rc_inc sites (stores of Ptr values where the
+store count is data-dependent). Groups by alloc kind — if any value
+with `AllocKind::Static(3)` ever gets rc_inc'd, all 3-word
+allocations get an RC prefix. Same for `AllocKind::Dynamic`.
+
+| Alloc kind | Without RC | With RC |
+|---|---|---|
+| `Alloc(n)` | `{field_0, ..., field_n}` | `{rc, field_0, ..., field_n}` |
+| `AllocDyn(n)` | `{slot_0, ..., slot_n}` | `{rc, slot_0, ..., slot_n}` |
+
+The RC field goes on the **aliased object**, not the container. In
+`List.repeat(n, some_str)`, `some_str` is the value that gains
+multiple references, so its alloc kind gets the RC prefix.
+
+The grouping is per alloc-kind (size), not per semantic type. A 3-word
+tag and a 3-word list header are the same alloc kind, so if either
+needs RC, both get it. In practice this rarely matters — the false
+positive costs one word per allocation, and few programs have two
+types of the same size where only one gets aliased.
+
+**Why first:** Every subsequent pass needs to know whether an alloc
+kind has an RC field, because it affects whether Free cascades,
+whether in-place mutation checks a refcount, and what offsets stores
+use.
+
+**Status:** `ownership::analyze_module` computes `RcLayout` but the
+layout isn't applied to codegen yet.
+
+### 2. Ownership analysis (per-function)
+
+**Input:** One function, plus RC layout from step 1.
+**Output:** `Analysis { ownership, alloc_kinds, reuse_pairs, rc_inc_sites }`.
+
+Four phases:
+
+**Phase 2a — Classify ownership.** Every Ptr value is Unique or
+Borrowed. Allocs and call results are Unique. Function params and
+heap loads are Borrowed. Block params inherit: Unique if all incoming
+values are Unique, Borrowed otherwise (fixpoint for loops).
+
+**Phase 2b — Track alloc kinds through phis.** Each Ptr value's alloc
+kind (`Static(n)` or `Dynamic`) propagates through block params. If
+all incoming edges agree, the param inherits the kind. Conflicting
+kinds → unknown. This is what lets us see that a loop accumulator
+is always a 3-word list header.
+
+**Phase 2c — Find reuse pairs.** A Unique value dies in its block if
+it's not in any successor's args. For each dying Unique with a known
+alloc kind, find a compatible Alloc later in the same block. The pair
+means: drop the old, reuse its memory for the new.
+
+**Phase 2d — Find rc_inc sites.** A Store of a Ptr into a heap object
+needs rc_inc unless it's an ownership transfer (Unique, last use, not
+forwarded to a successor). These are the only sites where runtime RC
+is needed.
+
+**Why before emit_drops:** The analysis is read-only — it doesn't
+modify the SSA. The transformation pass consumes its results.
+
+**Status:** Fully implemented in `ownership.rs`. Analysis only, no
+transformation.
+
+### 3. Emit drops and reuse (per-function) — NOT YET IMPLEMENTED
+
+**Input:** Function + ownership Analysis from step 2.
+**Output:** Modified SSA with Drop, Free, Reuse, RcInc, and move-out
+instructions.
+
+This is the core transformation pass that replaces `insert_rc` for
+statically-owned values:
+
+**Unique values that die with a reuse pair:**
+
+```
+token = Drop(old_val)       // free header, cascade-free children
+new_val = Reuse(token, 3)   // reuse old_val's memory for new alloc
+```
+
+Tokens are first-class SSA values. They flow through block params, so
+loop accumulators get in-place reuse across iterations.
+
+**Unique values that die without reuse:**
+
+```
+Free(old_val)               // free immediately, cascade children
+```
+
+**Borrowed values:** No action. The owner will free them.
+
+**rc_inc sites:** Emit `RcInc(val)` before the store. Only at sites
+identified by the analysis — not blanket coverage.
+
+**Move-out semantics:** When dropping a Unique parent that contains
+Ptr children, each child is either cascade-freed (not live after
+the drop) or moved out (still live — ownership transfers to a local
+value). The analysis detects this: if a `Load` of a Ptr from a
+Unique parent produces a value that's still used after the parent's
+last use, that slot is moved out.
+
+```
+child = Load(parent, 2)     // child is borrowed from parent
+...                          // child still used here
+token = Drop(parent)         // parent dropped — but child was loaded
+// child is now Unique (parent's reference is gone, child was moved out)
+```
+
+Without move-out, the Drop would cascade-free the child while it's
+still in use.
+
+**Why this order:** Must run after ownership analysis (needs its
+results) and before any RC fallback (which only handles the sites
+this pass couldn't resolve statically).
+
+### 4. Insert RC fallback (per-function) — PARTIALLY EXISTS
+
+**Input:** Function after emit_drops, plus list of rc_inc sites from
+ownership analysis.
+**Output:** SSA with runtime RcInc/RcDec for data-dependent aliasing.
+
+For types whose layout includes an RC field (from step 1), insert
+runtime reference counting only at the sites identified by the
+ownership analysis. This is a scoped version of today's `insert_rc` —
+it doesn't touch values that were handled statically.
+
+The only case: a boxed value stored into a list's data buffer a
+data-dependent number of times. The store gets `RcInc`, and when the
+list is freed, each element gets `RcDec` (cascade).
+
+Most programs produce zero rc_inc sites, making this pass a no-op.
+
+**Status:** Today's `insert_rc` exists but applies blanket RC to
+everything. It needs to be scoped to only the unresolved sites.
+
+### 5–7. Cleanup passes (per-function) — EXIST
+
+**`elide_static_rc`**: Removes RcInc/RcDec on StaticRef values
+(compile-time constants with sentinel refcount). Correct and complete.
+
+**`fuse_inc_dec`**: Cancels adjacent RcInc/RcDec pairs within the same
+block where the refcount elevation isn't observed between them.
+With the ownership-driven pipeline producing fewer RC ops, there are
+fewer pairs to fuse.
+
+**`optimize` (final)**: Standard DCE, constant folding, jump threading.
+Cleans up dead instructions left by the memory passes.
+
+### Whole-program ownership signatures — NOT YET IMPLEMENTED
+
+Orthogonal to the per-function pipeline. Runs once during
+ownership analysis, bottom-up over the call DAG.
+
+For each function, determines whether each Ptr parameter is
+**borrowed** (only read) or **consumed** (escapes into the return
+value):
+
+```
+fn map_inc(input: borrowed ptr) -> ptr
+fn repeat(n: u64, val: borrowed ptr) -> ptr
+```
+
+At each call site, the caller knows which args it still owns after
+the call. Consumed args transfer ownership to the callee, which can
+drop/reuse without RC. Borrowed args remain owned by the caller.
+
+Currently all function params are treated as Borrowed (conservative).
+Adding consumed params unlocks reuse inside callees without inlining.
+
+### Data buffer reuse — NOT YET IMPLEMENTED
+
+Header reuse (3-word list header → 3-word list header) works today
+via Drop+Reuse with matching alloc kinds.
+
+Data buffers are harder: the buffer grows by 1 element each iteration,
+so sizes don't match. Two options:
+
+1. **Realloc.** Resize in place when possible, copy when not.
+   Amortized O(1) with capacity doubling. The list header already
+   stores capacity in slot[1] — we just need to exploit it.
+
+2. **Token with size check.** Reuse if new size ≤ old capacity,
+   alloc fresh otherwise. Same amortized cost, more explicit in SSA.
+
+Either way, the key insight: when the old data buffer is Unique and
+the new buffer is one element larger, we can grow in place instead of
+allocating + copying.
+
+## Worked examples by type
+
+The analysis is type-generic — these examples show that the same
+Ptr-based rules handle every heap-allocated type uniformly.
+
+### Recursive tag: `Node(left, right)`
+
+```
+left  = call build_left(...)          // Unique (call result)
+right = call build_right(...)         // Unique (call result)
+node  = Alloc(3)                      // Unique
+Store(node, 0, tag)                   // U64 — ignored
+Store(node, 1, left)                  // Ptr, Unique, last use → ownership transfer, no RC
+Store(node, 2, right)                 // Ptr, Unique, last use → ownership transfer, no RC
+```
+
+**Result:** zero RC ops. Both children are consumed by the parent.
+
+What about `Node(x, x)` — same value stored twice?
+
+```
+x    = call make_thing(...)           // Unique
+node = Alloc(3)
+Store(node, 0, tag)
+Store(node, 1, x)                    // Ptr, Unique, but NOT last use (x used again below)
+Store(node, 2, x)                    // Ptr, Unique, last use
+```
+
+The first store is not the last use of `x`, so it's not an ownership
+transfer → rc_inc. But this is **statically visible** — we can see at
+compile time that `x` is stored exactly twice. The type needs an RC
+field, but the count is known: emit one `RcInc(x)` at the first store.
+
+### Closure capturing two values
+
+```
+clos = Alloc(3)
+Store(clos, 0, code_ptr)             // Ptr (function pointer), Unique, last use → transfer
+Store(clos, 1, captured_x)           // Ptr, depends on ownership of captured_x
+Store(clos, 2, captured_y)           // Ptr, depends on ownership of captured_y
+```
+
+If `captured_x` is a function parameter (Borrowed), storing it needs
+rc_inc — the closure is keeping a reference the caller doesn't know
+about. If `captured_x` is a local Unique value at its last use, it's
+an ownership transfer — no RC.
+
+Same rules, same analysis. No closure-specific logic.
+
+### List header
+
+```
+hdr = Alloc(3)
+Store(hdr, 0, len)                   // U64 — ignored
+Store(hdr, 1, cap)                   // U64 — ignored
+Store(hdr, 2, data_ptr)             // Ptr, Unique, last use → ownership transfer
+```
+
+**Result:** zero RC ops. The data buffer is consumed by the header.
+
+### List data buffer — the one special case
+
+```
+data = AllocDyn(n)
+// in a loop body:
+  StoreDyn(data, i, elem)            // Ptr, dynamic index
+```
+
+`StoreDyn` with a loop-varying index means the same `elem` could be
+stored 0 times, 1 time, or N times depending on runtime data. The
+analysis can't count the stores statically → rc_inc.
+
+This is the **only** pattern that triggers runtime RC. It's not
+special-cased for lists — any `StoreDyn` of a Ptr in a loop body
+triggers the same fallback. Lists just happen to be the only type
+with variable arity.
+
+### List.map with scalar elements — no RC at all
+
+```
+// map(+1) over List(I32)
+b_body(i, acc, len, data):
+  elem = LoadDyn(data, i)            // I32 — not Ptr, ignored
+  mapped = Add(elem, 1)              // I32
   ...
-  new_acc = reuse token_hdr, 3    // reuse acc's 3-word header
+  StoreDyn(new_data, old_len, mapped) // I32 — not Ptr, ignored
+  new_acc = Alloc(3)
   ...
-  jump b_loop(i+1, new_acc)
+  jump b_header(i+1, new_acc, len, data)
 ```
 
-The token threads through the loop: each iteration drops the old
-accumulator header and reuses it for the new one. Zero allocation
-per iteration for the header.
+No Ptr stored into the data buffer → zero RC ops, zero rc_inc sites.
+The accumulator header gets in-place reuse (Unique, same alloc kind).
 
-## Move-out semantics
-
-When dropping a Unique object that contains Ptr-typed slots, we need
-to decide what happens to each child pointer:
-
-- **Cascade-free**: decrement the child (recursive free if RC hits 0).
-  Used when the child is not needed after the parent is dropped.
-- **Move-out**: transfer ownership of the child to a local variable.
-  Used when the child is still live after the parent's drop point.
-
-The analysis detects move-out automatically: if a `Load` of a Ptr
-from a Unique parent produces a value that's still live when the
-parent is dropped, that slot is moved out rather than cascade-freed.
-
-After move-out, the child becomes Unique (sole owner, since the
-parent's reference is gone).
-
-## Alloc kind tracking through phis
-
-To pair drops with compatible allocs, we need to know each value's
-allocation size. For values defined by `Alloc(n)`, the kind is
-`Static(n)`. For `AllocDyn`, it's `Dynamic`.
-
-Block params inherit their alloc kind from incoming values. If all
-incoming values have the same kind (e.g., all are `Static(3)`), the
-param has that kind. If kinds conflict, the param's kind is unknown
-and can't participate in same-size reuse.
-
-## The three boxed types
-
-Ori has three kinds of heap-allocated values:
-
-| Type           | Arity          | Aliasing pattern        |
-|---------------|----------------|------------------------|
-| Lists          | Variable (N elements) | Same element stored N times in a loop |
-| Recursive tags | Fixed per variant     | `Node(x, x)` — always statically visible |
-| Closures       | Fixed captures        | Each capture is a distinct variable |
-
-**Only lists create data-dependent aliasing.** Tags and closures have
-fixed arity, so any aliasing is visible in the SSA and countable at
-compile time.
-
-## When runtime RC is actually needed
-
-Almost never. The one genuine case:
-
-> A boxed value stored as an element of a list, a data-dependent
-> number of times.
-
-Concrete examples:
-- `List.repeat(n, some_str)` — same string stored N times
-- `xs.walk([], |acc, _| acc.append(captured))` — captured value
-  appended on each iteration
-
-In these cases, the element's reference count depends on runtime data
-(the list length or how many times a condition is true). We can't
-resolve it at compile time.
-
-**Any boxed type** (list, tag, closure) can be the target of this
-aliasing — it just needs to be a list element. So all heap objects
-retain an RC field, but it's only ever dynamically incremented at one
-site: **storing a boxed element into a list's data buffer.**
-
-Everything else — tag construction, closure capture, value passing,
-loop accumulators — is handled by static ownership.
-
-## Heap object layout: conditional RC field
-
-Every heap object has the same base layout for its type. Whether the
-layout includes an RC field is a **per-type, compile-time decision**
-made by whole-program analysis.
-
-The analysis scans all rc_inc sites in the program. If a concrete
-type (e.g., `Str`, `List(I32)`, `Tree`) ever appears at a
-data-dependent store site, its layout gets an RC prefix:
-
-| Needs RC? | List layout              | Tag layout (Node)           |
-|-----------|-------------------------|-----------------------------|
-| No        | `{len, cap, data}`      | `{tag, left, right}`        |
-| Yes       | `{rc, len, cap, data}`  | `{rc, tag, left, right}`    |
-
-After monomorphization, every function knows the concrete layout of
-each type it operates on. Field offsets are baked into the generated
-code — `len` is at offset 0 or 1 depending on whether RC is present.
-No runtime branching, no wasted space on types that don't need RC.
-
-Example: if `Str` is only ever used in `map`/`filter` chains where
-each string is unique, Str's layout is `{len, cap, data}` — three
-words, no RC overhead. If somewhere in the program `List.repeat(n,
-some_str)` appears, Str's layout becomes `{rc, len, cap, data}` for
-the entire program.
-
-## Whole-program ownership signatures
-
-Since the call graph is a DAG, we can compute each function's ownership
-signature bottom-up:
+### List.repeat(n, boxed_val) — the RC fallback
 
 ```
-fn foo(a: borrowed ptr, b: consumed ptr) -> ptr
+b_body(i, acc):
+  ...
+  StoreDyn(new_data, old_len, val)   // Ptr, Borrowed (func param), in loop
+  ...
 ```
 
-- **Borrowed**: the function only reads from this parameter. Caller
-  retains ownership.
-- **Consumed**: the parameter (or data derived from it) appears in the
-  return value. Ownership transfers to the callee.
+`val` is Borrowed (function parameter) and stored into a dynamically-
+indexed buffer in a loop body. rc_inc on every iteration. This is the
+one case where the runtime refcount field is needed.
 
-At each call site, the caller knows exactly which arguments are
-borrowed (still owned after the call) and which are consumed (ownership
-transferred). No need to inline — the signature tells you everything.
+## When runtime RC is needed — summary
 
-For builtins (which can't be analyzed), we annotate ownership by hand.
+The analysis flags rc_inc at any `Store`/`StoreDyn` of a Ptr where
+the stored value is not an ownership transfer (Unique at last use).
+In practice, the cases that survive are:
 
-## Data buffer reuse (future work)
+| Pattern | Static or runtime? | Why |
+|---------|-------------------|-----|
+| `Store(ptr, fixed_offset, unique_val)` at last use | Static (transfer) | One owner, known at compile time |
+| `Store(ptr, fixed_offset, borrowed_val)` | Static (rc_inc, counted) | Fixed offset, count visible in SSA |
+| `Store(ptr, fixed_offset, val)` used again later | Static (rc_inc, counted) | Fixed offset, count visible in SSA |
+| `StoreDyn(ptr, loop_idx, ptr_val)` in loop body | **Runtime RC** | Store count depends on runtime data |
 
-The header reuse (e.g., 3-word list header) is straightforward: drop
-produces a token, alloc consumes it, same size.
-
-The data buffer is harder because sizes differ across iterations
-(growing by 1 each time). Options:
-
-1. **Realloc**: resize in place if possible, copy if not. Amortized
-   O(1) with capacity doubling.
-2. **Token with size check**: reuse if new size <= old capacity, alloc
-   fresh otherwise.
-
-The current SSA stores capacity in the list header (slot[1]) but
-never exploits it. A realloc-based approach would use capacity for
-amortized growth.
-
-## Implementation plan
-
-1. `src/ssa/ownership.rs` — the analysis pass, tested on hand-built
-   SSA modules.
-2. Start with the easy win: header reuse for loop accumulators (token
-   through phis).
-3. Add move-out detection for Ptr children of dropped Unique objects.
-4. Add data buffer reuse (realloc or token-based).
-5. Integrate into the main pipeline, replacing `insert_rc` +
-   `insert_reuse` for the static cases.
-6. Keep RC as a fallback for the list-element-store edge case.
+Only the last row needs a runtime refcount field in the type's layout.
+Everything else is resolved statically.

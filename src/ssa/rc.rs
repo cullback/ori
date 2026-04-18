@@ -163,7 +163,8 @@ fn insert_reuse_function(func: &mut Function) {
             match inst {
                 Inst::Alloc(dest, size) => {
                     alloc_kind.insert(*dest, Some(*size));
-                    alloc_slot_types.insert(*dest, vec![ScalarType::Ptr; *size]);
+                    let num_slots = size / 8;
+                    alloc_slot_types.insert(*dest, vec![ScalarType::Ptr; num_slots]);
                 }
                 Inst::AllocDyn(dest, _) => {
                     alloc_kind.insert(*dest, None);
@@ -171,8 +172,9 @@ fn insert_reuse_function(func: &mut Function) {
                 }
                 Inst::Store(ptr, offset, val) => {
                     if let Some(slots) = alloc_slot_types.get_mut(ptr) {
-                        if *offset < slots.len() {
-                            slots[*offset] = val.ty;
+                        let slot_idx = *offset / 8;
+                        if slot_idx < slots.len() {
+                            slots[slot_idx] = val.ty;
                         }
                     }
                 }

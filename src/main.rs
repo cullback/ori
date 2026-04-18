@@ -107,14 +107,14 @@ fn bytes_to_scalar(bytes: &[u8], heap: &mut ssa::eval::Heap) -> ssa::eval::Scala
 fn heap_alloc_list(heap: &mut ssa::eval::Heap, elems: &[ssa::eval::Scalar]) -> ssa::eval::Scalar {
     use ssa::eval::Scalar;
     let len = elems.len();
-    let data_idx = heap.alloc(len);
+    let data_idx = heap.alloc(len * 8);
     for (i, elem) in elems.iter().enumerate() {
-        heap.store(data_idx, i, *elem);
+        heap.store(data_idx, i * 8, *elem);
     }
-    let header_idx = heap.alloc(3);
+    let header_idx = heap.alloc(24);
     heap.store(header_idx, 0, Scalar::U64(len as u64));
-    heap.store(header_idx, 1, Scalar::U64(len as u64));
-    heap.store(header_idx, 2, Scalar::Ptr(data_idx));
+    heap.store(header_idx, 8, Scalar::U64(len as u64));
+    heap.store(header_idx, 16, Scalar::Ptr(data_idx));
     Scalar::Ptr(header_idx)
 }
 
@@ -123,17 +123,17 @@ fn scalar_str_to_bytes(heap: &ssa::eval::Heap, str_ptr: ssa::eval::Scalar) -> Ve
     let Scalar::Ptr(list_idx) = str_ptr else {
         panic!("expected Ptr for string, got {str_ptr:?}");
     };
-    let Scalar::U64(len) = heap.load(list_idx, 0) else {
+    let Scalar::U64(len) = heap.load(list_idx, 0, ssa::ScalarType::U64) else {
         panic!("expected U64 for list len");
     };
-    let Scalar::Ptr(data_idx) = heap.load(list_idx, 2) else {
+    let Scalar::Ptr(data_idx) = heap.load(list_idx, 16, ssa::ScalarType::Ptr) else {
         panic!("expected Ptr for list data");
     };
     #[expect(clippy::cast_possible_truncation)]
     let len_usize = len as usize;
     let mut bytes = Vec::with_capacity(len_usize);
     for i in 0..len_usize {
-        let Scalar::U8(b) = heap.load(data_idx, i) else {
+        let Scalar::U8(b) = heap.load(data_idx, i * 8, ssa::ScalarType::U8) else {
             panic!("expected U8 in string data");
         };
         bytes.push(b);
@@ -247,11 +247,11 @@ fn main() {
         eprintln!("unexpected non-Ptr result: {result:?}");
         process::exit(1);
     };
-    let ssa::eval::Scalar::U64(tag) = heap.load(result_idx, 0) else {
+    let ssa::eval::Scalar::U64(tag) = heap.load(result_idx, 0, ssa::ScalarType::U64) else {
         eprintln!("unexpected tag type");
         process::exit(1);
     };
-    let payload = heap.load(result_idx, 1);
+    let payload = heap.load(result_idx, 8, ssa::ScalarType::Ptr);
 
     // Tag 0 = first constructor (Ok), Tag 1 = second (Err)
     let bytes = scalar_str_to_bytes(&heap, payload);

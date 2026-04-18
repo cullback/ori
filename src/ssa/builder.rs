@@ -352,11 +352,11 @@ impl Builder {
         match dir {
             CoerceDir::AggToPtr(n) => {
                 let ptr = self.fresh_value(ScalarType::Ptr);
-                self.push(Inst::Alloc(ptr, n));
+                self.push(Inst::Alloc(ptr, n * 8));
                 for i in 0..n {
                     let field = self.fresh_value(ScalarType::U64);
                     self.push(Inst::Extract(field, value, i));
-                    self.push(Inst::Store(ptr, i, field));
+                    self.push(Inst::Store(ptr, i * 8, field));
                 }
                 ptr
             }
@@ -364,7 +364,7 @@ impl Builder {
                 let mut fields = Vec::with_capacity(n);
                 for i in 0..n {
                     let field = self.fresh_value(ScalarType::U64);
-                    self.push(Inst::Load(field, value, i));
+                    self.push(Inst::Load(field, value, i * 8));
                     fields.push(field);
                 }
                 self.pack(fields)

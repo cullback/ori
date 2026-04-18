@@ -506,13 +506,13 @@ mod tests {
         // ── b0: entry ──
         b.switch_to(b0);
         let len = b.load(input, 0, ScalarType::U64);
-        let data = b.load(input, 2, ScalarType::Ptr);
+        let data = b.load(input, 16, ScalarType::Ptr);
         let zero = b.const_u64(0);
         let empty_data = b.alloc_dyn(zero);
-        let empty = b.alloc(3);
+        let empty = b.alloc(24);
         b.store(empty, 0, zero);
-        b.store(empty, 1, zero);
-        b.store(empty, 2, empty_data);
+        b.store(empty, 8, zero);
+        b.store(empty, 16, empty_data);
         b.jump(b1, vec![zero, empty, len, data]);
 
         // ── b1: loop header ──
@@ -527,17 +527,17 @@ mod tests {
         let mapped = b.binop(BinaryOp::Add, elem, one_i32, ScalarType::I32);
 
         let old_len = b.load(acc2, 0, ScalarType::U64);
-        let old_data = b.load(acc2, 2, ScalarType::Ptr);
+        let old_data = b.load(acc2, 16, ScalarType::Ptr);
         let one_u64 = b.const_u64(1);
         let new_len = b.binop(BinaryOp::Add, old_len, one_u64, ScalarType::U64);
         let new_data = b.alloc_dyn(new_len);
         let _copy =
             b.call("__list_copy_into", vec![old_data, new_data, old_len], ScalarType::I64);
         b.store_dyn(new_data, old_len, mapped);
-        let new_acc = b.alloc(3);
+        let new_acc = b.alloc(24);
         b.store(new_acc, 0, new_len);
-        b.store(new_acc, 1, new_len);
-        b.store(new_acc, 2, new_data);
+        b.store(new_acc, 8, new_len);
+        b.store(new_acc, 16, new_data);
         let next_i = b.binop(BinaryOp::Add, i2, one_u64, ScalarType::U64);
         b.jump(b1, vec![next_i, new_acc, len2, data2]);
 
@@ -563,19 +563,19 @@ mod tests {
         assert_eq!(result.ownership[&input], Ownership::Borrowed);
 
         // data (loaded from input) is Borrowed.
-        let data = find_load(func, input, 2).expect("data = load input[2]");
+        let data = find_load(func, input, 16).expect("data = load input[16]");
         assert_eq!(result.ownership[&data], Ownership::Borrowed);
 
         // acc (block param of b1) should be Unique.
         let acc = func.blocks[&BlockId(1)].params[1];
         assert_eq!(result.ownership[&acc], Ownership::Unique);
-        assert_eq!(result.alloc_kinds[&acc], AllocKind::Static(3));
+        assert_eq!(result.alloc_kinds[&acc], AllocKind::Static(24));
 
         // acc2 (block param of b2, threaded from b1) should also be
         // Unique with the same alloc kind — this is where reuse happens.
         let acc2 = func.blocks[&BlockId(2)].params[1];
         assert_eq!(result.ownership[&acc2], Ownership::Unique);
-        assert_eq!(result.alloc_kinds[&acc2], AllocKind::Static(3));
+        assert_eq!(result.alloc_kinds[&acc2], AllocKind::Static(24));
 
         // Reuse pair: drop acc2 → reuse new_acc in b2.
         let header_pair = result
@@ -583,7 +583,7 @@ mod tests {
             .iter()
             .find(|p| p.drop_val == acc2)
             .expect("should find reuse pair for acc2 → new_acc");
-        assert_eq!(header_pair.kind, AllocKind::Static(3));
+        assert_eq!(header_pair.kind, AllocKind::Static(24));
         assert_eq!(header_pair.block, BlockId(2));
     }
 
@@ -618,10 +618,10 @@ mod tests {
         b.switch_to(b0);
         let zero = b.const_u64(0);
         let empty_data = b.alloc_dyn(zero);
-        let empty = b.alloc(3);
+        let empty = b.alloc(24);
         b.store(empty, 0, zero);
-        b.store(empty, 1, zero);
-        b.store(empty, 2, empty_data);
+        b.store(empty, 8, zero);
+        b.store(empty, 16, empty_data);
         b.jump(b1, vec![zero, empty]);
 
         // ── b1: loop header ──
@@ -632,17 +632,17 @@ mod tests {
         // ── b2: loop body — append val to acc ──
         b.switch_to(b2);
         let old_len = b.load(acc2, 0, ScalarType::U64);
-        let old_data = b.load(acc2, 2, ScalarType::Ptr);
+        let old_data = b.load(acc2, 16, ScalarType::Ptr);
         let one = b.const_u64(1);
         let new_len = b.binop(BinaryOp::Add, old_len, one, ScalarType::U64);
         let new_data = b.alloc_dyn(new_len);
         let _copy =
             b.call("__list_copy_into", vec![old_data, new_data, old_len], ScalarType::I64);
         b.store_dyn(new_data, old_len, val); // <-- val stored into list!
-        let new_acc = b.alloc(3);
+        let new_acc = b.alloc(24);
         b.store(new_acc, 0, new_len);
-        b.store(new_acc, 1, new_len);
-        b.store(new_acc, 2, new_data);
+        b.store(new_acc, 8, new_len);
+        b.store(new_acc, 16, new_data);
         let next_i = b.binop(BinaryOp::Add, i2, one, ScalarType::U64);
         b.jump(b1, vec![next_i, new_acc]);
 

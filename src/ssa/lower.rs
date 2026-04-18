@@ -79,10 +79,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let ScalarType::Agg(n) = val.ty else {
             return val;
         };
-        let ptr = self.builder.alloc(n);
+        let ptr = self.builder.alloc(n * 8);
         for i in 0..n {
             let field = self.builder.extract(val, i, ScalarType::U64); // type doesn't matter for runtime
-            self.builder.store(ptr, i, field);
+            self.builder.store(ptr, i * 8, field);
         }
         ptr
     }
@@ -92,7 +92,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         if self.is_agg(val) {
             self.builder.extract(val, slot, ty)
         } else {
-            self.builder.load(val, slot, ty)
+            self.builder.load(val, slot * 8, ty)
         }
     }
 
@@ -429,16 +429,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
             ExprKind::StrLit(bytes) => {
                 let len = bytes.len();
-                let data = self.builder.alloc(len);
+                let data = self.builder.alloc(len * 8);
                 for (i, &b) in bytes.iter().enumerate() {
                     let val = self.builder.const_u8(b);
-                    self.builder.store(data, i, val);
+                    self.builder.store(data, i * 8, val);
                 }
-                let header = self.builder.alloc(3);
+                let header = self.builder.alloc(24);
                 let len_val = self.builder.const_u64(len as u64);
                 self.builder.store(header, 0, len_val);
-                self.builder.store(header, 1, len_val);
-                self.builder.store(header, 2, data);
+                self.builder.store(header, 8, len_val);
+                self.builder.store(header, 16, data);
                 header
             }
 
@@ -574,9 +574,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 if Self::can_pack(&field_types) {
                     self.builder.pack(vals)
                 } else {
-                    let ptr = self.builder.alloc(fields.len());
+                    let ptr = self.builder.alloc(fields.len() * 8);
                     for (slot, val) in vals.into_iter().enumerate() {
-                        self.builder.store(ptr, slot, val);
+                        self.builder.store(ptr, slot * 8, val);
                     }
                     ptr
                 }
@@ -590,7 +590,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 if self.is_agg(val) {
                     self.builder.extract(val, slot, ty)
                 } else {
-                    self.builder.load(val, slot, ty)
+                    self.builder.load(val, slot * 8, ty)
                 }
             }
 
@@ -611,9 +611,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 if Self::can_pack(&field_types) {
                     self.builder.pack(vals)
                 } else {
-                    let ptr = self.builder.alloc(elems.len());
+                    let ptr = self.builder.alloc(elems.len() * 8);
                     for (i, val) in vals.into_iter().enumerate() {
-                        self.builder.store(ptr, i, val);
+                        self.builder.store(ptr, i * 8, val);
                     }
                     ptr
                 }
@@ -664,7 +664,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             if is_base_agg {
                                 self.builder.extract(base_val, slot, ty)
                             } else {
-                                self.builder.load(base_val, slot, ty)
+                                self.builder.load(base_val, slot * 8, ty)
                             }
                         }
                     })
@@ -672,9 +672,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 if is_base_agg && Self::can_pack(&field_types) {
                     self.builder.pack(vals)
                 } else {
-                    let ptr = self.builder.alloc(num_fields);
+                    let ptr = self.builder.alloc(num_fields * 8);
                     for (slot, val) in vals.into_iter().enumerate() {
-                        self.builder.store(ptr, slot, val);
+                        self.builder.store(ptr, slot * 8, val);
                     }
                     ptr
                 }
@@ -682,16 +682,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
             ExprKind::ListLit(elems) => {
                 let len = elems.len();
-                let data = self.builder.alloc(len);
+                let data = self.builder.alloc(len * 8);
                 for (i, elem) in elems.iter().enumerate() {
                     let val = self.lower_expr(elem);
-                    self.builder.store(data, i, val);
+                    self.builder.store(data, i * 8, val);
                 }
-                let header = self.builder.alloc(3);
+                let header = self.builder.alloc(24);
                 let len_val = self.builder.const_u64(len as u64);
                 self.builder.store(header, 0, len_val);
-                self.builder.store(header, 1, len_val);
-                self.builder.store(header, 2, data);
+                self.builder.store(header, 8, len_val);
+                self.builder.store(header, 16, data);
                 header
             }
 
@@ -1085,7 +1085,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let lt_meta = &self.decls.constructors["Lt"];
         let eq_meta = &self.decls.constructors["Eq"];
         let gt_meta = &self.decls.constructors["Gt"];
-        let alloc_size = 1; // Order tags have no payload
+        let alloc_size = 8; // Order tags have no payload, one U64 tag discriminant
 
         let lt_tag_idx = lt_meta.tag_index;
         let eq_tag_idx = eq_meta.tag_index;
@@ -1233,12 +1233,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
             self.builder.pack(pack_fields)
         } else {
-            let alloc_size = 1 + max_fields;
+            let alloc_size = (1 + max_fields) * 8;
             let ptr = self.builder.alloc(alloc_size);
             let tag_val = self.builder.const_u64(tag_index);
             self.builder.store(ptr, 0, tag_val);
             for (i, &arg) in args.iter().enumerate() {
-                self.builder.store(ptr, i + 1, arg);
+                self.builder.store(ptr, (i + 1) * 8, arg);
             }
             ptr
         }
@@ -1624,8 +1624,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .builder
             .binop(BinaryOp::Mul, hash, prime, ScalarType::U64);
 
-        // Hash the payload (slot 1) — treat as raw value.
-        let payload = self.builder.load(recv, 1, ScalarType::Ptr);
+        // Hash the payload (slot 1, byte offset 8) — treat as raw value.
+        let payload = self.builder.load(recv, 8, ScalarType::Ptr);
         let payload_hash = self
             .builder
             .call("__num_hash", vec![payload], ScalarType::U64);
@@ -1677,16 +1677,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// Helper: emit a string literal as a List(U8) header.
     fn lower_str_literal(&mut self, bytes: &[u8]) -> Value {
         let len = bytes.len();
-        let data = self.builder.alloc(len);
+        let data = self.builder.alloc(len * 8);
         for (i, &b) in bytes.iter().enumerate() {
             let val = self.builder.const_u8(b);
-            self.builder.store(data, i, val);
+            self.builder.store(data, i * 8, val);
         }
-        let header = self.builder.alloc(3);
+        let header = self.builder.alloc(24);
         let len_val = self.builder.const_u64(len as u64);
         self.builder.store(header, 0, len_val);
-        self.builder.store(header, 1, len_val);
-        self.builder.store(header, 2, data);
+        self.builder.store(header, 8, len_val);
+        self.builder.store(header, 16, data);
         header
     }
 
@@ -1840,7 +1840,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             let field_val = if scr_is_agg {
                                 self.builder.extract(scr_in_match, fi + 1, field_ty)
                             } else {
-                                self.builder.load(scr_in_match, fi + 1, field_ty)
+                                self.builder.load(scr_in_match, (fi + 1) * 8, field_ty)
                             };
                             self.bind_pattern_field(field_pat, field_val);
                         }
@@ -2202,7 +2202,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     let field_val = if scr_is_agg {
                         self.builder.extract(arm_scr, fi + 1, field_ty)
                     } else {
-                        self.builder.load(arm_scr, fi + 1, field_ty)
+                        self.builder.load(arm_scr, (fi + 1) * 8, field_ty)
                     };
                     self.bind_pattern_field(field_pat, field_val);
                 }
@@ -2335,7 +2335,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let result = if let Some(st) = resolved {
             let mut call_args = Vec::with_capacity(st.num_captures + 2);
             for i in 0..st.num_captures {
-                call_args.push(self.builder.load(body_step, i + 1, ScalarType::Ptr));
+                call_args.push(self.builder.load(body_step, (i + 1) * 8, ScalarType::Ptr));
             }
             call_args.push(body_acc);
             call_args.push(elem);
@@ -2359,7 +2359,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 ScalarType::Agg(_) => ScalarType::Ptr,
                 other => other,
             };
-            let payload = self.builder.load(result, 1, payload_load_ty);
+            let payload = self.builder.load(result, 8, payload_load_ty);
             let break_tag = self.decls.constructors["Break"].tag_index;
             let break_val = self.builder.const_u64(break_tag);
             let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
@@ -2383,7 +2383,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         direct: Option<&SingletonTarget>,
     ) -> Value {
         let len_val = self.builder.load(list_val, 0, ScalarType::U64);
-        let data_ptr = self.builder.load(list_val, 2, ScalarType::Ptr);
+        let data_ptr = self.builder.load(list_val, 16, ScalarType::Ptr);
         let step_ty = step_val.ty;
 
         let header = self.builder.create_block();
@@ -2418,7 +2418,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let result = if let Some(st) = resolved {
             let mut call_args = Vec::with_capacity(st.num_captures + 2);
             for i in 0..st.num_captures {
-                call_args.push(self.builder.load(body_step, i + 1, ScalarType::Ptr));
+                call_args.push(self.builder.load(body_step, (i + 1) * 8, ScalarType::Ptr));
             }
             call_args.push(body_acc);
             call_args.push(elem);
@@ -2440,7 +2440,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 ScalarType::Agg(_) => ScalarType::Ptr,
                 other => other,
             };
-            let payload = self.builder.load(result, 1, payload_load_ty);
+            let payload = self.builder.load(result, 8, payload_load_ty);
             let break_tag = self.decls.constructors["Break"].tag_index;
             let break_val = self.builder.const_u64(break_tag);
             let is_break = self
@@ -2482,7 +2482,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     let field_val = if val_is_agg {
                         self.builder.extract(val, i, ty)
                     } else {
-                        self.builder.load(val, i, ty)
+                        self.builder.load(val, i * 8, ty)
                     };
                     self.lower_destructure_elem(elem, field_val);
                 }
@@ -2530,7 +2530,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     let field_val = if val_is_agg {
                         self.builder.extract(val, slot, ty)
                     } else {
-                        self.builder.load(val, slot, ty)
+                        self.builder.load(val, slot * 8, ty)
                     };
                     self.lower_destructure_elem(elem, field_val);
                 }
@@ -2807,18 +2807,21 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>) -> Value {
     let val = args[1];
 
     let len = builder.load(list, 0, ScalarType::U64);
-    let data = builder.load(list, 2, ScalarType::Ptr);
+    let data = builder.load(list, 16, ScalarType::Ptr);
     let one = builder.const_u64(1);
     let new_len = builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
 
-    let new_data = builder.alloc_dyn(new_len);
+    // AllocDyn needs total byte count; elements default to 8 bytes each.
+    let elem_size = builder.const_u64(8);
+    let new_byte_len = builder.binop(BinaryOp::Mul, new_len, elem_size, ScalarType::U64);
+    let new_data = builder.alloc_dyn(new_byte_len);
     builder.call("__list_copy_into", vec![data, new_data, len], ScalarType::I64);
     builder.store_dyn(new_data, len, val);
 
-    let new_list = builder.alloc(3);
+    let new_list = builder.alloc(24);
     builder.store(new_list, 0, new_len);
-    builder.store(new_list, 1, new_len);
-    builder.store(new_list, 2, new_data);
+    builder.store(new_list, 8, new_len);
+    builder.store(new_list, 16, new_data);
     new_list
 }
 
@@ -2842,19 +2845,19 @@ fn emit_list_get_checked(builder: &mut Builder, args: Vec<Value>) -> Value {
     // Ok path: get element, wrap in Ok(elem) = [tag=0, elem]
     builder.switch_to(ok_block);
     let elem = builder.call("__list_get", vec![list, idx], ScalarType::Ptr);
-    let ok_result = builder.alloc(2);
+    let ok_result = builder.alloc(16);
     let ok_tag = builder.const_u64(0);
     builder.store(ok_result, 0, ok_tag);
-    builder.store(ok_result, 1, elem);
+    builder.store(ok_result, 8, elem);
     builder.jump(merge, vec![ok_result]);
 
     // Err path: Err(OutOfBounds) = [tag=1, OutOfBounds=tag0]
     builder.switch_to(err_block);
-    let err_result = builder.alloc(2);
+    let err_result = builder.alloc(16);
     let err_tag = builder.const_u64(1);
     builder.store(err_result, 0, err_tag);
     let oob_tag = builder.const_u8(0);
-    builder.store(err_result, 1, oob_tag);
+    builder.store(err_result, 8, oob_tag);
     builder.jump(merge, vec![err_result]);
 
     builder.switch_to(merge);
