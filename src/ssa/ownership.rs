@@ -7,6 +7,10 @@
 //! For each Ptr-typed SSA value, determines whether it's Unique
 //! (can be dropped/reused at last use) or Borrowed (reference into
 //! a living object, do not free).
+//!
+//! Relies on the explicit-block-params invariant: every cross-block
+//! value flow goes through block params. This means a value's scope
+//! is its defining block — no liveness analysis needed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -107,8 +111,6 @@ pub fn analyze_module(module: &Module) -> (HashMap<String, Analysis>, RcLayout) 
     for (name, func) in &module.functions {
         let result = analyze(func);
 
-        // For each rc_inc site, find the alloc kind of the stored
-        // value — that type needs an RC field.
         for site in &result.rc_inc_sites {
             if let Some(&kind) = result.alloc_kinds.get(&site.value) {
                 needs_rc.insert(kind);
@@ -116,8 +118,6 @@ pub fn analyze_module(module: &Module) -> (HashMap<String, Analysis>, RcLayout) 
                 // Value's alloc kind is unknown (e.g. function param
                 // whose origin we can't trace within this function).
                 // Conservatively mark all dynamic allocs as needing RC.
-                // TODO: cross-function alloc kind propagation via
-                // ownership signatures.
                 needs_rc.insert(AllocKind::Dynamic);
             }
         }
@@ -133,9 +133,8 @@ pub fn analyze_module(module: &Module) -> (HashMap<String, Analysis>, RcLayout) 
 pub fn analyze(func: &Function) -> Analysis {
     let ownership = classify_ownership(func);
     let alloc_kinds = compute_alloc_kinds(func);
-    let live_out = compute_live_out(func);
-    let reuse_pairs = find_reuse_pairs(func, &ownership, &alloc_kinds, &live_out);
-    let rc_inc_sites = find_rc_inc_sites(func, &ownership, &live_out);
+    let reuse_pairs = find_reuse_pairs(func, &ownership, &alloc_kinds);
+    let rc_inc_sites = find_rc_inc_sites(func, &ownership);
     Analysis {
         ownership,
         alloc_kinds,
@@ -273,74 +272,51 @@ fn compute_alloc_kinds(func: &Function) -> HashMap<Value, AllocKind> {
 }
 
 // ── Phase 3: Find reuse pairs ──────────────────────────────────
+//
+// With explicit block params, a value dies in its defining block
+// if it's not passed to any successor via terminator args.
+// No liveness analysis needed.
 
 fn find_reuse_pairs(
     func: &Function,
     ownership: &HashMap<Value, Ownership>,
     alloc_kinds: &HashMap<Value, AllocKind>,
-    live_out: &HashMap<BlockId, HashSet<Value>>,
 ) -> Vec<ReusePair> {
     let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
 
     let mut pairs = Vec::new();
 
     for (&bid, block) in &func.blocks {
-        // Collect all Ptr values visible in this block.
-        let mut alive: HashSet<Value> = HashSet::new();
-        // Values live-in (defined elsewhere, used here).
-        for inst in &block.insts {
-            for v in inst.operands() {
-                if is_ptr(v) && !block.params.contains(&v) {
-                    alive.insert(v);
-                }
-            }
-        }
-        for v in block.terminator.operands() {
-            if is_ptr(v) {
-                alive.insert(v);
-            }
-        }
+        // Collect Ptr values defined in this block (params + inst dests).
+        let mut local_ptrs: Vec<Value> = Vec::new();
         for &p in &block.params {
             if is_ptr(p) {
-                alive.insert(p);
+                local_ptrs.push(p);
             }
         }
         for inst in &block.insts {
             if let Some(d) = inst.dest() {
                 if is_ptr(d) {
-                    alive.insert(d);
+                    local_ptrs.push(d);
                 }
             }
         }
 
-        // Find Unique Ptr values that die in this block (last use is
-        // here, not live-out, not used in terminator args to successors).
-        let term_uses: HashSet<Value> = block
+        // A value dies here if it's not in the terminator args.
+        let term_args: HashSet<Value> = block
             .terminator
-            .operands()
-            .into_iter()
-            .filter(|v| is_ptr(*v))
+            .successors()
+            .iter()
+            .flat_map(|(_, args)| args.iter().copied())
             .collect();
-        let block_live_out = live_out.get(&bid).cloned().unwrap_or_default();
 
-        // For each alive Unique value, check if it dies here.
-        let mut dying_unique: Vec<(Value, usize)> = Vec::new(); // (value, last_use_index)
-        for &v in &alive {
+        // Find Unique values that die in this block.
+        let mut dying_unique: Vec<(Value, usize)> = Vec::new();
+        for &v in &local_ptrs {
             if ownership.get(&v).copied() != Some(Ownership::Unique) {
                 continue;
             }
-            if block_live_out.contains(&v) || term_uses.contains(&v) {
-                continue;
-            }
-            // Check it's not passed as a block arg on any successor edge.
-            let mut passed_to_succ = false;
-            for (_, args) in block.terminator.successors() {
-                if args.contains(&v) {
-                    passed_to_succ = true;
-                    break;
-                }
-            }
-            if passed_to_succ {
+            if term_args.contains(&v) {
                 continue;
             }
             // Find last instruction index that uses this value.
@@ -362,7 +338,6 @@ fn find_reuse_pairs(
                 continue;
             };
 
-            // Scan forward for a compatible alloc.
             for (idx, inst) in block.insts.iter().enumerate() {
                 if idx <= last_use_idx {
                     continue;
@@ -390,21 +365,27 @@ fn find_reuse_pairs(
 }
 
 // ── Phase 4: Find rc_inc sites ─────────────────────────────────
+//
+// A store of a Ptr into a heap object needs rc_inc unless it's an
+// ownership transfer: the stored value is Unique, this is its last
+// use, and it's not passed to any successor.
 
-/// Identify stores of Ptr values into heap objects that need
-/// runtime rc_inc. A store is an ownership transfer (no inc
-/// needed) only when the stored value is Unique, this is its last
-/// use, and it's not live-out.
 fn find_rc_inc_sites(
     func: &Function,
     ownership: &HashMap<Value, Ownership>,
-    live_out: &HashMap<BlockId, HashSet<Value>>,
 ) -> Vec<RcIncSite> {
     let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
 
     let mut sites = Vec::new();
 
     for (&bid, block) in &func.blocks {
+        let term_args: HashSet<Value> = block
+            .terminator
+            .successors()
+            .iter()
+            .flat_map(|(_, args)| args.iter().copied())
+            .collect();
+
         // Last instruction index where each Ptr value is used.
         let mut last_use: HashMap<Value, usize> = HashMap::new();
         for (idx, inst) in block.insts.iter().enumerate() {
@@ -414,13 +395,6 @@ fn find_rc_inc_sites(
                 }
             }
         }
-        let term_ptrs: HashSet<Value> = block
-            .terminator
-            .operands()
-            .into_iter()
-            .filter(|v| is_ptr(*v))
-            .collect();
-        let blk_live_out = live_out.get(&bid);
 
         for (idx, inst) in block.insts.iter().enumerate() {
             let stored_val = match inst {
@@ -429,14 +403,12 @@ fn find_rc_inc_sites(
                 _ => continue,
             };
 
-            // Check if this store is an ownership transfer:
-            // value is Unique, this is its last use, not live-out.
+            // Ownership transfer: Unique, last use, not passed to successor.
             if ownership.get(&stored_val).copied() == Some(Ownership::Unique) {
                 let is_last = last_use.get(&stored_val) == Some(&idx)
-                    && !term_ptrs.contains(&stored_val)
-                    && !blk_live_out.map_or(false, |s| s.contains(&stored_val));
+                    && !term_args.contains(&stored_val);
                 if is_last {
-                    continue; // ownership transfer, no rc_inc
+                    continue;
                 }
             }
 
@@ -448,85 +420,6 @@ fn find_rc_inc_sites(
     }
 
     sites
-}
-
-// ── Liveness ───────────────────────────────────────────────────
-
-/// Compute live-out sets: which Ptr values are live at the end of
-/// each block. A value is live-out if a successor uses it (either
-/// as a block arg or as a live-in reference to a dominating def).
-fn compute_live_out(func: &Function) -> HashMap<BlockId, HashSet<Value>> {
-    let is_ptr = |v: Value| func.value_types.get(&v) == Some(&ScalarType::Ptr);
-
-    // Defs and upward-exposed uses per block.
-    let mut defs: HashMap<BlockId, HashSet<Value>> = HashMap::new();
-    let mut ue_uses: HashMap<BlockId, HashSet<Value>> = HashMap::new();
-
-    for (&bid, block) in &func.blocks {
-        let d = defs.entry(bid).or_default();
-        let u = ue_uses.entry(bid).or_default();
-        for &p in &block.params {
-            if is_ptr(p) {
-                d.insert(p);
-            }
-        }
-        for inst in &block.insts {
-            for v in inst.operands() {
-                if is_ptr(v) && !d.contains(&v) {
-                    u.insert(v);
-                }
-            }
-            if let Some(dest) = inst.dest() {
-                if is_ptr(dest) {
-                    d.insert(dest);
-                }
-            }
-        }
-        for v in block.terminator.operands() {
-            if is_ptr(v) && !d.contains(&v) {
-                u.insert(v);
-            }
-        }
-    }
-
-    // Backward dataflow to fixpoint.
-    let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
-    let mut live_in: HashMap<BlockId, HashSet<Value>> =
-        block_ids.iter().map(|&b| (b, HashSet::new())).collect();
-    let mut live_out: HashMap<BlockId, HashSet<Value>> =
-        block_ids.iter().map(|&b| (b, HashSet::new())).collect();
-
-    loop {
-        let mut changed = false;
-        for &bid in block_ids.iter().rev() {
-            let mut new_out: HashSet<Value> = HashSet::new();
-            for (succ, _) in func.blocks[&bid].terminator.successors() {
-                new_out.extend(&live_in[&succ]);
-            }
-            if new_out != live_out[&bid] {
-                live_out.insert(bid, new_out);
-                changed = true;
-            }
-            let empty = HashSet::new();
-            let block_ue = ue_uses.get(&bid).unwrap_or(&empty);
-            let block_defs = defs.get(&bid).unwrap_or(&empty);
-            let mut new_in: HashSet<Value> = block_ue.clone();
-            for &v in &live_out[&bid] {
-                if !block_defs.contains(&v) {
-                    new_in.insert(v);
-                }
-            }
-            if new_in != live_in[&bid] {
-                live_in.insert(bid, new_in);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    live_out
 }
 
 // ── Display ────────────────────────────────────────────────────
@@ -595,9 +488,17 @@ mod tests {
         let b2 = b.create_block(); // loop body
         let b3 = b.create_block(); // exit
 
-        // b1 params: (i: u64, acc: ptr)
+        // b1 params: (i, acc, len, data)
         let i = b.add_block_param(b1, ScalarType::U64);
         let acc = b.add_block_param(b1, ScalarType::Ptr);
+        let h_len = b.add_block_param(b1, ScalarType::U64);
+        let h_data = b.add_block_param(b1, ScalarType::Ptr);
+
+        // b2 params: (i2, acc2, len2, data2) — explicit threading
+        let i2 = b.add_block_param(b2, ScalarType::U64);
+        let acc2 = b.add_block_param(b2, ScalarType::Ptr);
+        let len2 = b.add_block_param(b2, ScalarType::U64);
+        let data2 = b.add_block_param(b2, ScalarType::Ptr);
 
         // b3 params: (result: ptr)
         let result = b.add_block_param(b3, ScalarType::Ptr);
@@ -612,22 +513,21 @@ mod tests {
         b.store(empty, 0, zero);
         b.store(empty, 1, zero);
         b.store(empty, 2, empty_data);
-        b.jump(b1, vec![zero, empty]);
+        b.jump(b1, vec![zero, empty, len, data]);
 
         // ── b1: loop header ──
         b.switch_to(b1);
-        let done = b.binop(BinaryOp::Eq, i, len, ScalarType::U8);
-        b.branch(done, b3, vec![acc], b2, vec![]);
+        let done = b.binop(BinaryOp::Eq, i, h_len, ScalarType::U8);
+        b.branch(done, b3, vec![acc], b2, vec![i, acc, h_len, h_data]);
 
         // ── b2: loop body ──
         b.switch_to(b2);
-        let elem = b.load_dyn(data, i, ScalarType::I32);
+        let elem = b.load_dyn(data2, i2, ScalarType::I32);
         let one_i32 = b.const_i32(1);
         let mapped = b.binop(BinaryOp::Add, elem, one_i32, ScalarType::I32);
 
-        // Append: load old fields, alloc new buffer, copy, store.
-        let old_len = b.load(acc, 0, ScalarType::U64);
-        let old_data = b.load(acc, 2, ScalarType::Ptr);
+        let old_len = b.load(acc2, 0, ScalarType::U64);
+        let old_data = b.load(acc2, 2, ScalarType::Ptr);
         let one_u64 = b.const_u64(1);
         let new_len = b.binop(BinaryOp::Add, old_len, one_u64, ScalarType::U64);
         let new_data = b.alloc_dyn(new_len);
@@ -638,8 +538,8 @@ mod tests {
         b.store(new_acc, 0, new_len);
         b.store(new_acc, 1, new_len);
         b.store(new_acc, 2, new_data);
-        let next_i = b.binop(BinaryOp::Add, i, one_u64, ScalarType::U64);
-        b.jump(b1, vec![next_i, new_acc]);
+        let next_i = b.binop(BinaryOp::Add, i2, one_u64, ScalarType::U64);
+        b.jump(b1, vec![next_i, new_acc, len2, data2]);
 
         // ── b3: exit ──
         b.switch_to(b3);
@@ -663,24 +563,26 @@ mod tests {
         assert_eq!(result.ownership[&input], Ownership::Borrowed);
 
         // data (loaded from input) is Borrowed.
-        // Find the Load from input at offset 2.
         let data = find_load(func, input, 2).expect("data = load input[2]");
         assert_eq!(result.ownership[&data], Ownership::Borrowed);
 
-        // acc (block param of b1) should be Unique — both incoming
-        // values (empty from b0, new_acc from b2) are fresh allocs.
+        // acc (block param of b1) should be Unique.
         let acc = func.blocks[&BlockId(1)].params[1];
         assert_eq!(result.ownership[&acc], Ownership::Unique);
-
-        // acc's alloc kind should be Static(3), inherited through phi.
         assert_eq!(result.alloc_kinds[&acc], AllocKind::Static(3));
 
-        // There should be a reuse pair: drop acc → reuse new_acc.
+        // acc2 (block param of b2, threaded from b1) should also be
+        // Unique with the same alloc kind — this is where reuse happens.
+        let acc2 = func.blocks[&BlockId(2)].params[1];
+        assert_eq!(result.ownership[&acc2], Ownership::Unique);
+        assert_eq!(result.alloc_kinds[&acc2], AllocKind::Static(3));
+
+        // Reuse pair: drop acc2 → reuse new_acc in b2.
         let header_pair = result
             .reuse_pairs
             .iter()
-            .find(|p| p.drop_val == acc)
-            .expect("should find reuse pair for acc → new_acc");
+            .find(|p| p.drop_val == acc2)
+            .expect("should find reuse pair for acc2 → new_acc");
         assert_eq!(header_pair.kind, AllocKind::Static(3));
         assert_eq!(header_pair.block, BlockId(2));
     }
@@ -705,6 +607,11 @@ mod tests {
 
         let i = b.add_block_param(b1, ScalarType::U64);
         let acc = b.add_block_param(b1, ScalarType::Ptr);
+
+        // b2 params: (i2, acc2) — n and val are func params, always accessible
+        let i2 = b.add_block_param(b2, ScalarType::U64);
+        let acc2 = b.add_block_param(b2, ScalarType::Ptr);
+
         let result = b.add_block_param(b3, ScalarType::Ptr);
 
         // ── b0: entry ──
@@ -720,12 +627,12 @@ mod tests {
         // ── b1: loop header ──
         b.switch_to(b1);
         let done = b.binop(BinaryOp::Eq, i, n, ScalarType::U8);
-        b.branch(done, b3, vec![acc], b2, vec![]);
+        b.branch(done, b3, vec![acc], b2, vec![i, acc]);
 
         // ── b2: loop body — append val to acc ──
         b.switch_to(b2);
-        let old_len = b.load(acc, 0, ScalarType::U64);
-        let old_data = b.load(acc, 2, ScalarType::Ptr);
+        let old_len = b.load(acc2, 0, ScalarType::U64);
+        let old_data = b.load(acc2, 2, ScalarType::Ptr);
         let one = b.const_u64(1);
         let new_len = b.binop(BinaryOp::Add, old_len, one, ScalarType::U64);
         let new_data = b.alloc_dyn(new_len);
@@ -736,7 +643,7 @@ mod tests {
         b.store(new_acc, 0, new_len);
         b.store(new_acc, 1, new_len);
         b.store(new_acc, 2, new_data);
-        let next_i = b.binop(BinaryOp::Add, i, one, ScalarType::U64);
+        let next_i = b.binop(BinaryOp::Add, i2, one, ScalarType::U64);
         b.jump(b1, vec![next_i, new_acc]);
 
         // ── b3: exit ──
@@ -756,19 +663,17 @@ mod tests {
         let result = analyze(func);
         eprintln!("{result}");
 
-        // val (func param) is Borrowed.
         let val = func.params[1];
         assert_eq!(result.ownership[&val], Ownership::Borrowed);
 
-        // acc should still be Unique with header reuse.
-        let acc = func.blocks[&BlockId(1)].params[1];
-        assert_eq!(result.ownership[&acc], Ownership::Unique);
+        // acc2 in the body block is where reuse happens.
+        let acc2 = func.blocks[&BlockId(2)].params[1];
+        assert_eq!(result.ownership[&acc2], Ownership::Unique);
         assert!(
-            result.reuse_pairs.iter().any(|p| p.drop_val == acc),
+            result.reuse_pairs.iter().any(|p| p.drop_val == acc2),
             "header reuse should still work"
         );
 
-        // The store of val into the data buffer needs rc_inc.
         assert!(
             result.rc_inc_sites.iter().any(|s| s.value == val),
             "storing val into list should require rc_inc"
@@ -777,8 +682,6 @@ mod tests {
 
     #[test]
     fn map_loop_no_rc_inc() {
-        // The map loop stores only I32 elements (not Ptr), so
-        // there should be zero rc_inc sites.
         let module = build_map_loop();
         let func = &module.functions["map_inc"];
         let result = analyze(func);
@@ -792,14 +695,11 @@ mod tests {
 
     #[test]
     fn module_level_rc_layout() {
-        // map_inc: no rc_inc sites → no types need RC.
         let map_module = build_map_loop();
         let (_, layout) = analyze_module(&map_module);
         eprintln!("map_inc: {layout}");
         assert!(layout.needs_rc.is_empty());
 
-        // repeat: rc_inc on val (a func param with unknown alloc
-        // kind) → conservatively marks Dynamic as needing RC.
         let repeat_module = build_list_repeat();
         let (_, layout) = analyze_module(&repeat_module);
         eprintln!("repeat: {layout}");
