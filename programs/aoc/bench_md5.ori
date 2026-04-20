@@ -1,0 +1,12 @@
+import md5
+
+bench : U64 -> U8
+bench = |n| (
+    List.range(0, n).walk(0, |acc, i| (
+        hsh = md5_hash("abcdef".to_utf8().concat(i.to_str().to_utf8()))
+        acc + hsh.get(0).unwrap()
+    ))
+)
+
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| Ok(U64.from_u8(bench(5000)).to_str())

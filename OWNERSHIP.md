@@ -31,6 +31,7 @@ Store(ptr, 1, field_1)
 ```
 
 Ownership, reuse, and RC decisions are made per-Store:
+
 - Storing a scalar (U64, I32, etc.) → no memory management concern.
 - Storing a Ptr that is Unique and at its last use → ownership
   transfer. No RC needed.
@@ -115,10 +116,10 @@ store count is data-dependent). Groups by alloc kind — if any value
 with `AllocKind::Static(3)` ever gets rc_inc'd, all 3-word
 allocations get an RC prefix. Same for `AllocKind::Dynamic`.
 
-| Alloc kind | Without RC | With RC |
-|---|---|---|
-| `Alloc(n)` | `{field_0, ..., field_n}` | `{rc, field_0, ..., field_n}` |
-| `AllocDyn(n)` | `{slot_0, ..., slot_n}` | `{rc, slot_0, ..., slot_n}` |
+| Alloc kind    | Without RC                | With RC                       |
+| ------------- | ------------------------- | ----------------------------- |
+| `Alloc(n)`    | `{field_0, ..., field_n}` | `{rc, field_0, ..., field_n}` |
+| `AllocDyn(n)` | `{slot_0, ..., slot_n}`   | `{rc, slot_0, ..., slot_n}`   |
 
 The RC field goes on the **aliased object**, not the container. In
 `List.repeat(n, some_str)`, `some_str` is the value that gains
@@ -409,12 +410,12 @@ The analysis flags rc_inc at any `Store`/`StoreDyn` of a Ptr where
 the stored value is not an ownership transfer (Unique at last use).
 In practice, the cases that survive are:
 
-| Pattern | Static or runtime? | Why |
-|---------|-------------------|-----|
-| `Store(ptr, fixed_offset, unique_val)` at last use | Static (transfer) | One owner, known at compile time |
-| `Store(ptr, fixed_offset, borrowed_val)` | Static (rc_inc, counted) | Fixed offset, count visible in SSA |
-| `Store(ptr, fixed_offset, val)` used again later | Static (rc_inc, counted) | Fixed offset, count visible in SSA |
-| `StoreDyn(ptr, loop_idx, ptr_val)` in loop body | **Runtime RC** | Store count depends on runtime data |
+| Pattern                                            | Static or runtime?       | Why                                 |
+| -------------------------------------------------- | ------------------------ | ----------------------------------- |
+| `Store(ptr, fixed_offset, unique_val)` at last use | Static (transfer)        | One owner, known at compile time    |
+| `Store(ptr, fixed_offset, borrowed_val)`           | Static (rc_inc, counted) | Fixed offset, count visible in SSA  |
+| `Store(ptr, fixed_offset, val)` used again later   | Static (rc_inc, counted) | Fixed offset, count visible in SSA  |
+| `StoreDyn(ptr, loop_idx, ptr_val)` in loop body    | **Runtime RC**           | Store count depends on runtime data |
 
 Only the last row needs a runtime refcount field in the type's layout.
 Everything else is resolved statically.
