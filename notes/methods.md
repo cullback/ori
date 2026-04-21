@@ -1,6 +1,6 @@
 # Methods
 
-Methods are functions, constants, and derived implementations attached to a type via the `.( )` block. They define the type's interface and enable dot dispatch.
+Methods are functions, constants, and derived implementations attached to a type via the `.( )` block. The block defines the type's interface — everything callable through the type name. Dot dispatch is a convenience that falls out when the first parameter's type matches.
 
 ```ruby
 Path := [Unix(List(U8)), Windows(List(U8))].(
@@ -86,6 +86,8 @@ path.normalize()               # same as Path.normalize(path)
 my_color.to_hex()              # same as Color.to_hex(my_color)
 d.get("key")                   # same as Dict.get(d, "key")
 ```
+
+Dot syntax works when the value's type matches the first parameter's type. `path.normalize()` works because `normalize` takes a `Path` and `path` is a `Path`. `bytes.from_bytes()` would not — `from_bytes` takes `List(U8)`, so the compiler looks for `from_bytes` on `List`, not `Path`. Constructors like `from_bytes` use the static call form.
 
 Dot dispatch resolves at compile time based on the value's type — there are no vtables, no runtime lookup.
 

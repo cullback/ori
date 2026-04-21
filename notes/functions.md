@@ -112,6 +112,10 @@ No `map_err` or error type conversion needed — `?` propagates the error as-is,
 
 `|` is dual-duty but disambiguation is clean by position: expression-start → lambda params (`|x| x + 1`), infix between expressions → bitwise OR (`a | b`). Or-patterns use the `or` keyword instead, matching `and` for guards and keeping symbols (`&`, `|`, `^`) for bitwise operations and keywords (`and`, `or`) for logic and patterns.
 
+> Why `name = |args| body` instead of `name(args) = body` or `name args = body`?
+
+Functions are values — `add = |x, y| x + y` uses the same binding form as `pi = 3.14`. No separate "function definition" concept. This keeps `name = expr` as always a binding and `name(args)` as always a call — no lookahead needed to tell them apart. `name(args) = body` breaks this because the parser must see `=` before it knows `name(args)` isn't a call. `name args = body` (Haskell-style) assumes currying, which Ori doesn't have — without it, the syntax would be a special form that looks like application but isn't. It also conflicts with the no-space rule, where `foo (expr)` is explicitly not a call.
+
 > Why `.foo` shorthand instead of a placeholder like `_` or `it`?
 
 `.foo` reuses existing method syntax — it's visually identical to a method call with the receiver removed. No new keyword or sigil needed. The parser disambiguates by position: `.` after an expression is a method call, `.` at expression start is the shorthand. This keeps the grammar context-free and maintains grepability — `.foo(` still finds all method calls on `foo`, whether shorthand or not.
