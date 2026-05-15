@@ -2861,12 +2861,12 @@ fn emit_list_builtin_call(
         return emit_list_range(builder, args);
     } else if name.ends_with(".repeat") || name == "List.repeat" {
         return emit_list_repeat(builder, args, elem_ty);
+    } else if name.ends_with(".reverse") || name == "List.reverse" {
+        return emit_list_reverse(builder, args, elem_ty);
+    } else if name.ends_with(".sublist") || name == "List.sublist" {
+        return emit_list_sublist(builder, args, elem_ty);
     } else if name.ends_with(".set") || name == "List.set" {
         ("__list_set", ScalarType::Ptr)
-    } else if name.ends_with(".reverse") || name == "List.reverse" {
-        ("__list_reverse", ScalarType::Ptr)
-    } else if name.ends_with(".sublist") || name == "List.sublist" {
-        ("__list_sublist", ScalarType::Ptr)
     } else {
         panic!("unknown list builtin: {name}");
     };
@@ -2899,6 +2899,99 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
     let new_list = builder.alloc(24);
     builder.store(new_list, 0, new_len);
     builder.store(new_list, 8, new_len);
+    builder.store(new_list, 16, new_data);
+    new_list
+}
+
+/// Lower `xs.reverse()`: builds a new list with elements in reverse
+/// order. Loop loads from `i` and stores at `len - 1 - i`, with
+/// per-Ptr `RcInc` on each loaded element.
+fn emit_list_reverse(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
+    use crate::ssa::instruction::BinaryOp;
+    let list = args[0];
+
+    let len = builder.load(list, 0, ScalarType::U64);
+    let old_data = builder.load(list, 16, ScalarType::Ptr);
+    let eight = builder.const_u64(8);
+    let byte_len = builder.binop(BinaryOp::Mul, len, eight, ScalarType::U64);
+    let new_data = builder.alloc_dyn(byte_len);
+
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let exit = builder.create_block();
+    let header_i = builder.add_block_param(header, ScalarType::U64);
+    let body_i = builder.add_block_param(body, ScalarType::U64);
+
+    let zero = builder.const_u64(0);
+    builder.jump(header, vec![zero]);
+
+    builder.switch_to(header);
+    let cond = builder.binop(BinaryOp::Lt, header_i, len, ScalarType::U8);
+    builder.branch(cond, body, vec![header_i], exit, vec![]);
+
+    builder.switch_to(body);
+    let elem = builder.load_dyn(old_data, body_i, elem_ty);
+    if elem_ty == ScalarType::Ptr {
+        builder.rc_inc(elem);
+    }
+    // dst_idx = len - 1 - i
+    let one = builder.const_u64(1);
+    let len_minus_one = builder.binop(BinaryOp::Sub, len, one, ScalarType::U64);
+    let dst_idx = builder.binop(BinaryOp::Sub, len_minus_one, body_i, ScalarType::U64);
+    builder.store_dyn(new_data, dst_idx, elem);
+    let next_i = builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+    builder.jump(header, vec![next_i]);
+
+    builder.switch_to(exit);
+    let new_list = builder.alloc(24);
+    builder.store(new_list, 0, len);
+    builder.store(new_list, 8, len);
+    builder.store(new_list, 16, new_data);
+    new_list
+}
+
+/// Lower `xs.sublist(start, count)`: copies a contiguous range out of
+/// `xs`. Loop loads from `start + i` and stores at `i`, with per-Ptr
+/// `RcInc` on each loaded element.
+fn emit_list_sublist(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
+    use crate::ssa::instruction::BinaryOp;
+    let list = args[0];
+    let start = args[1];
+    let count = args[2];
+
+    let old_data = builder.load(list, 16, ScalarType::Ptr);
+    let eight = builder.const_u64(8);
+    let byte_len = builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
+    let new_data = builder.alloc_dyn(byte_len);
+
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let exit = builder.create_block();
+    let header_i = builder.add_block_param(header, ScalarType::U64);
+    let body_i = builder.add_block_param(body, ScalarType::U64);
+
+    let zero = builder.const_u64(0);
+    builder.jump(header, vec![zero]);
+
+    builder.switch_to(header);
+    let cond = builder.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
+    builder.branch(cond, body, vec![header_i], exit, vec![]);
+
+    builder.switch_to(body);
+    let src_idx = builder.binop(BinaryOp::Add, start, body_i, ScalarType::U64);
+    let elem = builder.load_dyn(old_data, src_idx, elem_ty);
+    if elem_ty == ScalarType::Ptr {
+        builder.rc_inc(elem);
+    }
+    builder.store_dyn(new_data, body_i, elem);
+    let one = builder.const_u64(1);
+    let next_i = builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+    builder.jump(header, vec![next_i]);
+
+    builder.switch_to(exit);
+    let new_list = builder.alloc(24);
+    builder.store(new_list, 0, count);
+    builder.store(new_list, 8, count);
     builder.store(new_list, 16, new_data);
     new_list
 }
