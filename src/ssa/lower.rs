@@ -2919,7 +2919,7 @@ fn emit_list_builtin_call(
     } else if name.ends_with(".sublist") || name == "List.sublist" {
         return emit_list_sublist(builder, args, elem_ty);
     } else if name.ends_with(".set") || name == "List.set" {
-        ("__list_set", ScalarType::Ptr)
+        return emit_list_set(builder, args, elem_ty);
     } else {
         panic!("unknown list builtin: {name}");
     };
@@ -2952,6 +2952,39 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
     let new_list = builder.alloc(24);
     builder.store(new_list, 0, new_len);
     builder.store(new_list, 8, new_len);
+    builder.store(new_list, 16, new_data);
+    new_list
+}
+
+/// Lower `xs.set(idx, val)`: builds a new list identical to `xs` but
+/// with slot `idx` replaced by `val`. The clone bumps refcounts on
+/// every Ptr child; we then `RcDec` the one at `idx` (it'll be
+/// overwritten) and `RcInc` the new value (ownership analysis decides
+/// — same rule as any other Store of a Ptr).
+fn emit_list_set(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
+    use crate::ssa::instruction::BinaryOp;
+    let list = args[0];
+    let idx = args[1];
+    let new_val = args[2];
+
+    let len = builder.load(list, 0, ScalarType::U64);
+    let old_data = builder.load(list, 16, ScalarType::Ptr);
+    let eight = builder.const_u64(8);
+    let byte_len = builder.binop(BinaryOp::Mul, len, eight, ScalarType::U64);
+    let new_data = builder.alloc_dyn(byte_len);
+    builder.copy_loop(new_data, old_data, len, elem_ty);
+
+    if elem_ty == ScalarType::Ptr {
+        // The clone bumped the rc of the old element at idx; we're
+        // about to overwrite it, so release that extra ref.
+        let old_at_idx = builder.load_dyn(new_data, idx, ScalarType::Ptr);
+        builder.rc_dec(old_at_idx);
+    }
+    builder.store_dyn(new_data, idx, new_val);
+
+    let new_list = builder.alloc(24);
+    builder.store(new_list, 0, len);
+    builder.store(new_list, 8, len);
     builder.store(new_list, 16, new_data);
     new_list
 }

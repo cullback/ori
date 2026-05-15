@@ -613,39 +613,6 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
 
 fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar> {
     match name {
-        "__list_set" => {
-            // args: [list_ptr, index_u64, new_val] → new_list_ptr
-            let Scalar::Ptr(list_idx) = args[0] else {
-                panic!("__list_set: expected Ptr");
-            };
-            let idx = scalar_to_usize(args[1]);
-            let len = heap.load(list_idx, 0, ScalarType::U64);
-            let cap = heap.load(list_idx, 8, ScalarType::U64);
-            let Scalar::Ptr(old_data) = heap.load(list_idx, 16, ScalarType::Ptr) else {
-                panic!("__list_set: data is not Ptr");
-            };
-            // Clone data buffer and list header
-            let new_data = heap.clone_object(old_data);
-            // The old element at this index was rc_inc'd by clone;
-            // we're replacing it, so dec the old and inc the new.
-            let old_elem = heap.load_dyn_auto(new_data, idx);
-            if let Scalar::Ptr(p) = old_elem { heap.rc_dec(p); }
-            let val = args[2];
-            if let Scalar::Ptr(p) = val { heap.rc_inc(p); }
-            let data_elem_ty = heap.lookup_type(old_data, 0).unwrap_or(ScalarType::I64);
-            let elem_ty = if data_elem_ty == ScalarType::U8 { ScalarType::U8 } else { ScalarType::I64 };
-            let val = if elem_ty == ScalarType::U8 && !matches!(val, Scalar::U8(_)) {
-                Scalar::U8(scalar_to_u64(val) as u8)
-            } else {
-                val
-            };
-            heap.store_dyn(new_data, idx, val, elem_ty);
-            let new_list = heap.alloc(24);
-            heap.store(new_list, 0, len);
-            heap.store(new_list, 8, cap);
-            heap.store(new_list, 16, Scalar::Ptr(new_data));
-            Some(Scalar::Ptr(new_list))
-        }
         "__num_to_str" => {
             // args: [number] → str_ptr (List(U8))
             let s = match args[0] {
