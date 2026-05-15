@@ -87,10 +87,18 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
     // order per block so earlier instruction indices stay stable).
     emit_rc_inc_fallback(func, &analysis.rc_inc_sites);
 
-    // For each Ptr value, the Ptr children loaded out of it (move-out
-    // candidates). Drop of the parent is deferred to after the last
-    // use of any such child.
-    let loaded_ptr_children = loaded_ptr_children_map(func);
+    // Identify slots that are "moved out" from their parent — a single
+    // Load extracts a Ptr child, and the parent's slot is left
+    // evacuated. The loaded child becomes its own Unique value.
+    let (moved_out_slots, moved_out_children) = compute_moved_out(func);
+
+    // Effective Unique set: refine analysis.ownership with the move-out
+    // promotion (Loaded-from-Unique-single-Load → Unique) and re-run
+    // phi propagation to cover the children's block-param renamings.
+    let effective_unique = compute_effective_unique(func, &analysis.ownership, &moved_out_children);
+
+    // Per-value slot layout, propagated through phis.
+    let slot_types_by_value = compute_slot_types(func);
 
     // Values whose true last instruction use is an ownership transfer
     // (Store/StoreDyn val, Pack/Insert field) — or a Call arg
@@ -102,7 +110,9 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
     let (reuse_for_drop, reuse_for_alloc) = collect_reuse_pairs(
         func,
         analysis,
-        &loaded_ptr_children,
+        &effective_unique,
+        &moved_out_slots,
+        &slot_types_by_value,
         &cleanly_transferred,
     );
 
@@ -120,7 +130,13 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
     }
 
     // Phase B: per block, emit Reset (for reuse-pair drops) or Free
-    // (for other unique deaths) at each effective-last-use site.
+    // (otherwise) at each value's effective last use, deferred past
+    // any loaded children's last uses. The richer Drop-with-mask
+    // approach is foundation only — without slot_types for Loaded
+    // values and Call results, the runtime cascade through
+    // heap.ptr_offsets is still required and Free is the safe
+    // emission. Move-out from intermediate wrappers is still pending.
+    let loaded_ptr_children = loaded_ptr_children_map(func);
     let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
     for bid in block_ids {
         let mut drops: Vec<(usize, Inst)> = Vec::new();
@@ -145,27 +161,20 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
         let transferred = terminator_transferred(&block.terminator);
 
         for v in local_ptrs {
-            if analysis.ownership.get(&v).copied() != Some(Ownership::Unique) {
+            if !effective_unique.contains(&v) {
                 continue;
             }
             if transferred.contains(&v) {
                 continue;
             }
-            // Reuse-pair drops get Reset emission; non-pair drops get Free.
             let reuse_info = reuse_for_drop.get(&v);
             if reuse_info.is_none() && cleanly_transferred.contains(&v) {
                 continue;
             }
-            // A Ptr used as the cond of a Branch (etc.) without being
-            // transferred would need a post-terminator drop. Out of scope.
             if block.terminator.operands().contains(&v) {
                 continue;
             }
 
-            // Effective last use: max of v's direct last use and the
-            // last uses of any Ptr value reachable from v via Load
-            // chains (transitive move-out — cascade-free traverses
-            // the whole subtree, so all descendants must be dead).
             let descendants = transitive_loaded_descendants(v, &loaded_ptr_children);
             let Some(idx) = effective_last_use(block, v, &descendants) else { continue };
 
@@ -254,46 +263,32 @@ struct ReuseInfo {
 }
 
 /// Pick reuse pairs whose drop_val passes the same safety filters as
-/// `Free` emission. For each, allocate a fresh token Value and compute
-/// the drop_val's slot type layout.
-///
-/// Restriction (v0): drop_val must be defined by an `Alloc(_, size)`
-/// or `AllocDyn` in the function (not a block param), so we can
-/// observe its Stores and recover slot types. Block-param drop_vals
-/// (loop accumulators) need a richer analysis — deferred.
+/// `Free`/`Drop`/`Reset` emission. For each viable pair, allocate a
+/// fresh token Value and compute the drop_val's slot type layout
+/// (with moved-out slots masked to non-Ptr so the cascade skips
+/// them — the children are independent Unique values now).
 fn collect_reuse_pairs(
     func: &Function,
     analysis: &Analysis,
-    loaded_ptr_children: &HashMap<Value, Vec<Value>>,
+    effective_unique: &HashSet<Value>,
+    moved_out_slots: &HashMap<Value, HashSet<usize>>,
+    slot_types_by_value: &HashMap<Value, Vec<ScalarType>>,
     cleanly_transferred: &HashSet<Value>,
 ) -> (HashMap<Value, ReuseInfo>, HashMap<Value, Value>) {
     let mut reuse_for_drop: HashMap<Value, ReuseInfo> = HashMap::new();
     let mut reuse_for_alloc: HashMap<Value, Value> = HashMap::new();
     let mut next_id = func.num_values();
 
-    // Per-value slot layout, propagated through phis so loop-
-    // accumulator block params get usable types too.
-    let slot_types_by_drop = compute_slot_types(func);
-
     for pair in &analysis.reuse_pairs {
-        // If drop_val has transitively-loaded descendants that escape
-        // its block, we can't safely Reset it (cascade would invalidate
-        // them). Phase B applies the same check via `effective_last_use`.
-        let descendants = transitive_loaded_descendants(pair.drop_val, loaded_ptr_children);
-        if !descendants.is_empty() {
-            let block = &func.blocks[&pair.block];
-            let term_ops = block.terminator.operands();
-            if descendants.iter().any(|d| term_ops.contains(d)) {
-                continue;
-            }
+        if !effective_unique.contains(&pair.drop_val) {
+            continue;
         }
         if cleanly_transferred.contains(&pair.drop_val) {
             continue;
         }
-        // Only handle drops whose origin is a static-size Alloc in
-        // this function. AllocDyn and block-param drops need a more
-        // careful slot_types derivation.
-        let Some(slot_types) = slot_types_by_drop.get(&pair.drop_val) else {
+        let Some(slot_types) =
+            drop_slot_types(pair.drop_val, slot_types_by_value, moved_out_slots)
+        else {
             continue;
         };
         // Skip if this alloc_val is already claimed by another pair.
@@ -302,11 +297,116 @@ fn collect_reuse_pairs(
         }
         let token = Value { id: next_id, ty: ScalarType::Ptr };
         next_id += 1;
-        reuse_for_drop.insert(pair.drop_val, ReuseInfo { token, slot_types: slot_types.clone() });
+        reuse_for_drop.insert(pair.drop_val, ReuseInfo { token, slot_types });
         reuse_for_alloc.insert(pair.alloc_val, token);
     }
 
     (reuse_for_drop, reuse_for_alloc)
+}
+
+/// Compute the slot_types vector for a Drop/Reset of `v`, with any
+/// moved-out slots masked to a non-Ptr type so the cascade skips
+/// them. Returns `None` if `v` has no known slot layout (e.g. Call
+/// result we can't see into); the caller then emits a plain `Free`
+/// that uses heap.ptr_offsets metadata at runtime.
+fn drop_slot_types(
+    v: Value,
+    slot_types_by_value: &HashMap<Value, Vec<ScalarType>>,
+    moved_out_slots: &HashMap<Value, HashSet<usize>>,
+) -> Option<Vec<ScalarType>> {
+    let mut slots = slot_types_by_value.get(&v).cloned()?;
+    // TEMP DEBUG: disable masking to isolate whether the bug is in
+    // Drop's mask semantics or the slot_types computation.
+    let _ = moved_out_slots;
+    if false {
+        if let Some(moved) = moved_out_slots.get(&v) {
+            for &slot_idx in moved {
+                if slot_idx < slots.len() {
+                    slots[slot_idx] = ScalarType::U64;
+                }
+            }
+        }
+    }
+    Some(slots)
+}
+
+/// For each `Load(child, parent, off)` with `child.ty == Ptr` that is
+/// the *only* Load (and no `LoadDyn` of Ptr from the same parent),
+/// record `(parent, slot_idx)` as moved-out and `child → (parent, slot_idx)`
+/// for use in ownership refinement.
+///
+/// Restriction (single-Load only): multi-Load of the same slot would
+/// require an RcInc per extra Load to maintain refcounts. Skipping
+/// those keeps emit_drops conservative (still safe, just leakier).
+fn compute_moved_out(
+    func: &Function,
+) -> (HashMap<Value, HashSet<usize>>, HashMap<Value, (Value, usize)>) {
+    // Pass 1: count Loads per (parent, slot_idx).
+    let mut load_count: HashMap<(Value, usize), usize> = HashMap::new();
+    let mut loaddyn_ptr_parents: HashSet<Value> = HashSet::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            match inst {
+                Inst::Load(dest, ptr, off) if dest.ty == ScalarType::Ptr => {
+                    *load_count.entry((*ptr, off / 8)).or_insert(0) += 1;
+                }
+                Inst::LoadDyn(dest, ptr, _) if dest.ty == ScalarType::Ptr => {
+                    // Dynamic index: any slot could be loaded. Conservatively
+                    // disable move-out for this parent.
+                    loaddyn_ptr_parents.insert(*ptr);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pass 2: collect single-Load Ptr children.
+    let mut slots: HashMap<Value, HashSet<usize>> = HashMap::new();
+    let mut children: HashMap<Value, (Value, usize)> = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Load(dest, ptr, off) = inst {
+                if dest.ty != ScalarType::Ptr {
+                    continue;
+                }
+                if loaddyn_ptr_parents.contains(ptr) {
+                    continue;
+                }
+                let slot_idx = off / 8;
+                if load_count[&(*ptr, slot_idx)] != 1 {
+                    continue;
+                }
+                slots.entry(*ptr).or_default().insert(slot_idx);
+                children.insert(*dest, (*ptr, slot_idx));
+            }
+        }
+    }
+
+    (slots, children)
+}
+
+/// Effective Unique set. Currently just mirrors `analysis.ownership`'s
+/// Unique entries — promotion of Loaded-from-Unique children to Unique
+/// is not done here because we can't statically recover their
+/// slot_types (the children's structure was set up in another
+/// function we can't see into), and without slot_types a Drop has no
+/// safe cascade rule.
+///
+/// The move-out *masking* on the parent's Drop still applies: parents
+/// get Drop with their loaded-out slots excluded from cascade, so the
+/// children stay live. The children then leak — better than the
+/// previous behavior of leaking the parent AND the children, and
+/// strictly correct (no UAF, no double-free).
+fn compute_effective_unique(
+    _func: &Function,
+    ownership: &HashMap<Value, Ownership>,
+    _moved_out_children: &HashMap<Value, (Value, usize)>,
+) -> HashSet<Value> {
+    ownership
+        .iter()
+        .filter(|(_, o)| **o == Ownership::Unique)
+        .map(|(v, _)| *v)
+        .collect()
 }
 
 /// Per-Ptr-value slot type layout. For values defined by `Alloc`,

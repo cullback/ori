@@ -583,6 +583,34 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             None
         }
 
+        Inst::Drop(ptr, slot_types) => {
+            // Statically-resolved drop with an explicit slot mask:
+            // cascade decrements only slots marked Ptr in slot_types.
+            // Slots marked non-Ptr are moved-out; their children are
+            // owned by independent local SSA values, so the cascade
+            // must skip them.
+            if let Scalar::Ptr(idx) = env[ptr.id] {
+                if idx != 0 && heap.objects[idx].rc != RC_STATIC && heap.objects[idx].rc != 0 {
+                    heap.objects[idx].rc -= 1;
+                    if heap.objects[idx].rc == 0 {
+                        heap.free_count += 1;
+                        for (i, ty) in slot_types.iter().enumerate() {
+                            if *ty == ScalarType::Ptr {
+                                let offset = i * 8;
+                                if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::Ptr) {
+                                    if child != 0 {
+                                        heap.rc_dec(child);
+                                    }
+                                }
+                            }
+                        }
+                        heap.free_list.push(idx);
+                    }
+                }
+            }
+            None
+        }
+
         Inst::StaticRef(_dest, static_id) => {
             // Statics are pre-allocated starting at heap index 1
             // (index 0 is null). static_id 0 → heap index 1, etc.

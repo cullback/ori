@@ -150,6 +150,12 @@ pub enum Inst {
     /// Emitted by `emit_drops` instead of `RcDec` when ownership
     /// analysis resolves the lifetime statically.
     Free(Value),
+    /// Statically-resolved drop with an explicit slot mask. Decrements
+    /// `ptr`'s refcount; if rc reaches zero, cascade-decrements only
+    /// the slots whose `ScalarType` in `slot_types` is `Ptr`. Slots
+    /// marked non-Ptr are "moved out" — their children are owned by
+    /// independent local SSA values, so the cascade must skip them.
+    Drop(Value, Vec<ScalarType>),
     /// dest = if refcount(ptr) == 1: dec Ptr-typed fields per
     /// `slot_types`, return ptr for reuse. Otherwise: normal dec,
     /// return null sentinel.
@@ -200,7 +206,7 @@ impl Inst {
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(*v),
-            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) => None,
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) | Self::Drop(..) => None,
         }
     }
 
@@ -223,7 +229,7 @@ impl Inst {
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(v),
-            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) => None,
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) | Self::Drop(..) => None,
         }
     }
 
@@ -239,6 +245,7 @@ impl Inst {
             Self::LoadDyn(_, ptr, idx) => vec![*ptr, *idx],
             Self::StoreDyn(ptr, idx, val) => vec![*ptr, *idx, *val],
             Self::RcInc(v) | Self::RcDec(v) | Self::Free(v) => vec![*v],
+            Self::Drop(v, _) => vec![*v],
             Self::Reset(_, ptr, _) => vec![*ptr],
             Self::Reuse(_, token, _) => vec![*token],
             Self::ReuseDyn(_, token, size) => vec![*token, *size],
@@ -262,6 +269,7 @@ impl Inst {
             Self::LoadDyn(_, ptr, idx) => { f(ptr); f(idx); }
             Self::StoreDyn(ptr, idx, val) => { f(ptr); f(idx); f(val); }
             Self::RcInc(v) | Self::RcDec(v) | Self::Free(v) => f(v),
+            Self::Drop(v, _) => f(v),
             Self::Reset(_, ptr, _) => f(ptr),
             Self::Reuse(_, token, _) => f(token),
             Self::ReuseDyn(_, token, size) => { f(token); f(size); }

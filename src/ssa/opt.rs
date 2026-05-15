@@ -623,6 +623,7 @@ fn is_side_effect(inst: &Inst) -> bool {
             | Inst::RcInc(..)
             | Inst::RcDec(..)
             | Inst::Free(..)
+            | Inst::Drop(..)
             | Inst::Reset(..)
             | Inst::Reuse(..)
             | Inst::ReuseDyn(..)
