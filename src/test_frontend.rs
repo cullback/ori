@@ -73,9 +73,22 @@ fn validate_after(module: &crate::ssa::Module, pass: &str) {
 
 /// Compile and run an Ori program via SSA with the given I64 input.
 fn run(source: &str, input: i64) -> Scalar {
+    run_with_heap(source, input).0
+}
+
+/// Like `run` but also returns the final `Heap`, so tests can inspect
+/// allocation stats (e.g. assert `peak_live` stays bounded for a
+/// program that should mutate in place).
+#[allow(dead_code)]
+fn run_with_heap(source: &str, input: i64) -> (Scalar, crate::ssa::eval::Heap) {
     let (ssa_module, input_vals) = compile(source);
     let mut heap = crate::ssa::eval::new_heap();
     crate::ssa::eval::load_statics(&ssa_module, &mut heap);
+    // Stats start after harness setup so they reflect program behavior.
+    heap.alloc_count = 0;
+    heap.fresh_alloc_count = 0;
+    heap.free_count = 0;
+    heap.peak_live = 0;
     let ssa_args: Vec<Scalar> = input_vals
         .iter()
         .enumerate()
@@ -93,7 +106,14 @@ fn run(source: &str, input: i64) -> Scalar {
             }
         })
         .collect();
-    crate::ssa::eval::eval(&ssa_module, &mut heap, &ssa_args)
+    // Reset again after arg setup, since args themselves shouldn't
+    // count against the program's stats.
+    heap.alloc_count = 0;
+    heap.fresh_alloc_count = 0;
+    heap.free_count = 0;
+    heap.peak_live = 0;
+    let result = crate::ssa::eval::eval(&ssa_module, &mut heap, &ssa_args);
+    (result, heap)
 }
 
 fn run_i64(source: &str, input: i64) -> i64 {
@@ -179,6 +199,40 @@ fn run_u64(source: &str, input: i64) -> u64 {
         Scalar::U64(n) => n,
         other => panic!("expected U64 result, got {other:?}"),
     }
+}
+
+// ============================================================
+// Heap statistics — sanity check that the counters fire.
+// ============================================================
+
+#[test]
+fn heap_stats_scalar_program_allocates_nothing() {
+    // Pure scalar arithmetic should produce zero allocations.
+    let source = "\
+main : I64 -> I64
+main = |arg| arg * 2 + 7";
+    let (_, heap) = run_with_heap(source, 5);
+    assert_eq!(heap.alloc_count, 0);
+    assert_eq!(heap.fresh_alloc_count, 0);
+    assert_eq!(heap.free_count, 0);
+    assert_eq!(heap.peak_live, 0);
+}
+
+#[test]
+fn heap_stats_baseline_for_list_construction() {
+    // A list literal allocates: data buffer + header. The list dies
+    // when last referenced; static-ownership should Free both.
+    let source = "\
+main : I64 -> U64
+main = |arg| [1, 2, 3].len()";
+    let (_, heap) = run_with_heap(source, 0);
+    // At minimum, the list literal produces 2 allocations (data + header).
+    assert!(heap.alloc_count >= 2, "alloc_count = {}", heap.alloc_count);
+    // Both should be freed by program exit.
+    assert_eq!(
+        heap.alloc_count, heap.free_count,
+        "leak: {} allocs, {} frees", heap.alloc_count, heap.free_count
+    );
 }
 
 // ============================================================

@@ -268,6 +268,12 @@ fn main() {
     }
 
     let result = ssa::eval::eval(&ssa_module, &mut heap, &ssa_args);
+    if std::env::var("ORI_HEAP_STATS").is_ok() {
+        eprintln!(
+            "heap stats: alloc={} fresh={} free={} peak_live={}",
+            heap.alloc_count, heap.fresh_alloc_count, heap.free_count, heap.peak_live,
+        );
+    }
 
     // Handle Result output — result is a Ptr to a tagged union
     let ssa::eval::Scalar::Ptr(result_idx) = result else {

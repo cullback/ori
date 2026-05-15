@@ -36,6 +36,29 @@ pub struct Heap {
     objects: Vec<HeapObject>,
     /// Free-list of indices with refcount 0, available for reuse.
     free_list: Vec<usize>,
+    /// Cumulative allocation count (fresh + freelist reuse). Statics
+    /// don't count.
+    pub alloc_count: u64,
+    /// Cumulative allocations that grew the underlying object table
+    /// (i.e. the freelist was empty). This is the "physical" measure
+    /// of memory use; if a loop's `alloc_count` grows with iteration
+    /// count but `fresh_alloc_count` stays small, the static-ownership
+    /// reuse is doing its job.
+    pub fresh_alloc_count: u64,
+    /// Cumulative free count (refcount drops to zero). Statics don't
+    /// count (sentinel refcount).
+    pub free_count: u64,
+    /// Maximum number of simultaneously-live non-static heap objects
+    /// observed during execution. Useful for asserting that in-place
+    /// mutation kept a program's memory usage bounded.
+    pub peak_live: u64,
+}
+
+impl Heap {
+    /// Number of non-static heap objects currently live.
+    pub fn live_count(&self) -> u64 {
+        self.alloc_count - self.free_count
+    }
 }
 
 /// Get the ScalarType for a Scalar value.
@@ -93,10 +116,19 @@ impl Heap {
         Self {
             objects: vec![HeapObject { rc: 0, data: vec![], ptr_offsets: vec![], type_map: vec![] }],
             free_list: Vec::new(),
+            alloc_count: 0,
+            fresh_alloc_count: 0,
+            free_count: 0,
+            peak_live: 0,
         }
     }
 
     pub fn alloc(&mut self, num_bytes: usize) -> usize {
+        self.alloc_count += 1;
+        let live = self.alloc_count - self.free_count;
+        if live > self.peak_live {
+            self.peak_live = live;
+        }
         if let Some(idx) = self.free_list.pop() {
             let obj = &mut self.objects[idx];
             obj.rc = 1;
@@ -106,6 +138,7 @@ impl Heap {
             obj.type_map.clear();
             idx
         } else {
+            self.fresh_alloc_count += 1;
             let idx = self.objects.len();
             self.objects.push(HeapObject {
                 rc: 1,
@@ -215,6 +248,7 @@ impl Heap {
         }
         self.objects[idx].rc -= 1;
         if self.objects[idx].rc == 0 {
+            self.free_count += 1;
             // Collect Ptr children before adding to free list.
             let children: Vec<usize> = self.objects[idx]
                 .ptr_offsets
@@ -236,6 +270,11 @@ impl Heap {
     /// Clone a heap object, returning the new index.
     /// Increments refcounts of any Ptr children in the cloned data.
     pub fn clone_object(&mut self, idx: usize) -> usize {
+        self.alloc_count += 1;
+        let live = self.alloc_count - self.free_count;
+        if live > self.peak_live {
+            self.peak_live = live;
+        }
         let data = self.objects[idx].data.clone();
         let ptr_offsets = self.objects[idx].ptr_offsets.clone();
         // The clone creates new references to all Ptr children.
@@ -255,6 +294,7 @@ impl Heap {
             obj.type_map = type_map;
             new_idx
         } else {
+            self.fresh_alloc_count += 1;
             let new_idx = self.objects.len();
             self.objects.push(HeapObject { rc: 1, data, ptr_offsets, type_map });
             new_idx
@@ -562,6 +602,9 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                         }
                     }
                     heap.objects[idx].rc = 0;
+                    // The object is conceptually freed; the matching
+                    // Reuse will re-allocate in-place via reuse_or_alloc.
+                    heap.free_count += 1;
                     Some(Scalar::Ptr(idx))
                 } else {
                     // Shared: normal dec, return null.
@@ -702,6 +745,15 @@ fn scalar_to_u64(s: Scalar) -> u64 {
 fn reuse_or_alloc(heap: &mut Heap, token: Scalar, num_bytes: usize) -> usize {
     if let Scalar::Ptr(idx) = token {
         if idx != 0 {
+            // In-place reuse: count as a logical alloc (so `alloc_count`
+            // reflects the program's allocation behavior) but NOT as a
+            // fresh one (so `fresh_alloc_count` reflects real memory
+            // growth).
+            heap.alloc_count += 1;
+            let live = heap.alloc_count - heap.free_count;
+            if live > heap.peak_live {
+                heap.peak_live = live;
+            }
             heap.objects[idx].rc = 1;
             heap.objects[idx].data.resize(num_bytes, 0);
             heap.objects[idx].ptr_offsets.clear();
