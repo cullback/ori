@@ -867,7 +867,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .map(|(_, v)| *v);
             if op_name == "to_bits" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
-                return self.builder.bitcast(arg, ScalarType::U64);
+                let dest_ty = bits_dest_ty(segments[0]);
+                return self.builder.bitcast(arg, dest_ty);
             }
             if op_name == "from_bits" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
@@ -990,7 +991,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
             if op_name == "to_bits" {
-                return self.builder.bitcast(recv_val, ScalarType::U64);
+                let dest_ty = bits_dest_ty_for_ty(&receiver.ty);
+                return self.builder.bitcast(recv_val, dest_ty);
             }
             if op_name == "from_bits" {
                 return self.builder.bitcast(recv_val, ScalarType::F64);
@@ -2907,6 +2909,30 @@ fn walk_apply_name(callee: &str, step_ty: &Type) -> String {
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation
 )]
+/// Destination type for `<T>.to_bits` by type name. Each signed
+/// integer maps to its same-width unsigned counterpart; F64 to U64.
+/// Panics for types that don't support `to_bits`.
+fn bits_dest_ty(type_name: &str) -> ScalarType {
+    match type_name {
+        "I8" => ScalarType::U8,
+        "I16" => ScalarType::U16,
+        "I32" => ScalarType::U32,
+        "I64" | "F64" => ScalarType::U64,
+        other => panic!("to_bits not supported on {other}"),
+    }
+}
+
+/// Destination type for `value.to_bits()` given the receiver's
+/// inferred type. Same mapping as `bits_dest_ty` but driven from a
+/// `Type` instead of a type-name string.
+fn bits_dest_ty_for_ty(ty: &Type) -> ScalarType {
+    let name = match ty {
+        Type::Con(name) | Type::App(name, _) => name.as_str(),
+        _ => panic!("to_bits receiver not a nominal numeric type"),
+    };
+    bits_dest_ty(name)
+}
+
 fn lower_int_const(builder: &mut Builder, n: i64, ty: &Type) -> Value {
     use crate::numeric::NumericType;
     if let Type::Con(name) = ty {

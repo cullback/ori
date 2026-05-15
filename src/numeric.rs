@@ -96,17 +96,20 @@ impl NumericType {
             "mod" | "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr" => self.is_integer(),
             "from_u8" => matches!(self, Self::U64 | Self::U32),
             "to_u8" => matches!(self, Self::U32 | Self::U64 | Self::I64),
-            // Widen-as-U64 / widen-as-I64. For unsigned types these
-            // are arithmetic widenings (zero-extend); for signed
-            // types they're bit reinterpretations (same bits, new
-            // type). Both implemented as a single Cast SSA op.
-            "to_u64" => matches!(
-                self,
-                Self::U8 | Self::U16 | Self::U32 | Self::I8 | Self::I16 | Self::I32 | Self::I64
-            ),
+            // Arithmetic widening to U64/I64. Only available where
+            // the conversion is total (no information loss, no
+            // wraparound). Signed → unsigned and other lossy paths
+            // go through `to_bits` + further widening instead.
+            "to_u64" => matches!(self, Self::U8 | Self::U16 | Self::U32),
             "to_i64" => matches!(self, Self::I8 | Self::I16 | Self::I32),
-            // F64 ↔ U64 bit reinterpretation (IEEE 754 access).
-            "to_bits" => matches!(self, Self::F64),
+            // Same-width bit reinterpretation. For signed integers,
+            // gives the corresponding unsigned type. For F64, gives
+            // U64 (IEEE 754 layout). To get U64 from a narrow signed
+            // type, compose: `.to_bits().to_u64()`.
+            "to_bits" => matches!(
+                self,
+                Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::F64
+            ),
             "from_bits" => matches!(self, Self::F64),
             _ => false,
         }

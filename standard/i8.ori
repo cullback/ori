@@ -9,7 +9,7 @@ I8 := {}.(
     equals : I8, I8 -> Bool
     compare : I8, I8 -> Order
     to_i64 : I8 -> I64
-    to_u64 : I8 -> U64
+    to_bits : I8 -> U8
 
     min : I8, I8 -> I8
     min = |a, b| if a <= b then a else b
@@ -21,5 +21,5 @@ I8 := {}.(
     to_str = |n| I64.to_str(n.to_i64())
 
     hash : I8 -> U64
-    hash = |n| U64.hash(n.to_u64())
+    hash = |n| U64.hash(n.to_bits().to_u64())
 )
