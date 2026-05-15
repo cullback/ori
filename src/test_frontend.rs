@@ -57,6 +57,8 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     validate_after(&ssa_module, "emit_drops");
     crate::ssa::rc::elide_static_rc(&mut ssa_module);
     validate_after(&ssa_module, "elide_static_rc");
+    crate::ssa::rc::fuse_inc_dec(&mut ssa_module);
+    validate_after(&ssa_module, "fuse_inc_dec");
     crate::ssa::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize (final)");
     (ssa_module, input_vals)

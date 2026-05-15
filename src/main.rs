@@ -104,6 +104,13 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     ssa::rc::elide_static_rc(module);
     check(module, "elide_static_rc");
 
+    // Cancel adjacent `RcInc(v) ... RcDec(v)` bracket pairs around
+    // borrowed uses — most are introduced by the rc_inc fallback for
+    // flagged store sites and then immediately dropped on the borrow's
+    // last use. Cheap to run; no-op when no such pairs exist.
+    ssa::rc::fuse_inc_dec(module);
+    check(module, "fuse_inc_dec");
+
     ssa::opt::optimize(module);
     check(module, "optimize (final)");
 }
