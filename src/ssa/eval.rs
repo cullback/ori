@@ -646,86 +646,6 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(new_list, 16, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
-        "__list_copy_into" => {
-            // args: [src_ptr, dst_ptr, count] → I64(0). Copies `count`
-            // 8-byte elements from src to dst, bumping rc on any `Ptr` children.
-            // Self-copy is a no-op (same heap index).
-            let Scalar::Ptr(src) = args[0] else {
-                panic!("__list_copy_into: expected Ptr for src");
-            };
-            let Scalar::Ptr(dst) = args[1] else {
-                panic!("__list_copy_into: expected Ptr for dst");
-            };
-            if src == dst {
-                return Some(Scalar::I64(0));
-            }
-            let n = scalar_to_usize(args[2]);
-            let byte_count = n * 8;
-            // Copy raw bytes
-            let src_bytes = heap.objects[src].data[..byte_count].to_vec();
-            heap.objects[dst].data[..byte_count].copy_from_slice(&src_bytes);
-            // Copy ptr_offsets from src that fall in the copied range, and rc_inc each
-            let src_ptr_offsets: Vec<usize> = heap.objects[src]
-                .ptr_offsets
-                .iter()
-                .copied()
-                .filter(|&off| off < byte_count)
-                .collect();
-            let src_type_entries: Vec<(usize, ScalarType)> = heap.objects[src]
-                .type_map
-                .iter()
-                .copied()
-                .filter(|(off, _)| *off < byte_count)
-                .collect();
-            for &off in &src_ptr_offsets {
-                if let Scalar::Ptr(p) = read_scalar(&heap.objects[dst].data, off, ScalarType::Ptr) {
-                    if p != 0 {
-                        heap.rc_inc(p);
-                    }
-                }
-                if !heap.objects[dst].ptr_offsets.contains(&off) {
-                    heap.objects[dst].ptr_offsets.push(off);
-                }
-            }
-            for (off, ty) in src_type_entries {
-                if let Some(entry) = heap.objects[dst].type_map.iter_mut().find(|(o, _)| *o == off) {
-                    entry.1 = ty;
-                } else {
-                    heap.objects[dst].type_map.push((off, ty));
-                }
-            }
-            Some(Scalar::I64(0))
-        }
-        "__list_append" => {
-            // args: [list_ptr, val] → new_list_ptr
-            let Scalar::Ptr(list_idx) = args[0] else {
-                panic!("__list_append: expected Ptr");
-            };
-            let Scalar::U64(len) = heap.load(list_idx, 0, ScalarType::U64) else {
-                panic!("__list_append: len is not U64");
-            };
-            let Scalar::Ptr(old_data) = heap.load(list_idx, 16, ScalarType::Ptr) else {
-                panic!("__list_append: data is not Ptr");
-            };
-            let new_len = len + 1;
-            let new_data = heap.clone_object(old_data);
-            if let Scalar::Ptr(p) = args[1] { heap.rc_inc(p); }
-            // Detect element stride from existing data buffer (U8 for strings, 8 otherwise).
-            let data_elem_ty = heap.lookup_type(old_data, 0).unwrap_or(ScalarType::I64);
-            let elem_ty = if data_elem_ty == ScalarType::U8 { ScalarType::U8 } else { ScalarType::I64 };
-            // Coerce value to match buffer element type if needed.
-            let val = if elem_ty == ScalarType::U8 && !matches!(args[1], Scalar::U8(_)) {
-                Scalar::U8(scalar_to_u64(args[1]) as u8)
-            } else {
-                args[1]
-            };
-            heap.store_dyn(new_data, len as usize, val, elem_ty);
-            let new_list = heap.alloc(24);
-            heap.store(new_list, 0, Scalar::U64(new_len));
-            heap.store(new_list, 8, Scalar::U64(new_len));
-            heap.store(new_list, 16, Scalar::Ptr(new_data));
-            Some(Scalar::Ptr(new_list))
-        }
         "__num_to_str" => {
             // args: [number] → str_ptr (List(U8))
             let s = match args[0] {
@@ -772,40 +692,6 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             // FNV-1a: hash one u64 value
             let hash = (14695981039346656037_u64 ^ bits).wrapping_mul(1099511628211);
             Some(Scalar::U64(hash))
-        }
-        "__str_concat" => {
-            // args: [str_a, str_b] → str_ptr (List(U8))
-            let Scalar::Ptr(a_idx) = args[0] else {
-                panic!("__str_concat: expected Ptr");
-            };
-            let Scalar::Ptr(b_idx) = args[1] else {
-                panic!("__str_concat: expected Ptr");
-            };
-            let Scalar::U64(a_len) = heap.load(a_idx, 0, ScalarType::U64) else {
-                panic!("__str_concat: expected U64 len");
-            };
-            let Scalar::U64(b_len) = heap.load(b_idx, 0, ScalarType::U64) else {
-                panic!("__str_concat: expected U64 len");
-            };
-            let Scalar::Ptr(a_data) = heap.load(a_idx, 16, ScalarType::Ptr) else {
-                panic!("__str_concat: expected Ptr data");
-            };
-            let Scalar::Ptr(b_data) = heap.load(b_idx, 16, ScalarType::Ptr) else {
-                panic!("__str_concat: expected Ptr data");
-            };
-            let total = a_len + b_len;
-            let data = heap.alloc(total as usize * 8);
-            for i in 0..a_len as usize {
-                heap.store(data, i * 8, heap.load(a_data, i * 8, ScalarType::U8));
-            }
-            for i in 0..b_len as usize {
-                heap.store(data, (a_len as usize + i) * 8, heap.load(b_data, i * 8, ScalarType::U8));
-            }
-            let list = heap.alloc(24);
-            heap.store(list, 0, Scalar::U64(total));
-            heap.store(list, 8, Scalar::U64(total));
-            heap.store(list, 16, Scalar::Ptr(data));
-            Some(Scalar::Ptr(list))
         }
         "__u64_from_u8" => {
             // args: [u8] → u64 (widening conversion)

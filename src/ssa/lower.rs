@@ -1759,9 +1759,62 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         header
     }
 
-    /// Helper: emit string concatenation via builtin.
+    /// Inline string concatenation. Strings are `List(U8)` headers,
+    /// so the shape is the same as list append: load len + data from
+    /// both sides, alloc a fresh buffer of `a_len + b_len`, byte-copy
+    /// each side in, build a new header.
     fn lower_str_concat(&mut self, a: Value, b: Value) -> Value {
-        self.builder.call("__str_concat", vec![a, b], ScalarType::Ptr)
+        let a_len = self.builder.load(a, 0, ScalarType::U64);
+        let a_data = self.builder.load(a, 16, ScalarType::Ptr);
+        let b_len = self.builder.load(b, 0, ScalarType::U64);
+        let b_data = self.builder.load(b, 16, ScalarType::Ptr);
+        let total = self
+            .builder
+            .binop(BinaryOp::Add, a_len, b_len, ScalarType::U64);
+        let eight = self.builder.const_u64(8);
+        let byte_total = self
+            .builder
+            .binop(BinaryOp::Mul, total, eight, ScalarType::U64);
+        let new_data = self.builder.alloc_dyn(byte_total);
+
+        // First copy: new_data[0..a_len] := a_data[0..a_len]
+        self.builder.copy_loop(new_data, a_data, a_len, ScalarType::U8);
+
+        // Second copy: new_data[a_len..a_len+b_len] := b_data[0..b_len]
+        // Manual loop because dst_idx = a_len + i.
+        let header = self.builder.create_block();
+        let body = self.builder.create_block();
+        let exit = self.builder.create_block();
+        let header_i = self.builder.add_block_param(header, ScalarType::U64);
+        let body_i = self.builder.add_block_param(body, ScalarType::U64);
+
+        let zero = self.builder.const_u64(0);
+        self.builder.jump(header, vec![zero]);
+
+        self.builder.switch_to(header);
+        let cond = self
+            .builder
+            .binop(BinaryOp::Lt, header_i, b_len, ScalarType::U8);
+        self.builder.branch(cond, body, vec![header_i], exit, vec![]);
+
+        self.builder.switch_to(body);
+        let elem = self.builder.load_dyn(b_data, body_i, ScalarType::U8);
+        let dst_idx = self
+            .builder
+            .binop(BinaryOp::Add, a_len, body_i, ScalarType::U64);
+        self.builder.store_dyn(new_data, dst_idx, elem);
+        let one = self.builder.const_u64(1);
+        let next_i = self
+            .builder
+            .binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+        self.builder.jump(header, vec![next_i]);
+
+        self.builder.switch_to(exit);
+        let new_list = self.builder.alloc(24);
+        self.builder.store(new_list, 0, total);
+        self.builder.store(new_list, 8, total);
+        self.builder.store(new_list, 16, new_data);
+        new_list
     }
 
     fn lower_cmp(&mut self, lhs: Value, rhs: Value, op: BinaryOp) -> Value {
