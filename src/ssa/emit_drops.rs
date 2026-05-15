@@ -271,9 +271,9 @@ fn collect_reuse_pairs(
     let mut reuse_for_alloc: HashMap<Value, Value> = HashMap::new();
     let mut next_id = func.num_values();
 
-    // For Alloc-defined values, scan all Stores to recover slot types
-    // (so Reset knows which slots are Ptr-typed for cascade-free).
-    let slot_types_by_drop = compute_slot_types_for_allocs(func);
+    // Per-value slot layout, propagated through phis so loop-
+    // accumulator block params get usable types too.
+    let slot_types_by_drop = compute_slot_types(func);
 
     for pair in &analysis.reuse_pairs {
         // If drop_val has transitively-loaded descendants that escape
@@ -309,14 +309,19 @@ fn collect_reuse_pairs(
     (reuse_for_drop, reuse_for_alloc)
 }
 
-/// For each `Alloc(dest, size)`, compute the per-slot ScalarType by
-/// scanning subsequent `Store(dest, offset, val)` instructions in the
-/// same block. Slot count is `size / 8` (uniform 8-byte stride that
-/// lower currently emits). Slots without an observed Store default to
-/// `Ptr` — conservative, so the cascade-free path still triggers if
-/// we got the layout wrong.
-fn compute_slot_types_for_allocs(func: &Function) -> HashMap<Value, Vec<ScalarType>> {
+/// Per-Ptr-value slot type layout. For values defined by `Alloc`,
+/// scan subsequent `Store`s. For block params, propagate the layout
+/// from incoming edge args via a fixpoint (same shape as
+/// `compute_alloc_kinds`). Slot count uses the lowering's uniform
+/// 8-byte stride.
+///
+/// This lets `emit_drops` emit `Reset` on loop-accumulator block
+/// params — without phi propagation those values have no known
+/// layout, and the reuse pair can't be honored.
+fn compute_slot_types(func: &Function) -> HashMap<Value, Vec<ScalarType>> {
     let mut map: HashMap<Value, Vec<ScalarType>> = HashMap::new();
+
+    // Phase 1: direct Alloc-defined values, refined by Stores.
     for block in func.blocks.values() {
         for inst in &block.insts {
             if let Inst::Alloc(dest, size) = inst {
@@ -335,6 +340,43 @@ fn compute_slot_types_for_allocs(func: &Function) -> HashMap<Value, Vec<ScalarTy
             }
         }
     }
+
+    // Phase 2: propagate through block params. If all incoming edge
+    // args have the same slot layout, the param inherits it. Conflict
+    // (different layouts) → no entry for that param.
+    let mut conflict: HashSet<Value> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for block in func.blocks.values() {
+            for edge in block.terminator.successors() {
+                let succ_params = &func.blocks[&edge.target].params;
+                for (param, arg) in succ_params.iter().zip(edge.args.iter()) {
+                    if conflict.contains(param) {
+                        continue;
+                    }
+                    let Some(arg_slots) = map.get(arg).cloned() else {
+                        continue;
+                    };
+                    match map.get(param) {
+                        None => {
+                            map.insert(*param, arg_slots);
+                            changed = true;
+                        }
+                        Some(existing) if existing != &arg_slots => {
+                            map.remove(param);
+                            conflict.insert(*param);
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     map
 }
 
