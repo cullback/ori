@@ -22,10 +22,15 @@
 //!
 //! **C. Drop emission.** Per block, for each Ptr value defined in the
 //! block that is Unique and not transferred to a successor/Return:
-//! - If it's in a viable reuse pair, emit `Reset(token, v, slot_types)`
-//!   right after its last use (defines the token consumed in Phase B).
-//! - Otherwise (and only if safe — no Ptr children loaded out, not
-//!   cleanly-transferred to a new owner), emit `Free(v)`.
+//! - Compute the *effective last use* = max of v's direct last use
+//!   and the last use of each Ptr child Loaded from v in this block.
+//!   This is move-out: deferring the drop until after Borrowed
+//!   children are dead so the cascade-free doesn't corrupt them. If
+//!   any child escapes the block (appears in the terminator), skip.
+//! - If v is in a viable reuse pair, emit `Reset(token, v, slot_types)`
+//!   at the effective last use (defines the token consumed in Phase B).
+//! - Otherwise (and not cleanly-transferred to another owner), emit
+//!   `Free(v)` at the effective last use.
 //!
 //! ## Input invariants
 //!
@@ -53,12 +58,13 @@
 //! Planned extensions:
 //! - Block-param drop_vals (loop accumulators) — currently skipped
 //!   because slot_types can't be recovered without dominator analysis.
-//! - Move-out semantics for Unique parents with loaded Ptr children
-//!   or passed to Calls that return Ptr children (`__list_get` style).
-//!   Until then, Call args are conservatively skipped (leaks instead
-//!   of use-after-free).
+//! - Move-out for Calls that return a Ptr aliasing a child of an arg
+//!   (`__list_get` style). Until then, Call args are conservatively
+//!   skipped (leaks instead of use-after-free).
 //! - Whole-program ownership signatures (borrowed vs consumed params)
 //!   to remove the conservative Call-args treatment.
+//! - Size-resilient reuse pairing (`AllocDyn` with growing capacity)
+//!   so list data buffers reuse in-place across `append`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -81,22 +87,22 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
     // order per block so earlier instruction indices stay stable).
     emit_rc_inc_fallback(func, &analysis.rc_inc_sites);
 
-    // Values from which a Ptr child is Loaded anywhere in the function.
-    // Cascade-freeing those would invalidate the borrowed child.
-    let parents_with_loaded_ptr_children = parents_with_loaded_ptr_children(func);
+    // For each Ptr value, the Ptr children loaded out of it (move-out
+    // candidates). Drop of the parent is deferred to after the last
+    // use of any such child.
+    let loaded_ptr_children = loaded_ptr_children_map(func);
 
     // Values whose true last instruction use is an ownership transfer
-    // (Store/StoreDyn val, Pack/Insert field). Those should not be
-    // Free'd locally — the new owner cascade-frees them via its own
-    // drop. Stores that *aren't* a value's last use are handled by
-    // the rc_inc fallback above (which emits RcInc before the store).
+    // (Store/StoreDyn val, Pack/Insert field) — or a Call arg
+    // (conservative for now). The new owner cascade-frees on its own
+    // drop. Non-last-use stores are handled by the rc_inc fallback.
     let cleanly_transferred = cleanly_transferred(func, &analysis.ownership);
 
     // Identify viable reuse pairs and reserve tokens.
     let (reuse_for_drop, reuse_for_alloc) = collect_reuse_pairs(
         func,
         analysis,
-        &parents_with_loaded_ptr_children,
+        &loaded_ptr_children,
         &cleanly_transferred,
     );
 
@@ -114,7 +120,7 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
     }
 
     // Phase B: per block, emit Reset (for reuse-pair drops) or Free
-    // (for other unique deaths) at each last-use site.
+    // (for other unique deaths) at each effective-last-use site.
     let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
     for bid in block_ids {
         let mut drops: Vec<(usize, Inst)> = Vec::new();
@@ -147,13 +153,8 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
             }
             // Reuse-pair drops get Reset emission; non-pair drops get Free.
             let reuse_info = reuse_for_drop.get(&v);
-            if reuse_info.is_none() {
-                if parents_with_loaded_ptr_children.contains(&v) {
-                    continue;
-                }
-                if cleanly_transferred.contains(&v) {
-                    continue;
-                }
+            if reuse_info.is_none() && cleanly_transferred.contains(&v) {
+                continue;
             }
             // A Ptr used as the cond of a Branch (etc.) without being
             // transferred would need a post-terminator drop. Out of scope.
@@ -161,15 +162,13 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
                 continue;
             }
 
-            // Last instruction index that uses v as an operand.
-            let last_idx = block
-                .insts
-                .iter()
-                .enumerate()
-                .filter(|(_, inst)| inst.operands().contains(&v))
-                .map(|(i, _)| i)
-                .last();
-            let Some(idx) = last_idx else { continue };
+            // Effective last use: max of v's direct last use and the
+            // last uses of any Ptr children Loaded from v in this
+            // block (move-out semantics — defer drop until children
+            // are dead so the cascade-free doesn't corrupt them).
+            let empty: Vec<Value> = Vec::new();
+            let children = loaded_ptr_children.get(&v).unwrap_or(&empty);
+            let Some(idx) = effective_last_use(block, v, children) else { continue };
 
             let inst = match reuse_info {
                 Some(info) => Inst::Reset(info.token, v, info.slot_types.clone()),
@@ -185,6 +184,47 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
             block_mut.insts.insert(idx + 1, inst);
         }
     }
+}
+
+/// Effective last use of `v` within `block`, factoring in move-out
+/// children. If any child crosses the block boundary (appears in the
+/// terminator's operands), returns `None` — the drop can't be
+/// deferred safely within this block.
+fn effective_last_use(
+    block: &super::Block,
+    v: Value,
+    loaded_children: &[Value],
+) -> Option<usize> {
+    let direct_last = block
+        .insts
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| inst.operands().contains(&v))
+        .map(|(i, _)| i)
+        .last()?;
+
+    // If any loaded child escapes this block, we can't defer locally.
+    let term_ops: Vec<Value> = block.terminator.operands();
+    for c in loaded_children {
+        if term_ops.contains(c) {
+            return None;
+        }
+    }
+
+    let mut effective = direct_last;
+    for &c in loaded_children {
+        if let Some(c_last) = block
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| inst.operands().contains(&c))
+            .map(|(i, _)| i)
+            .last()
+        {
+            effective = effective.max(c_last);
+        }
+    }
+    Some(effective)
 }
 
 struct ReuseInfo {
@@ -203,7 +243,7 @@ struct ReuseInfo {
 fn collect_reuse_pairs(
     func: &Function,
     analysis: &Analysis,
-    parents_with_loaded_ptr_children: &HashSet<Value>,
+    loaded_ptr_children: &HashMap<Value, Vec<Value>>,
     cleanly_transferred: &HashSet<Value>,
 ) -> (HashMap<Value, ReuseInfo>, HashMap<Value, Value>) {
     let mut reuse_for_drop: HashMap<Value, ReuseInfo> = HashMap::new();
@@ -215,8 +255,17 @@ fn collect_reuse_pairs(
     let slot_types_by_drop = compute_slot_types_for_allocs(func);
 
     for pair in &analysis.reuse_pairs {
-        if parents_with_loaded_ptr_children.contains(&pair.drop_val) {
-            continue;
+        // If drop_val has loaded Ptr children that escape its block,
+        // we can't safely Reset it (cascade would invalidate them).
+        // Defer to Phase B's `effective_last_use` check: if any child
+        // appears in the block's terminator, skip. Otherwise the
+        // drop site is deferred past the children's last uses.
+        if let Some(children) = loaded_ptr_children.get(&pair.drop_val) {
+            let block = &func.blocks[&pair.block];
+            let term_ops = block.terminator.operands();
+            if children.iter().any(|c| term_ops.contains(c)) {
+                continue;
+            }
         }
         if cleanly_transferred.contains(&pair.drop_val) {
             continue;
@@ -269,25 +318,25 @@ fn compute_slot_types_for_allocs(func: &Function) -> HashMap<Value, Vec<ScalarTy
     map
 }
 
-/// Find every Ptr value `p` such that some `Load(_, p, _)` (or
-/// `LoadDyn`) in the function produces a Ptr-typed result. Those
-/// children would be cascade-freed if `p` is `Free`'d while still in
-/// use elsewhere.
-fn parents_with_loaded_ptr_children(func: &Function) -> HashSet<Value> {
-    let mut parents = HashSet::new();
+/// Map each parent value to the set of Ptr children Loaded from it.
+/// Used for move-out semantics: when emitting a drop on a parent, we
+/// defer to after the last use of any such child, so the cascade-free
+/// path doesn't invalidate still-borrowed children.
+fn loaded_ptr_children_map(func: &Function) -> HashMap<Value, Vec<Value>> {
+    let mut map: HashMap<Value, Vec<Value>> = HashMap::new();
     for block in func.blocks.values() {
         for inst in &block.insts {
             match inst {
                 Inst::Load(dest, ptr, _) | Inst::LoadDyn(dest, ptr, _) => {
                     if dest.ty == ScalarType::Ptr {
-                        parents.insert(*ptr);
+                        map.entry(*ptr).or_default().push(*dest);
                     }
                 }
                 _ => {}
             }
         }
     }
-    parents
+    map
 }
 
 /// Insert `RcInc(value)` immediately before each flagged store. The
