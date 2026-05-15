@@ -774,46 +774,6 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             heap.store(new_list, 16, Scalar::Ptr(new_data));
             Some(Scalar::Ptr(new_list))
         }
-        "__list_repeat" => {
-            // args: [val, count] → list_ptr
-            let val = args[0];
-            let Scalar::U64(count) = args[1] else {
-                panic!("__list_repeat: expected U64 count");
-            };
-            #[expect(clippy::cast_possible_truncation)]
-            let n = count as usize;
-            let data = heap.alloc(n * 8);
-            for i in 0..n {
-                if let Scalar::Ptr(p) = val { heap.rc_inc(p); }
-                heap.store(data, i * 8, val);
-            }
-            let list = heap.alloc(24);
-            heap.store(list, 0, Scalar::U64(count));
-            heap.store(list, 8, Scalar::U64(count));
-            heap.store(list, 16, Scalar::Ptr(data));
-            Some(Scalar::Ptr(list))
-        }
-        "__list_range" => {
-            // args: [start, end] → list_ptr of U64s
-            let Scalar::U64(start) = args[0] else {
-                panic!("__list_range: expected U64 start");
-            };
-            let Scalar::U64(end) = args[1] else {
-                panic!("__list_range: expected U64 end");
-            };
-            let n = if end > start { end - start } else { 0 };
-            #[expect(clippy::cast_possible_truncation)]
-            let n_usize = n as usize;
-            let data = heap.alloc(n_usize * 8);
-            for i in 0..n_usize {
-                heap.store(data, i * 8, Scalar::U64(start + i as u64));
-            }
-            let list = heap.alloc(24);
-            heap.store(list, 0, Scalar::U64(n));
-            heap.store(list, 8, Scalar::U64(n));
-            heap.store(list, 16, Scalar::Ptr(data));
-            Some(Scalar::Ptr(list))
-        }
         "__num_to_str" => {
             // args: [number] → str_ptr (List(U8))
             let s = match args[0] {

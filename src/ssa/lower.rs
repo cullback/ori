@@ -205,17 +205,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.repr_type(&expr.ty)
     }
 
-    /// Element scalar type of a `List(T)` receiver. Falls back to
-    /// `I64` if `ty` isn't a `List` (which shouldn't happen for list
-    /// builtins). For strings — `List(U8)` — returns `U8`.
-    fn list_elem_scalar_type(&self, ty: &Type) -> ScalarType {
+    /// Element scalar type of a `List(T)`, or `None` if `ty` isn't a
+    /// list. Strings — `List(U8)` — give `U8`.
+    fn list_elem_scalar_type(&self, ty: &Type) -> Option<ScalarType> {
         let unwrapped = self.resolve_transparent(ty);
         match &unwrapped {
-            Type::App(name, args) if name == "List" => args
-                .first()
-                .map(|t| self.scalar_type(t))
-                .unwrap_or(ScalarType::I64),
-            _ => ScalarType::I64,
+            Type::App(name, args) if name == "List" => args.first().map(|t| self.scalar_type(t)),
+            _ => None,
         }
     }
 
@@ -1031,7 +1027,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             arg_vals.push(self.lower_expr(a));
         }
         if Self::is_list_builtin(&mangled) {
-            let elem_ty = self.list_elem_scalar_type(&receiver.ty);
+            // Receiver is `List(T)`; element type drives in-copy RC.
+            let elem_ty = self.list_elem_scalar_type(&receiver.ty)
+                .unwrap_or(ScalarType::I64);
             return emit_list_builtin_call(&mut self.builder, &mangled, arg_vals, elem_ty);
         }
         let ret_ty = self.func_ret_type(&mangled);
@@ -1085,9 +1083,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
         if Self::is_list_builtin(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-            // The first arg is the list; its element type drives the
-            // RC-in-copy decisions inside the inlined emission.
-            let elem_ty = self.list_elem_scalar_type(&args[0].ty);
+            // Static-form list builtins (`List.range`, `List.repeat`,
+            // etc.) return a list — their result type carries the
+            // element. Method-form ones (`xs.set(i, v)`) have a list
+            // as their first arg. Try result type first, fall back.
+            let elem_ty = self.list_elem_scalar_type(result_ty)
+                .or_else(|| self.list_elem_scalar_type(&args[0].ty))
+                .unwrap_or(ScalarType::I64);
             return emit_list_builtin_call(&mut self.builder, func, arg_vals, elem_ty);
         }
         if self.decls.constructors.contains_key(func) {
@@ -2855,16 +2857,16 @@ fn emit_list_builtin_call(
         return emit_list_get_checked(builder, args);
     } else if name.ends_with(".append") || name == "List.append" {
         return emit_list_append(builder, args, elem_ty);
+    } else if name.ends_with(".range") || name == "List.range" {
+        return emit_list_range(builder, args);
+    } else if name.ends_with(".repeat") || name == "List.repeat" {
+        return emit_list_repeat(builder, args, elem_ty);
     } else if name.ends_with(".set") || name == "List.set" {
         ("__list_set", ScalarType::Ptr)
     } else if name.ends_with(".reverse") || name == "List.reverse" {
         ("__list_reverse", ScalarType::Ptr)
     } else if name.ends_with(".sublist") || name == "List.sublist" {
         ("__list_sublist", ScalarType::Ptr)
-    } else if name.ends_with(".repeat") || name == "List.repeat" {
-        ("__list_repeat", ScalarType::Ptr)
-    } else if name.ends_with(".range") || name == "List.range" {
-        ("__list_range", ScalarType::Ptr)
     } else {
         panic!("unknown list builtin: {name}");
     };
@@ -2899,6 +2901,111 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
     builder.store(new_list, 8, new_len);
     builder.store(new_list, 16, new_data);
     new_list
+}
+
+/// Lower `List.repeat(val, count)`: builds a length-`count` list with
+/// every slot equal to `val`. For `Ptr` elements, emits an `RcInc`
+/// per iteration so the heap refcounts match the eventual cascade.
+fn emit_list_repeat(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
+    use crate::ssa::instruction::BinaryOp;
+    let val = args[0];
+    let count = args[1];
+
+    // Allocate the data buffer: count * 8 bytes (uniform stride).
+    let eight = builder.const_u64(8);
+    let byte_len = builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
+    let data = builder.alloc_dyn(byte_len);
+
+    // Fill loop.
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let exit = builder.create_block();
+    let header_i = builder.add_block_param(header, ScalarType::U64);
+    let body_i = builder.add_block_param(body, ScalarType::U64);
+
+    let zero = builder.const_u64(0);
+    builder.jump(header, vec![zero]);
+
+    builder.switch_to(header);
+    let cond = builder.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
+    builder.branch(cond, body, vec![header_i], exit, vec![]);
+
+    builder.switch_to(body);
+    if elem_ty == ScalarType::Ptr {
+        builder.rc_inc(val);
+    }
+    builder.store_dyn(data, body_i, val);
+    let one = builder.const_u64(1);
+    let next_i = builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+    builder.jump(header, vec![next_i]);
+
+    builder.switch_to(exit);
+    let list = builder.alloc(24);
+    builder.store(list, 0, count);
+    builder.store(list, 8, count);
+    builder.store(list, 16, data);
+    list
+}
+
+/// Lower `List.range(start, end)`: builds a U64 list containing
+/// `[start, start+1, ..., end-1]`. Empty when `start >= end`.
+///
+/// SSA shape: clamp count to zero on underflow via a branch, alloc
+/// the data buffer, fill it with a counter loop, alloc the header.
+fn emit_list_range(builder: &mut Builder, args: Vec<Value>) -> Value {
+    use crate::ssa::instruction::BinaryOp;
+    let start = args[0];
+    let end = args[1];
+
+    // count = (end > start) ? end - start : 0
+    let nonempty = builder.binop(BinaryOp::Gt, end, start, ScalarType::U8);
+    let then_block = builder.create_block();
+    let else_block = builder.create_block();
+    let count_merge = builder.create_block();
+    let count = builder.add_block_param(count_merge, ScalarType::U64);
+    builder.branch(nonempty, then_block, vec![], else_block, vec![]);
+
+    builder.switch_to(then_block);
+    let diff = builder.binop(BinaryOp::Sub, end, start, ScalarType::U64);
+    builder.jump(count_merge, vec![diff]);
+
+    builder.switch_to(else_block);
+    let zero = builder.const_u64(0);
+    builder.jump(count_merge, vec![zero]);
+
+    builder.switch_to(count_merge);
+    // data buffer: count * 8 bytes
+    let eight = builder.const_u64(8);
+    let byte_len = builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
+    let data = builder.alloc_dyn(byte_len);
+
+    // Fill loop: for i in 0..count: data[i] = start + i.
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let exit = builder.create_block();
+    let header_i = builder.add_block_param(header, ScalarType::U64);
+    let body_i = builder.add_block_param(body, ScalarType::U64);
+
+    let zero2 = builder.const_u64(0);
+    builder.jump(header, vec![zero2]);
+
+    builder.switch_to(header);
+    let cond = builder.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
+    builder.branch(cond, body, vec![header_i], exit, vec![]);
+
+    builder.switch_to(body);
+    let val = builder.binop(BinaryOp::Add, start, body_i, ScalarType::U64);
+    builder.store_dyn(data, body_i, val);
+    let one = builder.const_u64(1);
+    let next_i = builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+    builder.jump(header, vec![next_i]);
+
+    builder.switch_to(exit);
+    let list = builder.alloc(24);
+    builder.store(list, 0, count);
+    builder.store(list, 8, count);
+    builder.store(list, 16, data);
+    list
 }
 
 /// Emit a bounds-checked List.get that returns Result(a, [OutOfBounds]).
