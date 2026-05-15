@@ -116,7 +116,7 @@ pub enum BinaryOp {
 /// An SSA instruction.
 ///
 /// Instructions that produce a value have it as their first field.
-/// `Store`, `RcInc`, and `RcDec` are side-effecting and produce no value.
+/// `Store`, `RcInc`, `RcDec`, and `Free` are side-effecting and produce no value.
 #[derive(Debug, Clone)]
 pub enum Inst {
     /// dest = constant (type comes from dest.ty).
@@ -144,6 +144,12 @@ pub enum Inst {
     RcInc(Value),
     /// Decrement reference count of `ptr`, free if zero.
     RcDec(Value),
+    /// Statically-resolved free: caller has proven `ptr` is Unique and
+    /// at its last use, so the object can be freed without a refcount
+    /// check. Cascade-frees Ptr children (same as RcDec at rc=0).
+    /// Emitted by `emit_drops` instead of `RcDec` when ownership
+    /// analysis resolves the lifetime statically.
+    Free(Value),
     /// dest = if refcount(ptr) == 1: dec Ptr-typed fields per
     /// `slot_types`, return ptr for reuse. Otherwise: normal dec,
     /// return null sentinel.
@@ -184,7 +190,7 @@ impl Inst {
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(*v),
-            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) => None,
         }
     }
 
@@ -205,7 +211,7 @@ impl Inst {
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(v),
-            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) => None,
         }
     }
 
@@ -220,7 +226,7 @@ impl Inst {
             Self::Store(ptr, _, val) => vec![*ptr, *val],
             Self::LoadDyn(_, ptr, idx) => vec![*ptr, *idx],
             Self::StoreDyn(ptr, idx, val) => vec![*ptr, *idx, *val],
-            Self::RcInc(v) | Self::RcDec(v) => vec![*v],
+            Self::RcInc(v) | Self::RcDec(v) | Self::Free(v) => vec![*v],
             Self::Reset(_, ptr, _) => vec![*ptr],
             Self::Reuse(_, token, _) => vec![*token],
             Self::ReuseDyn(_, token, size) => vec![*token, *size],
@@ -242,7 +248,7 @@ impl Inst {
             Self::Store(ptr, _, val) => { f(ptr); f(val); }
             Self::LoadDyn(_, ptr, idx) => { f(ptr); f(idx); }
             Self::StoreDyn(ptr, idx, val) => { f(ptr); f(idx); f(val); }
-            Self::RcInc(v) | Self::RcDec(v) => f(v),
+            Self::RcInc(v) | Self::RcDec(v) | Self::Free(v) => f(v),
             Self::Reset(_, ptr, _) => f(ptr),
             Self::Reuse(_, token, _) => f(token),
             Self::ReuseDyn(_, token, size) => { f(token); f(size); }

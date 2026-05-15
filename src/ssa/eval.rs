@@ -529,6 +529,18 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             None
         }
 
+        Inst::Free(ptr) => {
+            // Statically-resolved free: emit_drops has proven this
+            // value is Unique and at its last use. The interpreter's
+            // rc_dec path already cascade-frees children when rc
+            // reaches 0; since static-ownership never inc'd this
+            // value past 1, rc_dec drops it the same way Free should.
+            if let Scalar::Ptr(idx) = env[ptr.id] {
+                heap.rc_dec(idx);
+            }
+            None
+        }
+
         Inst::StaticRef(_dest, static_id) => {
             // Statics are pre-allocated starting at heap index 1
             // (index 0 is null). static_id 0 → heap index 1, etc.

@@ -44,26 +44,29 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
-    validate_after(&ssa_module, "lower");
+    // ssa_construct repairs lower's implicit cross-block references.
+    // Validation only meaningful from here onward.
+    crate::ssa::ssa_construct::run(&mut ssa_module);
+    validate_after(&ssa_module, "ssa_construct");
     crate::ssa::static_promote::promote(&mut ssa_module);
     validate_after(&ssa_module, "static_promote");
     crate::ssa::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize");
-    crate::ssa::rc::insert_rc(&mut ssa_module);
-    validate_after(&ssa_module, "insert_rc");
+    let (analyses, _layout) = crate::ssa::ownership::analyze_module(&ssa_module);
+    crate::ssa::emit_drops::run(&mut ssa_module, &analyses);
+    validate_after(&ssa_module, "emit_drops");
     crate::ssa::rc::elide_static_rc(&mut ssa_module);
     validate_after(&ssa_module, "elide_static_rc");
-    crate::ssa::rc::insert_reuse(&mut ssa_module);
-    validate_after(&ssa_module, "insert_reuse");
-    crate::ssa::rc::fuse_inc_dec(&mut ssa_module);
-    validate_after(&ssa_module, "fuse_inc_dec");
     crate::ssa::opt::optimize(&mut ssa_module);
-    validate_after(&ssa_module, "optimize (post-rc)");
+    validate_after(&ssa_module, "optimize (final)");
     (ssa_module, input_vals)
 }
 
-fn validate_after(_module: &crate::ssa::Module, _pass: &str) {
-    // Temporarily disabled — remaining failures are from other passes/patterns
+fn validate_after(module: &crate::ssa::Module, pass: &str) {
+    let r = crate::ssa::validate::validate(module);
+    if !r.is_clean() {
+        panic!("SSA validation failed after '{pass}':\n{}", r.error_summary());
+    }
 }
 
 // ---- Test runners ----

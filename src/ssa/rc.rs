@@ -1,29 +1,46 @@
-//! Reference counting insertion pass (Perceus-style).
+//! Reference counting passes (legacy Perceus + static cleanup).
 //!
-//! Inserts `RcInc` and `RcDec` instructions so that every heap
-//! allocation is freed when no longer reachable. Runs after
-//! `ssa::lower` and before `ssa::eval`.
+//! Four entry points exist; only one (`elide_static_rc`) is wired
+//! into the current pipeline. The others (`insert_rc`, `insert_reuse`,
+//! `fuse_inc_dec`) implement the original blanket Perceus pipeline
+//! and are kept as reference for the planned shared-store fallback.
 //!
-//! ## Ownership model
+//! ## What's wired today
 //!
-//! Each `Ptr`-typed SSA value holds exactly one ownership token.
-//! The token is created at the value's definition (Alloc, Call
-//! result, block param) and must be released when the value dies
-//! (via `RcDec`). Extra tokens are created with `RcInc` when a
-//! value is needed on multiple paths or stored into the heap.
+//! - **`elide_static_rc`** — strip `RcInc`/`RcDec` on `StaticRef`
+//!   values. Static objects use a sentinel refcount; RC ops on them
+//!   are no-ops at runtime but still cost an interpreter step. Runs
+//!   after `emit_drops`.
 //!
-//! **Calling convention: borrow-by-default.** Call arguments are
-//! borrowed — the caller retains ownership and the callee must
-//! `RcInc` if it needs to keep a reference (e.g. storing into a
-//! heap object or returning). This is natural for an immutable
-//! language where most calls just inspect their arguments.
+//! ## Dormant (not yet wired)
 //!
-//! ## Heap references
+//! - **`insert_rc`** — blanket Perceus: emit `RcInc` at every Store
+//!   of a Ptr, `RcDec` at every Ptr value's last use. Was the old
+//!   pipeline's mainstay; replaced by `emit_drops` for statically-
+//!   resolvable cases.
+//! - **`insert_reuse`** — pattern-match `RcDec(v) ... Alloc(n)` pairs
+//!   and rewrite to `Reset` + `Reuse` when sizes match.
+//! - **`fuse_inc_dec`** — cancel adjacent `RcInc(v) ... RcDec(v)`
+//!   pairs within a block when the bracket can be safely elided.
 //!
-//! - `Store(ptr, offset, val)` where val is Ptr: the heap slot
-//!   becomes an additional reference → emit `RcInc(val)`.
-//! - `Load(dest, ptr, offset)` where dest is Ptr: creates a new
-//!   alias from the heap slot → emit `RcInc(dest)`.
+//! ## Planned: `insert_rc_fallback`
+//!
+//! For each rc_inc site flagged by `ownership::analyze_module`
+//! (shared stores where the value count is data-dependent), emit a
+//! single scoped `RcInc`. This is the only RC code emit_drops can't
+//! handle statically — it will not be blanket like `insert_rc`. See
+//! OWNERSHIP.md §4.
+//!
+//! ## Input invariants (for `elide_static_rc`)
+//!
+//! - Explicit-block-params (from `ssa_construct`).
+//! - `StaticRef` instructions exist for every static-promoted value
+//!   (from `static_promote`).
+//!
+//! ## Output invariants
+//!
+//! - `RcInc`/`RcDec` on `StaticRef`-defined values are removed.
+//! - All other invariants preserved.
 
 use std::collections::{HashMap, HashSet};
 

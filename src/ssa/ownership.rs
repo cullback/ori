@@ -1,16 +1,61 @@
-//! Static ownership analysis — experimental.
+//! Static ownership analysis.
 //!
-//! Replaces Perceus-style runtime reference counting with
-//! compile-time ownership tracking. See OWNERSHIP.md for the full
-//! design rationale.
+//! Computes per-function ownership information that `emit_drops`
+//! consumes. Read-only: produces `Analysis` (ownership classification,
+//! alloc kinds, reuse-pair opportunities, rc_inc sites) and a
+//! module-wide `RcLayout` (which alloc kinds need a runtime refcount
+//! field). The actual SSA transformation lives in `emit_drops`. See
+//! OWNERSHIP.md for the full design rationale.
 //!
-//! For each Ptr-typed SSA value, determines whether it's Unique
-//! (can be dropped/reused at last use) or Borrowed (reference into
-//! a living object, do not free).
+//! ## How
 //!
-//! Relies on the explicit-block-params invariant: every cross-block
-//! value flow goes through block params. This means a value's scope
-//! is its defining block — no liveness analysis needed.
+//! Four phases per function:
+//! 1. **Classify ownership.** Every Ptr value is Unique or Borrowed.
+//!    Allocs and call results are Unique. Function params and heap
+//!    loads are Borrowed. Block params inherit: Unique if all
+//!    incoming values are Unique, else Borrowed (fixpoint for loops).
+//! 2. **Track alloc kinds.** Each Ptr value's origin alloc kind
+//!    (`Static(n)` or `Dynamic`) propagates through block params.
+//! 3. **Find reuse pairs.** A Unique value dies in its block if not
+//!    forwarded to a successor. Pair each dying Unique with a
+//!    compatible later `Alloc` in the same block — that pair is a
+//!    drop+reuse opportunity.
+//! 4. **Find rc_inc sites.** A `Store` of a Ptr into a heap object
+//!    needs runtime rc_inc unless it's an ownership transfer (value
+//!    is Unique, last use, not forwarded). These are the only
+//!    surviving sites that need runtime RC.
+//!
+//! Module-level: aggregate the rc_inc-site alloc kinds into
+//! `RcLayout::needs_rc`. Any alloc kind that appears as the value
+//! of an rc_inc site gets an RC prefix slot in its layout.
+//!
+//! ## Input invariants
+//!
+//! - **Explicit-block-params** (from `ssa_construct`). The analysis
+//!   uses "value's scope is its defining block" as a primitive,
+//!   skipping liveness analysis entirely. Without this invariant the
+//!   results would be unsound.
+//! - System T properties: DAG call graph, no infinite loops in pure
+//!   code. Used implicitly by the fixpoint phases.
+//!
+//! ## Output (analysis, not transformation)
+//!
+//! - Returns `(HashMap<String, Analysis>, RcLayout)`. Does not
+//!   modify the module.
+//! - `Analysis` for each function: ownership map, alloc kind map,
+//!   reuse pairs, rc_inc sites.
+//! - `RcLayout`: set of alloc kinds whose layout needs a runtime RC
+//!   prefix (because some rc_inc site stores into them).
+//!
+//! ## Notes
+//!
+//! - The classification today treats all function parameters as
+//!   Borrowed — conservative. Whole-program ownership signatures
+//!   (consumed vs borrowed params) are a planned extension that
+//!   would unlock reuse inside callees without inlining.
+//! - `RcLayout` is computed but not yet applied to codegen — the
+//!   layout pass that would prefix RC slots onto allocations is
+//!   future work.
 
 use std::collections::{HashMap, HashSet};
 
@@ -53,6 +98,12 @@ pub struct ReusePair {
 #[derive(Debug)]
 pub struct RcIncSite {
     pub block: BlockId,
+    /// Index of the `Store`/`StoreDyn` instruction within
+    /// `func.blocks[block].insts` at the time the analysis ran.
+    /// `emit_drops` uses this to insert `RcInc` right before the
+    /// store; don't reorder instructions between this analysis and
+    /// the fallback emission.
+    pub inst_idx: usize,
     /// The Ptr value being stored (gains a new reference).
     pub value: Value,
 }
@@ -414,6 +465,7 @@ fn find_rc_inc_sites(
 
             sites.push(RcIncSite {
                 block: bid,
+                inst_idx: idx,
                 value: stored_val,
             });
         }

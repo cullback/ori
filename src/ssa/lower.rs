@@ -1,3 +1,55 @@
+//! AST → SSA lowering.
+//!
+//! The single entry into the SSA pipeline. Walks each monomorphized
+//! `FuncDef`, emitting straight-line SSA per body via the `Builder`.
+//! Match compilation, intrinsic dispatch, constructor layout, and
+//! built-in list operations are all handled here — no separate
+//! method-resolution or layout pass downstream.
+//!
+//! ## How
+//!
+//! Per `ExprKind`, dispatch to an emitter that writes instructions
+//! through `Builder`. Two side tables shape the output:
+//! - `self.vars: HashMap<SymbolId, Value>` — the live local map for
+//!   the current block. Updated as let-bindings introduce names.
+//! - `decl_info::DeclInfo` — constructor layouts, function arities
+//!   and return types, recursive-field flags.
+//!
+//! `if`/`match` arms each create their own blocks via `Builder`. Lower
+//! threads the *scrutinee* through arm-block params explicitly, but
+//! does **not** thread other locals — those are emitted as direct SSA
+//! references to upstream block-local values. `ssa_construct` repairs
+//! this immediately afterwards.
+//!
+//! ## Input invariants
+//!
+//! - `Module` is monomorphized (no type variables remain).
+//! - Lambdas have been lifted and specialized — every `Call` has a
+//!   known first-order target.
+//! - Patterns are flattened — no nested constructor patterns, no
+//!   `Pattern::List`.
+//! - Folds are eliminated — every `Fold` is now a synthesized
+//!   `__fold_N` helper.
+//! - Reachability has been pruned — no orphan decls.
+//!
+//! ## Output invariants
+//!
+//! - One `ssa::Function` per `FuncDef`; one `ssa::Module` overall.
+//! - Every SSA `Value` carries its `ScalarType` at creation.
+//! - **Cross-block references via implicit scoping are permitted.**
+//!   `ssa_construct` is the next pass and is responsible for
+//!   establishing the explicit-block-params invariant.
+//!
+//! ## Notes
+//!
+//! - `__apply_K` dispatchers from `lambda_specialize` and `__list_*`
+//!   intrinsics are referenced by name; lowering emits direct `Call`
+//!   instructions for them.
+//! - The interpreter (`eval.rs`) tolerates the implicit-scoping
+//!   output via its flat register file, so dropping `ssa_construct`
+//!   wouldn't surface as test failures — it'd surface as bugs in
+//!   passes that trust the documented invariant.
+
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};

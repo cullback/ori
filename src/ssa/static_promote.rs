@@ -1,9 +1,40 @@
-//! Promote constant list/string literals to static data.
+//! Promote constant allocations to the module's static section.
 //!
 //! Detects allocations where every slot is filled with a constant
 //! value (or a pointer to another constant allocation) and moves
-//! them to `Module::statics`. The alloc+stores are replaced with
-//! a single `StaticRef` instruction.
+//! them to `Module::statics`. The alloc+stores are replaced with a
+//! single `StaticRef` instruction. Static objects use a sentinel
+//! refcount and never participate in RC operations at runtime.
+//!
+//! ## How
+//!
+//! Per function, scan blocks in order. For each `Alloc(dest, n)`:
+//! - Track the Const values flowing into `Store(dest, off, val)` and
+//!   `StaticRef` values from earlier promotions.
+//! - If every slot is filled with a known constant (or a pointer
+//!   into the existing static set), allocate a `StaticObject` in
+//!   `Module::statics`, replace the `Alloc` with a `StaticRef`, and
+//!   drop the now-redundant `Store`s.
+//!
+//! ## Input invariants
+//!
+//! - Explicit-block-params (from `ssa_construct`). Required so we can
+//!   identify which Stores correspond to which Alloc by SSA value
+//!   id without cross-block aliasing.
+//!
+//! ## Output invariants
+//!
+//! - Promoted allocations become `StaticRef` instructions; their
+//!   `Store`s are removed.
+//! - `Module::statics` contains the resulting frozen objects.
+//! - All other invariants from upstream are preserved.
+//!
+//! ## Notes
+//!
+//! - Runs before `optimize` so subsequent constant folding and DCE
+//!   can lean on `StaticRef` values being trivially known.
+//! - `emit_drops` and `elide_static_rc` later treat `StaticRef`
+//!   values as no-ops (sentinel refcount means Free/RcDec do nothing).
 
 use std::collections::{HashMap, HashSet};
 

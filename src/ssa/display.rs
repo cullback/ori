@@ -168,6 +168,7 @@ impl fmt::Display for FmtInst<'_> {
             }
             Inst::RcInc(ptr) => write!(f, "rc_inc {}", fmt_val(*ptr, consts)),
             Inst::RcDec(ptr) => write!(f, "rc_dec {}", fmt_val(*ptr, consts)),
+            Inst::Free(ptr) => write!(f, "free {}", fmt_val(*ptr, consts)),
             Inst::Reset(d, ptr, _) => write!(f, "{d}: ptr = reset {}", fmt_val(*ptr, consts)),
             Inst::Reuse(d, tok, n) => write!(f, "{d}: ptr = reuse {}, {n}", fmt_val(*tok, consts)),
             Inst::ReuseDyn(d, tok, n) => write!(f, "{d}: ptr = reuse_dyn {}, {}", fmt_val(*tok, consts), fmt_val(*n, consts)),

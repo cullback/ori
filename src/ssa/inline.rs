@@ -3,10 +3,46 @@
 //! Replaces `Call` instructions with the callee's body spliced inline.
 //! Callee parameters are substituted with the call arguments, callee
 //! blocks are renumbered and appended to the caller, and `Return`
-//! terminators become `Jump`s to a continuation block.
+//! terminators become `Jump`s to a continuation block. System T's DAG
+//! call graph means there's no recursion to worry about — inlining is
+//! always terminating.
 //!
-//! Inline candidates are small non-recursive user functions. Intrinsics
-//! (prefixed `__`) are never inlined.
+//! ## How
+//!
+//! For each `Call(dest, name, args)` in each function, if `name`
+//! resolves to a user-defined `Function` with ≤ `MAX_INLINE_INSTS`
+//! instructions:
+//! 1. Allocate fresh `Value` and `BlockId`s for the callee.
+//! 2. Substitute callee params with the call args; rename all other
+//!    callee values and block ids.
+//! 3. Split the caller block at the call site, creating a
+//!    continuation block holding the post-call instructions.
+//! 4. Jump from the caller's entry-split into the renamed callee
+//!    entry block. Each callee `Return(v)` becomes
+//!    `Jump(continuation, [v])`.
+//!
+//! ## Input invariants
+//!
+//! - Explicit-block-params (from `ssa_construct`). The splice relies
+//!   on cross-block values being threaded explicitly.
+//! - Calls reference callees by string name; `__`-prefixed callees
+//!   are intrinsics and are always skipped.
+//!
+//! ## Output invariants
+//!
+//! - All input invariants preserved.
+//! - Inlined calls are gone; their bodies are spliced into the
+//!   caller. The original callee `Function` may become unreachable
+//!   (cleaned up by `dead_functions` inside `opt`).
+//!
+//! ## Notes
+//!
+//! - `MAX_INLINE_INSTS = 30`. Tunable. Higher unlocks more
+//!   optimization opportunities but bloats SSA size.
+//! - Splicing produces Agg/Ptr type mismatches that subsequent opt
+//!   passes (`load_of_agg`, `split_agg_params`, `extract_of_pack`)
+//!   clean up. Inline alone isn't a "clean" transformation; the opt
+//!   pipeline that runs after it is part of the contract.
 
 use std::collections::{HashMap, HashSet};
 

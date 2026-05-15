@@ -1,5 +1,49 @@
-//! Simple SSA optimization passes: dead code elimination, constant
-//! folding, and no-op elimination.
+//! General SSA optimization passes.
+//!
+//! Bundled into a single `optimize` entry point, run multiple times in
+//! the pipeline (after construct, after inline, after const_eval,
+//! after emit_drops). Each sub-pass is self-sufficient — no fixpoint
+//! looping, the sequence is deliberately chosen.
+//!
+//! ## What's inside
+//!
+//! - `const_fold` — fold `BinOp(Const, Const)` to `Const`.
+//! - `nop_elim` — remove identity operations (`x * 1`, `x + 0`, etc.)
+//!   by rewriting uses of the result to the identity operand.
+//! - `load_of_agg` — turn `Load(_, agg, off)` into `Extract` when the
+//!   source has Agg type (post-inline cleanup).
+//! - `split_agg_params` — split N-wide `Agg(n)` block params into N
+//!   scalar params, expanding callers' `Pack` args into fields.
+//! - `extract_of_pack` — fold `Extract(Pack(a,b,c), i)` to the i-th
+//!   operand.
+//! - `jump_threading` — collapse empty blocks whose only terminator
+//!   is `Jump`. Predecessors redirect to the final target with args
+//!   composed through the chain.
+//! - `branch_switch_fold` — collapse `Branch ? jump-merge : jump-merge`
+//!   where the merge block dispatches on its scrutinee via `SwitchInt`,
+//!   short-circuiting through the switch.
+//! - `merge_blocks` — merge a block into its sole predecessor when
+//!   the predecessor unconditionally jumps to it.
+//! - `dce` — drop instructions with no side effect and no live uses.
+//!
+//! ## Input invariants
+//!
+//! - Explicit-block-params (from `ssa_construct`).
+//! - Every `Value` carries its `ScalarType` at definition.
+//!
+//! ## Output invariants
+//!
+//! - Same as input. Each sub-pass either preserves invariants or is
+//!   considered a bug.
+//!
+//! ## Notes
+//!
+//! - `branch_switch_fold` skips folds whose switch-arm edges
+//!   reference the merge block's scrutinee param — those would
+//!   require constant substitution to be valid at the new branch site.
+//! - `is_side_effect` (helper) lists every side-effecting `Inst`
+//!   variant. New instruction variants that produce side effects must
+//!   be added there or DCE will incorrectly drop them.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +63,7 @@ pub fn optimize(module: &mut Module) {
         branch_switch_fold(func);
         jump_threading(func);
         branch_switch_fold(func);
-        // merge_blocks(func); // TODO: fix value scoping bug
+        merge_blocks(func);
 
         dce(func);
     }
@@ -470,6 +514,17 @@ fn branch_switch_fold(func: &mut Function) {
             continue;
         };
 
+        // The arm edges live in the merge block; their args may
+        // reference the merge block's param (the switch scrutinee).
+        // We can't carry such references back to `bid` without
+        // substituting the constant value, so bail in that case.
+        let merge_param = merge_block.params[0];
+        if true_edge.args.iter().any(|a| *a == merge_param)
+            || false_edge.args.iter().any(|a| *a == merge_param)
+        {
+            continue;
+        }
+
         let cond = *cond;
         let new_then_args = [then_edge.args.clone(), true_edge.args].concat();
         let new_else_args = [else_edge.args.clone(), false_edge.args].concat();
@@ -567,6 +622,7 @@ fn is_side_effect(inst: &Inst) -> bool {
             | Inst::StoreDyn(..)
             | Inst::RcInc(..)
             | Inst::RcDec(..)
+            | Inst::Free(..)
             | Inst::Reset(..)
             | Inst::Reuse(..)
             | Inst::ReuseDyn(..)

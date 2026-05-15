@@ -1,9 +1,46 @@
 //! Compile-time constant evaluation pass.
 //!
-//! Since Ori is System T (all functions terminate), any zero-argument
-//! function can be safely evaluated at compile time. This pass finds
-//! such functions, runs the interpreter on them, converts the results
-//! to static objects, and replaces call sites with `StaticRef`.
+//! Since Ori is System T (all pure functions terminate), any
+//! zero-argument function can be safely evaluated at compile time.
+//! This pass finds such functions, runs the interpreter on them,
+//! converts the results to static objects, and replaces call sites
+//! with `StaticRef`. Termination is guaranteed by construction — no
+//! fuel limit or speculative cutoff.
+//!
+//! ## How
+//!
+//! 1. Identify zero-arg user functions (`__`-prefixed intrinsics
+//!    skipped). Walk the call DAG bottom-up.
+//! 2. For each such function, run `eval::eval_function` against a
+//!    scratch heap. Convert the resulting `Scalar` (and any heap
+//!    objects it transitively references) into `StaticObject` slots
+//!    in `Module::statics`.
+//! 3. Rewrite every `Call(dest, name, [])` in the module to
+//!    `StaticRef(dest, new_static_id)`.
+//!
+//! ## Input invariants
+//!
+//! - Explicit-block-params (from `ssa_construct`). The interpreter
+//!   relies on consistent SSA structure.
+//! - Inlining and other opt passes have run, so trivially-foldable
+//!   bodies are already simplified — const_eval only needs to handle
+//!   zero-arg leaves of the call graph that survive optimization.
+//!
+//! ## Output invariants
+//!
+//! - All input invariants preserved.
+//! - Zero-arg user functions that successfully evaluated are no
+//!   longer called (their `Function`s become unreachable and may be
+//!   pruned by `dead_functions`).
+//! - `Module::statics` grows with the materialized results.
+//!
+//! ## Notes
+//!
+//! - Effectful functions are not subject to this pass — they aren't
+//!   pure and may have observable side effects.
+//! - Results that escape via heap pointers are materialized into
+//!   `StaticObject` graphs; cycles are impossible because Ori's data
+//!   types are inductive and immutable.
 
 use std::collections::HashMap;
 

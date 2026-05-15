@@ -55,48 +55,71 @@ fn compile(
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = ssa::lower::lower(&mono, &resolved.fields)?;
-    // Validate unconditionally between passes. The IR is clean across
-    // every pass now (0 structural errors, 0 soft warnings), and we
-    // want any regression to surface immediately. Can be revisited
-    // far later to trade off compile time once the IR stabilizes.
-    let check = |m: &ssa::Module, pass: &str| {
-        let r = ssa::validate::validate(m);
-        if !r.is_clean() {
-            eprintln!("SSA validation failed after '{pass}':\n{}", r.error_summary());
-            process::exit(1);
-        }
-        if !r.warnings.is_empty() {
-            eprintln!(
-                "SSA soft-validation warnings after '{pass}':\n{}",
-                r.warnings.join("\n")
-            );
-            process::exit(1);
-        }
-    };
-    check(&ssa_module, "lower");
-    ssa::static_promote::promote(&mut ssa_module);
-    check(&ssa_module, "static_promote");
-    ssa::opt::optimize(&mut ssa_module);
-    check(&ssa_module, "optimize");
-    ssa::inline::inline(&mut ssa_module);
-    check(&ssa_module, "inline");
-    ssa::opt::optimize(&mut ssa_module);
-    check(&ssa_module, "optimize (post-inline)");
-    ssa::opt::optimize(&mut ssa_module);
-    ssa::const_eval::evaluate(&mut ssa_module);
-    check(&ssa_module, "const_eval");
-    ssa::opt::optimize(&mut ssa_module);
-    ssa::rc::insert_rc(&mut ssa_module);
-    check(&ssa_module, "insert_rc");
-    ssa::rc::elide_static_rc(&mut ssa_module);
-    check(&ssa_module, "elide_static_rc");
-    ssa::rc::insert_reuse(&mut ssa_module);
-    check(&ssa_module, "insert_reuse");
-    ssa::rc::fuse_inc_dec(&mut ssa_module);
-    check(&ssa_module, "fuse_inc_dec");
-    ssa::opt::optimize(&mut ssa_module);
-    check(&ssa_module, "optimize (final)");
+    run_ssa_pipeline(&mut ssa_module);
     Ok((ssa_module, input_vals))
+}
+
+/// Run the full SSA pipeline on a freshly-lowered module. Every pass
+/// is `Module -> Module` (or analysis-only) and the order is
+/// load-bearing; see the per-module docs in `src/ssa/*.rs` for the
+/// input/output invariants each pass relies on and establishes.
+fn run_ssa_pipeline(module: &mut ssa::Module) {
+    // `lower`'s output may have implicit cross-block references;
+    // `ssa_construct` establishes the explicit-block-params invariant
+    // that every downstream pass depends on. No `check` before this.
+    ssa::ssa_construct::run(module);
+    check(module, "ssa_construct");
+
+    ssa::static_promote::promote(module);
+    check(module, "static_promote");
+
+    ssa::opt::optimize(module);
+    check(module, "optimize");
+
+    ssa::inline::inline(module);
+    check(module, "inline");
+
+    ssa::opt::optimize(module);
+    check(module, "optimize (post-inline)");
+
+    ssa::const_eval::evaluate(module);
+    check(module, "const_eval");
+
+    ssa::opt::optimize(module);
+    check(module, "optimize (post-const-eval)");
+
+    // Static ownership pipeline. Ownership analysis is read-only and
+    // computes per-function Analysis + module-wide RcLayout. emit_drops
+    // consumes that to insert Free at last use for Unique values.
+    // elide_static_rc strips RC ops on static-promoted values.
+    // See OWNERSHIP.md.
+    let (analyses, _layout) = ssa::ownership::analyze_module(module);
+    ssa::emit_drops::run(module, &analyses);
+    check(module, "emit_drops");
+
+    ssa::rc::elide_static_rc(module);
+    check(module, "elide_static_rc");
+
+    ssa::opt::optimize(module);
+    check(module, "optimize (final)");
+}
+
+/// Validate the module after a pass. Aborts the process with a
+/// readable error if validation fails — surfacing pass-induced
+/// breakage at the source instead of as a runtime crash later.
+fn check(module: &ssa::Module, pass: &str) {
+    let r = ssa::validate::validate(module);
+    if !r.is_clean() {
+        eprintln!("SSA validation failed after '{pass}':\n{}", r.error_summary());
+        process::exit(1);
+    }
+    if !r.warnings.is_empty() {
+        eprintln!(
+            "SSA soft-validation warnings after '{pass}':\n{}",
+            r.warnings.join("\n")
+        );
+        process::exit(1);
+    }
 }
 
 fn bytes_to_scalar(bytes: &[u8], heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {
