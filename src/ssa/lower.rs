@@ -205,6 +205,20 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.repr_type(&expr.ty)
     }
 
+    /// Element scalar type of a `List(T)` receiver. Falls back to
+    /// `I64` if `ty` isn't a `List` (which shouldn't happen for list
+    /// builtins). For strings — `List(U8)` — returns `U8`.
+    fn list_elem_scalar_type(&self, ty: &Type) -> ScalarType {
+        let unwrapped = self.resolve_transparent(ty);
+        match &unwrapped {
+            Type::App(name, args) if name == "List" => args
+                .first()
+                .map(|t| self.scalar_type(t))
+                .unwrap_or(ScalarType::I64),
+            _ => ScalarType::I64,
+        }
+    }
+
     /// If `ty` is a composite that `can_pack` would accept, return
     /// its field count. Records and tuples return their field count
     /// directly; tag unions return 1 + max_fields (tag slot + payload).
@@ -1017,7 +1031,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             arg_vals.push(self.lower_expr(a));
         }
         if Self::is_list_builtin(&mangled) {
-            return emit_list_builtin_call(&mut self.builder, &mangled, arg_vals);
+            let elem_ty = self.list_elem_scalar_type(&receiver.ty);
+            return emit_list_builtin_call(&mut self.builder, &mangled, arg_vals, elem_ty);
         }
         let ret_ty = self.func_ret_type(&mangled);
         self.builder.call(&mangled, arg_vals, ret_ty)
@@ -1070,7 +1085,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
         if Self::is_list_builtin(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-            return emit_list_builtin_call(&mut self.builder, func, arg_vals);
+            // The first arg is the list; its element type drives the
+            // RC-in-copy decisions inside the inlined emission.
+            let elem_ty = self.list_elem_scalar_type(&args[0].ty);
+            return emit_list_builtin_call(&mut self.builder, func, arg_vals, elem_ty);
         }
         if self.decls.constructors.contains_key(func) {
             let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -2823,7 +2841,12 @@ fn lower_int_const(builder: &mut Builder, n: i64, ty: &Type) -> Value {
     builder.const_i64(n)
 }
 
-fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -> Value {
+fn emit_list_builtin_call(
+    builder: &mut Builder,
+    name: &str,
+    args: Vec<Value>,
+    elem_ty: ScalarType,
+) -> Value {
     if name.ends_with(".len") || name == "List.len" {
         // `List.len` is a single load from slot 0 of the header.
         return builder.load(args[0], 0, ScalarType::U64);
@@ -2831,7 +2854,7 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
     let (intrinsic, ret_ty) = if name.ends_with(".get") || name == "List.get" {
         return emit_list_get_checked(builder, args);
     } else if name.ends_with(".append") || name == "List.append" {
-        return emit_list_append(builder, args);
+        return emit_list_append(builder, args, elem_ty);
     } else if name.ends_with(".set") || name == "List.set" {
         ("__list_set", ScalarType::Ptr)
     } else if name.ends_with(".reverse") || name == "List.reverse" {
@@ -2848,11 +2871,13 @@ fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -
     builder.call(intrinsic, args, ret_ty)
 }
 
-/// Lower `list.append(val)` as SSA-level `load + alloc_dyn +
-/// copy_into + store + alloc 3 + stores`. Exposing the allocations
-/// at SSA level lets `insert_reuse` pair them with the caller's
-/// `rc_dec list` and mutate in place when the list is unique.
-fn emit_list_append(builder: &mut Builder, args: Vec<Value>) -> Value {
+/// Lower `list.append(val)` as SSA-level primitives: load len + data
+/// pointer, alloc new data buffer, copy old elements (with per-Ptr
+/// rc_inc when the element type is `Ptr`), store the new element,
+/// alloc new header, fill it. All visible to ownership analysis —
+/// when the input list is Unique, the new header alloc pairs with
+/// the old header for in-place reuse.
+fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
     use crate::ssa::instruction::BinaryOp;
     let list = args[0];
     let val = args[1];
@@ -2862,11 +2887,11 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>) -> Value {
     let one = builder.const_u64(1);
     let new_len = builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
 
-    // AllocDyn needs total byte count; elements default to 8 bytes each.
+    // AllocDyn needs total byte count; data buffers use 8-byte stride.
     let elem_size = builder.const_u64(8);
     let new_byte_len = builder.binop(BinaryOp::Mul, new_len, elem_size, ScalarType::U64);
     let new_data = builder.alloc_dyn(new_byte_len);
-    builder.call("__list_copy_into", vec![data, new_data, len], ScalarType::I64);
+    builder.copy_loop(new_data, data, len, elem_ty);
     builder.store_dyn(new_data, len, val);
 
     let new_list = builder.alloc(24);

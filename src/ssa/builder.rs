@@ -238,6 +238,44 @@ impl Builder {
         self.push(Inst::RcDec(ptr));
     }
 
+    /// Emit a forward bulk-copy loop. Copies `count` elements from
+    /// `src` to `dst` using `LoadDyn`/`StoreDyn` with 8-byte stride.
+    /// When `elem_ty == Ptr`, every loaded element gets an `RcInc`
+    /// (the clone creates an additional alias). Caller continues
+    /// emission in a fresh exit block — values from before the loop
+    /// flow through automatically via `ssa_construct`.
+    ///
+    /// Layout: entry → header(i=0); header(i): i < count ? body(i) :
+    /// exit; body(i): elem = load_dyn(src, i); [rc_inc elem]; store_dyn
+    /// (dst, i, elem); jump header(i + 1); exit: ...
+    pub fn copy_loop(&mut self, dst: Value, src: Value, count: Value, elem_ty: ScalarType) {
+        let header = self.create_block();
+        let body = self.create_block();
+        let exit = self.create_block();
+
+        let header_i = self.add_block_param(header, ScalarType::U64);
+        let body_i = self.add_block_param(body, ScalarType::U64);
+
+        let zero = self.const_u64(0);
+        self.jump(header, vec![zero]);
+
+        self.switch_to(header);
+        let cond = self.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
+        self.branch(cond, body, vec![header_i], exit, vec![]);
+
+        self.switch_to(body);
+        let elem = self.load_dyn(src, body_i, elem_ty);
+        if elem_ty == ScalarType::Ptr {
+            self.rc_inc(elem);
+        }
+        self.store_dyn(dst, body_i, elem);
+        let one = self.const_u64(1);
+        let next_i = self.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+        self.jump(header, vec![next_i]);
+
+        self.switch_to(exit);
+    }
+
     // ---- Aggregates ----
 
     pub fn pack(&mut self, fields: Vec<Value>) -> Value {
