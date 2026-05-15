@@ -865,6 +865,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .iter()
                 .find(|(sym, _)| self.symbols.display(**sym) == segments[0])
                 .map(|(_, v)| *v);
+            if op_name == "to_str" {
+                // Only reached for F64 — integer to_str is in stdlib.
+                let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
+                return self
+                    .builder
+                    .call("__num_to_str", vec![arg], ScalarType::Ptr);
+            }
             if op_name == "from_u8" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
                 let dest_ty = match segments[0] {
@@ -876,6 +883,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             if op_name == "to_u8" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
                 return self.builder.cast(arg, ScalarType::U8);
+            }
+            if op_name == "to_u64" {
+                let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
+                return self.builder.cast(arg, ScalarType::U64);
+            }
+            if op_name == "to_i64" {
+                let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
+                return self.builder.cast(arg, ScalarType::I64);
             }
             // Binary arithmetic op
             let (lhs, rhs) = if let Some(local_val) = local_val {
@@ -973,6 +988,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             return self.lower_tag_hash(recv_val, &receiver.ty);
         }
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
+            if op_name == "to_str" {
+                // F64 only; integer to_str dispatched via stdlib method.
+                return self
+                    .builder
+                    .call("__num_to_str", vec![recv_val], ScalarType::Ptr);
+            }
             if op_name == "hash" {
                 return self
                     .builder
@@ -984,6 +1005,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
             if op_name == "to_u8" {
                 return self.builder.cast(recv_val, ScalarType::U8);
+            }
+            if op_name == "to_u64" {
+                return self.builder.cast(recv_val, ScalarType::U64);
+            }
+            if op_name == "to_i64" {
+                return self.builder.cast(recv_val, ScalarType::I64);
             }
             let rhs = self.lower_expr(&args[0]);
             let ty = self.expr_scalar_type(receiver);

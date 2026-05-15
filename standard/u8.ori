@@ -13,11 +13,14 @@ U8 := {}.(
     shr : U8, U8 -> U8
     equals : U8, U8 -> Bool
     compare : U8, U8 -> Order
-    to_str : U8 -> Str
+    to_u64 : U8 -> U64
 
     min : U8, U8 -> U8
     min = |a, b| if a <= b then a else b
 
     max : U8, U8 -> U8
     max = |a, b| if a >= b then a else b
+
+    to_str : U8 -> Str
+    to_str = |n| U64.to_str(n.to_u64())
 )

@@ -8,11 +8,14 @@ I16 := {}.(
     mod : I16, I16 -> I16
     equals : I16, I16 -> Bool
     compare : I16, I16 -> Order
-    to_str : I16 -> Str
+    to_i64 : I16 -> I64
 
     min : I16, I16 -> I16
     min = |a, b| if a <= b then a else b
 
     max : I16, I16 -> I16
     max = |a, b| if a >= b then a else b
+
+    to_str : I16 -> Str
+    to_str = |n| I64.to_str(n.to_i64())
 )
