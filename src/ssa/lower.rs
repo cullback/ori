@@ -865,13 +865,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .iter()
                 .find(|(sym, _)| self.symbols.display(**sym) == segments[0])
                 .map(|(_, v)| *v);
-            if op_name == "to_str" {
-                // Unary: `x.to_str()` or eta-expanded `I64.to_str(x)`
-                let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
-                return self
-                    .builder
-                    .call("__num_to_str", vec![arg], ScalarType::Ptr);
-            }
             if op_name == "from_u8" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
                 let dest_ty = match segments[0] {
@@ -980,11 +973,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             return self.lower_tag_hash(recv_val, &receiver.ty);
         }
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
-            if op_name == "to_str" {
-                return self
-                    .builder
-                    .call("__num_to_str", vec![recv_val], ScalarType::Ptr);
-            }
             if op_name == "hash" {
                 return self
                     .builder

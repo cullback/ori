@@ -481,14 +481,16 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                 panic!("load_dyn from non-ptr: {:?}", env[ptr.id]);
             };
             let slot = scalar_to_usize(env[idx_val.id]);
-            // For sub-8-byte types (e.g., U8 in strings), the dest type is
-            // authoritative and determines the stride. For 8-byte types, the
-            // lowering may use Ptr generically, so use load_dyn_auto which
-            // checks the type_map to recover the actual stored type.
-            if dest.ty.byte_width() < 8 {
-                Some(heap.load_dyn(heap_idx, slot, dest.ty))
-            } else {
+            // Data buffers use a uniform 8-byte stride (matches StoreDyn).
+            let offset = slot * 8;
+            // Dest type `Ptr` is the generic-element placeholder some
+            // lowering paths use when they don't know the element type
+            // (e.g. emit_list_get_checked). Recover the true type from
+            // type_map. Concrete dest types are authoritative.
+            if dest.ty == ScalarType::Ptr {
                 Some(heap.load_dyn_auto(heap_idx, slot))
+            } else {
+                Some(heap.load(heap_idx, offset, dest.ty))
             }
         }
 

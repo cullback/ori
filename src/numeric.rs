@@ -85,14 +85,15 @@ impl NumericType {
     }
 
     /// True if this type supports the given builtin method.
-    /// All numeric types support `add`, `sub`, `mul`, `div`, `equals`,
-    /// `to_str`. Only integers support `mod`.
+    /// Builtin methods bypass user-defined stdlib dispatch — used for
+    /// ops the compiler knows how to lower directly. `to_str` is
+    /// deliberately omitted: the stdlib provides per-type bodies.
     pub fn has_builtin_method(self, method: &str) -> bool {
         match method {
-            "add" | "sub" | "mul" | "div" | "equals" | "compare" | "to_str" | "hash" => true,
+            "add" | "sub" | "mul" | "div" | "equals" | "compare" | "hash" => true,
             "mod" | "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr" => self.is_integer(),
             "from_u8" => matches!(self, Self::U64 | Self::U32),
-            "to_u8" => matches!(self, Self::U32 | Self::U64),
+            "to_u8" => matches!(self, Self::U32 | Self::U64 | Self::I64),
             _ => false,
         }
     }

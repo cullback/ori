@@ -13,7 +13,6 @@ U64 := {}.(
     shr : U64, U64 -> U64
     equals : U64, U64 -> Bool
     compare : U64, U64 -> Order
-    to_str : U64 -> Str
     from_u8 : U8 -> U64
     to_u8 : U64 -> U8
 
@@ -22,4 +21,28 @@ U64 := {}.(
 
     max : U64, U64 -> U64
     max = |a, b| if a >= b then a else b
+
+    # Decimal string representation. Builds digits low-to-high inside
+    # a 20-step walk_until (U64::MAX has 20 digits), then reverses.
+    # ```ori
+    # expect U64.to_str(0) == "0"
+    # expect U64.to_str(7) == "7"
+    # expect U64.to_str(123) == "123"
+    # ```
+    to_str : U64 -> Str
+    to_str = |n|
+        if n == 0 then "0"
+        else (
+            state = List.range(0, 20).walk_until({ digits: [], n: n }, |s, _|
+                if s.n == 0 then Break(s)
+                else Continue({
+                    digits: s.digits.append(U64.to_u8(s.n % 10 + 48)),
+                    n: s.n / 10,
+                })
+            )
+            bytes = state.digits.reverse()
+            if Str.from_utf8(bytes)
+                : Ok(s) then s
+                : Err(_) then ""
+        )
 )
