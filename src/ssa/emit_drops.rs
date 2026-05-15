@@ -163,12 +163,11 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
             }
 
             // Effective last use: max of v's direct last use and the
-            // last uses of any Ptr children Loaded from v in this
-            // block (move-out semantics — defer drop until children
-            // are dead so the cascade-free doesn't corrupt them).
-            let empty: Vec<Value> = Vec::new();
-            let children = loaded_ptr_children.get(&v).unwrap_or(&empty);
-            let Some(idx) = effective_last_use(block, v, children) else { continue };
+            // last uses of any Ptr value reachable from v via Load
+            // chains (transitive move-out — cascade-free traverses
+            // the whole subtree, so all descendants must be dead).
+            let descendants = transitive_loaded_descendants(v, &loaded_ptr_children);
+            let Some(idx) = effective_last_use(block, v, &descendants) else { continue };
 
             let inst = match reuse_info {
                 Some(info) => Inst::Reset(info.token, v, info.slot_types.clone()),
@@ -187,13 +186,14 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
 }
 
 /// Effective last use of `v` within `block`, factoring in move-out
-/// children. If any child crosses the block boundary (appears in the
-/// terminator's operands), returns `None` — the drop can't be
-/// deferred safely within this block.
+/// over a set of transitively-loaded descendants. If any descendant
+/// crosses the block boundary (appears in the terminator's operands),
+/// returns `None` — the drop can't be deferred safely within this
+/// block.
 fn effective_last_use(
     block: &super::Block,
     v: Value,
-    loaded_children: &[Value],
+    descendants: &HashSet<Value>,
 ) -> Option<usize> {
     let direct_last = block
         .insts
@@ -203,28 +203,49 @@ fn effective_last_use(
         .map(|(i, _)| i)
         .last()?;
 
-    // If any loaded child escapes this block, we can't defer locally.
     let term_ops: Vec<Value> = block.terminator.operands();
-    for c in loaded_children {
-        if term_ops.contains(c) {
+    for d in descendants {
+        if term_ops.contains(d) {
             return None;
         }
     }
 
     let mut effective = direct_last;
-    for &c in loaded_children {
-        if let Some(c_last) = block
+    for &d in descendants {
+        if let Some(d_last) = block
             .insts
             .iter()
             .enumerate()
-            .filter(|(_, inst)| inst.operands().contains(&c))
+            .filter(|(_, inst)| inst.operands().contains(&d))
             .map(|(i, _)| i)
             .last()
         {
-            effective = effective.max(c_last);
+            effective = effective.max(d_last);
         }
     }
     Some(effective)
+}
+
+/// All values transitively reachable from `v` via `Load(_, p, _)` /
+/// `LoadDyn(_, p, _)` of Ptr-typed results. Cascade-free of `v`
+/// touches every descendant, so they must all be dead at the drop
+/// point.
+fn transitive_loaded_descendants(
+    v: Value,
+    loaded_ptr_children: &HashMap<Value, Vec<Value>>,
+) -> HashSet<Value> {
+    let mut result: HashSet<Value> = HashSet::new();
+    let mut stack: Vec<Value> = vec![v];
+    while let Some(cur) = stack.pop() {
+        if let Some(children) = loaded_ptr_children.get(&cur) {
+            for &c in children {
+                if result.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    result
 }
 
 struct ReuseInfo {
@@ -255,15 +276,14 @@ fn collect_reuse_pairs(
     let slot_types_by_drop = compute_slot_types_for_allocs(func);
 
     for pair in &analysis.reuse_pairs {
-        // If drop_val has loaded Ptr children that escape its block,
-        // we can't safely Reset it (cascade would invalidate them).
-        // Defer to Phase B's `effective_last_use` check: if any child
-        // appears in the block's terminator, skip. Otherwise the
-        // drop site is deferred past the children's last uses.
-        if let Some(children) = loaded_ptr_children.get(&pair.drop_val) {
+        // If drop_val has transitively-loaded descendants that escape
+        // its block, we can't safely Reset it (cascade would invalidate
+        // them). Phase B applies the same check via `effective_last_use`.
+        let descendants = transitive_loaded_descendants(pair.drop_val, loaded_ptr_children);
+        if !descendants.is_empty() {
             let block = &func.blocks[&pair.block];
             let term_ops = block.terminator.operands();
-            if children.iter().any(|c| term_ops.contains(c)) {
+            if descendants.iter().any(|d| term_ops.contains(d)) {
                 continue;
             }
         }

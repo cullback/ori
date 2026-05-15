@@ -1530,8 +1530,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     /// List equality: compare lengths, then element-by-element.
     fn emit_list_eq(&mut self, lhs: Value, rhs: Value, elem_ty: Option<&Type>) -> Value {
-        let len_a = self.builder.call("__list_len", vec![lhs], ScalarType::U64);
-        let len_b = self.builder.call("__list_len", vec![rhs], ScalarType::U64);
+        let len_a = self.builder.load(lhs, 0, ScalarType::U64);
+        let len_b = self.builder.load(rhs, 0, ScalarType::U64);
         let len_eq = self.builder.binop(BinaryOp::Eq, len_a, len_b, ScalarType::U8);
 
         let check_elems = self.builder.create_block();
@@ -1557,8 +1557,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.branch(done, merge, vec![true_val], body, vec![i_param, header_len_param]);
 
         self.builder.switch_to(body);
-        let elem_a = self.builder.call("__list_get", vec![lhs, body_i_param], ScalarType::Ptr);
-        let elem_b = self.builder.call("__list_get", vec![rhs, body_i_param], ScalarType::Ptr);
+        // Borrow-only read for element comparison — no rc_inc needed,
+        // the elements aren't retained past the comparison.
+        let data_a = self.builder.load(lhs, 16, ScalarType::Ptr);
+        let data_b = self.builder.load(rhs, 16, ScalarType::Ptr);
+        let elem_a = self.builder.load_dyn(data_a, body_i_param, ScalarType::Ptr);
+        let elem_b = self.builder.load_dyn(data_b, body_i_param, ScalarType::Ptr);
         let elem_eq = if let Some(et) = elem_ty {
             if self.is_scalar_eq_type(et) {
                 self.builder.binop(BinaryOp::Eq, elem_a, elem_b, ScalarType::U8)
@@ -2820,9 +2824,11 @@ fn lower_int_const(builder: &mut Builder, n: i64, ty: &Type) -> Value {
 }
 
 fn emit_list_builtin_call(builder: &mut Builder, name: &str, args: Vec<Value>) -> Value {
-    let (intrinsic, ret_ty) = if name.ends_with(".len") || name == "List.len" {
-        ("__list_len", ScalarType::U64)
-    } else if name.ends_with(".get") || name == "List.get" {
+    if name.ends_with(".len") || name == "List.len" {
+        // `List.len` is a single load from slot 0 of the header.
+        return builder.load(args[0], 0, ScalarType::U64);
+    }
+    let (intrinsic, ret_ty) = if name.ends_with(".get") || name == "List.get" {
         return emit_list_get_checked(builder, args);
     } else if name.ends_with(".append") || name == "List.append" {
         return emit_list_append(builder, args);
@@ -2877,7 +2883,7 @@ fn emit_list_get_checked(builder: &mut Builder, args: Vec<Value>) -> Value {
     let list = args[0];
     let idx = args[1];
 
-    let len = builder.call("__list_len", vec![list], ScalarType::U64);
+    let len = builder.load(list, 0, ScalarType::U64);
     let in_bounds = builder.binop(BinaryOp::Lt, idx, len, ScalarType::U8);
 
     let ok_block = builder.create_block();
@@ -2889,7 +2895,13 @@ fn emit_list_get_checked(builder: &mut Builder, args: Vec<Value>) -> Value {
 
     // Ok path: get element, wrap in Ok(elem) = [tag=0, elem]
     builder.switch_to(ok_block);
-    let elem = builder.call("__list_get", vec![list, idx], ScalarType::Ptr);
+    let data = builder.load(list, 16, ScalarType::Ptr);
+    let elem = builder.load_dyn(data, idx, ScalarType::Ptr);
+    // Loading a Ptr child creates a new alias; runtime rc_inc keeps
+    // the element alive past the source list's eventual drop. The
+    // eval's RcInc is a no-op for non-Ptr scalars, so this is safe
+    // even when the element type is I64 / U8 / etc.
+    builder.rc_inc(elem);
     let ok_result = builder.alloc(16);
     let ok_tag = builder.const_u64(0);
     builder.store(ok_result, 0, ok_tag);
