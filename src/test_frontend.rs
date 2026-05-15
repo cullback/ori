@@ -53,7 +53,9 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     crate::ssa::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize");
     let (analyses, _layout) = crate::ssa::ownership::analyze_module(&ssa_module);
-    crate::ssa::emit_drops::run(&mut ssa_module, &analyses);
+    let layouts = crate::ssa::layouts::analyze(&ssa_module);
+    let usage = crate::ssa::param_usage::analyze(&ssa_module);
+    crate::ssa::emit_drops::run(&mut ssa_module, &analyses, &layouts, &usage);
     validate_after(&ssa_module, "emit_drops");
     crate::ssa::rc::elide_static_rc(&mut ssa_module);
     validate_after(&ssa_module, "elide_static_rc");

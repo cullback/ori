@@ -98,7 +98,9 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     // elide_static_rc strips RC ops on static-promoted values.
     // See OWNERSHIP.md.
     let (analyses, _layout) = ssa::ownership::analyze_module(module);
-    ssa::emit_drops::run(module, &analyses);
+    let layouts = ssa::layouts::analyze(module);
+    let usage = ssa::param_usage::analyze(module);
+    ssa::emit_drops::run(module, &analyses, &layouts, &usage);
     check(module, "emit_drops");
 
     ssa::rc::elide_static_rc(module);

@@ -9,6 +9,8 @@ pub mod opt;
 pub mod rc;
 pub mod static_promote;
 pub mod ownership;
+pub mod layouts;
+pub mod param_usage;
 pub mod emit_drops;
 pub mod ssa_construct;
 pub mod validate;

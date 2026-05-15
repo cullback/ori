@@ -594,9 +594,18 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                     heap.objects[idx].rc -= 1;
                     if heap.objects[idx].rc == 0 {
                         heap.free_count += 1;
+                        let data_len = heap.objects[idx].data.len();
                         for (i, ty) in slot_types.iter().enumerate() {
                             if *ty == ScalarType::Ptr {
                                 let offset = i * 8;
+                                if offset + 8 > data_len {
+                                    // slot_types over-estimated the
+                                    // object's size — skip the
+                                    // phantom slot. Static analysis
+                                    // is conservative; runtime is
+                                    // authoritative.
+                                    break;
+                                }
                                 if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::Ptr) {
                                     if child != 0 {
                                         heap.rc_dec(child);

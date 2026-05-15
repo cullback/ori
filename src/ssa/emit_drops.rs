@@ -1,9 +1,11 @@
-//! Emit `RcInc` / `Free` / `Reset` / `Reuse` for statically-owned values.
+//! Emit `RcInc` / `Drop` / `Free` / `Reset` / `Reuse` for statically-
+//! owned values.
 //!
-//! Consumes the per-function `ownership::Analysis` and inserts
-//! drop, reuse, and scoped rc_inc instructions. The transformation
-//! half of the static-ownership pipeline — analysis lives in
-//! `ownership.rs`. See OWNERSHIP.md §3-4 for the full design.
+//! Consumes the per-function `ownership::Analysis` and the whole-
+//! program `layouts::ModuleLayouts`, and inserts drop, reuse, and
+//! scoped rc_inc instructions. The transformation half of the static-
+//! ownership pipeline — analysis lives in `ownership.rs` and
+//! `layouts.rs`. See OWNERSHIP.md §3-4 for the full design.
 //!
 //! ## How
 //!
@@ -29,8 +31,11 @@
 //!   any child escapes the block (appears in the terminator), skip.
 //! - If v is in a viable reuse pair, emit `Reset(token, v, slot_types)`
 //!   at the effective last use (defines the token consumed in Phase B).
-//! - Otherwise (and not cleanly-transferred to another owner), emit
-//!   `Free(v)` at the effective last use.
+//! - Otherwise, when the whole-program layouts pass produced a
+//!   slot_types vector for `v`, emit `Drop(v, slots)` with moved-out
+//!   slots masked so the cascade skips them. Falls back to `Free(v)`
+//!   (runtime cascade via `heap.ptr_offsets`) when no static layout
+//!   is available.
 //!
 //! ## Input invariants
 //!
@@ -69,20 +74,39 @@
 use std::collections::{HashMap, HashSet};
 
 use super::instruction::{BlockId, Inst, ScalarType, Terminator, Value};
+use super::layouts::{Layout, ModuleLayouts};
 use super::ownership::{Analysis, Ownership};
+use super::param_usage::{ModuleUsage, ParamUsage};
 use super::{Function, Module};
 
 /// Run emit_drops over every function in `module`, using the per-
-/// function analyses produced by `ownership::analyze_module`.
-pub fn run(module: &mut Module, analyses: &HashMap<String, Analysis>) {
+/// function analyses produced by `ownership::analyze_module`, the
+/// whole-program layout signatures from `layouts::analyze`, and the
+/// whole-program param-usage classification from
+/// `param_usage::analyze`.
+pub fn run(
+    module: &mut Module,
+    analyses: &HashMap<String, Analysis>,
+    layouts: &ModuleLayouts,
+    usage: &ModuleUsage,
+) {
+    // Take ownership of per-function layout maps so we can hand them
+    // into each `emit_drops_function` without re-borrowing `module`.
+    let mut value_layouts = layouts.values.clone();
     for (name, func) in &mut module.functions {
         if let Some(analysis) = analyses.get(name) {
-            emit_drops_function(func, analysis);
+            let func_layouts = value_layouts.remove(name).unwrap_or_default();
+            emit_drops_function(func, analysis, &func_layouts, usage);
         }
     }
 }
 
-fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
+fn emit_drops_function(
+    func: &mut Function,
+    analysis: &Analysis,
+    layouts: &HashMap<Value, Layout>,
+    usage: &ModuleUsage,
+) {
     // Phase RC: emit RcInc at each flagged store site (in reverse
     // order per block so earlier instruction indices stay stable).
     emit_rc_inc_fallback(func, &analysis.rc_inc_sites);
@@ -94,17 +118,20 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
 
     // Effective Unique set: refine analysis.ownership with the move-out
     // promotion (Loaded-from-Unique-single-Load → Unique) and re-run
-    // phi propagation to cover the children's block-param renamings.
+    // block-param propagation to cover the children's renamings at
+    // SSA join points.
     let effective_unique = compute_effective_unique(func, &analysis.ownership, &moved_out_children);
 
-    // Per-value slot layout, propagated through phis.
-    let slot_types_by_value = compute_slot_types(func);
+    // Whole-program slot layout per Ptr-typed Value: covers Allocs,
+    // function entry params, Call results, and block params (via
+    // propagation across block-param edges).
+    let slot_types_by_value: HashMap<Value, Vec<ScalarType>> = layouts.clone();
 
     // Values whose true last instruction use is an ownership transfer
     // (Store/StoreDyn val, Pack/Insert field) — or a Call arg
     // (conservative for now). The new owner cascade-frees on its own
     // drop. Non-last-use stores are handled by the rc_inc fallback.
-    let cleanly_transferred = cleanly_transferred(func, &analysis.ownership);
+    let cleanly_transferred = cleanly_transferred(func, &analysis.ownership, usage);
 
     // Identify viable reuse pairs and reserve tokens.
     let (reuse_for_drop, reuse_for_alloc) = collect_reuse_pairs(
@@ -129,13 +156,13 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
         }
     }
 
-    // Phase B: per block, emit Reset (for reuse-pair drops) or Free
-    // (otherwise) at each value's effective last use, deferred past
-    // any loaded children's last uses. The richer Drop-with-mask
-    // approach is foundation only — without slot_types for Loaded
-    // values and Call results, the runtime cascade through
-    // heap.ptr_offsets is still required and Free is the safe
-    // emission. Move-out from intermediate wrappers is still pending.
+    // Phase B: per block, emit Reset (for reuse-pair drops) or
+    // Drop/Free (otherwise) at each value's effective last use,
+    // deferred past any loaded children's last uses. When the
+    // whole-program layouts pass produces slot_types for `v`, emit
+    // `Drop(v, slot_types)` with moved-out slots masked to non-Ptr so
+    // the cascade skips them. Falls back to `Free(v)` (runtime cascade
+    // via heap.ptr_offsets) when the layout is unknown.
     let loaded_ptr_children = loaded_ptr_children_map(func);
     let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
     for bid in block_ids {
@@ -180,7 +207,10 @@ fn emit_drops_function(func: &mut Function, analysis: &Analysis) {
 
             let inst = match reuse_info {
                 Some(info) => Inst::Reset(info.token, v, info.slot_types.clone()),
-                None => Inst::Free(v),
+                None => match drop_slot_types(v, &slot_types_by_value, &moved_out_slots) {
+                    Some(slots) => Inst::Drop(v, slots),
+                    None => Inst::Free(v),
+                },
             };
             drops.push((idx, inst));
         }
@@ -307,23 +337,18 @@ fn collect_reuse_pairs(
 /// Compute the slot_types vector for a Drop/Reset of `v`, with any
 /// moved-out slots masked to a non-Ptr type so the cascade skips
 /// them. Returns `None` if `v` has no known slot layout (e.g. Call
-/// result we can't see into); the caller then emits a plain `Free`
-/// that uses heap.ptr_offsets metadata at runtime.
+/// result the layouts pass couldn't see into); the caller then emits
+/// a plain `Free` that uses heap.ptr_offsets metadata at runtime.
 fn drop_slot_types(
     v: Value,
     slot_types_by_value: &HashMap<Value, Vec<ScalarType>>,
     moved_out_slots: &HashMap<Value, HashSet<usize>>,
 ) -> Option<Vec<ScalarType>> {
     let mut slots = slot_types_by_value.get(&v).cloned()?;
-    // TEMP DEBUG: disable masking to isolate whether the bug is in
-    // Drop's mask semantics or the slot_types computation.
-    let _ = moved_out_slots;
-    if false {
-        if let Some(moved) = moved_out_slots.get(&v) {
-            for &slot_idx in moved {
-                if slot_idx < slots.len() {
-                    slots[slot_idx] = ScalarType::U64;
-                }
+    if let Some(moved) = moved_out_slots.get(&v) {
+        for &slot_idx in moved {
+            if slot_idx < slots.len() {
+                slots[slot_idx] = ScalarType::U64;
             }
         }
     }
@@ -385,91 +410,64 @@ fn compute_moved_out(
     (slots, children)
 }
 
-/// Effective Unique set. Currently just mirrors `analysis.ownership`'s
-/// Unique entries — promotion of Loaded-from-Unique children to Unique
-/// is not done here because we can't statically recover their
-/// slot_types (the children's structure was set up in another
-/// function we can't see into), and without slot_types a Drop has no
-/// safe cascade rule.
+/// Effective Unique set. Starts with `analysis.ownership`'s Unique
+/// entries, then promotes single-Load Ptr children of Unique parents
+/// to Unique. Block params receive transitive promotion: if every
+/// incoming edge args is now Unique, the param is too.
 ///
-/// The move-out *masking* on the parent's Drop still applies: parents
-/// get Drop with their loaded-out slots excluded from cascade, so the
-/// children stay live. The children then leak — better than the
-/// previous behavior of leaking the parent AND the children, and
-/// strictly correct (no UAF, no double-free).
+/// The promotion is sound because:
+/// - A single-Load child from a Unique parent inherits the parent's
+///   refcount slot — the runtime never incs at Load, so the slot's
+///   "owner" passes from parent to child.
+/// - The parent's Drop is emitted with the moved-out slot masked to
+///   non-Ptr (via `drop_slot_types`), so the parent's cascade skips
+///   the slot and doesn't double-decrement the child.
+///
+/// The child's own Drop/Free at its last use handles its onward
+/// substructure (via runtime metadata if no static layout is known).
 fn compute_effective_unique(
-    _func: &Function,
+    func: &Function,
     ownership: &HashMap<Value, Ownership>,
-    _moved_out_children: &HashMap<Value, (Value, usize)>,
+    moved_out_children: &HashMap<Value, (Value, usize)>,
 ) -> HashSet<Value> {
-    ownership
+    let mut unique: HashSet<Value> = ownership
         .iter()
         .filter(|(_, o)| **o == Ownership::Unique)
         .map(|(v, _)| *v)
-        .collect()
-}
+        .collect();
 
-/// Per-Ptr-value slot type layout. For values defined by `Alloc`,
-/// scan subsequent `Store`s. For block params, propagate the layout
-/// from incoming edge args via a fixpoint (same shape as
-/// `compute_alloc_kinds`). Slot count uses the lowering's uniform
-/// 8-byte stride.
-///
-/// This lets `emit_drops` emit `Reset` on loop-accumulator block
-/// params — without phi propagation those values have no known
-/// layout, and the reuse pair can't be honored.
-fn compute_slot_types(func: &Function) -> HashMap<Value, Vec<ScalarType>> {
-    let mut map: HashMap<Value, Vec<ScalarType>> = HashMap::new();
-
-    // Phase 1: direct Alloc-defined values, refined by Stores.
-    for block in func.blocks.values() {
-        for inst in &block.insts {
-            if let Inst::Alloc(dest, size) = inst {
-                let num_slots = size / 8;
-                map.insert(*dest, vec![ScalarType::Ptr; num_slots]);
-            }
-        }
-        for inst in &block.insts {
-            if let Inst::Store(ptr, offset, val) = inst {
-                if let Some(slots) = map.get_mut(ptr) {
-                    let slot_idx = offset / 8;
-                    if slot_idx < slots.len() {
-                        slots[slot_idx] = val.ty;
-                    }
-                }
-            }
+    // Promote moved-out children of Unique parents to Unique.
+    for (&child, &(parent, _slot)) in moved_out_children {
+        if unique.contains(&parent) {
+            unique.insert(child);
         }
     }
 
-    // Phase 2: propagate through block params. If all incoming edge
-    // args have the same slot layout, the param inherits it. Conflict
-    // (different layouts) → no entry for that param.
-    let mut conflict: HashSet<Value> = HashSet::new();
+    // Propagate across block-param edges: a block param becomes Unique
+    // if *every* incoming edge passes a Unique value. Iterate to
+    // fixpoint; the lattice is monotone (params only ever join into
+    // Unique).
     loop {
-        let mut changed = false;
+        let mut candidates: HashMap<Value, bool> = HashMap::new();
         for block in func.blocks.values() {
             for edge in block.terminator.successors() {
-                let succ_params = &func.blocks[&edge.target].params;
-                for (param, arg) in succ_params.iter().zip(edge.args.iter()) {
-                    if conflict.contains(param) {
+                let succ = &func.blocks[&edge.target];
+                for (param, arg) in succ.params.iter().zip(edge.args.iter()) {
+                    if param.ty != ScalarType::Ptr || unique.contains(param) {
                         continue;
                     }
-                    let Some(arg_slots) = map.get(arg).cloned() else {
-                        continue;
-                    };
-                    match map.get(param) {
-                        None => {
-                            map.insert(*param, arg_slots);
-                            changed = true;
-                        }
-                        Some(existing) if existing != &arg_slots => {
-                            map.remove(param);
-                            conflict.insert(*param);
-                            changed = true;
-                        }
-                        _ => {}
-                    }
+                    let arg_unique = unique.contains(arg);
+                    candidates
+                        .entry(*param)
+                        .and_modify(|all| *all = *all && arg_unique)
+                        .or_insert(arg_unique);
                 }
+            }
+        }
+        let mut changed = false;
+        for (param, all_unique) in candidates {
+            if all_unique && unique.insert(param) {
+                changed = true;
             }
         }
         if !changed {
@@ -477,7 +475,7 @@ fn compute_slot_types(func: &Function) -> HashMap<Value, Vec<ScalarType>> {
         }
     }
 
-    map
+    unique
 }
 
 /// Map each parent value to the set of Ptr children Loaded from it.
@@ -543,6 +541,7 @@ fn emit_rc_inc_fallback(func: &mut Function, sites: &[super::ownership::RcIncSit
 fn cleanly_transferred(
     func: &Function,
     ownership: &HashMap<Value, Ownership>,
+    usage: &ModuleUsage,
 ) -> HashSet<Value> {
     let is_ptr = |v: Value| v.ty == ScalarType::Ptr;
     let mut s = HashSet::new();
@@ -580,11 +579,17 @@ fn cleanly_transferred(
             }
         }
 
-        // Category 2: Call args. Conservative until move-out lands.
+        // Category 2: Call args. Mark as transferred only at positions
+        // the callee declares `Transferring` per `ModuleUsage`. Args
+        // passed to `Borrowing` positions stay drop-eligible in this
+        // function — the callee promises not to take ownership.
         for inst in &block.insts {
-            if let Inst::Call(_, _, args) = inst {
-                for a in args {
-                    if is_ptr(*a) {
+            if let Inst::Call(_, callee, args) = inst {
+                for (i, a) in args.iter().enumerate() {
+                    if !is_ptr(*a) {
+                        continue;
+                    }
+                    if usage.usage(callee, i) == ParamUsage::Transferring {
                         s.insert(*a);
                     }
                 }
