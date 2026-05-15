@@ -23,4 +23,7 @@ U8 := {}.(
 
     to_str : U8 -> Str
     to_str = |n| U64.to_str(n.to_u64())
+
+    hash : U8 -> U64
+    hash = |n| U64.hash(n.to_u64())
 )

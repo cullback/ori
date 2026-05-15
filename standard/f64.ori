@@ -103,4 +103,7 @@ F64 := {}.(
             )
         )
     )
+
+    hash : F64 -> U64
+    hash = |x| U64.hash(F64.to_bits(x))
 )

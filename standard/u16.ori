@@ -18,4 +18,7 @@ U16 := {}.(
 
     to_str : U16 -> Str
     to_str = |n| U64.to_str(n.to_u64())
+
+    hash : U16 -> U64
+    hash = |n| U64.hash(n.to_u64())
 )

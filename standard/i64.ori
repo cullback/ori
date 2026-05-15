@@ -9,6 +9,9 @@ I64 := {}.(
     equals : I64, I64 -> Bool
     compare : I64, I64 -> Order
     to_u8 : I64 -> U8
+    # Bit reinterpretation: same 64 bits, signed view -> unsigned view.
+    # Negative values become large U64s.
+    to_u64 : I64 -> U64
 
     min : I64, I64 -> I64
     min = |a, b| if a <= b then a else b
@@ -43,4 +46,7 @@ I64 := {}.(
                 : Ok(s) then s
                 : Err(_) then ""
         )
+
+    hash : I64 -> U64
+    hash = |n| U64.hash(n.to_u64())
 )

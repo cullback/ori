@@ -92,14 +92,18 @@ impl NumericType {
     /// nontrivial in pure Ori).
     pub fn has_builtin_method(self, method: &str) -> bool {
         match method {
-            "add" | "sub" | "mul" | "div" | "equals" | "compare" | "hash" => true,
+            "add" | "sub" | "mul" | "div" | "equals" | "compare" => true,
             "mod" | "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr" => self.is_integer(),
             "from_u8" => matches!(self, Self::U64 | Self::U32),
             "to_u8" => matches!(self, Self::U32 | Self::U64 | Self::I64),
-            // Widen unsigned -> U64 / signed -> I64. Used by the
-            // smaller integer types to delegate `to_str` to the
-            // U64/I64 workhorse implementations in stdlib.
-            "to_u64" => matches!(self, Self::U8 | Self::U16 | Self::U32),
+            // Widen-as-U64 / widen-as-I64. For unsigned types these
+            // are arithmetic widenings (zero-extend); for signed
+            // types they're bit reinterpretations (same bits, new
+            // type). Both implemented as a single Cast SSA op.
+            "to_u64" => matches!(
+                self,
+                Self::U8 | Self::U16 | Self::U32 | Self::I8 | Self::I16 | Self::I32 | Self::I64
+            ),
             "to_i64" => matches!(self, Self::I8 | Self::I16 | Self::I32),
             // F64 ↔ U64 bit reinterpretation (IEEE 754 access).
             "to_bits" => matches!(self, Self::F64),

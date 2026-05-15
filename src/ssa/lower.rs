@@ -995,11 +995,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             if op_name == "from_bits" {
                 return self.builder.bitcast(recv_val, ScalarType::F64);
             }
-            if op_name == "hash" {
-                return self
-                    .builder
-                    .call("__num_hash", vec![recv_val], ScalarType::U64);
-            }
             if op_name == "from_u8" {
                 let dest_ty = self.expr_scalar_type(outer);
                 return self.builder.cast(recv_val, dest_ty);
@@ -1620,6 +1615,27 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         merge_param
     }
 
+    /// FNV-1a hash of a single scalar value. Widens or bit-reinterprets
+    /// to U64 (F64 via BitCast; integer/Ptr via Cast — same-width Cast
+    /// is bit-equivalent), then `(FNV_OFFSET XOR bits) * FNV_PRIME`.
+    fn emit_scalar_hash(&mut self, value: Value) -> Value {
+        let bits = if value.ty == ScalarType::F64 {
+            self.builder.bitcast(value, ScalarType::U64)
+        } else if value.ty == ScalarType::U64 {
+            value
+        } else {
+            self.builder.cast(value, ScalarType::U64)
+        };
+        #[expect(clippy::unreadable_literal)]
+        let offset = self.builder.const_u64(14695981039346656037);
+        let xord = self
+            .builder
+            .binop(BinaryOp::Xor, offset, bits, ScalarType::U64);
+        #[expect(clippy::unreadable_literal)]
+        let prime = self.builder.const_u64(1099511628211);
+        self.builder.binop(BinaryOp::Mul, xord, prime, ScalarType::U64)
+    }
+
     /// Record hash: FNV-1a over each field in sorted order.
     fn lower_record_hash(&mut self, recv: Value, ty: &Type) -> Value {
         let Type::Record { fields, .. } = ty else {
@@ -1637,8 +1653,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let field_hash = if let Type::Record { .. } = field_ty {
                 self.lower_record_hash(field_val, field_ty)
             } else {
-                self.builder
-                    .call("__num_hash", vec![field_val], ScalarType::U64)
+                self.emit_scalar_hash(field_val)
             };
             // hash = (hash XOR field_hash) * FNV prime
             hash = self
@@ -1669,8 +1684,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             } else if let Type::Tuple(_) = elem_ty {
                 self.lower_tuple_hash(elem_val, elem_ty)
             } else {
-                self.builder
-                    .call("__num_hash", vec![elem_val], ScalarType::U64)
+                self.emit_scalar_hash(elem_val)
             };
             hash = self
                 .builder
@@ -1696,9 +1710,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         // Hash the tag index.
         let tag = self.builder.load(recv, 0, ScalarType::U64);
-        let tag_hash = self
-            .builder
-            .call("__num_hash", vec![tag], ScalarType::U64);
+        let tag_hash = self.emit_scalar_hash(tag);
         hash = self
             .builder
             .binop(BinaryOp::Xor, hash, tag_hash, ScalarType::U64);
@@ -1710,9 +1722,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         // Hash the payload (slot 1, byte offset 8) — treat as raw value.
         let payload = self.builder.load(recv, 8, ScalarType::Ptr);
-        let payload_hash = self
-            .builder
-            .call("__num_hash", vec![payload], ScalarType::U64);
+        let payload_hash = self.emit_scalar_hash(payload);
         hash = self
             .builder
             .binop(BinaryOp::Xor, hash, payload_hash, ScalarType::U64);

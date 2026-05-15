@@ -22,6 +22,17 @@ U64 := {}.(
     max : U64, U64 -> U64
     max = |a, b| if a >= b then a else b
 
+    # FNV-1a hash of the U64 bit pattern. Other numeric types' hash
+    # methods delegate to this after widening or bit-reinterpreting.
+    hash : U64 -> U64
+    hash = |n| (
+        offset : U64
+        offset = 14695981039346656037
+        prime : U64
+        prime = 1099511628211
+        offset.bit_xor(n).mul(prime)
+    )
+
     # Decimal string representation. Builds digits low-to-high inside
     # a 20-step walk_until (U64::MAX has 20 digits), then reverses.
     # ```ori

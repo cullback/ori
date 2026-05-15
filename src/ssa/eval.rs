@@ -632,27 +632,6 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
 
 fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar> {
     match name {
-        "__num_hash" => {
-            // args: [number] → U64 hash
-            // FNV-1a-style bit mixing: cast to u64, then mix.
-            #[expect(clippy::cast_sign_loss)]
-            let bits: u64 = match args[0] {
-                Scalar::I64(n) => n as u64,
-                Scalar::U64(n) => n,
-                Scalar::I32(n) => n as u64,
-                Scalar::U32(n) => u64::from(n),
-                Scalar::I16(n) => n as u64,
-                Scalar::U16(n) => u64::from(n),
-                Scalar::I8(n) => n as u64,
-                Scalar::U8(n) => u64::from(n),
-                Scalar::F64(n) => n.to_bits(),
-                // Bool is now U8, handled above.
-                Scalar::Ptr(idx) => idx as u64,
-            };
-            // FNV-1a: hash one u64 value
-            let hash = (14695981039346656037_u64 ^ bits).wrapping_mul(1099511628211);
-            Some(Scalar::U64(hash))
-        }
         "__crash" => {
             // args: [str_ptr] — print message to stderr and abort.
             let Scalar::Ptr(list_idx) = args[0] else {

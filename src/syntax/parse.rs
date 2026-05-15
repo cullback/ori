@@ -546,7 +546,16 @@ impl ParseCtx {
                 Expr::new(ExprKind::FloatLit(n), span)
             }
             Rule::int_lit => {
-                let n: i64 = pair.as_str().parse().unwrap();
+                let s = pair.as_str();
+                // Try I64 first; fall back to U64 (storing the bit
+                // pattern as I64) so we can express constants like
+                // FNV-1a's offset basis that fit in U64 but not I64.
+                #[expect(clippy::cast_possible_wrap)]
+                let n: i64 = s.parse::<i64>().unwrap_or_else(|_| {
+                    s.parse::<u64>()
+                        .expect("int literal must fit in U64")
+                        as i64
+                });
                 Expr::new(ExprKind::IntLit(n), span)
             }
             Rule::dot_lambda => {
