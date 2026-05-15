@@ -244,6 +244,12 @@ impl Builder {
         v
     }
 
+    pub fn bitcast(&mut self, src: Value, dest_ty: ScalarType) -> Value {
+        let v = self.fresh_value(dest_ty);
+        self.push(Inst::BitCast(v, src));
+        v
+    }
+
     /// Emit a forward bulk-copy loop. Copies `count` elements from
     /// `src` to `dst` using `LoadDyn`/`StoreDyn` with 8-byte stride.
     /// When `elem_ty == Ptr`, every loaded element gets an `RcInc`

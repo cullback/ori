@@ -77,6 +77,10 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     check(module, "optimize");
 
     ssa::inline::inline(module);
+    // `inline` may leave cross-block refs (its in-pass repair was
+    // O(N²) and chokes on medium-sized functions). Re-establish the
+    // invariant via `ssa_construct` before the next pass.
+    ssa::ssa_construct::run(module);
     check(module, "inline");
 
     ssa::opt::optimize(module);

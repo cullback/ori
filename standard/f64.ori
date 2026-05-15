@@ -7,11 +7,100 @@ F64 := {}.(
     div : F64, F64 -> F64
     equals : F64, F64 -> Bool
     compare : F64, F64 -> Order
-    to_str : F64 -> Str
+    # IEEE 754 bit access. `to_bits` returns the 64-bit pattern as
+    # U64; `from_bits` inverses. Pure register move at machine level.
+    to_bits : F64 -> U64
+    from_bits : U64 -> F64
 
     min : F64, F64 -> F64
     min = |a, b| if a <= b then a else b
 
     max : F64, F64 -> F64
     max = |a, b| if a >= b then a else b
+
+    # Position of the highest set bit in a non-zero U64 (0..63).
+    # Used internally to convert U64 to F64. Binary search via
+    # branching: 6 if-else levels for 64 bits.
+    msb_u64 : U64 -> U64
+    msb_u64 = |n| (
+        n1 = if n.shr(32) > 0 then n.shr(32) else n
+        p1 = if n.shr(32) > 0 then 32 else 0
+        n2 = if n1.shr(16) > 0 then n1.shr(16) else n1
+        p2 = if n1.shr(16) > 0 then p1 + 16 else p1
+        n3 = if n2.shr(8) > 0 then n2.shr(8) else n2
+        p3 = if n2.shr(8) > 0 then p2 + 8 else p2
+        n4 = if n3.shr(4) > 0 then n3.shr(4) else n3
+        p4 = if n3.shr(4) > 0 then p3 + 4 else p3
+        n5 = if n4.shr(2) > 0 then n4.shr(2) else n4
+        p5 = if n4.shr(2) > 0 then p4 + 2 else p4
+        if n5.shr(1) > 0 then p5 + 1 else p5
+    )
+
+    # Convert U64 to F64. Exact for `n` whose mantissa fits in 53
+    # bits; truncates lower bits otherwise (no rounding).
+    from_u64 : U64 -> F64
+    from_u64 = |n|
+        if n == 0 then F64.from_bits(0)
+        else (
+            m = F64.msb_u64(n)
+            # Position the implicit-1 bit at slot 52 of the mantissa.
+            mant_with_lead = if m >= 52 then n.shr(m - 52) else n.shl(52 - m)
+            mant = mant_with_lead.bit_and(4503599627370495)
+            exp_field = (m + 1023).shl(52)
+            F64.from_bits(exp_field.bit_or(mant))
+        )
+
+    # Truncating cast: F64 to U64. Assumes `x >= 0.0` and `x < 2^64`.
+    # Returns 0 for x in [0, 1). Loses precision for x >= 2^53.
+    to_u64_trunc : F64 -> U64
+    to_u64_trunc = |x| (
+        bits = F64.to_bits(x)
+        exp_raw = bits.shr(52).bit_and(2047)
+        mant_with_lead = bits.bit_and(4503599627370495).bit_or(4503599627370496)
+        if exp_raw < 1023 then 0
+        else if exp_raw <= 1075 then mant_with_lead.shr(1075 - exp_raw)
+        else mant_with_lead.shl(exp_raw - 1075)
+    )
+
+    # Decimal string. Handles NaN, +/- inf, +/- 0, and finite values
+    # with |x| < ~1e15. Larger values lose precision in the integer
+    # part. Up to 6 fractional digits, trailing zeros trimmed.
+    to_str : F64 -> Str
+    to_str = |x| (
+        bits = F64.to_bits(x)
+        sign_bit = bits.shr(63)
+        exp_raw = bits.shr(52).bit_and(2047)
+        mant_raw = bits.bit_and(4503599627370495)
+        if exp_raw == 2047 then (
+            if mant_raw == 0 then
+                if sign_bit == 0 then "inf" else "-inf"
+            else "NaN"
+        )
+        else if exp_raw == 0 and mant_raw == 0 then "0"
+        else (
+            sign_str = if sign_bit == 0 then "" else "-"
+            abs_x = F64.from_bits(bits.bit_and(9223372036854775807))
+            int_part = F64.to_u64_trunc(abs_x)
+            frac = abs_x - F64.from_u64(int_part)
+            int_str = U64.to_str(int_part)
+            digits_state = List.range(0, 6).walk_until({ x: frac, digits: [] }, |s, _|
+                if s.x == 0.0 then Break(s)
+                else (
+                    scaled = s.x * 10.0
+                    d = F64.to_u64_trunc(scaled)
+                    Continue({
+                        x: scaled - F64.from_u64(d),
+                        digits: s.digits.append(U64.to_u8(d + 48)),
+                    })
+                )
+            )
+            if digits_state.digits.len() == 0 then
+                sign_str.concat(int_str)
+            else (
+                bytes = digits_state.digits
+                frac_str = if Str.from_utf8(bytes) : Ok(s) then s : Err(_) then ""
+                sign_str.concat(int_str).concat(".").concat(frac_str)
+            )
+        )
+    )
 )

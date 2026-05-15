@@ -168,6 +168,10 @@ pub enum Inst {
     /// (e.g. `U8 → U64`) zero-extends; narrowing truncates. Source and
     /// destination must both be integer types — no float/Ptr coercion.
     Cast(Value, Value),
+    /// dest = src reinterpreted as `dest`'s scalar type (same width).
+    /// Pure register move at the machine level; no arithmetic. Used
+    /// for `F64 ↔ U64` IEEE 754 bit access and similar.
+    BitCast(Value, Value),
     /// dest = group N values into one aggregate (register-level, no heap).
     Pack(Value, Vec<Value>),
     /// dest = extract field at `index` from aggregate value.
@@ -192,6 +196,7 @@ impl Inst {
             | Self::ReuseDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
+            | Self::BitCast(v, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(*v),
@@ -214,6 +219,7 @@ impl Inst {
             | Self::ReuseDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
+            | Self::BitCast(v, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(v),
@@ -237,7 +243,7 @@ impl Inst {
             Self::Reuse(_, token, _) => vec![*token],
             Self::ReuseDyn(_, token, size) => vec![*token, *size],
             Self::StaticRef(..) => vec![],
-            Self::Cast(_, src) => vec![*src],
+            Self::Cast(_, src) | Self::BitCast(_, src) => vec![*src],
             Self::Pack(_, fields) => fields.clone(),
             Self::Extract(_, agg, _) => vec![*agg],
             Self::Insert(_, agg, _, val) => vec![*agg, *val],
@@ -259,7 +265,7 @@ impl Inst {
             Self::Reset(_, ptr, _) => f(ptr),
             Self::Reuse(_, token, _) => f(token),
             Self::ReuseDyn(_, token, size) => { f(token); f(size); }
-            Self::Cast(_, src) => f(src),
+            Self::Cast(_, src) | Self::BitCast(_, src) => f(src),
             Self::Pack(_, fields) => fields.iter_mut().for_each(&mut f),
             Self::Extract(_, agg, _) => f(agg),
             Self::Insert(_, agg, _, val) => { f(agg); f(val); }

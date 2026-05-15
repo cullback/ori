@@ -177,6 +177,10 @@ impl fmt::Display for FmtInst<'_> {
                 let dt = d.ty;
                 write!(f, "{d}: {dt} = cast {}", fmt_val(*src, consts))
             }
+            Inst::BitCast(d, src) => {
+                let dt = d.ty;
+                write!(f, "{d}: {dt} = bitcast {}", fmt_val(*src, consts))
+            }
             Inst::Pack(d, fields) => {
                 write!(f, "{d} = pack({})", fmt_args(fields, consts))
             }

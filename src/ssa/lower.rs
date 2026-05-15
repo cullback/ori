@@ -865,12 +865,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .iter()
                 .find(|(sym, _)| self.symbols.display(**sym) == segments[0])
                 .map(|(_, v)| *v);
-            if op_name == "to_str" {
-                // Only reached for F64 — integer to_str is in stdlib.
+            if op_name == "to_bits" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
-                return self
-                    .builder
-                    .call("__num_to_str", vec![arg], ScalarType::Ptr);
+                return self.builder.bitcast(arg, ScalarType::U64);
+            }
+            if op_name == "from_bits" {
+                let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
+                return self.builder.bitcast(arg, ScalarType::F64);
             }
             if op_name == "from_u8" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
@@ -988,11 +989,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             return self.lower_tag_hash(recv_val, &receiver.ty);
         }
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
-            if op_name == "to_str" {
-                // F64 only; integer to_str dispatched via stdlib method.
-                return self
-                    .builder
-                    .call("__num_to_str", vec![recv_val], ScalarType::Ptr);
+            if op_name == "to_bits" {
+                return self.builder.bitcast(recv_val, ScalarType::U64);
+            }
+            if op_name == "from_bits" {
+                return self.builder.bitcast(recv_val, ScalarType::F64);
             }
             if op_name == "hash" {
                 return self
@@ -1747,7 +1748,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let field_val = self.load_field(recv, i, self.scalar_type(&field_ty));
             let val_str = if let Type::Record { .. } = &field_ty {
                 self.lower_record_to_str(field_val, &field_ty)
+            } else if let Type::Con(name) = &field_ty {
+                // Dispatch through the type's stdlib `to_str` method.
+                let mangled = format!("{name}.to_str");
+                self.builder.call(&mangled, vec![field_val], ScalarType::Ptr)
             } else {
+                // Fallback for unhandled cases. Should be unreachable
+                // post-mono for primitive-typed record fields.
                 self.builder.call("__num_to_str", vec![field_val], ScalarType::Ptr)
             };
             acc = self.lower_str_concat(acc, val_str);

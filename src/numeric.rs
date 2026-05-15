@@ -101,9 +101,9 @@ impl NumericType {
             // U64/I64 workhorse implementations in stdlib.
             "to_u64" => matches!(self, Self::U8 | Self::U16 | Self::U32),
             "to_i64" => matches!(self, Self::I8 | Self::I16 | Self::I32),
-            // Only F64 still uses the intrinsic; integer to_str is
-            // in stdlib.
-            "to_str" => matches!(self, Self::F64),
+            // F64 ↔ U64 bit reinterpretation (IEEE 754 access).
+            "to_bits" => matches!(self, Self::F64),
+            "from_bits" => matches!(self, Self::F64),
             _ => false,
         }
     }

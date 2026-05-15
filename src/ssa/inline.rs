@@ -148,10 +148,10 @@ fn inline_calls_in_function(caller: &mut Function, snapshots: &HashMap<String, F
         let callee = &snapshots[&callee_name];
         perform_inline(caller, block_id, inst_idx, callee);
     }
-    // After inlining, callee function params that mapped to caller-local
-    // values may have become cross-block references. Repair them by
-    // threading through block params.
-    repair_cross_block_refs(caller);
+    // Cross-block refs introduced by inlining are repaired in bulk by
+    // the `ssa_construct` pass that runs after `inline` in the
+    // pipeline. Don't do it here (the old O(N²) repair chokes on
+    // medium-large functions like F64.to_str post-inline).
 }
 
 /// Find the first Call instruction that targets an inlineable callee.
@@ -435,108 +435,3 @@ fn rewrite_terminator_operands(term: &mut Terminator, map: &HashMap<Value, Value
     super::opt::rewrite_terminator_operands(term, map);
 }
 
-/// Repair cross-block references by threading values through block
-/// params. After inlining, callee function params that were remapped
-/// to caller-local values may appear as cross-block references.
-/// This pass iteratively adds block params until every block is
-/// self-contained.
-fn repair_cross_block_refs(func: &mut Function) {
-    let func_param_set: HashSet<Value> = func.params.iter().copied().collect();
-    let mut next_val: usize = {
-        let mut m = 0_usize;
-        for &p in &func.params {
-            m = m.max(p.id + 1);
-        }
-        for block in func.blocks.values() {
-            for &p in &block.params {
-                m = m.max(p.id + 1);
-            }
-            for inst in &block.insts {
-                if let Some(d) = inst.dest() {
-                    m = m.max(d.id + 1);
-                }
-            }
-        }
-        m
-    };
-
-    loop {
-        // Find the first cross-block reference.
-        let mut violation: Option<(BlockId, Value)> = None;
-        'outer: for (&bid, block) in &func.blocks {
-            let mut local: HashSet<Value> = block.params.iter().copied().collect();
-            for inst in &block.insts {
-                for v in inst.operands() {
-                    if !local.contains(&v) && !func_param_set.contains(&v) {
-                        violation = Some((bid, v));
-                        break 'outer;
-                    }
-                }
-                if let Some(d) = inst.dest() {
-                    local.insert(d);
-                }
-            }
-            for v in block.terminator.operands() {
-                if !local.contains(&v) && !func_param_set.contains(&v) {
-                    violation = Some((bid, v));
-                    break 'outer;
-                }
-            }
-        }
-
-        let Some((bid, val)) = violation else {
-            break;
-        };
-
-        // Create a fresh block param for `val` in block `bid`.
-        let new_param = Value { id: next_val, ty: val.ty };
-        next_val += 1;
-        func.blocks.get_mut(&bid).unwrap().params.push(new_param);
-
-        // Rewrite uses of `val` in this block to `new_param`.
-        let remap: HashMap<Value, Value> = [(val, new_param)].into();
-        let block = func.blocks.get_mut(&bid).unwrap();
-        for inst in &mut block.insts {
-            super::opt::rewrite_operands(inst, &remap);
-        }
-        super::opt::rewrite_terminator_operands(&mut block.terminator, &remap);
-
-        // Update every edge that targets `bid` to pass `val` as an
-        // extra arg. If `val` isn't available in the predecessor,
-        // it'll be caught as a violation on the next iteration.
-        let all_bids: Vec<BlockId> = func.blocks.keys().copied().collect();
-        for pred_bid in all_bids {
-            let block = func.blocks.get_mut(&pred_bid).unwrap();
-            match &mut block.terminator {
-                Terminator::Jump(edge) if edge.target == bid => {
-                    edge.args.push(val);
-                }
-                Terminator::Branch {
-                    then_edge,
-                    else_edge,
-                    ..
-                } => {
-                    if then_edge.target == bid {
-                        then_edge.args.push(val);
-                    }
-                    if else_edge.target == bid {
-                        else_edge.args.push(val);
-                    }
-                }
-                Terminator::SwitchInt { arms, default, .. } => {
-                    for (_, edge) in arms.iter_mut() {
-                        if edge.target == bid {
-                            edge.args.push(val);
-                        }
-                    }
-                    if let Some(edge) = default {
-                        if edge.target == bid {
-                            edge.args.push(val);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}

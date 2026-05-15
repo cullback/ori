@@ -598,6 +598,16 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(bits_to_scalar(dest.ty, bits))
         }
 
+        Inst::BitCast(dest, src) => {
+            // Same-width bit reinterpretation. `F64 ↔ U64` is the
+            // canonical use; integer ↔ integer of equal width works too.
+            let bits = match env[src.id] {
+                Scalar::F64(n) => n.to_bits(),
+                other => scalar_to_u64(other),
+            };
+            Some(bits_to_scalar(dest.ty, bits))
+        }
+
         Inst::Extract(dest, agg, idx) => {
             if let Scalar::Ptr(p) = env[agg.id] {
                 Some(heap.load_auto(p, *idx * 8, dest.ty))
@@ -622,32 +632,6 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
 
 fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar> {
     match name {
-        "__num_to_str" => {
-            // args: [number] → str_ptr (List(U8))
-            let s = match args[0] {
-                Scalar::I8(n) => n.to_string(),
-                Scalar::U8(n) => n.to_string(),
-                Scalar::I16(n) => n.to_string(),
-                Scalar::U16(n) => n.to_string(),
-                Scalar::I32(n) => n.to_string(),
-                Scalar::U32(n) => n.to_string(),
-                Scalar::I64(n) => n.to_string(),
-                Scalar::U64(n) => n.to_string(),
-                Scalar::F64(n) => n.to_string(),
-                _ => panic!("__num_to_str: expected number"),
-            };
-            let bytes = s.into_bytes();
-            let len = bytes.len();
-            let data = heap.alloc(len * 8);
-            for (i, b) in bytes.into_iter().enumerate() {
-                heap.store(data, i * 8, Scalar::U8(b));
-            }
-            let list = heap.alloc(24);
-            heap.store(list, 0, Scalar::U64(len as u64));
-            heap.store(list, 8, Scalar::U64(len as u64));
-            heap.store(list, 16, Scalar::Ptr(data));
-            Some(Scalar::Ptr(list))
-        }
         "__num_hash" => {
             // args: [number] → U64 hash
             // FNV-1a-style bit mixing: cast to u64, then mix.
