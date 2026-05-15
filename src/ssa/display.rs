@@ -173,6 +173,10 @@ impl fmt::Display for FmtInst<'_> {
             Inst::Reuse(d, tok, n) => write!(f, "{d}: ptr = reuse {}, {n}", fmt_val(*tok, consts)),
             Inst::ReuseDyn(d, tok, n) => write!(f, "{d}: ptr = reuse_dyn {}, {}", fmt_val(*tok, consts), fmt_val(*n, consts)),
             Inst::StaticRef(d, id) => write!(f, "{d}: ptr = static_ref @{id}"),
+            Inst::Cast(d, src) => {
+                let dt = d.ty;
+                write!(f, "{d}: {dt} = cast {}", fmt_val(*src, consts))
+            }
             Inst::Pack(d, fields) => {
                 write!(f, "{d} = pack({})", fmt_args(fields, consts))
             }

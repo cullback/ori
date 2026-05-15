@@ -589,6 +589,13 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(idx))
         }
 
+        Inst::Cast(dest, src) => {
+            // Integer widening (zero-extend) / narrowing (truncate).
+            // The destination type drives the result variant.
+            let bits = scalar_to_u64(env[src.id]);
+            Some(bits_to_scalar(dest.ty, bits))
+        }
+
         Inst::Extract(dest, agg, idx) => {
             if let Scalar::Ptr(p) = env[agg.id] {
                 Some(heap.load_auto(p, *idx * 8, dest.ty))
@@ -659,28 +666,6 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
             // FNV-1a: hash one u64 value
             let hash = (14695981039346656037_u64 ^ bits).wrapping_mul(1099511628211);
             Some(Scalar::U64(hash))
-        }
-        "__u64_from_u8" => {
-            // args: [u8] → u64 (widening conversion)
-            let Scalar::U8(n) = args[0] else {
-                panic!("__u64_from_u8: expected U8, got {:?}", args[0]);
-            };
-            Some(Scalar::U64(u64::from(n)))
-        }
-        "__u32_from_u8" => {
-            let Scalar::U8(n) = args[0] else {
-                panic!("__u32_from_u8: expected U8, got {:?}", args[0]);
-            };
-            Some(Scalar::U32(u32::from(n)))
-        }
-        #[expect(clippy::cast_possible_truncation)]
-        "__to_u8" => {
-            let n = match args[0] {
-                Scalar::U32(n) => n as u8,
-                Scalar::U64(n) => n as u8,
-                other => panic!("__to_u8: unexpected {other:?}"),
-            };
-            Some(Scalar::U8(n))
         }
         "__crash" => {
             // args: [str_ptr] — print message to stderr and abort.

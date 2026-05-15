@@ -164,6 +164,10 @@ pub enum Inst {
     /// dest = pointer to a pre-allocated static object by index.
     /// The object lives in `Module::statics` and is never freed.
     StaticRef(Value, usize),
+    /// dest = src converted to `dest`'s scalar type. Integer widening
+    /// (e.g. `U8 → U64`) zero-extends; narrowing truncates. Source and
+    /// destination must both be integer types — no float/Ptr coercion.
+    Cast(Value, Value),
     /// dest = group N values into one aggregate (register-level, no heap).
     Pack(Value, Vec<Value>),
     /// dest = extract field at `index` from aggregate value.
@@ -187,6 +191,7 @@ impl Inst {
             | Self::Reuse(v, _, _)
             | Self::ReuseDyn(v, _, _)
             | Self::StaticRef(v, _)
+            | Self::Cast(v, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(*v),
@@ -208,6 +213,7 @@ impl Inst {
             | Self::Reuse(v, _, _)
             | Self::ReuseDyn(v, _, _)
             | Self::StaticRef(v, _)
+            | Self::Cast(v, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::Insert(v, _, _, _) => Some(v),
@@ -231,6 +237,7 @@ impl Inst {
             Self::Reuse(_, token, _) => vec![*token],
             Self::ReuseDyn(_, token, size) => vec![*token, *size],
             Self::StaticRef(..) => vec![],
+            Self::Cast(_, src) => vec![*src],
             Self::Pack(_, fields) => fields.clone(),
             Self::Extract(_, agg, _) => vec![*agg],
             Self::Insert(_, agg, _, val) => vec![*agg, *val],
@@ -252,6 +259,7 @@ impl Inst {
             Self::Reset(_, ptr, _) => f(ptr),
             Self::Reuse(_, token, _) => f(token),
             Self::ReuseDyn(_, token, size) => { f(token); f(size); }
+            Self::Cast(_, src) => f(src),
             Self::Pack(_, fields) => fields.iter_mut().for_each(&mut f),
             Self::Extract(_, agg, _) => f(agg),
             Self::Insert(_, agg, _, val) => { f(agg); f(val); }

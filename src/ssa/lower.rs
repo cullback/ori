@@ -874,15 +874,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
             if op_name == "from_u8" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
-                let (rt_fn, ret_ty) = match segments[0] {
-                    "U32" => ("__u32_from_u8", ScalarType::U32),
-                    _ => ("__u64_from_u8", ScalarType::U64),
+                let dest_ty = match segments[0] {
+                    "U32" => ScalarType::U32,
+                    _ => ScalarType::U64,
                 };
-                return self.builder.call(rt_fn, vec![arg], ret_ty);
+                return self.builder.cast(arg, dest_ty);
             }
             if op_name == "to_u8" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
-                return self.builder.call("__to_u8", vec![arg], ScalarType::U8);
+                return self.builder.cast(arg, ScalarType::U8);
             }
             // Binary arithmetic op
             let (lhs, rhs) = if let Some(local_val) = local_val {
@@ -991,12 +991,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .call("__num_hash", vec![recv_val], ScalarType::U64);
             }
             if op_name == "from_u8" {
-                let ret_ty = self.expr_scalar_type(outer);
-                let rt_fn = if ret_ty == ScalarType::U32 { "__u32_from_u8" } else { "__u64_from_u8" };
-                return self.builder.call(rt_fn, vec![recv_val], ret_ty);
+                let dest_ty = self.expr_scalar_type(outer);
+                return self.builder.cast(recv_val, dest_ty);
             }
             if op_name == "to_u8" {
-                return self.builder.call("__to_u8", vec![recv_val], ScalarType::U8);
+                return self.builder.cast(recv_val, ScalarType::U8);
             }
             let rhs = self.lower_expr(&args[0]);
             let ty = self.expr_scalar_type(receiver);
@@ -2903,27 +2902,24 @@ fn emit_list_builtin_call(
     elem_ty: ScalarType,
 ) -> Value {
     if name.ends_with(".len") || name == "List.len" {
-        // `List.len` is a single load from slot 0 of the header.
-        return builder.load(args[0], 0, ScalarType::U64);
-    }
-    let (intrinsic, ret_ty) = if name.ends_with(".get") || name == "List.get" {
-        return emit_list_get_checked(builder, args);
+        builder.load(args[0], 0, ScalarType::U64)
+    } else if name.ends_with(".get") || name == "List.get" {
+        emit_list_get_checked(builder, args)
     } else if name.ends_with(".append") || name == "List.append" {
-        return emit_list_append(builder, args, elem_ty);
+        emit_list_append(builder, args, elem_ty)
     } else if name.ends_with(".range") || name == "List.range" {
-        return emit_list_range(builder, args);
+        emit_list_range(builder, args)
     } else if name.ends_with(".repeat") || name == "List.repeat" {
-        return emit_list_repeat(builder, args, elem_ty);
+        emit_list_repeat(builder, args, elem_ty)
     } else if name.ends_with(".reverse") || name == "List.reverse" {
-        return emit_list_reverse(builder, args, elem_ty);
+        emit_list_reverse(builder, args, elem_ty)
     } else if name.ends_with(".sublist") || name == "List.sublist" {
-        return emit_list_sublist(builder, args, elem_ty);
+        emit_list_sublist(builder, args, elem_ty)
     } else if name.ends_with(".set") || name == "List.set" {
-        return emit_list_set(builder, args, elem_ty);
+        emit_list_set(builder, args, elem_ty)
     } else {
         panic!("unknown list builtin: {name}");
-    };
-    builder.call(intrinsic, args, ret_ty)
+    }
 }
 
 /// Lower `list.append(val)` as SSA-level primitives: load len + data
