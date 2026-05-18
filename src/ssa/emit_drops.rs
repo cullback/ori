@@ -222,6 +222,205 @@ fn emit_drops_function(
             block_mut.insts.insert(idx + 1, inst);
         }
     }
+
+    // Phase C: edge-specific drops at branch points. When a Unique
+    // Ptr value is alive in a block but forwarded to only *some*
+    // successor edges (a loop-back keeps it; a loop-exit discards
+    // it), insert a Drop on the discarding edge by splitting the
+    // critical edge. Phase B can't handle this case because it sees
+    // the value in `terminator_transferred` and skips emission.
+    emit_edge_drops(
+        func,
+        &effective_unique,
+        &slot_types_by_value,
+        &moved_out_slots,
+        &cleanly_transferred,
+    );
+}
+
+/// Phase C: insert drops on terminator edges where a Ptr value dies.
+///
+/// A value `v` "dies on edge E" iff:
+/// - `v` is defined in the source block (block param or instruction dest),
+/// - `v` is in `effective_unique`,
+/// - `v` is *not* in `E.args`,
+/// - `v` *is* in some other successor edge's args (otherwise Phase B
+///   would have already dropped it intra-block).
+///
+/// For each (block, edge) with a non-empty dying set, split the edge:
+/// insert a new block X taking `E.args ++ dying_values` as params,
+/// drop the dying values, and jump to `E.target` with the original
+/// `E.args`-typed prefix. Update the source block's edge to point to
+/// X with the extended arg list.
+fn emit_edge_drops(
+    func: &mut Function,
+    effective_unique: &HashSet<Value>,
+    slot_types_by_value: &HashMap<Value, Vec<ScalarType>>,
+    moved_out_slots: &HashMap<Value, HashSet<usize>>,
+    cleanly_transferred: &HashSet<Value>,
+) {
+    let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
+
+    // First pass: collect work items so we don't mutate the map mid-iteration.
+    // Each item = (source_block, edge_index, dying_values, original_edge).
+    struct EdgeWork {
+        src_bid: BlockId,
+        edge_idx: usize,
+        dying: Vec<Value>,
+        target: BlockId,
+        original_args: Vec<Value>,
+    }
+    let mut work: Vec<EdgeWork> = Vec::new();
+
+    for bid in &block_ids {
+        let block = &func.blocks[bid];
+
+        // Local Ptr values: block params + Ptr-typed instruction dests.
+        let mut local_ptrs: Vec<Value> = Vec::new();
+        for &p in &block.params {
+            if p.ty == ScalarType::Ptr {
+                local_ptrs.push(p);
+            }
+        }
+        for inst in &block.insts {
+            if let Some(d) = inst.dest() {
+                if d.ty == ScalarType::Ptr {
+                    local_ptrs.push(d);
+                }
+            }
+        }
+
+        let succs: Vec<(BlockId, Vec<Value>)> = block
+            .terminator
+            .successors()
+            .iter()
+            .map(|e| (e.target, e.args.clone()))
+            .collect();
+        if succs.len() < 2 {
+            continue;
+        }
+        let arg_sets: Vec<HashSet<Value>> =
+            succs.iter().map(|(_, args)| args.iter().copied().collect()).collect();
+
+        for (edge_idx, (target, original_args)) in succs.iter().enumerate() {
+            let mut dying: Vec<Value> = Vec::new();
+            for &v in &local_ptrs {
+                if !effective_unique.contains(&v) {
+                    continue;
+                }
+                if cleanly_transferred.contains(&v) {
+                    continue;
+                }
+                if arg_sets[edge_idx].contains(&v) {
+                    continue;
+                }
+                // v not in this edge's args. Drop only if v is in some
+                // other edge's args — otherwise Phase B has already
+                // handled it (or it has no last use to anchor a drop).
+                let escapes_elsewhere = arg_sets
+                    .iter()
+                    .enumerate()
+                    .any(|(i, args)| i != edge_idx && args.contains(&v));
+                if escapes_elsewhere {
+                    dying.push(v);
+                }
+            }
+            if !dying.is_empty() {
+                work.push(EdgeWork {
+                    src_bid: *bid,
+                    edge_idx,
+                    dying,
+                    target: *target,
+                    original_args: original_args.clone(),
+                });
+            }
+        }
+    }
+
+    // Second pass: split edges.
+    let mut next_value_id = func.num_values();
+    for item in work {
+        // Fresh params for the new block: one per original arg, then
+        // one per dying value.
+        let mut new_params: Vec<Value> = Vec::with_capacity(item.original_args.len() + item.dying.len());
+        for arg in &item.original_args {
+            new_params.push(Value { id: next_value_id, ty: arg.ty });
+            next_value_id += 1;
+        }
+        let mut dying_renamed: Vec<Value> = Vec::with_capacity(item.dying.len());
+        for v in &item.dying {
+            let new_v = Value { id: next_value_id, ty: v.ty };
+            next_value_id += 1;
+            new_params.push(new_v);
+            dying_renamed.push(new_v);
+        }
+
+        // Build the new block's body: a Drop per dying value, then a
+        // Jump back to the original target with just the forwarded
+        // args.
+        let mut new_insts: Vec<Inst> = Vec::with_capacity(item.dying.len());
+        for (orig_v, new_v) in item.dying.iter().zip(dying_renamed.iter()) {
+            let inst = match drop_slot_types(*orig_v, slot_types_by_value, moved_out_slots) {
+                Some(slots) => Inst::Drop(*new_v, slots),
+                None => Inst::Free(*new_v),
+            };
+            new_insts.push(inst);
+        }
+        let forward_args: Vec<Value> = new_params[0..item.original_args.len()].to_vec();
+        let new_terminator =
+            Terminator::Jump(super::instruction::BlockEdge { target: item.target, args: forward_args });
+
+        let new_bid = BlockId(func.next_block);
+        func.next_block += 1;
+        let new_block = super::Block {
+            params: new_params,
+            insts: new_insts,
+            terminator: new_terminator,
+        };
+        func.blocks.insert(new_bid, new_block);
+
+        // Re-point the source block's edge to the new block, with
+        // original_args extended by the dying values.
+        let mut extended_args = item.original_args.clone();
+        extended_args.extend(item.dying.iter().copied());
+        let src_block = func.blocks.get_mut(&item.src_bid).unwrap();
+        replace_edge(&mut src_block.terminator, item.edge_idx, new_bid, extended_args);
+    }
+}
+
+/// Replace the `edge_idx`-th successor edge of `term` with a new
+/// target + args. Indexing matches `Terminator::successors()`.
+fn replace_edge(term: &mut Terminator, edge_idx: usize, target: BlockId, args: Vec<Value>) {
+    match term {
+        Terminator::Jump(edge) if edge_idx == 0 => {
+            edge.target = target;
+            edge.args = args;
+        }
+        Terminator::Branch { then_edge, else_edge, .. } => {
+            let edge = match edge_idx {
+                0 => then_edge,
+                1 => else_edge,
+                _ => panic!("branch has only 2 edges; got idx {edge_idx}"),
+            };
+            edge.target = target;
+            edge.args = args;
+        }
+        Terminator::SwitchInt { arms, default, .. } => {
+            if edge_idx < arms.len() {
+                arms[edge_idx].1.target = target;
+                arms[edge_idx].1.args = args;
+            } else if edge_idx == arms.len() {
+                let default = default
+                    .as_mut()
+                    .expect("switch edge_idx points past default but there is none");
+                default.target = target;
+                default.args = args;
+            } else {
+                panic!("switch edge_idx out of range: {edge_idx}");
+            }
+        }
+        _ => panic!("invalid edge index {edge_idx} for terminator"),
+    }
 }
 
 /// Effective last use of `v` within `block`, factoring in move-out
@@ -410,21 +609,28 @@ fn compute_moved_out(
     (slots, children)
 }
 
-/// Effective Unique set. Starts with `analysis.ownership`'s Unique
-/// entries, then promotes single-Load Ptr children of Unique parents
-/// to Unique. Block params receive transitive promotion: if every
-/// incoming edge args is now Unique, the param is too.
+/// Effective Unique set. Starts optimistic (every Ptr block param
+/// assumed Unique) and demotes via iterative refinement until no
+/// demotion is needed. Optimistic is necessary for loop block
+/// params, whose loop-back incoming arg is the param itself (via a
+/// chain of other block params) — pessimistic fixpoint would never
+/// promote them.
 ///
-/// The promotion is sound because:
+/// Sources of Unique-ness:
+/// - `ownership::Analysis::Unique` (Allocs, Calls, Reuses).
+/// - Single-Load Ptr children of Unique parents (move-out).
+/// - Block params, assumed Unique unless a *known-Borrowed* incoming
+///   arg refutes it.
+///
+/// Soundness:
 /// - A single-Load child from a Unique parent inherits the parent's
-///   refcount slot — the runtime never incs at Load, so the slot's
-///   "owner" passes from parent to child.
+///   refcount slot — the runtime never incs at Load.
 /// - The parent's Drop is emitted with the moved-out slot masked to
 ///   non-Ptr (via `drop_slot_types`), so the parent's cascade skips
 ///   the slot and doesn't double-decrement the child.
-///
-/// The child's own Drop/Free at its last use handles its onward
-/// substructure (via runtime metadata if no static layout is known).
+/// - A block param's Unique-ness is consistent with a fixed point
+///   over the SSA join lattice: if every incoming arg is (assumed)
+///   Unique, the param is consistently Unique.
 fn compute_effective_unique(
     func: &Function,
     ownership: &HashMap<Value, Ownership>,
@@ -443,35 +649,38 @@ fn compute_effective_unique(
         }
     }
 
-    // Propagate across block-param edges: a block param becomes Unique
-    // if *every* incoming edge passes a Unique value. Iterate to
-    // fixpoint; the lattice is monotone (params only ever join into
-    // Unique).
+    // Optimistic seed: every Ptr block param is assumed Unique.
+    for block in func.blocks.values() {
+        for p in &block.params {
+            if p.ty == ScalarType::Ptr {
+                unique.insert(*p);
+            }
+        }
+    }
+
+    // Demote block params whose incoming edge args include a value
+    // that's not in `unique`. Iterate until quiescent — demoting one
+    // param may flow into other params downstream.
     loop {
-        let mut candidates: HashMap<Value, bool> = HashMap::new();
+        let mut to_remove: Vec<Value> = Vec::new();
         for block in func.blocks.values() {
             for edge in block.terminator.successors() {
                 let succ = &func.blocks[&edge.target];
                 for (param, arg) in succ.params.iter().zip(edge.args.iter()) {
-                    if param.ty != ScalarType::Ptr || unique.contains(param) {
+                    if param.ty != ScalarType::Ptr || !unique.contains(param) {
                         continue;
                     }
-                    let arg_unique = unique.contains(arg);
-                    candidates
-                        .entry(*param)
-                        .and_modify(|all| *all = *all && arg_unique)
-                        .or_insert(arg_unique);
+                    if !unique.contains(arg) {
+                        to_remove.push(*param);
+                    }
                 }
             }
         }
-        let mut changed = false;
-        for (param, all_unique) in candidates {
-            if all_unique && unique.insert(param) {
-                changed = true;
-            }
-        }
-        if !changed {
+        if to_remove.is_empty() {
             break;
+        }
+        for v in to_remove {
+            unique.remove(&v);
         }
     }
 
