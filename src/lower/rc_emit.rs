@@ -230,14 +230,21 @@ fn emit_block(
     // Owning-load convention: after each Ptr-returning Load/LoadDyn,
     // emit RcInc(dest). This makes the loaded child an independent
     // owning slot rather than aliasing the parent's.
+    //
+    // Exception: lower's `copy_loop` (for list elements) already
+    // emits `RcInc(elem)` immediately after the Load. If we see that
+    // pattern, skip — the rc traffic is already in place.
     for (idx, inst) in block.insts.iter().enumerate() {
-        match inst {
-            Inst::Load(dest, _, _) | Inst::LoadDyn(dest, _, _)
-                if dest.ty == ScalarType::Ptr =>
-            {
-                inserts.push((idx + 1, Inst::RcInc(*dest)));
-            }
-            _ => {}
+        let dest = match inst {
+            Inst::Load(d, _, _) | Inst::LoadDyn(d, _, _) if d.ty == ScalarType::Ptr => *d,
+            _ => continue,
+        };
+        let already_owning = block
+            .insts
+            .get(idx + 1)
+            .is_some_and(|next| matches!(next, Inst::RcInc(v) if *v == dest));
+        if !already_owning {
+            inserts.push((idx + 1, Inst::RcInc(dest)));
         }
     }
 
