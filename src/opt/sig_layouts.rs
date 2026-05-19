@@ -38,8 +38,8 @@
 
 use std::collections::HashMap;
 
-use super::Module;
-use super::instruction::{Inst, ScalarType, Terminator, Value};
+use crate::ssa::Module;
+use crate::ssa::instruction::{Inst, ScalarType, Terminator, Value};
 
 /// Per-slot type vector. `slot_types[i]` is the type of the i-th
 /// 8-byte slot in the heap object.
@@ -212,7 +212,7 @@ pub fn analyze(module: &Module) -> ModuleLayouts {
 ///   agree; if any predecessor has a known layout that disagrees with
 ///   another, the param is dropped from the map).
 fn infer_function(
-    func: &super::Function,
+    func: &crate::ssa::Function,
     signatures: &HashMap<String, FuncSignature>,
 ) -> HashMap<Value, Layout> {
     let mut map: HashMap<Value, Layout> = HashMap::new();

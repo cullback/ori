@@ -43,25 +43,25 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
-    let (mut ssa_module, input_vals) = crate::ssa::lower::lower(&mono, &resolved.fields).unwrap();
-    // ssa_construct repairs lower's implicit cross-block references.
+    let (mut ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
+    // ssa_form repairs lower's implicit cross-block references.
     // Validation only meaningful from here onward.
-    crate::ssa::ssa_construct::run(&mut ssa_module);
+    crate::lower::ssa_form::run(&mut ssa_module);
     validate_after(&ssa_module, "ssa_construct");
-    crate::ssa::static_promote::promote(&mut ssa_module);
+    crate::opt::static_promote::promote(&mut ssa_module);
     validate_after(&ssa_module, "static_promote");
-    crate::ssa::opt::optimize(&mut ssa_module);
+    crate::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize");
-    let (analyses, _layout) = crate::ssa::ownership::analyze_module(&ssa_module);
-    let layouts = crate::ssa::layouts::analyze(&ssa_module);
-    let usage = crate::ssa::param_usage::analyze(&ssa_module);
-    crate::ssa::emit_drops::run(&mut ssa_module, &analyses, &layouts, &usage);
+    let (analyses, _layout) = crate::opt::ownership::analyze_module(&ssa_module);
+    let layouts = crate::opt::sig_layouts::analyze(&ssa_module);
+    let usage = crate::opt::sig_borrow::analyze(&ssa_module);
+    crate::opt::emit_drops::run(&mut ssa_module, &analyses, &layouts, &usage);
     validate_after(&ssa_module, "emit_drops");
-    crate::ssa::rc::elide_static_rc(&mut ssa_module);
+    crate::opt::rc::elide_static_rc(&mut ssa_module);
     validate_after(&ssa_module, "elide_static_rc");
-    crate::ssa::rc::fuse_inc_dec(&mut ssa_module);
+    crate::opt::rc::fuse_inc_dec(&mut ssa_module);
     validate_after(&ssa_module, "fuse_inc_dec");
-    crate::ssa::opt::optimize(&mut ssa_module);
+    crate::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize (final)");
     (ssa_module, input_vals)
 }

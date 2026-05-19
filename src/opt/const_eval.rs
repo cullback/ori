@@ -44,9 +44,9 @@
 
 use std::collections::HashMap;
 
-use super::eval::{self, Heap, Scalar};
-use super::instruction::{Inst, ScalarType};
-use super::{Module, StaticObject, StaticSlot};
+use crate::ssa::eval::{self, Heap, Scalar};
+use crate::ssa::instruction::{Inst, ScalarType};
+use crate::ssa::{Module, StaticObject, StaticSlot};
 
 /// Evaluate zero-argument pure functions at compile time and replace
 /// their call sites with static references.

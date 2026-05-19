@@ -73,11 +73,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BlockId, Inst, ScalarType, Terminator, Value};
-use super::layouts::{Layout, ModuleLayouts};
-use super::ownership::{Analysis, Ownership};
-use super::param_usage::{ModuleUsage, ParamUsage};
-use super::{Function, Module};
+use crate::ssa::instruction::{BlockId, Inst, ScalarType, Terminator, Value};
+use crate::opt::sig_layouts::{Layout, ModuleLayouts};
+use crate::opt::ownership::{Analysis, Ownership};
+use crate::opt::sig_borrow::{ModuleUsage, ParamUsage};
+use crate::ssa::{Function, Module};
 
 /// Run emit_drops over every function in `module`, using the per-
 /// function analyses produced by `ownership::analyze_module`, the
@@ -368,11 +368,11 @@ fn emit_edge_drops(
         }
         let forward_args: Vec<Value> = new_params[0..item.original_args.len()].to_vec();
         let new_terminator =
-            Terminator::Jump(super::instruction::BlockEdge { target: item.target, args: forward_args });
+            Terminator::Jump(crate::ssa::instruction::BlockEdge { target: item.target, args: forward_args });
 
         let new_bid = BlockId(func.next_block);
         func.next_block += 1;
-        let new_block = super::Block {
+        let new_block = crate::ssa::Block {
             params: new_params,
             insts: new_insts,
             terminator: new_terminator,
@@ -429,7 +429,7 @@ fn replace_edge(term: &mut Terminator, edge_idx: usize, target: BlockId, args: V
 /// returns `None` — the drop can't be deferred safely within this
 /// block.
 fn effective_last_use(
-    block: &super::Block,
+    block: &crate::ssa::Block,
     v: Value,
     descendants: &HashSet<Value>,
 ) -> Option<usize> {
@@ -716,7 +716,7 @@ fn loaded_ptr_children_map(func: &Function) -> HashMap<Value, Vec<Value>> {
 ///
 /// Sites are sorted within each block by descending `inst_idx` so
 /// earlier indices stay stable as we insert.
-fn emit_rc_inc_fallback(func: &mut Function, sites: &[super::ownership::RcIncSite]) {
+fn emit_rc_inc_fallback(func: &mut Function, sites: &[crate::opt::ownership::RcIncSite]) {
     if sites.is_empty() {
         return;
     }

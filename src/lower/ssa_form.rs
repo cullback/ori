@@ -43,8 +43,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BlockEdge, BlockId, Terminator, Value};
-use super::{Function, Module};
+use crate::ssa::instruction::{BlockEdge, BlockId, Terminator, Value};
+use crate::ssa::{Function, Module};
 
 pub fn run(module: &mut Module) {
     for func in module.functions.values_mut() {

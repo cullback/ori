@@ -1,18 +1,7 @@
-mod builder;
-pub mod const_eval;
+pub mod builder;
 mod display;
 pub mod eval;
-pub mod inline;
-mod instruction;
-pub mod lower;
-pub mod opt;
-pub mod rc;
-pub mod static_promote;
-pub mod ownership;
-pub mod layouts;
-pub mod param_usage;
-pub mod emit_drops;
-pub mod ssa_construct;
+pub mod instruction;
 pub mod validate;
 
 #[allow(unused_imports)]

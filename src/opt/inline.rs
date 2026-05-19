@@ -46,8 +46,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BlockEdge, BlockId, Inst, Terminator, Value};
-use super::{Block, Function, Module};
+use crate::ssa::instruction::{BlockEdge, BlockId, Inst, Terminator, Value};
+use crate::ssa::{Block, Function, Module};
 
 /// Maximum number of instructions in a callee for it to be inlined.
 pub const MAX_INLINE_INSTS: usize = 30;
@@ -428,10 +428,10 @@ fn remap_terminator(
 
 fn rewrite_operands(inst: &mut Inst, map: &HashMap<Value, Value>) {
     // Reuse the same logic as opt.rs
-    super::opt::rewrite_operands(inst, map);
+    crate::opt::rewrite_operands(inst, map);
 }
 
 fn rewrite_terminator_operands(term: &mut Terminator, map: &HashMap<Value, Value>) {
-    super::opt::rewrite_terminator_operands(term, map);
+    crate::opt::rewrite_terminator_operands(term, map);
 }
 

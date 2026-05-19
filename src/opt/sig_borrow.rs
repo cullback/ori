@@ -42,8 +42,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::Module;
-use super::instruction::{Inst, ScalarType, Terminator, Value};
+use crate::ssa::Module;
+use crate::ssa::instruction::{Inst, ScalarType, Terminator, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamUsage {
@@ -112,7 +112,7 @@ pub fn analyze(module: &Module) -> ModuleUsage {
 }
 
 /// For a single function, decide each Ptr param's usage.
-fn infer_function(func: &super::Function, usage: &ModuleUsage) -> Vec<Option<ParamUsage>> {
+fn infer_function(func: &crate::ssa::Function, usage: &ModuleUsage) -> Vec<Option<ParamUsage>> {
     // Step 1: build the set of values "transferred" by this function
     // body. A value is transferred if it (or a Ptr child reachable
     // from it) ends up in a Return / Store / Pack / Insert / a
@@ -156,7 +156,7 @@ fn infer_function(func: &super::Function, usage: &ModuleUsage) -> Vec<Option<Par
 
 /// Set of Ptr values that this function transfers ownership of —
 /// directly or via downstream operations.
-fn compute_transferred_values(func: &super::Function, usage: &ModuleUsage) -> HashSet<Value> {
+fn compute_transferred_values(func: &crate::ssa::Function, usage: &ModuleUsage) -> HashSet<Value> {
     let mut transferred: HashSet<Value> = HashSet::new();
 
     // Seed from terminator (Return / Jump args) and direct transfer

@@ -44,8 +44,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
-use super::{Function, Module};
+use crate::ssa::instruction::{BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
+use crate::ssa::{Function, Module};
 
 /// Insert reference counting operations into every function.
 pub fn insert_rc(module: &mut Module) {
@@ -501,7 +501,7 @@ fn insert_rc_function(func: &mut Function) {
 
         let tramp_insts: Vec<Inst> = decs.into_iter().map(|v| Inst::RcDec(remap(v))).collect();
         let tramp_target_args: Vec<Value> = target_args.iter().map(|v| remap(*v)).collect();
-        func.blocks.insert(tramp_id, super::Block {
+        func.blocks.insert(tramp_id, crate::ssa::Block {
             params: tramp_params,
             insts: tramp_insts,
             terminator: Terminator::Jump(BlockEdge { target: target_id, args: tramp_target_args }),

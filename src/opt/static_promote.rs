@@ -38,8 +38,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{Inst, ScalarType, Value};
-use super::{Function, Module, StaticObject, StaticSlot};
+use crate::ssa::instruction::{Inst, ScalarType, Value};
+use crate::ssa::{Function, Module, StaticObject, StaticSlot};
 
 /// Promote constant allocations to the module's static section.
 pub fn promote(module: &mut Module) {
@@ -54,7 +54,7 @@ fn promote_function(func: &mut Function, statics: &mut Vec<StaticObject>) {
     }
 }
 
-fn promote_block(block: &mut super::Block, statics: &mut Vec<StaticObject>) {
+fn promote_block(block: &mut crate::ssa::Block, statics: &mut Vec<StaticObject>) {
     // Step 1: index all Const definitions.
     let mut const_vals: HashMap<Value, (ScalarType, u64)> = HashMap::new();
     for inst in &block.insts {

@@ -59,8 +59,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BlockId, Inst, ScalarType, Value};
-use super::{Function, Module};
+use crate::ssa::instruction::{BlockId, Inst, ScalarType, Value};
+use crate::ssa::{Function, Module};
 
 // ── Types ──────────────────────────────────────────────────────
 

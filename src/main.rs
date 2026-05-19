@@ -1,7 +1,9 @@
 mod ast;
 mod ast_display;
 mod error;
+mod lower;
 mod numeric;
+mod opt;
 mod passes;
 mod source;
 #[allow(
@@ -54,7 +56,7 @@ fn compile(
     passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
-    let (mut ssa_module, input_vals) = ssa::lower::lower(&mono, &resolved.fields)?;
+    let (mut ssa_module, input_vals) = lower::lower(&mono, &resolved.fields)?;
     run_ssa_pipeline(&mut ssa_module);
     Ok((ssa_module, input_vals))
 }
@@ -67,29 +69,29 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     // `lower`'s output may have implicit cross-block references;
     // `ssa_construct` establishes the explicit-block-params invariant
     // that every downstream pass depends on. No `check` before this.
-    ssa::ssa_construct::run(module);
+    lower::ssa_form::run(module);
     check(module, "ssa_construct");
 
-    ssa::static_promote::promote(module);
+    opt::static_promote::promote(module);
     check(module, "static_promote");
 
-    ssa::opt::optimize(module);
+    opt::optimize(module);
     check(module, "optimize");
 
-    ssa::inline::inline(module);
+    opt::inline::inline(module);
     // `inline` may leave cross-block refs (its in-pass repair was
     // O(N²) and chokes on medium-sized functions). Re-establish the
     // invariant via `ssa_construct` before the next pass.
-    ssa::ssa_construct::run(module);
+    lower::ssa_form::run(module);
     check(module, "inline");
 
-    ssa::opt::optimize(module);
+    opt::optimize(module);
     check(module, "optimize (post-inline)");
 
-    ssa::const_eval::evaluate(module);
+    opt::const_eval::evaluate(module);
     check(module, "const_eval");
 
-    ssa::opt::optimize(module);
+    opt::optimize(module);
     check(module, "optimize (post-const-eval)");
 
     // Static ownership pipeline. Ownership analysis is read-only and
@@ -97,23 +99,23 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     // consumes that to insert Free at last use for Unique values.
     // elide_static_rc strips RC ops on static-promoted values.
     // See OWNERSHIP.md.
-    let (analyses, _layout) = ssa::ownership::analyze_module(module);
-    let layouts = ssa::layouts::analyze(module);
-    let usage = ssa::param_usage::analyze(module);
-    ssa::emit_drops::run(module, &analyses, &layouts, &usage);
+    let (analyses, _layout) = opt::ownership::analyze_module(module);
+    let layouts = opt::sig_layouts::analyze(module);
+    let usage = opt::sig_borrow::analyze(module);
+    opt::emit_drops::run(module, &analyses, &layouts, &usage);
     check(module, "emit_drops");
 
-    ssa::rc::elide_static_rc(module);
+    opt::rc::elide_static_rc(module);
     check(module, "elide_static_rc");
 
     // Cancel adjacent `RcInc(v) ... RcDec(v)` bracket pairs around
     // borrowed uses — most are introduced by the rc_inc fallback for
     // flagged store sites and then immediately dropped on the borrow's
     // last use. Cheap to run; no-op when no such pairs exist.
-    ssa::rc::fuse_inc_dec(module);
+    opt::rc::fuse_inc_dec(module);
     check(module, "fuse_inc_dec");
 
-    ssa::opt::optimize(module);
+    opt::optimize(module);
     check(module, "optimize (final)");
 }
 

@@ -50,6 +50,8 @@
 //!   wouldn't surface as test failures — it'd surface as bugs in
 //!   passes that trust the documented invariant.
 
+pub mod ssa_form;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};

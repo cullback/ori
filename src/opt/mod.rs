@@ -45,10 +45,19 @@
 //!   variant. New instruction variants that produce side effects must
 //!   be added there or DCE will incorrectly drop them.
 
+pub mod const_eval;
+pub mod emit_drops;
+pub mod inline;
+pub mod ownership;
+pub mod rc;
+pub mod sig_borrow;
+pub mod sig_layouts;
+pub mod static_promote;
+
 use std::collections::{HashMap, HashSet};
 
-use super::instruction::{BinaryOp, BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
-use super::{Function, Module};
+use crate::ssa::instruction::{BinaryOp, BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
+use crate::ssa::{Function, Module};
 
 /// Run optimization passes in a single deliberate sequence.
 /// Each pass is self-sufficient — no fixpoint looping needed.
@@ -1087,7 +1096,7 @@ pub fn rewrite_operands(inst: &mut Inst, map: &std::collections::HashMap<Value, 
 }
 
 pub fn rewrite_terminator_operands(
-    term: &mut super::instruction::Terminator,
+    term: &mut crate::ssa::instruction::Terminator,
     map: &std::collections::HashMap<Value, Value>,
 ) {
     term.map_operands_mut(|v| { if let Some(&r) = map.get(v) { *v = r; } });
