@@ -15,7 +15,8 @@ pub mod jump_threading;
 pub mod merge_blocks;
 pub mod nop_elim;
 pub mod operands;
-pub mod rc;
+pub mod rc_elide_static;
+pub mod rc_fuse;
 pub mod static_promote;
 
 use crate::ssa::Module;

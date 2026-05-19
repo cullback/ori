@@ -91,10 +91,10 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     opt::optimize(module);
     check(module, "optimize (post-const-eval)");
 
-    opt::rc::elide_static_rc(module);
+    opt::rc_elide_static::run(module);
     check(module, "elide_static_rc");
 
-    opt::rc::fuse_inc_dec(module);
+    opt::rc_fuse::run(module);
     check(module, "fuse_inc_dec");
 
     opt::optimize(module);

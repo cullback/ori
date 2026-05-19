@@ -51,9 +51,9 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     validate_after(&ssa_module, "static_promote");
     crate::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize");
-    crate::opt::rc::elide_static_rc(&mut ssa_module);
+    crate::opt::rc_elide_static::run(&mut ssa_module);
     validate_after(&ssa_module, "elide_static_rc");
-    crate::opt::rc::fuse_inc_dec(&mut ssa_module);
+    crate::opt::rc_fuse::run(&mut ssa_module);
     validate_after(&ssa_module, "fuse_inc_dec");
     crate::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize (final)");
