@@ -6,7 +6,6 @@
 //! optional — disabling all of `opt::*` produces a correct, leak-free,
 //! slow program.
 
-pub mod agg;
 pub mod branch_fold;
 pub mod const_eval;
 pub mod const_fold;
@@ -35,9 +34,6 @@ pub fn optimize(module: &mut Module) {
     for func in module.functions.values_mut() {
         const_fold::run(func);
         nop_elim::run(func);
-        agg::load_of_agg(func);
-        agg::split_agg_params(func);
-        agg::extract_of_pack(func);
         jump_threading::run(func);
         branch_fold::run(func);
         jump_threading::run(func);

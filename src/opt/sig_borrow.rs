@@ -182,16 +182,6 @@ fn compute_transferred_values(func: &crate::ssa::Function, usage: &ModuleUsage) 
                 {
                     transferred.insert(*val);
                 }
-                Inst::Pack(_, fields) => {
-                    for v in fields {
-                        if v.ty == ScalarType::Ptr {
-                            transferred.insert(*v);
-                        }
-                    }
-                }
-                Inst::Insert(_, _, _, val) if val.ty == ScalarType::Ptr => {
-                    transferred.insert(*val);
-                }
                 Inst::Call(_, callee, args) => {
                     for (i, a) in args.iter().enumerate() {
                         if a.ty == ScalarType::Ptr

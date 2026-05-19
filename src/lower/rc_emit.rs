@@ -352,25 +352,6 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 borr.push(*src);
             }
         }
-        Inst::Pack(_, fields) => {
-            for f in fields {
-                if is_ptr(f) {
-                    cons.push(*f);
-                }
-            }
-        }
-        Inst::Extract(_, agg, _) => {
-            if is_ptr(agg) {
-                borr.push(*agg);
-            }
-        }
-        Inst::Insert(_, agg, _, val) => {
-            for v in [agg, val] {
-                if is_ptr(v) {
-                    cons.push(*v);
-                }
-            }
-        }
     }
     (cons, borr)
 }

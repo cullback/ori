@@ -2,26 +2,6 @@ use super::{Block, Function, Module};
 use crate::ssa::instruction::{BinaryOp, BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
 use std::collections::{BTreeMap, HashMap};
 
-/// Coercion direction between Agg(n) and Ptr at terminator edges.
-enum CoerceDir {
-    /// Pack register values into a heap object.
-    AggToPtr(usize),
-    /// Load heap object fields into a pack.
-    PtrToAgg(usize),
-}
-
-/// `jump`/`branch`/`switch_int`/`ret` coerce arguments flowing
-/// between `Agg(n)` and `Ptr` representations. Boxing (Agg→Ptr)
-/// allocates a heap object and stores fields. Unboxing (Ptr→Agg)
-/// loads fields from a heap object into a Pack.
-fn coerce_kind(src: ScalarType, dst: ScalarType) -> Option<CoerceDir> {
-    match (src, dst) {
-        (ScalarType::Agg(n), ScalarType::Ptr) => Some(CoerceDir::AggToPtr(n)),
-        (ScalarType::Ptr, ScalarType::Agg(n)) => Some(CoerceDir::PtrToAgg(n)),
-        _ => None,
-    }
-}
-
 /// Block under construction — no terminator yet.
 pub struct PendingBlock {
     pub params: Vec<Value>,
@@ -183,14 +163,6 @@ impl Builder {
     // ---- Calls ----
 
     pub fn call(&mut self, func: &str, args: Vec<Value>, ret_ty: ScalarType) -> Value {
-        let has_agg = args.iter().any(|a| matches!(a.ty, ScalarType::Agg(_)));
-        let args = if has_agg {
-            args.into_iter()
-                .map(|a| self.coerce_to(a, ScalarType::Ptr))
-                .collect()
-        } else {
-            args
-        };
         let v = self.fresh_value(ret_ty);
         self.push(Inst::Call(v, func.to_owned(), args));
         v
@@ -289,49 +261,36 @@ impl Builder {
     }
 
     // ---- Aggregates ----
+    //
+    // Phase A: aggregates are always heap-allocated. `pack` desugars
+    // to Alloc + Stores; `extract` to Load. The Inst::Pack /
+    // Inst::Extract / Inst::Insert variants and `ScalarType::Agg`
+    // are gone — use these builder methods for source compatibility.
 
     pub fn pack(&mut self, fields: Vec<Value>) -> Value {
         let n = fields.len();
-        let v = self.fresh_value(ScalarType::Agg(n));
-        self.push(Inst::Pack(v, fields));
-        v
+        let ptr = self.alloc(n * 8);
+        for (i, f) in fields.into_iter().enumerate() {
+            self.store(ptr, i * 8, f);
+        }
+        ptr
     }
 
     pub fn extract(&mut self, agg: Value, index: usize, ty: ScalarType) -> Value {
-        let v = self.fresh_value(ty);
-        self.push(Inst::Extract(v, agg, index));
-        v
-    }
-
-    pub fn insert(&mut self, agg: Value, index: usize, val: Value) -> Value {
-        let v = self.fresh_value(agg.ty);
-        self.push(Inst::Insert(v, agg, index, val));
-        v
+        self.load(agg, index * 8, ty)
     }
 
     // ---- Terminators ----
-    //
-    // Each terminator method finalizes the current block: it takes the
-    // pending block, combines it with the terminator to produce a
-    // complete Block, and moves it into the finished map. Args are
-    // coerced in-line for `Agg→Ptr` edges so the emitted IR matches
-    // declared types without needing a later cleanup pass.
 
     pub fn set_return_type(&mut self, ty: ScalarType) {
         self.func.return_type = Some(ty);
     }
 
     pub fn ret(&mut self, value: Value) {
-        let ret_ty = self.func.return_type;
-        let coerced = match ret_ty {
-            Some(ty) => self.coerce_to(value, ty),
-            None => value,
-        };
-        self.seal(Terminator::Return(coerced));
+        self.seal(Terminator::Return(value));
     }
 
     pub fn jump(&mut self, target: BlockId, args: Vec<Value>) {
-        let args = self.coerce_args(target, args);
         self.seal(Terminator::Jump(BlockEdge { target, args }));
     }
 
@@ -343,8 +302,6 @@ impl Builder {
         else_block: BlockId,
         else_args: Vec<Value>,
     ) {
-        let then_args = self.coerce_args(then_block, then_args);
-        let else_args = self.coerce_args(else_block, else_args);
         self.seal(Terminator::Branch {
             cond,
             then_edge: BlockEdge { target: then_block, args: then_args },
@@ -360,66 +317,14 @@ impl Builder {
     ) {
         let arms = arms
             .into_iter()
-            .map(|(v, bid, args)| (v, BlockEdge { target: bid, args: self.coerce_args(bid, args) }))
+            .map(|(v, bid, args)| (v, BlockEdge { target: bid, args }))
             .collect();
-        let default = default.map(|(bid, args)| BlockEdge { target: bid, args: self.coerce_args(bid, args) });
+        let default = default.map(|(bid, args)| BlockEdge { target: bid, args });
         self.seal(Terminator::SwitchInt {
             scrutinee,
             arms,
             default,
         });
-    }
-
-    fn coerce_args(&mut self, target: BlockId, args: Vec<Value>) -> Vec<Value> {
-        let param_tys = self.block_param_types(target);
-        if param_tys.len() != args.len() {
-            // Dead fallthrough in match lowering passes mismatched
-            // counts on purpose. Let the validator flag it rather
-            // than guessing which positions to coerce.
-            return args;
-        }
-        args.into_iter()
-            .zip(param_tys)
-            .map(|(v, ty)| self.coerce_to(v, ty))
-            .collect()
-    }
-
-    fn block_param_types(&self, bid: BlockId) -> Vec<ScalarType> {
-        let params: &[Value] = if let Some(b) = self.func.pending.get(&bid) {
-            &b.params
-        } else if let Some(b) = self.func.finished.get(&bid) {
-            &b.params
-        } else {
-            return Vec::new();
-        };
-        params.iter().map(|p| p.ty).collect()
-    }
-
-    fn coerce_to(&mut self, value: Value, dst_ty: ScalarType) -> Value {
-        let Some(dir) = coerce_kind(value.ty, dst_ty) else {
-            return value;
-        };
-        match dir {
-            CoerceDir::AggToPtr(n) => {
-                let ptr = self.fresh_value(ScalarType::Ptr);
-                self.push(Inst::Alloc(ptr, n * 8));
-                for i in 0..n {
-                    let field = self.fresh_value(ScalarType::U64);
-                    self.push(Inst::Extract(field, value, i));
-                    self.push(Inst::Store(ptr, i * 8, field));
-                }
-                ptr
-            }
-            CoerceDir::PtrToAgg(n) => {
-                let mut fields = Vec::with_capacity(n);
-                for i in 0..n {
-                    let field = self.fresh_value(ScalarType::U64);
-                    self.push(Inst::Load(field, value, i * 8));
-                    fields.push(field);
-                }
-                self.pack(fields)
-            }
-        }
     }
 
     // ---- Function building ----

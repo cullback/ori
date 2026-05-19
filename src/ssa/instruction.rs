@@ -51,9 +51,6 @@ pub enum ScalarType {
     U64,
     F64,
     Ptr,
-    /// Value-type aggregate with this many fields. Lives in registers,
-    /// not on the heap. Only used for ≤8-field records/tuples/tags.
-    Agg(usize),
 }
 
 impl ScalarType {
@@ -64,7 +61,6 @@ impl ScalarType {
             Self::I16 | Self::U16 => 2,
             Self::I32 | Self::U32 => 4,
             Self::I64 | Self::U64 | Self::F64 | Self::Ptr => 8,
-            Self::Agg(_) => panic!("Agg has no byte width — not stored on heap"),
         }
     }
 }
@@ -178,12 +174,6 @@ pub enum Inst {
     /// Pure register move at the machine level; no arithmetic. Used
     /// for `F64 ↔ U64` IEEE 754 bit access and similar.
     BitCast(Value, Value),
-    /// dest = group N values into one aggregate (register-level, no heap).
-    Pack(Value, Vec<Value>),
-    /// dest = extract field at `index` from aggregate value.
-    Extract(Value, Value, usize),
-    /// dest = copy aggregate with field at `index` replaced by `val`.
-    Insert(Value, Value, usize, Value),
 }
 
 impl Inst {
@@ -202,10 +192,7 @@ impl Inst {
             | Self::ReuseDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
-            | Self::BitCast(v, _)
-            | Self::Pack(v, _)
-            | Self::Extract(v, _, _)
-            | Self::Insert(v, _, _, _) => Some(*v),
+            | Self::BitCast(v, _) => Some(*v),
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) | Self::Drop(..) => None,
         }
     }
@@ -225,10 +212,7 @@ impl Inst {
             | Self::ReuseDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
-            | Self::BitCast(v, _)
-            | Self::Pack(v, _)
-            | Self::Extract(v, _, _)
-            | Self::Insert(v, _, _, _) => Some(v),
+            | Self::BitCast(v, _) => Some(v),
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) | Self::Drop(..) => None,
         }
     }
@@ -251,9 +235,6 @@ impl Inst {
             Self::ReuseDyn(_, token, size) => vec![*token, *size],
             Self::StaticRef(..) => vec![],
             Self::Cast(_, src) | Self::BitCast(_, src) => vec![*src],
-            Self::Pack(_, fields) => fields.clone(),
-            Self::Extract(_, agg, _) => vec![*agg],
-            Self::Insert(_, agg, _, val) => vec![*agg, *val],
         }
     }
 
@@ -274,9 +255,6 @@ impl Inst {
             Self::Reuse(_, token, _) => f(token),
             Self::ReuseDyn(_, token, size) => { f(token); f(size); }
             Self::Cast(_, src) | Self::BitCast(_, src) => f(src),
-            Self::Pack(_, fields) => fields.iter_mut().for_each(&mut f),
-            Self::Extract(_, agg, _) => f(agg),
-            Self::Insert(_, agg, _, val) => { f(agg); f(val); }
         }
     }
 }

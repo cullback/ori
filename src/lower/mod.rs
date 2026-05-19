@@ -152,32 +152,22 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
-    /// Check if a value is a value-type aggregate (Pack result).
-    fn is_agg(&self, val: Value) -> bool {
-        matches!(val.ty, ScalarType::Agg(_))
+    /// Phase A: there are no value-type aggregates anymore — every
+    /// aggregate is heap-allocated. Kept as a `false` stub so call
+    /// sites compile without churn.
+    fn is_agg(&self, _val: Value) -> bool {
+        false
     }
 
-    /// Box a value-type aggregate into a heap-allocated Ptr.
-    /// Returns the value unchanged if it's already Ptr.
+    /// Phase A: nothing to box — every aggregate is already a Ptr.
     fn box_if_agg(&mut self, val: Value) -> Value {
-        let ScalarType::Agg(n) = val.ty else {
-            return val;
-        };
-        let ptr = self.builder.alloc(n * 8);
-        for i in 0..n {
-            let field = self.builder.extract(val, i, ScalarType::U64); // type doesn't matter for runtime
-            self.builder.store(ptr, i * 8, field);
-        }
-        ptr
+        val
     }
 
-    /// Load a field from a value — Extract if Agg, Load if Ptr.
+    /// Phase A: every aggregate is a Ptr, so every field access is
+    /// a Load.
     fn load_field(&mut self, val: Value, slot: usize, ty: ScalarType) -> Value {
-        if self.is_agg(val) {
-            self.builder.extract(val, slot, ty)
-        } else {
-            self.builder.load(val, slot * 8, ty)
-        }
+        self.builder.load(val, slot * 8, ty)
     }
 
     /// Pack is dead — every aggregate is heap-allocated now. The
@@ -279,7 +269,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let max_fields = tags.iter().map(|(_, fs)| fs.len()).max().unwrap_or(0);
                 let all_non_ptr = tags.iter().all(|(_, fs)| {
                     fs.iter()
-                        .all(|t| !matches!(self.scalar_type(t), ScalarType::Ptr | ScalarType::Agg(_)))
+                        .all(|t| !matches!(self.scalar_type(t), ScalarType::Ptr))
                 });
                 if all_non_ptr && 1 + max_fields <= 8 {
                     Some(1 + max_fields)
@@ -334,16 +324,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ScalarType::U64 => self.builder.const_u64(0),
             ScalarType::F64 => self.builder.const_f64(0.0),
             ScalarType::Ptr => self.builder.const_ptr_null(),
-            ScalarType::Agg(n) => {
-                // Phase A: no value-type aggregates. If anything still
-                // produces an Agg(n) type, fall back to a heap alloc.
-                let ptr = self.builder.alloc(n * 8);
-                let zero = self.builder.const_u64(0);
-                for i in 0..n {
-                    self.builder.store(ptr, i * 8, zero);
-                }
-                ptr
-            }
         }
     }
 
@@ -2536,10 +2516,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             // the accumulator in its STORAGE representation (Ptr even when
             // acc_ty is Agg). coerce_args at the branch/jump handles the
             // Ptr→Agg conversion if the target block param is Agg.
-            let payload_load_ty = match acc_ty {
-                ScalarType::Agg(_) => ScalarType::Ptr,
-                other => other,
-            };
+            let payload_load_ty = acc_ty;
             let payload = self.builder.load(result, 8, payload_load_ty);
             let break_tag = self.decls.constructors["Break"].tag_index;
             let break_val = self.builder.const_u64(break_tag);
@@ -2617,10 +2594,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         if until {
             let tag = self.builder.load(result, 0, ScalarType::U64);
-            let payload_load_ty = match acc_ty {
-                ScalarType::Agg(_) => ScalarType::Ptr,
-                other => other,
-            };
+            let payload_load_ty = acc_ty;
             let payload = self.builder.load(result, 8, payload_load_ty);
             let break_tag = self.decls.constructors["Break"].tag_index;
             let break_val = self.builder.const_u64(break_tag);

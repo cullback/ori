@@ -106,7 +106,6 @@ fn read_scalar(buf: &[u8], offset: usize, ty: ScalarType) -> Scalar {
         ScalarType::I64 => Scalar::I64(i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())),
         ScalarType::F64 => Scalar::F64(f64::from_bits(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()))),
         ScalarType::Ptr => Scalar::Ptr(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()) as usize),
-        ScalarType::Agg(_) => panic!("cannot read Agg from heap"),
     }
 }
 
@@ -662,24 +661,6 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.id], size)))
         }
 
-        Inst::Pack(_dest, fields) => {
-            // Pack is conceptually register-only — `Agg(N)` is a
-            // value-type aggregate. The interpreter has no fixed-size
-            // representation for it, so we back it with a heap
-            // allocation. Mark it static (`rc = RC_STATIC`) so it's
-            // never freed or reused — preventing free-list reuse
-            // from confusing a stale Ptr to a real heap object with
-            // a Pack backing. The real fix is to remove `Agg`
-            // entirely from the SSA (planned phase A).
-            let n = fields.len();
-            let idx = heap.alloc(n * 8);
-            heap.objects[idx].rc = RC_STATIC;
-            for (i, f) in fields.iter().enumerate() {
-                heap.store(idx, i * 8, env[f.id]);
-            }
-            Some(Scalar::Ptr(idx))
-        }
-
         Inst::Cast(dest, src) => {
             // Integer widening (zero-extend) / narrowing (truncate).
             // The destination type drives the result variant.
@@ -697,23 +678,6 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(bits_to_scalar(dest.ty, bits))
         }
 
-        Inst::Extract(dest, agg, idx) => {
-            if let Scalar::Ptr(p) = env[agg.id] {
-                Some(heap.load_auto(p, *idx * 8, dest.ty))
-            } else {
-                panic!("extract from non-Ptr value v{}: {:?}", agg.id, env[agg.id])
-            }
-        }
-
-        Inst::Insert(_dest, agg, idx, val) => {
-            if let Scalar::Ptr(p) = env[agg.id] {
-                let new_idx = heap.clone_object(p);
-                heap.store(new_idx, *idx * 8, env[val.id]);
-                Some(Scalar::Ptr(new_idx))
-            } else {
-                panic!("insert into non-Ptr value v{}: {:?}", agg.id, env[agg.id])
-            }
-        }
     }
 }
 
@@ -767,7 +731,6 @@ fn bits_to_scalar(ty: ScalarType, bits: u64) -> Scalar {
         ScalarType::U64 => Scalar::U64(bits),
         ScalarType::F64 => Scalar::F64(f64::from_bits(bits)),
         ScalarType::Ptr => Scalar::Ptr(bits as usize),
-        ScalarType::Agg(_) => panic!("cannot create scalar from aggregate type"),
     }
 }
 

@@ -185,16 +185,6 @@ impl fmt::Display for FmtInst<'_> {
                 let dt = d.ty;
                 write!(f, "{d}: {dt} = bitcast {}", fmt_val(*src, consts))
             }
-            Inst::Pack(d, fields) => {
-                write!(f, "{d} = pack({})", fmt_args(fields, consts))
-            }
-            Inst::Extract(d, agg, idx) => {
-                let dt = d.ty;
-                write!(f, "{d}: {dt} = extract {}, {idx}", fmt_val(*agg, consts))
-            }
-            Inst::Insert(d, agg, idx, val) => {
-                write!(f, "{d} = insert {}, {idx}, {}", fmt_val(*agg, consts), fmt_val(*val, consts))
-            }
         }
     }
 }
@@ -266,7 +256,6 @@ impl fmt::Display for ScalarType {
             Self::U64 => write!(f, "u64"),
             Self::F64 => write!(f, "f64"),
             Self::Ptr => write!(f, "ptr"),
-            Self::Agg(n) => write!(f, "agg{n}"),
         }
     }
 }
