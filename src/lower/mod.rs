@@ -180,11 +180,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
-    /// Check if a list of scalar types can be packed (all non-Ptr, ≤8 fields).
+    /// Pack is dead — every aggregate is heap-allocated now. The
+    /// `can_pack` heuristic that used to gate the Pack/Alloc choice
+    /// in `lower_constructor_call` is permanently false.
+    /// (Kept as a `false`-returning stub to minimize diff while the
+    /// Phase A migration unwinds Agg from the SSA.)
+    #[allow(dead_code, unused_variables)]
     fn can_pack(field_types: &[ScalarType]) -> bool {
-        field_types.len() <= 8
-            && !field_types.is_empty()
-            && field_types.iter().all(|t| !matches!(t, ScalarType::Ptr | ScalarType::Agg(_)))
+        false
     }
 
     /// If the closure expression is a known tag constructor, return
@@ -220,17 +223,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         resolve_scalar_type(&unwrapped, &self.decls.fieldless_tags)
     }
 
-    /// Like `scalar_type` but returns `Agg(n)` for packable composite
-    /// types. Used at merge-point block params so that freshly packed
-    /// values flow through without heap boxing.
+    /// Phase A: aggregates are always heap-allocated, so `repr_type`
+    /// is identical to `scalar_type`. Kept as a separate function so
+    /// future SROA-style passes can re-introduce a register
+    /// representation without rewriting every call site.
     fn repr_type(&self, ty: &Type) -> ScalarType {
-        let base = self.scalar_type(ty);
-        if base == ScalarType::Ptr {
-            if let Some(n) = self.packable_field_count(ty) {
-                return ScalarType::Agg(n);
-            }
-        }
-        base
+        self.scalar_type(ty)
     }
 
     fn expr_repr_type(&self, expr: &Expr<'src>) -> ScalarType {
@@ -337,8 +335,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ScalarType::F64 => self.builder.const_f64(0.0),
             ScalarType::Ptr => self.builder.const_ptr_null(),
             ScalarType::Agg(n) => {
-                let fields: Vec<Value> = (0..n).map(|_| self.builder.const_u64(0)).collect();
-                self.builder.pack(fields)
+                // Phase A: no value-type aggregates. If anything still
+                // produces an Agg(n) type, fall back to a heap alloc.
+                let ptr = self.builder.alloc(n * 8);
+                let zero = self.builder.const_u64(0);
+                for i in 0..n {
+                    self.builder.store(ptr, i * 8, zero);
+                }
+                ptr
             }
         }
     }
@@ -1328,20 +1332,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .unwrap_or(ScalarType::U8);
             return self.const_tag(tag_index, disc_ty);
         }
-        // Check if all fields (tag + payload) are non-Ptr → Pack.
-        let all_non_ptr = field_types.iter().all(|t| !matches!(t, ScalarType::Ptr | ScalarType::Agg(_)));
-        if all_non_ptr && 1 + max_fields <= 8 {
-            let tag_val = self.builder.const_u64(tag_index);
-            let mut pack_fields = Vec::with_capacity(1 + args.len());
-            pack_fields.push(tag_val);
-            pack_fields.extend_from_slice(args);
-            // Pad to max_fields + 1 (tag) if this variant has fewer fields.
-            while pack_fields.len() < 1 + max_fields {
-                let pad = self.builder.const_u64(0);
-                pack_fields.push(pad);
-            }
-            self.builder.pack(pack_fields)
-        } else {
+        // Every tag-union constructor is heap-allocated (Phase A:
+        // `Agg(n)` is gone). The shape: tag at slot 0, payload from
+        // slot 1.
+        {
             let alloc_size = (1 + max_fields) * 8;
             let ptr = self.builder.alloc(alloc_size);
             let tag_val = self.builder.const_u64(tag_index);
