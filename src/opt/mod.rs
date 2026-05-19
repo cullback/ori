@@ -15,10 +15,7 @@ pub mod jump_threading;
 pub mod merge_blocks;
 pub mod nop_elim;
 pub mod operands;
-pub mod ownership;
 pub mod rc;
-pub mod sig_borrow;
-pub mod sig_layouts;
 pub mod static_promote;
 
 use crate::ssa::Module;
