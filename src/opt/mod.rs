@@ -11,7 +11,6 @@ pub mod branch_fold;
 pub mod const_eval;
 pub mod const_fold;
 pub mod dce;
-pub mod emit_drops;
 pub mod inline;
 pub mod jump_threading;
 pub mod merge_blocks;

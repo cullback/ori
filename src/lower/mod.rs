@@ -100,9 +100,7 @@ pub fn lower(
     // ORI_RC_EMIT_NAIVE: emit naïve Perceus RC traffic so the SSA is
     // leak-free by construction. Without this flag, the existing
     // emit_drops pass (in opt/) inserts the RC traffic later.
-    if std::env::var("ORI_RC_EMIT_NAIVE").is_ok() {
-        rc_emit::run(&mut module);
-    }
+    rc_emit::run(&mut module);
     Ok((module, input_vals))
 }
 

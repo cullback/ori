@@ -66,12 +66,9 @@ fn compile(
 /// load-bearing; see the per-module docs in `src/ssa/*.rs` for the
 /// input/output invariants each pass relies on and establishes.
 fn run_ssa_pipeline(module: &mut ssa::Module) {
-    // Set `ORI_RC_EMIT_NAIVE=1` to use the canonical-Perceus path:
-    // lower emits naïve RC; emit_drops is skipped. Default keeps the
-    // existing static-ownership analysis emitting Drop/Free.
-    let naive_rc = std::env::var("ORI_RC_EMIT_NAIVE").is_ok();
-    // `lower` already established explicit-block-params and (when
-    // `naive_rc`) the naïve RC traffic; the SSA is well-formed here.
+    // `lower` established explicit-block-params and naïve Perceus RC
+    // traffic; the SSA is well-formed and leak-free at this point.
+    // Opt passes (below) remove the redundancy this introduces.
     check(module, "lower");
 
     opt::static_promote::promote(module);
@@ -93,14 +90,6 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
 
     opt::optimize(module);
     check(module, "optimize (post-const-eval)");
-
-    if !naive_rc {
-        let (analyses, _layout) = opt::ownership::analyze_module(module);
-        let layouts = opt::sig_layouts::analyze(module);
-        let usage = opt::sig_borrow::analyze(module);
-        opt::emit_drops::run(module, &analyses, &layouts, &usage);
-        check(module, "emit_drops");
-    }
 
     opt::rc::elide_static_rc(module);
     check(module, "elide_static_rc");

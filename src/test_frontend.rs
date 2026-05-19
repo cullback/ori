@@ -44,21 +44,13 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
-    let naive_rc = std::env::var("ORI_RC_EMIT_NAIVE").is_ok();
-    // `lower` already established explicit-block-params and (when
-    // `naive_rc`) the naïve RC traffic; the SSA is well-formed here.
+    // `lower` established explicit-block-params and naïve Perceus RC
+    // traffic; the SSA is well-formed and leak-free.
     validate_after(&ssa_module, "lower");
     crate::opt::static_promote::promote(&mut ssa_module);
     validate_after(&ssa_module, "static_promote");
     crate::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize");
-    if !naive_rc {
-        let (analyses, _layout) = crate::opt::ownership::analyze_module(&ssa_module);
-        let layouts = crate::opt::sig_layouts::analyze(&ssa_module);
-        let usage = crate::opt::sig_borrow::analyze(&ssa_module);
-        crate::opt::emit_drops::run(&mut ssa_module, &analyses, &layouts, &usage);
-        validate_after(&ssa_module, "emit_drops");
-    }
     crate::opt::rc::elide_static_rc(&mut ssa_module);
     validate_after(&ssa_module, "elide_static_rc");
     crate::opt::rc::fuse_inc_dec(&mut ssa_module);
