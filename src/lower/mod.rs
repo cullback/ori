@@ -152,33 +152,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
-    /// Phase A: there are no value-type aggregates anymore — every
-    /// aggregate is heap-allocated. Kept as a `false` stub so call
-    /// sites compile without churn.
-    fn is_agg(&self, _val: Value) -> bool {
-        false
-    }
-
-    /// Phase A: nothing to box — every aggregate is already a Ptr.
-    fn box_if_agg(&mut self, val: Value) -> Value {
-        val
-    }
-
-    /// Phase A: every aggregate is a Ptr, so every field access is
-    /// a Load.
-    fn load_field(&mut self, val: Value, slot: usize, ty: ScalarType) -> Value {
-        self.builder.load(val, slot * 8, ty)
-    }
-
-    /// Pack is dead — every aggregate is heap-allocated now. The
-    /// `can_pack` heuristic that used to gate the Pack/Alloc choice
-    /// in `lower_constructor_call` is permanently false.
-    /// (Kept as a `false`-returning stub to minimize diff while the
-    /// Phase A migration unwinds Agg from the SSA.)
-    #[allow(dead_code, unused_variables)]
-    fn can_pack(field_types: &[ScalarType]) -> bool {
-        false
-    }
 
     /// If the closure expression is a known tag constructor, return
     /// the direct call target.
@@ -235,51 +208,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
-    /// If `ty` is a composite that `can_pack` would accept, return
-    /// its field count. Records and tuples return their field count
-    /// directly; tag unions return 1 + max_fields (tag slot + payload).
-    fn packable_field_count(&self, ty: &Type) -> Option<usize> {
-        let resolved = self.resolve_transparent(ty);
-        match &resolved {
-            Type::Record { fields, .. } => {
-                let mut sorted: Vec<(&str, &Type)> =
-                    fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
-                sorted.sort_unstable_by_key(|(n, _)| *n);
-                let field_types: Vec<ScalarType> =
-                    sorted.iter().map(|(_, t)| self.scalar_type(t)).collect();
-                if Self::can_pack(&field_types) {
-                    Some(field_types.len())
-                } else {
-                    None
-                }
-            }
-            Type::Tuple(elems) => {
-                let field_types: Vec<ScalarType> =
-                    elems.iter().map(|t| self.scalar_type(t)).collect();
-                if Self::can_pack(&field_types) {
-                    Some(field_types.len())
-                } else {
-                    None
-                }
-            }
-            Type::TagUnion { tags, .. } => {
-                if tags.iter().all(|(_, fs)| fs.is_empty()) {
-                    return None;
-                }
-                let max_fields = tags.iter().map(|(_, fs)| fs.len()).max().unwrap_or(0);
-                let all_non_ptr = tags.iter().all(|(_, fs)| {
-                    fs.iter()
-                        .all(|t| !matches!(self.scalar_type(t), ScalarType::Ptr))
-                });
-                if all_non_ptr && 1 + max_fields <= 8 {
-                    Some(1 + max_fields)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
 
     /// Emit a constant for a fieldless tag index using the appropriate discriminant type.
     fn const_tag(&mut self, tag_index: u64, disc_ty: ScalarType) -> Value {
@@ -642,15 +570,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .iter()
                     .map(|(_, _, e)| self.lower_expr(e))
                     .collect();
-                if Self::can_pack(&field_types) {
-                    self.builder.pack(vals)
-                } else {
-                    let ptr = self.builder.alloc(fields.len() * 8);
-                    for (i, val) in vals.into_iter().enumerate() {
-                        self.builder.store(ptr, i * 8, val);
-                    }
-                    ptr
+                let _ = field_types; // retained for type-aware extensions
+                let ptr = self.builder.alloc(fields.len() * 8);
+                for (i, val) in vals.into_iter().enumerate() {
+                    self.builder.store(ptr, i * 8, val);
                 }
+                ptr
             }
 
             ExprKind::FieldAccess { record, field } => {
@@ -658,11 +583,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let field_name = self.fields.get(*field);
                 let slot = self.field_index(&record.ty, field_name);
                 let ty = self.expr_scalar_type(expr);
-                if self.is_agg(val) {
-                    self.builder.extract(val, slot, ty)
-                } else {
-                    self.builder.load(val, slot * 8, ty)
-                }
+                self.builder.load(val, slot * 8, ty)
             }
 
             ExprKind::MethodCall {
@@ -673,21 +594,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             } => self.lower_method_call(receiver, method, args, expr),
 
             ExprKind::Tuple(elems) => {
-                let field_types: Vec<ScalarType> = elems.iter()
-                    .map(|e| self.expr_scalar_type(e))
-                    .collect();
                 let vals: Vec<Value> = elems.iter()
                     .map(|e| self.lower_expr(e))
                     .collect();
-                if Self::can_pack(&field_types) {
-                    self.builder.pack(vals)
-                } else {
-                    let ptr = self.builder.alloc(elems.len() * 8);
-                    for (i, val) in vals.into_iter().enumerate() {
-                        self.builder.store(ptr, i * 8, val);
-                    }
-                    ptr
+                let ptr = self.builder.alloc(elems.len() * 8);
+                for (i, val) in vals.into_iter().enumerate() {
+                    self.builder.store(ptr, i * 8, val);
                 }
+                ptr
             }
 
             ExprKind::Lambda { .. } => {
@@ -696,7 +610,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
             ExprKind::RecordUpdate { base, updates } => {
                 let base_val = self.lower_expr(base);
-                let is_base_agg = self.is_agg(base_val);
                 // Get all field names from the base record type, sorted.
                 let all_fields: Vec<String> = match &base.ty {
                     Type::Record { fields, .. } => {
@@ -732,17 +645,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             self.lower_expr(upd_expr)
                         } else {
                             let ty = field_types.get(slot).copied().unwrap_or(ScalarType::Ptr);
-                            if is_base_agg {
-                                self.builder.extract(base_val, slot, ty)
-                            } else {
-                                self.builder.load(base_val, slot * 8, ty)
-                            }
+                            self.builder.load(base_val, slot * 8, ty)
                         }
                     })
                     .collect();
-                if is_base_agg && Self::can_pack(&field_types) {
-                    self.builder.pack(vals)
-                } else {
+                {
                     let ptr = self.builder.alloc(num_fields * 8);
                     for (slot, val) in vals.into_iter().enumerate() {
                         self.builder.store(ptr, slot * 8, val);
@@ -1357,13 +1264,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     // just calls it. Cached in `eq_func_cache` so each type gets
     // one function.
 
-    /// True if `ensure_eq_func` would generate a meaningful equality
-    /// function (not just scalar eq).
-    fn has_eq_func(&self, ty: &Type) -> bool {
-        matches!(ty, Type::Record { .. } | Type::Tuple(_) | Type::TagUnion { .. })
-            || matches!(ty, Type::App(n, _) if n == "List")
-            || self.packable_field_count(ty).is_some()
-    }
 
     /// For a nominal type like Result or Step, find the slot count
     /// (1 + max_fields) by looking up its constructors.
@@ -1508,8 +1408,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         for (slot, field_ty) in field_types.iter().enumerate() {
             let sty = self.scalar_type(field_ty);
-            let l = self.load_field(lhs, slot, sty);
-            let r = self.load_field(rhs, slot, sty);
+            let l = self.builder.load(lhs, slot * 8, sty);
+            let r = self.builder.load(rhs, slot * 8, sty);
             let field_eq = if self.is_scalar_eq_type(field_ty) {
                 self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8)
             } else {
@@ -1548,8 +1448,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let merge_param = self.builder.add_block_param(merge, ScalarType::U8);
 
         for slot in 0..n {
-            let l = self.load_field(lhs, slot, ScalarType::U64);
-            let r = self.load_field(rhs, slot, ScalarType::U64);
+            let l = self.builder.load(lhs, slot * 8, ScalarType::U64);
+            let r = self.builder.load(rhs, slot * 8, ScalarType::U64);
             let eq = self.builder.binop(BinaryOp::Eq, l, r, ScalarType::U8);
             let next = if slot + 1 < n { self.builder.create_block() } else { true_block };
             self.builder.branch(eq, next, vec![], false_block, vec![]);
@@ -1657,7 +1557,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let mut hash = self.builder.const_u64(14695981039346656037);
 
         for (slot, (_name, field_ty)) in sorted.iter().enumerate() {
-            let field_val = self.load_field(recv, slot, self.scalar_type(field_ty));
+            let field_val = self.builder.load(recv, slot * 8, self.scalar_type(field_ty));
             let field_hash = if let Type::Record { .. } = field_ty {
                 self.lower_record_hash(field_val, field_ty)
             } else {
@@ -1686,7 +1586,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let mut hash = self.builder.const_u64(14695981039346656037);
 
         for (slot, elem_ty) in elem_types.iter().enumerate() {
-            let elem_val = self.load_field(recv, slot, self.scalar_type(elem_ty));
+            let elem_val = self.builder.load(recv, slot * 8, self.scalar_type(elem_ty));
             let elem_hash = if let Type::Record { .. } = elem_ty {
                 self.lower_record_hash(elem_val, elem_ty)
             } else if let Type::Tuple(_) = elem_ty {
@@ -1763,7 +1663,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let label_val = self.lower_str_literal(label.as_bytes());
             acc = self.lower_str_concat(acc, label_val);
             // value.to_str()
-            let field_val = self.load_field(recv, i, self.scalar_type(&field_ty));
+            let field_val = self.builder.load(recv, i * 8, self.scalar_type(&field_ty));
             let val_str = if let Type::Record { .. } = &field_ty {
                 self.lower_record_to_str(field_val, &field_ty)
             } else if let Type::Con(name) = &field_ty {
@@ -1886,11 +1786,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ast::Pattern::Constructor { name, .. } => {
                 let (tag_index, max_fields, _) = self.con_layout(name, Some(&inner_ty));
                 let fieldless = max_fields == 0;
-                let scr_is_agg = self.is_agg(scr);
                 let tag = if fieldless {
                     scr
-                } else if scr_is_agg {
-                    self.builder.extract(scr, 0, ScalarType::U64)
                 } else {
                     self.builder.load(scr, 0, ScalarType::U64)
                 };
@@ -1963,11 +1860,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         let (tag_index, max_fields, field_types) =
                             self.con_layout(name, Some(&inner_ty));
                         let fieldless = max_fields == 0;
-                        let scr_is_agg = self.is_agg(scr);
                         let tag = if fieldless {
                             scr // already the discriminant
-                        } else if scr_is_agg {
-                            self.builder.extract(scr, 0, ScalarType::U64)
                         } else {
                             self.builder.load(scr, 0, ScalarType::U64)
                         };
@@ -1998,11 +1892,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         for (fi, field_pat) in fields.iter().enumerate() {
                             let field_ty =
                                 field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
-                            let field_val = if scr_is_agg {
-                                self.builder.extract(scr_in_match, fi + 1, field_ty)
-                            } else {
-                                self.builder.load(scr_in_match, (fi + 1) * 8, field_ty)
-                            };
+                            let field_val =
+                                self.builder.load(scr_in_match, (fi + 1) * 8, field_ty);
                             self.bind_pattern_field(field_pat, field_val);
                         }
                     }
@@ -2296,11 +2187,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         };
         let (_, first_max, _) = self.con_layout(first_con_name, Some(&scrutinee_ty));
         let fieldless = first_max == 0;
-        let scr_is_agg = self.is_agg(scr_val);
         let tag = if fieldless {
             scr_val // already the discriminant
-        } else if scr_is_agg {
-            self.builder.extract(scr_val, 0, ScalarType::U64)
         } else {
             self.builder.load(scr_val, 0, ScalarType::U64)
         };
@@ -2360,11 +2248,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             if !fieldless {
                 for (fi, field_pat) in fields.iter().enumerate() {
                     let field_ty = field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
-                    let field_val = if scr_is_agg {
-                        self.builder.extract(arm_scr, fi + 1, field_ty)
-                    } else {
-                        self.builder.load(arm_scr, (fi + 1) * 8, field_ty)
-                    };
+                    let field_val = self.builder.load(arm_scr, (fi + 1) * 8, field_ty);
                     self.bind_pattern_field(field_pat, field_val);
                 }
             }
@@ -2619,7 +2503,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         val: Value,
         val_ty: &Type,
     ) {
-        let val_is_agg = self.is_agg(val);
         match pattern {
             ast::Pattern::Tuple(elems) => {
                 let elem_types = match val_ty {
@@ -2634,11 +2517,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         .get(i)
                         .map(|t| self.scalar_type(t))
                         .unwrap_or(ScalarType::Ptr);
-                    let field_val = if val_is_agg {
-                        self.builder.extract(val, i, ty)
-                    } else {
-                        self.builder.load(val, i * 8, ty)
-                    };
+                    let field_val = self.builder.load(val, i * 8, ty);
                     self.lower_destructure_elem(elem, field_val);
                 }
             }
@@ -2682,11 +2561,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         .get(slot)
                         .map(|(_, t)| self.scalar_type(t))
                         .unwrap_or(ScalarType::Ptr);
-                    let field_val = if val_is_agg {
-                        self.builder.extract(val, slot, ty)
-                    } else {
-                        self.builder.load(val, slot * 8, ty)
-                    };
+                    let field_val = self.builder.load(val, slot * 8, ty);
                     self.lower_destructure_elem(elem, field_val);
                 }
             }
