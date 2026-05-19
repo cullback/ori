@@ -663,8 +663,17 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
         }
 
         Inst::Pack(_dest, fields) => {
+            // Pack is conceptually register-only — `Agg(N)` is a
+            // value-type aggregate. The interpreter has no fixed-size
+            // representation for it, so we back it with a heap
+            // allocation. Mark it static (`rc = RC_STATIC`) so it's
+            // never freed or reused — preventing free-list reuse
+            // from confusing a stale Ptr to a real heap object with
+            // a Pack backing. The real fix is to remove `Agg`
+            // entirely from the SSA (planned phase A).
             let n = fields.len();
             let idx = heap.alloc(n * 8);
+            heap.objects[idx].rc = RC_STATIC;
             for (i, f) in fields.iter().enumerate() {
                 heap.store(idx, i * 8, env[f.id]);
             }
