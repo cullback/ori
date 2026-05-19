@@ -66,11 +66,21 @@ fn compile(
 /// load-bearing; see the per-module docs in `src/ssa/*.rs` for the
 /// input/output invariants each pass relies on and establishes.
 fn run_ssa_pipeline(module: &mut ssa::Module) {
+    // Set `ORI_RC_EMIT_NAIVE=1` to use the canonical-Perceus path:
+    // lower emits naïve RC; emit_drops is skipped. Default keeps the
+    // existing static-ownership analysis emitting Drop/Free.
+    let naive_rc = std::env::var("ORI_RC_EMIT_NAIVE").is_ok();
+
     // `lower`'s output may have implicit cross-block references;
-    // `ssa_construct` establishes the explicit-block-params invariant
+    // `ssa_form` establishes the explicit-block-params invariant
     // that every downstream pass depends on. No `check` before this.
     lower::ssa_form::run(module);
-    check(module, "ssa_construct");
+    check(module, "ssa_form");
+
+    if naive_rc {
+        lower::rc_emit::run(module);
+        check(module, "rc_emit");
+    }
 
     opt::static_promote::promote(module);
     check(module, "static_promote");
@@ -79,9 +89,6 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     check(module, "optimize");
 
     opt::inline::inline(module);
-    // `inline` may leave cross-block refs (its in-pass repair was
-    // O(N²) and chokes on medium-sized functions). Re-establish the
-    // invariant via `ssa_construct` before the next pass.
     lower::ssa_form::run(module);
     check(module, "inline");
 
@@ -94,24 +101,17 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     opt::optimize(module);
     check(module, "optimize (post-const-eval)");
 
-    // Static ownership pipeline. Ownership analysis is read-only and
-    // computes per-function Analysis + module-wide RcLayout. emit_drops
-    // consumes that to insert Free at last use for Unique values.
-    // elide_static_rc strips RC ops on static-promoted values.
-    // See OWNERSHIP.md.
-    let (analyses, _layout) = opt::ownership::analyze_module(module);
-    let layouts = opt::sig_layouts::analyze(module);
-    let usage = opt::sig_borrow::analyze(module);
-    opt::emit_drops::run(module, &analyses, &layouts, &usage);
-    check(module, "emit_drops");
+    if !naive_rc {
+        let (analyses, _layout) = opt::ownership::analyze_module(module);
+        let layouts = opt::sig_layouts::analyze(module);
+        let usage = opt::sig_borrow::analyze(module);
+        opt::emit_drops::run(module, &analyses, &layouts, &usage);
+        check(module, "emit_drops");
+    }
 
     opt::rc::elide_static_rc(module);
     check(module, "elide_static_rc");
 
-    // Cancel adjacent `RcInc(v) ... RcDec(v)` bracket pairs around
-    // borrowed uses — most are introduced by the rc_inc fallback for
-    // flagged store sites and then immediately dropped on the borrow's
-    // last use. Cheap to run; no-op when no such pairs exist.
     opt::rc::fuse_inc_dec(module);
     check(module, "fuse_inc_dec");
 

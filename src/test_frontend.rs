@@ -44,19 +44,26 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
+    let naive_rc = std::env::var("ORI_RC_EMIT_NAIVE").is_ok();
     // ssa_form repairs lower's implicit cross-block references.
     // Validation only meaningful from here onward.
     crate::lower::ssa_form::run(&mut ssa_module);
-    validate_after(&ssa_module, "ssa_construct");
+    validate_after(&ssa_module, "ssa_form");
+    if naive_rc {
+        crate::lower::rc_emit::run(&mut ssa_module);
+        validate_after(&ssa_module, "rc_emit");
+    }
     crate::opt::static_promote::promote(&mut ssa_module);
     validate_after(&ssa_module, "static_promote");
     crate::opt::optimize(&mut ssa_module);
     validate_after(&ssa_module, "optimize");
-    let (analyses, _layout) = crate::opt::ownership::analyze_module(&ssa_module);
-    let layouts = crate::opt::sig_layouts::analyze(&ssa_module);
-    let usage = crate::opt::sig_borrow::analyze(&ssa_module);
-    crate::opt::emit_drops::run(&mut ssa_module, &analyses, &layouts, &usage);
-    validate_after(&ssa_module, "emit_drops");
+    if !naive_rc {
+        let (analyses, _layout) = crate::opt::ownership::analyze_module(&ssa_module);
+        let layouts = crate::opt::sig_layouts::analyze(&ssa_module);
+        let usage = crate::opt::sig_borrow::analyze(&ssa_module);
+        crate::opt::emit_drops::run(&mut ssa_module, &analyses, &layouts, &usage);
+        validate_after(&ssa_module, "emit_drops");
+    }
     crate::opt::rc::elide_static_rc(&mut ssa_module);
     validate_after(&ssa_module, "elide_static_rc");
     crate::opt::rc::fuse_inc_dec(&mut ssa_module);
