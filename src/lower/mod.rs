@@ -67,12 +67,43 @@ use crate::types::engine::{Type, TypeVar};
 use crate::types::infer::InferResult;
 
 /// Lower a monomorphized AST module to SSA IR.
+///
+/// The output satisfies all of `lower/`'s established invariants:
+/// - **block-param scoping** — every cross-block value reference is
+///   threaded through explicit block-arg forwarding (no implicit
+///   scoping). Established by `ssa_form`.
+/// - **concrete types** — every `Value` carries its `ScalarType`.
+///   Established by `lower_to_ssa` at value creation.
+///
+/// Per the architecture: optional invariants (naïve RC traffic,
+/// per-Ptr layouts) are gated behind feature flags during the
+/// canonical-Perceus migration and will be unconditional once
+/// stable.
 pub fn lower(
     mono: &Monomorphized<'_>,
     fields: &FieldInterner,
 ) -> Result<(Module, Vec<Value>), CompileError> {
     let decls = decl_info::build(mono);
-    lower_to_ssa(&mono.module, &mono.infer, &decls, &mono.symbols, fields, &mono.singletons, &mono.tag_targets)
+    let (mut module, input_vals) = lower_to_ssa(
+        &mono.module,
+        &mono.infer,
+        &decls,
+        &mono.symbols,
+        fields,
+        &mono.singletons,
+        &mono.tag_targets,
+    )?;
+    // Establish the explicit-block-params invariant. `lower_to_ssa`
+    // emits cross-block references implicitly; downstream passes
+    // require explicit block-arg threading.
+    ssa_form::run(&mut module);
+    // ORI_RC_EMIT_NAIVE: emit naïve Perceus RC traffic so the SSA is
+    // leak-free by construction. Without this flag, the existing
+    // emit_drops pass (in opt/) inserts the RC traffic later.
+    if std::env::var("ORI_RC_EMIT_NAIVE").is_ok() {
+        rc_emit::run(&mut module);
+    }
+    Ok((module, input_vals))
 }
 
 // ---- SSA lowering context ----

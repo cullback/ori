@@ -70,17 +70,9 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     // lower emits naïve RC; emit_drops is skipped. Default keeps the
     // existing static-ownership analysis emitting Drop/Free.
     let naive_rc = std::env::var("ORI_RC_EMIT_NAIVE").is_ok();
-
-    // `lower`'s output may have implicit cross-block references;
-    // `ssa_form` establishes the explicit-block-params invariant
-    // that every downstream pass depends on. No `check` before this.
-    lower::ssa_form::run(module);
-    check(module, "ssa_form");
-
-    if naive_rc {
-        lower::rc_emit::run(module);
-        check(module, "rc_emit");
-    }
+    // `lower` already established explicit-block-params and (when
+    // `naive_rc`) the naïve RC traffic; the SSA is well-formed here.
+    check(module, "lower");
 
     opt::static_promote::promote(module);
     check(module, "static_promote");
@@ -89,6 +81,7 @@ fn run_ssa_pipeline(module: &mut ssa::Module) {
     check(module, "optimize");
 
     opt::inline::inline(module);
+    // inline may leave cross-block refs; re-run ssa_form to repair.
     lower::ssa_form::run(module);
     check(module, "inline");
 

@@ -45,14 +45,9 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
     let naive_rc = std::env::var("ORI_RC_EMIT_NAIVE").is_ok();
-    // ssa_form repairs lower's implicit cross-block references.
-    // Validation only meaningful from here onward.
-    crate::lower::ssa_form::run(&mut ssa_module);
-    validate_after(&ssa_module, "ssa_form");
-    if naive_rc {
-        crate::lower::rc_emit::run(&mut ssa_module);
-        validate_after(&ssa_module, "rc_emit");
-    }
+    // `lower` already established explicit-block-params and (when
+    // `naive_rc`) the naïve RC traffic; the SSA is well-formed here.
+    validate_after(&ssa_module, "lower");
     crate::opt::static_promote::promote(&mut ssa_module);
     validate_after(&ssa_module, "static_promote");
     crate::opt::optimize(&mut ssa_module);
