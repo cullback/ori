@@ -33,7 +33,9 @@ fn through_infer(
 /// produces structurally-broken SSA the test fails here with the
 /// pass name, rather than later during eval with a confusing
 /// runtime panic.
-fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
+/// Like `compile` but stops right after `lower` — no opt passes.
+/// Used by diagnostic tests to inspect lower's raw output.
+fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
     let infer_result = through_infer(&mut resolved);
     let mut mono =
@@ -43,10 +45,13 @@ fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
-    let (mut ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
-    // `lower` established explicit-block-params and naïve Perceus RC
-    // traffic; the SSA is well-formed and leak-free.
+    let (ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
     validate_after(&ssa_module, "lower");
+    (ssa_module, input_vals)
+}
+
+fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
+    let (mut ssa_module, input_vals) = compile_until_lower(source);
     crate::opt::static_promote::promote(&mut ssa_module);
     validate_after(&ssa_module, "static_promote");
     crate::opt::optimize(&mut ssa_module);
@@ -218,11 +223,12 @@ main = |arg| arg * 2 + 7";
 
 #[test]
 fn heap_stats_baseline_for_list_construction() {
-    // A list literal allocates: data buffer + header. The list dies
-    // when last referenced; static-ownership should Free both.
+    // A list literal whose elements depend on a runtime value can't
+    // be promoted to a static. It allocates a data buffer + header.
+    // Both should be freed by program exit.
     let source = "\
 main : I64 -> U64
-main = |arg| [1, 2, 3].len()";
+main = |arg| [1, arg, 3].len()";
     let (_, heap) = run_with_heap(source, 0);
     // At minimum, the list literal produces 2 allocations (data + header).
     assert!(heap.alloc_count >= 2, "alloc_count = {}", heap.alloc_count);
@@ -3611,4 +3617,143 @@ main = |_| (
     if x == 42 then 1 else 0
 )";
     assert_eq!(run_u64(source, 0), 1);
+}
+
+#[test]
+#[ignore = "diagnostic; run with --ignored --nocapture"]
+fn audit_ssa_cleanliness() {
+    audit_ssa_cleanliness_inner(/*run_opt=*/true);
+}
+
+#[test]
+#[ignore = "diagnostic; run with --ignored --nocapture"]
+fn audit_ssa_cleanliness_raw() {
+    audit_ssa_cleanliness_inner(/*run_opt=*/false);
+}
+
+/// Compare raw vs optimized SSA on runtime metrics (alloc_count,
+/// fresh_alloc_count, peak_live). Some opt passes (static_promote,
+/// rc_elide_static) move work off the heap without changing IR shape
+/// much — inst count alone underestimates their value.
+#[test]
+#[ignore = "diagnostic; run with --ignored --nocapture"]
+fn audit_opt_runtime_impact() {
+    let programs = [
+        ("list_set", "main : I64 -> I64\nmain = |arg| (\n    xs = List.repeat(arg, 5)\n    ys = xs.set(2, 99)\n    ys.get(2).unwrap()\n)", 0i64),
+        ("rec_update", "Point = { x : I64, y : I64 }\nmain : I64 -> I64\nmain = |arg| (\n    p = { x: arg, y: arg + 1 }\n    q = { p & x: 99 }\n    q.x + q.y\n)", 5),
+        // List literal — should be promotable to static.
+        ("list_literal", "main : I64 -> I64\nmain = |_| List.sum([10, 20, 12, 100])", 0),
+        ("rec_const", "Point = { x : I64, y : I64 }\nmain : I64 -> I64\nmain = |_| (\n    p = { x: 10, y: 20 }\n    p.x + p.y\n)", 0),
+        // Repeated calls — chance for inline/const fold.
+        ("repeated_calls", "double : I64 -> I64\ndouble = |x| x + x\nmain : I64 -> I64\nmain = |arg| double(double(arg)) + double(arg)", 7),
+    ];
+    eprintln!("\n{:12}  {:>8} {:>8} {:>8}   {:>8} {:>8} {:>8}",
+        "program", "raw_alc", "raw_fr", "raw_pk", "opt_alc", "opt_fr", "opt_pk");
+    for (label, source, input) in &programs {
+        let (raw_alc, raw_fresh, raw_peak) = run_get_stats(source, *input, false);
+        let (opt_alc, opt_fresh, opt_peak) = run_get_stats(source, *input, true);
+        eprintln!(
+            "{label:12}  {raw_alc:>8} {raw_fresh:>8} {raw_peak:>8}   {opt_alc:>8} {opt_fresh:>8} {opt_peak:>8}",
+        );
+    }
+    eprintln!("\n--- list_literal IR (opt) ---");
+    let (m, _) = compile(programs[2].1);
+    eprintln!("{m}");
+    eprintln!("\n--- list_literal IR (raw) ---");
+    let (m, _) = compile_until_lower(programs[2].1);
+    eprintln!("{m}");
+}
+
+fn run_get_stats(source: &str, input: i64, run_opt: bool) -> (u64, u64, u64) {
+    let (ssa_module, input_vals) = if run_opt {
+        compile(source)
+    } else {
+        compile_until_lower(source)
+    };
+    let mut heap = crate::ssa::eval::new_heap();
+    crate::ssa::eval::load_statics(&ssa_module, &mut heap);
+    heap.alloc_count = 0;
+    heap.fresh_alloc_count = 0;
+    heap.free_count = 0;
+    heap.peak_live = 0;
+    let ssa_args: Vec<Scalar> = input_vals
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            if i == 0 {
+                Scalar::I64(input)
+            } else {
+                let data = heap.alloc(0);
+                let header = heap.alloc(3);
+                heap.store(header, 0, Scalar::U64(0));
+                heap.store(header, 1, Scalar::U64(0));
+                heap.store(header, 2, Scalar::Ptr(data));
+                Scalar::Ptr(header)
+            }
+        })
+        .collect();
+    heap.alloc_count = 0;
+    heap.fresh_alloc_count = 0;
+    heap.free_count = 0;
+    heap.peak_live = 0;
+    let _ = crate::ssa::eval::eval(&ssa_module, &mut heap, &ssa_args);
+    (heap.alloc_count, heap.fresh_alloc_count, heap.peak_live)
+}
+
+fn audit_ssa_cleanliness_inner(run_opt: bool) {
+    let programs = [
+        ("identity", "main : I64 -> I64\nmain = |x| x"),
+        ("list_set", "main : I64 -> I64\nmain = |arg| (\n    xs = List.repeat(arg, 5)\n    ys = xs.set(2, 99)\n    ys.get(2).unwrap()\n)"),
+        ("rec_update", "Point = { x : I64, y : I64 }\nmain : I64 -> I64\nmain = |arg| (\n    p = { x: arg, y: arg + 1 }\n    q = { p & x: 99 }\n    q.x + q.y\n)"),
+        ("walk_sum", "main : U64 -> U64\nmain = |n| (\n    xs = List.range(0, n)\n    xs.walk(0, |acc, x| acc + x)\n)"),
+    ];
+
+    eprintln!("\n=== audit (run_opt={run_opt}) ===");
+
+    let mut t_insts = 0usize;
+    let mut t_rc = 0usize;
+    let mut t_warn = 0usize;
+    let mut t_blocks = 0usize;
+    let mut t_funcs = 0usize;
+
+    eprintln!();
+    for (label, source) in &programs {
+        let (module, _) = if run_opt { compile(source) } else { compile_until_lower(source) };
+        let report = crate::ssa::validate::validate(&module);
+        let mut insts = 0usize;
+        let mut rc = 0usize;
+        let mut blocks = 0usize;
+        let mut funcs = 0usize;
+        for func in module.functions.values() {
+            funcs += 1;
+            for block in func.blocks.values() {
+                blocks += 1;
+                for inst in &block.insts {
+                    insts += 1;
+                    if matches!(inst, crate::ssa::Inst::RcInc(..) | crate::ssa::Inst::RcDec(..) | crate::ssa::Inst::Drop(..) | crate::ssa::Inst::Free(..)) {
+                        rc += 1;
+                    }
+                }
+            }
+        }
+        t_insts += insts;
+        t_rc += rc;
+        t_warn += report.warnings.len();
+        t_blocks += blocks;
+        t_funcs += funcs;
+        eprintln!("{label:12} funcs={funcs:3} blocks={blocks:4} insts={insts:5} rc={rc:4} warn={}", report.warnings.len());
+        for w in report.warnings.iter().take(2) {
+            eprintln!("           warn: {w}");
+        }
+    }
+    eprintln!("---");
+    eprintln!("TOTAL        funcs={t_funcs:3} blocks={t_blocks:4} insts={t_insts:5} rc={t_rc:4} warn={t_warn}");
+    eprintln!("rc fraction: {:.1}%", 100.0 * t_rc as f64 / t_insts.max(1) as f64);
+
+    // Dump rec_update and walk_sum IRs for visual inspection.
+    for &i in &[2usize, 3] {
+        eprintln!("\n--- {} IR ---", programs[i].0);
+        let (m, _) = if run_opt { compile(programs[i].1) } else { compile_until_lower(programs[i].1) };
+        eprintln!("{m}");
+    }
 }

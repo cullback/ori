@@ -64,7 +64,10 @@ fn promote_block(block: &mut crate::ssa::Block, statics: &mut Vec<StaticObject>)
     }
 
     // Step 2: index all Alloc+Store sequences. Track which allocs
-    // have all-constant slots.
+    // have all-constant slots. After the byte-backed-heap refactor,
+    // store offsets are byte offsets but each store covers
+    // `val.ty.byte_width()` bytes (typically 8). Track stores by
+    // offset and verify full coverage in step 3.
     let mut allocs: HashMap<Value, AllocEntry> = HashMap::new();
     for (idx, inst) in block.insts.iter().enumerate() {
         if let Inst::Alloc(dest, size) = inst {
@@ -73,7 +76,7 @@ fn promote_block(block: &mut crate::ssa::Block, statics: &mut Vec<StaticObject>)
                 AllocEntry {
                     inst_idx: idx,
                     size: *size,
-                    stores: vec![None; *size],
+                    stores: Vec::new(),
                     store_indices: Vec::new(),
                 },
             );
@@ -81,7 +84,7 @@ fn promote_block(block: &mut crate::ssa::Block, statics: &mut Vec<StaticObject>)
         if let Inst::Store(ptr, offset, val) = inst {
             if let Some(entry) = allocs.get_mut(ptr) {
                 if *offset < entry.size {
-                    entry.stores[*offset] = Some(*val);
+                    entry.stores.push((*offset, *val));
                     entry.store_indices.push(idx);
                 }
             }
@@ -92,6 +95,7 @@ fn promote_block(block: &mut crate::ssa::Block, statics: &mut Vec<StaticObject>)
     // An alloc is constant if every stored value is either:
     // - A Const instruction result
     // - Another fully-constant alloc (nested static)
+    // AND the stores tile the entire allocation without gaps.
     let mut promoted: HashMap<Value, usize> = HashMap::new(); // alloc_val → static_id
     let mut remove: HashSet<usize> = HashSet::new();
 
@@ -101,13 +105,28 @@ fn promote_block(block: &mut crate::ssa::Block, statics: &mut Vec<StaticObject>)
 
     for alloc_val in ordered {
         let entry = &allocs[&alloc_val];
-        if entry.stores.iter().any(|s| s.is_none()) {
-            continue; // Not all slots filled.
+        // Sort stores by offset and verify they cover [0, size)
+        // contiguously without overlap. Use byte widths derived from
+        // each stored value's type.
+        let mut stores: Vec<(usize, Value)> = entry.stores.clone();
+        stores.sort_by_key(|(off, _)| *off);
+        let mut cursor = 0usize;
+        let mut fully_covered = true;
+        for (offset, val) in &stores {
+            if *offset != cursor {
+                fully_covered = false;
+                break;
+            }
+            cursor += val.ty.byte_width();
         }
-        let mut slots: Vec<StaticSlot> = Vec::with_capacity(entry.size);
+        if !fully_covered || cursor != entry.size {
+            continue;
+        }
+
+        let mut slots: Vec<StaticSlot> = Vec::with_capacity(stores.len());
         let mut all_const = true;
 
-        for stored_val in entry.stores.iter().flatten() {
+        for (_, stored_val) in &stores {
             if let Some((ty, bits)) = const_vals.get(stored_val) {
                 match ty {
                     ScalarType::U8 => slots.push(StaticSlot::U8(*bits as u8)),
@@ -163,6 +182,8 @@ fn promote_block(block: &mut crate::ssa::Block, statics: &mut Vec<StaticObject>)
 struct AllocEntry {
     inst_idx: usize,
     size: usize,
-    stores: Vec<Option<Value>>,
+    /// `(byte_offset, value)` pairs in the order stores were emitted.
+    /// Step 3 sorts by offset and checks contiguous coverage.
+    stores: Vec<(usize, Value)>,
     store_indices: Vec<usize>,
 }
