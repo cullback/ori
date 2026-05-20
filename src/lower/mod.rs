@@ -121,6 +121,59 @@ pub fn lower(
     Ok((module, input_vals))
 }
 
+// ---- Free-variable analysis (for dead-let elimination) ----
+
+/// `true` if `e` (or any sub-expression) references `target`. Used
+/// by `lower_block` to drop let-bindings whose name is never used
+/// in the rest of the block.
+fn expr_uses(e: &Expr<'_>, target: SymbolId) -> bool {
+    match &e.kind {
+        ExprKind::Name(sym) => *sym == target,
+        ExprKind::IntLit(..) | ExprKind::FloatLit(..) | ExprKind::StrLit(..) => false,
+        ExprKind::BinOp { lhs, rhs, .. } => expr_uses(lhs, target) || expr_uses(rhs, target),
+        ExprKind::Call { target: t, args } => {
+            *t == target || args.iter().any(|a| expr_uses(a, target))
+        }
+        ExprKind::Block(stmts, result) => {
+            stmts.iter().any(|s| stmt_uses(s, target)) || expr_uses(result, target)
+        }
+        ExprKind::If { expr, arms, else_body } => {
+            expr_uses(expr, target)
+                || arms.iter().any(|a| a.guards.iter().any(|g| expr_uses(g, target)) || expr_uses(&a.body, target))
+                || else_body.as_ref().is_some_and(|e| expr_uses(e, target))
+        }
+        ExprKind::Fold { expr, arms } => {
+            expr_uses(expr, target)
+                || arms.iter().any(|a| a.guards.iter().any(|g| expr_uses(g, target)) || expr_uses(&a.body, target))
+        }
+        ExprKind::Lambda { body, .. } => expr_uses(body, target),
+        ExprKind::QualifiedCall { args, .. } => args.iter().any(|a| expr_uses(a, target)),
+        ExprKind::Record { fields } => fields.iter().any(|(_, e)| expr_uses(e, target)),
+        ExprKind::RecordUpdate { base, updates } => {
+            expr_uses(base, target) || updates.iter().any(|(_, e)| expr_uses(e, target))
+        }
+        ExprKind::FieldAccess { record, .. } => expr_uses(record, target),
+        ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
+            elems.iter().any(|e| expr_uses(e, target))
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            expr_uses(receiver, target) || args.iter().any(|a| expr_uses(a, target))
+        }
+        ExprKind::Is { expr, .. } => expr_uses(expr, target),
+        ExprKind::Closure { captures, .. } => captures.iter().any(|c| expr_uses(c, target)),
+    }
+}
+
+fn stmt_uses(s: &Stmt<'_>, target: SymbolId) -> bool {
+    match s {
+        Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => expr_uses(val, target),
+        Stmt::Guard { condition, return_val } => {
+            expr_uses(condition, target) || expr_uses(return_val, target)
+        }
+        Stmt::TypeHint { .. } => false,
+    }
+}
+
 // ---- SSA lowering context ----
 
 use crate::passes::lambda_specialize::SingletonTarget;
@@ -689,9 +742,20 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     // ---- Block lowering ----
 
     fn lower_block(&mut self, stmts: &[Stmt<'src>], result: &Expr<'src>) -> Value {
-        for stmt in stmts {
+        for (i, stmt) in stmts.iter().enumerate() {
             match stmt {
                 Stmt::Let { name, val } => {
+                    // Drop unused let bindings. Ori is pure (System T),
+                    // so an unused binding's RHS has no observable
+                    // effect and can be elided. Look forward through
+                    // remaining stmts and the result expression.
+                    let used = stmts[i + 1..]
+                        .iter()
+                        .any(|s| stmt_uses(s, *name))
+                        || expr_uses(result, *name);
+                    if !used {
+                        continue;
+                    }
                     let v = self.lower_expr(val);
                     self.vars.insert(*name, v);
                 }
