@@ -105,28 +105,40 @@ fn promote_block(block: &mut crate::ssa::Block, statics: &mut Vec<StaticObject>)
 
     for alloc_val in ordered {
         let entry = &allocs[&alloc_val];
-        // Sort stores by offset and verify they cover [0, size)
-        // contiguously without overlap. Use byte widths derived from
-        // each stored value's type.
-        let mut stores: Vec<(usize, Value)> = entry.stores.clone();
-        stores.sort_by_key(|(off, _)| *off);
-        let mut cursor = 0usize;
-        let mut fully_covered = true;
-        for (offset, val) in &stores {
-            if *offset != cursor {
-                fully_covered = false;
-                break;
-            }
-            cursor += val.ty.byte_width();
-        }
-        if !fully_covered || cursor != entry.size {
+        // The runtime's `init_statics` lays out StaticObject slots at
+        // a fixed 8-byte stride regardless of value width — so we
+        // accept any store layout where each slot 0..num_slots has
+        // exactly one store at offset `i * 8`, and each value fits
+        // in 8 bytes. This covers both the I64/U64 contiguous case
+        // (width 8, stride 8) and the string-like sparse case (U8
+        // values at 8-byte stride with 7-byte gaps).
+        if entry.size % 8 != 0 {
             continue;
         }
+        let num_slots = entry.size / 8;
+        let mut slot_vals: Vec<Option<Value>> = vec![None; num_slots];
+        let mut layout_ok = true;
+        for (offset, val) in &entry.stores {
+            if *offset % 8 != 0 || val.ty.byte_width() > 8 {
+                layout_ok = false;
+                break;
+            }
+            let slot_idx = offset / 8;
+            if slot_idx >= num_slots {
+                layout_ok = false;
+                break;
+            }
+            slot_vals[slot_idx] = Some(*val);
+        }
+        if !layout_ok || slot_vals.iter().any(|s| s.is_none()) {
+            continue;
+        }
+        let stores: Vec<Value> = slot_vals.into_iter().map(|s| s.unwrap()).collect();
 
         let mut slots: Vec<StaticSlot> = Vec::with_capacity(stores.len());
         let mut all_const = true;
 
-        for (_, stored_val) in &stores {
+        for stored_val in &stores {
             if let Some((ty, bits)) = const_vals.get(stored_val) {
                 match ty {
                     ScalarType::U8 => slots.push(StaticSlot::U8(*bits as u8)),
