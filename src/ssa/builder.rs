@@ -182,6 +182,22 @@ impl Builder {
         v
     }
 
+    /// FBIP `reuse_or_clone`: returns a Ptr the caller owns at rc=1.
+    /// In-place if `src.rc == 1` (contents preserved), cloned + src
+    /// `rc_dec`'d otherwise. Consumes the caller's owning slot on
+    /// `src`.
+    pub fn reuse_or_clone(&mut self, src: Value, size: usize) -> Value {
+        let v = self.fresh_value(ScalarType::Ptr);
+        self.push(Inst::ReuseOrClone(v, src, size));
+        v
+    }
+
+    pub fn reuse_or_clone_dyn(&mut self, src: Value, size_val: Value) -> Value {
+        let v = self.fresh_value(ScalarType::Ptr);
+        self.push(Inst::ReuseOrCloneDyn(v, src, size_val));
+        v
+    }
+
     pub fn load(&mut self, ptr: Value, offset: usize, ty: ScalarType) -> Value {
         let v = self.fresh_value(ty);
         self.push(Inst::Load(v, ptr, offset));

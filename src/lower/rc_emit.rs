@@ -347,6 +347,23 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 }
             }
         }
+        Inst::ReuseOrClone(_, src, _) => {
+            // ReuseOrClone consumes its src: either reuses storage
+            // in place (rc=1 path) or clones + rc_dec'es src (rc>1
+            // path). Either way the SSA's owning slot for src is
+            // transferred into the result.
+            if is_ptr(src) {
+                cons.push(*src);
+            }
+        }
+        Inst::ReuseOrCloneDyn(_, src, size) => {
+            if is_ptr(src) {
+                cons.push(*src);
+            }
+            if is_ptr(size) {
+                borr.push(*size);
+            }
+        }
         Inst::Cast(_, src) | Inst::BitCast(_, src) => {
             if is_ptr(src) {
                 borr.push(*src);

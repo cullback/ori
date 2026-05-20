@@ -661,6 +661,15 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.id], size)))
         }
 
+        Inst::ReuseOrClone(_dest, src, num_bytes) => {
+            Some(Scalar::Ptr(reuse_or_clone(heap, env[src.id], *num_bytes)))
+        }
+
+        Inst::ReuseOrCloneDyn(_dest, src, size_val) => {
+            let size = scalar_to_usize(env[size_val.id]);
+            Some(Scalar::Ptr(reuse_or_clone(heap, env[src.id], size)))
+        }
+
         Inst::Cast(dest, src) => {
             // Integer widening (zero-extend) / narrowing (truncate).
             // The destination type drives the result variant.
@@ -771,6 +780,45 @@ fn reuse_or_alloc(heap: &mut Heap, token: Scalar, num_bytes: usize) -> usize {
         }
     }
     heap.alloc(num_bytes)
+}
+
+/// FBIP `reuse_or_clone`: if `src` is uniquely owned, return its
+/// idx directly so the caller can mutate in place (contents
+/// preserved, rc stays 1). Otherwise allocate fresh, clone src's
+/// contents with `rc_inc` on each Ptr child, and `rc_dec(src)` to
+/// release the caller's owning slot on the original.
+fn reuse_or_clone(heap: &mut Heap, src: Scalar, num_bytes: usize) -> usize {
+    let Scalar::Ptr(idx) = src else {
+        panic!("reuse_or_clone src not a Ptr: {src:?}");
+    };
+    if idx == 0 {
+        return heap.alloc(num_bytes);
+    }
+    if heap.objects[idx].rc == RC_STATIC {
+        // Static src — can't mutate in place. Clone, no rc_dec.
+        let new_idx = heap.clone_object(idx);
+        heap.objects[new_idx].data.resize(num_bytes, 0);
+        return new_idx;
+    }
+    if heap.objects[idx].rc == 1 {
+        // Unique. Return src directly. Resize if needed (extending
+        // with zeros for the FBIP "grow" patterns like list.append).
+        heap.alloc_count += 1;
+        let live = heap.alloc_count - heap.free_count;
+        if live > heap.peak_live {
+            heap.peak_live = live;
+        }
+        if heap.objects[idx].data.len() < num_bytes {
+            heap.objects[idx].data.resize(num_bytes, 0);
+        }
+        return idx;
+    }
+    // Shared. Clone (with rc_inc on Ptr children), then drop our
+    // ref on the original.
+    let new_idx = heap.clone_object(idx);
+    heap.objects[new_idx].data.resize(num_bytes, 0);
+    heap.rc_dec(idx);
+    new_idx
 }
 
 fn scalar_to_usize(s: Scalar) -> usize {

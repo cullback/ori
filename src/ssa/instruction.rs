@@ -163,6 +163,20 @@ pub enum Inst {
     /// `num_slots_val`). Otherwise allocate fresh. Parallel to `Reuse`
     /// but with a dynamic size.
     ReuseDyn(Value, Value, Value),
+    /// dest = FBIP "reuse-or-clone": if `src.rc == 1`, return `src`
+    /// directly (in-place mutation path, contents preserved). If
+    /// `src.rc > 1`, allocate a fresh `size`-byte object and clone
+    /// src's contents into it (with `rc_inc` on each Ptr child),
+    /// then `rc_dec(src)`. Either way the caller gets a Ptr they
+    /// own with rc=1; what differs is whether src's storage is
+    /// reused or a copy was made. Used for functional updates
+    /// (`list.set`, `record_update`, etc.) to enable in-place
+    /// mutation when uniqueness allows.
+    ReuseOrClone(Value, Value, usize),
+    /// Dynamic-size version of `ReuseOrClone`. `size_val` carries
+    /// the byte count at runtime. Used for data buffer reuse where
+    /// list length isn't statically known.
+    ReuseOrCloneDyn(Value, Value, Value),
     /// dest = pointer to a pre-allocated static object by index.
     /// The object lives in `Module::statics` and is never freed.
     StaticRef(Value, usize),
@@ -190,6 +204,8 @@ impl Inst {
             | Self::Reset(v, _, _)
             | Self::Reuse(v, _, _)
             | Self::ReuseDyn(v, _, _)
+            | Self::ReuseOrClone(v, _, _)
+            | Self::ReuseOrCloneDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
             | Self::BitCast(v, _) => Some(*v),
@@ -210,6 +226,8 @@ impl Inst {
             | Self::Reset(v, _, _)
             | Self::Reuse(v, _, _)
             | Self::ReuseDyn(v, _, _)
+            | Self::ReuseOrClone(v, _, _)
+            | Self::ReuseOrCloneDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
             | Self::BitCast(v, _) => Some(v),
@@ -233,6 +251,8 @@ impl Inst {
             Self::Reset(_, ptr, _) => vec![*ptr],
             Self::Reuse(_, token, _) => vec![*token],
             Self::ReuseDyn(_, token, size) => vec![*token, *size],
+            Self::ReuseOrClone(_, src, _) => vec![*src],
+            Self::ReuseOrCloneDyn(_, src, size) => vec![*src, *size],
             Self::StaticRef(..) => vec![],
             Self::Cast(_, src) | Self::BitCast(_, src) => vec![*src],
         }
@@ -254,6 +274,8 @@ impl Inst {
             Self::Reset(_, ptr, _) => f(ptr),
             Self::Reuse(_, token, _) => f(token),
             Self::ReuseDyn(_, token, size) => { f(token); f(size); }
+            Self::ReuseOrClone(_, src, _) => f(src),
+            Self::ReuseOrCloneDyn(_, src, size) => { f(src); f(size); }
             Self::Cast(_, src) | Self::BitCast(_, src) => f(src),
         }
     }
