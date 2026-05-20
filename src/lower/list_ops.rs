@@ -90,39 +90,28 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
 /// this is zero heap allocations: every `reuse_or_clone` takes the
 /// in-place path. When either is shared, the runtime clones —
 /// correct copy-on-write semantics.
-fn emit_list_set(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
+fn emit_list_set(builder: &mut Builder, args: Vec<Value>, _elem_ty: ScalarType) -> Value {
     use crate::ssa::instruction::BinaryOp;
     let list = args[0];
     let idx = args[1];
     let new_val = args[2];
 
-    // Pre-emit the null constant so the move-out's Load is
-    // immediately followed by Store(slot, null) in the inst list
-    // (so rc_emit's owning-load suppression detects it).
-    let null = builder.const_ptr_null();
-
     // Step 1: header — reuse if unique, clone otherwise.
     let new_list = builder.reuse_or_clone(list, 24);
 
     let len = builder.load(new_list, 0, ScalarType::U64);
-    let old_data = builder.load(new_list, 16, ScalarType::RcPtr);
-
-    // Step 2: move the data ptr out of the header so cascade-free
-    // won't decrement it. Safe because new_list is unique to us.
-    builder.store(new_list, 16, null);
+    // Step 2: take the data ptr out of the header so reuse_or_clone_dyn
+    // sees rc=1 in the in-place path (slot 16's claim transfers to
+    // old_data; slot 16 is left null so it won't double-drop).
+    let old_data = builder.move_out(new_list, 16, ScalarType::RcPtr);
 
     // Step 3: data buffer — reuse if unique, clone otherwise.
     let eight = builder.const_u64(8);
     let byte_len = builder.binop(BinaryOp::Mul, len, eight, ScalarType::U64);
     let new_data = builder.reuse_or_clone_dyn(old_data, byte_len);
 
-    // Step 4: replace slot `idx`. In both paths (in-place mutation
-    // and copy-on-write clone), the slot currently holds the old
-    // element with an owning ref; rc_dec it before overwriting.
-    if elem_ty.is_heap_ptr() {
-        let old_at_idx = builder.load_dyn(new_data, idx, ScalarType::RcPtr);
-        builder.rc_dec(old_at_idx);
-    }
+    // Step 4: replace slot `idx`. StoreDyn auto-releases the previous
+    // occupant and auto-claims new_val (for RcPtr-typed slots).
     builder.store_dyn(new_data, idx, new_val);
 
     // Step 5: install the new buffer in the header.
@@ -157,10 +146,8 @@ fn emit_list_reverse(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarTyp
     builder.branch(cond, body, vec![header_i], exit, vec![]);
 
     builder.switch_to(body);
+    // RcPtr-typed loads auto-rc_inc, so the loaded elem is owning.
     let elem = builder.load_dyn(old_data, body_i, elem_ty);
-    if elem_ty.is_heap_ptr() {
-        builder.rc_inc(elem);
-    }
     // dst_idx = len - 1 - i
     let one = builder.const_u64(1);
     let len_minus_one = builder.binop(BinaryOp::Sub, len, one, ScalarType::U64);
@@ -206,10 +193,8 @@ fn emit_list_sublist(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarTyp
 
     builder.switch_to(body);
     let src_idx = builder.binop(BinaryOp::Add, start, body_i, ScalarType::U64);
+    // RcPtr-typed loads auto-rc_inc, so the loaded elem is owning.
     let elem = builder.load_dyn(old_data, src_idx, elem_ty);
-    if elem_ty.is_heap_ptr() {
-        builder.rc_inc(elem);
-    }
     builder.store_dyn(new_data, body_i, elem);
     let one = builder.const_u64(1);
     let next_i = builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
@@ -251,9 +236,8 @@ fn emit_list_repeat(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
     builder.branch(cond, body, vec![header_i], exit, vec![]);
 
     builder.switch_to(body);
-    if elem_ty.is_heap_ptr() {
-        builder.rc_inc(val);
-    }
+    // store_dyn auto-rc_incs val (when val is RcPtr), so the buffer
+    // ends up with N owning claims and the caller's local stays valid.
     builder.store_dyn(data, body_i, val);
     let one = builder.const_u64(1);
     let next_i = builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
@@ -348,12 +332,9 @@ fn emit_list_get_checked(builder: &mut Builder, args: Vec<Value>) -> Value {
     // Ok path: get element, wrap in Ok(elem) = [tag=0, elem]
     builder.switch_to(ok_block);
     let data = builder.load(list, 16, ScalarType::RcPtr);
+    // RcPtr load auto-rc_incs, so elem is an owning local that
+    // outlives the source list.
     let elem = builder.load_dyn(data, idx, ScalarType::RcPtr);
-    // Loading a Ptr child creates a new alias; runtime rc_inc keeps
-    // the element alive past the source list's eventual drop. The
-    // eval's RcInc is a no-op for non-Ptr scalars, so this is safe
-    // even when the element type is I64 / U8 / etc.
-    builder.rc_inc(elem);
     let ok_result = builder.alloc(16);
     let ok_tag = builder.const_u64(0);
     builder.store(ok_result, 0, ok_tag);

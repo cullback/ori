@@ -108,5 +108,6 @@ pub fn is_side_effect(inst: &Inst) -> bool {
             | Inst::ReuseDyn(..)
             | Inst::ReuseOrClone(..)
             | Inst::ReuseOrCloneDyn(..)
+            | Inst::MoveOut(..)
     )
 }

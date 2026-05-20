@@ -504,14 +504,36 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             let Scalar::Ptr(idx) = env[ptr.id] else {
                 panic!("load from non-ptr: {:?}", env[ptr.id]);
             };
-            Some(heap.load_auto(idx, *offset, dest.ty))
+            let loaded = heap.load_auto(idx, *offset, dest.ty);
+            // Auto-rc: if loaded value is an owning RcPtr, mint a new
+            // reference for the local SSA value.
+            if dest.ty == ScalarType::RcPtr {
+                if let Scalar::Ptr(child) = loaded {
+                    heap.rc_inc(child);
+                }
+            }
+            Some(loaded)
         }
 
         Inst::Store(ptr, offset, val) => {
             let Scalar::Ptr(idx) = env[ptr.id] else {
                 panic!("store to non-ptr: {:?}", env[ptr.id]);
             };
-            heap.store(idx, *offset, env[val.id]);
+            let new_val = env[val.id];
+            // Auto-rc: bump new claim BEFORE releasing old, so if new
+            // and old refer to the same heap object we don't free it
+            // mid-store. rc_inc(new) first, then rc_dec(prev).
+            if val.ty == ScalarType::RcPtr {
+                if let Scalar::Ptr(child) = new_val {
+                    heap.rc_inc(child);
+                }
+            }
+            if heap.lookup_type(idx, *offset) == Some(ScalarType::RcPtr) {
+                if let Scalar::Ptr(prev) = heap.load(idx, *offset, ScalarType::RcPtr) {
+                    heap.rc_dec(prev);
+                }
+            }
+            heap.store(idx, *offset, new_val);
             None
         }
 
@@ -522,15 +544,24 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             let slot = scalar_to_usize(env[idx_val.id]);
             // Data buffers use a uniform 8-byte stride (matches StoreDyn).
             let offset = slot * 8;
-            // Dest type `Ptr` is the generic-element placeholder some
-            // lowering paths use when they don't know the element type
-            // (e.g. emit_list_get_checked). Recover the true type from
-            // type_map. Concrete dest types are authoritative.
-            if dest.ty.is_heap_ptr() {
-                Some(heap.load_dyn_auto(heap_idx, slot))
+            // Dest type `Ptr`/`RcPtr` is the generic-element placeholder
+            // some lowering paths use when they don't know the element
+            // type (e.g. emit_list_get_checked). Recover the true type
+            // from type_map. Concrete dest types are authoritative.
+            let loaded = if dest.ty.is_heap_ptr() {
+                heap.load_dyn_auto(heap_idx, slot)
             } else {
-                Some(heap.load(heap_idx, offset, dest.ty))
+                heap.load(heap_idx, offset, dest.ty)
+            };
+            // Auto-rc: owning load of an RcPtr mints a new reference.
+            // Only when the actual loaded scalar is a Ptr (the type_map
+            // might disagree with dest.ty for generic-placeholder loads).
+            if dest.ty == ScalarType::RcPtr {
+                if let Scalar::Ptr(child) = loaded {
+                    heap.rc_inc(child);
+                }
             }
+            Some(loaded)
         }
 
         Inst::StoreDyn(ptr, idx_val, val) => {
@@ -538,6 +569,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                 panic!("store_dyn to non-ptr: {:?}", env[ptr.id]);
             };
             let slot = scalar_to_usize(env[idx_val.id]);
+            let offset = slot * 8;
             // Detect element stride from the buffer's existing type_map.
             // U8 buffers (strings) use 1-byte stride; all others use 8-byte stride.
             let buf_elem_ty = heap.lookup_type(heap_idx, 0);
@@ -552,8 +584,32 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             } else {
                 (ScalarType::I64, env[val.id])
             };
+            // Auto-rc: bump new claim BEFORE releasing old (see Store).
+            if val.ty == ScalarType::RcPtr {
+                if let Scalar::Ptr(child) = store_val {
+                    heap.rc_inc(child);
+                }
+            }
+            if heap.lookup_type(heap_idx, offset) == Some(ScalarType::RcPtr) {
+                if let Scalar::Ptr(prev) = heap.load(heap_idx, offset, ScalarType::RcPtr) {
+                    heap.rc_dec(prev);
+                }
+            }
             heap.store_dyn(heap_idx, slot, store_val, elem_ty);
             None
+        }
+
+        Inst::MoveOut(_dest, ptr, offset) => {
+            let Scalar::Ptr(idx) = env[ptr.id] else {
+                panic!("move_out from non-ptr: {:?}", env[ptr.id]);
+            };
+            let loaded = heap.load_auto(idx, *offset, ScalarType::RcPtr);
+            // Write null back. Use raw write_scalar so we don't trip
+            // the type_map's "this is a Ptr slot" tracking (the slot
+            // is still semantically RcPtr — we're just clearing it).
+            heap.store(idx, *offset, Scalar::Ptr(0));
+            // No rc change: slot's prior claim transfers to the local.
+            Some(loaded)
         }
 
         Inst::RcInc(ptr) => {

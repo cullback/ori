@@ -218,6 +218,16 @@ impl Builder {
         self.push(Inst::StoreDyn(ptr, idx, val));
     }
 
+    /// Move a value out of a slot: load it, write null back. No rc
+    /// change — the slot's claim transfers to the returned local.
+    /// Used in FBIP patterns to take a child out of a parent before
+    /// reusing the parent's storage.
+    pub fn move_out(&mut self, ptr: Value, offset: usize, ty: ScalarType) -> Value {
+        let v = self.fresh_value(ty);
+        self.push(Inst::MoveOut(v, ptr, offset));
+        v
+    }
+
     pub fn rc_inc(&mut self, ptr: Value) {
         self.push(Inst::RcInc(ptr));
     }
@@ -240,14 +250,16 @@ impl Builder {
 
     /// Emit a forward bulk-copy loop. Copies `count` elements from
     /// `src` to `dst` using `LoadDyn`/`StoreDyn` with 8-byte stride.
-    /// When `elem_ty == Ptr`, every loaded element gets an `RcInc`
-    /// (the clone creates an additional alias). Caller continues
-    /// emission in a fresh exit block — values from before the loop
-    /// flow through automatically via `ssa_construct`.
+    /// For RcPtr elements, the rc accounting is automatic: the
+    /// owning Load rc-incs the element (slot + local), the Store
+    /// rc-incs again (dst slot claims it). At end of iteration the
+    /// local goes out of scope and rc_emit emits an rc_dec — net
+    /// result is one extra rc per element (the new dst slot), which
+    /// is exactly what a clone needs.
     ///
     /// Layout: entry → header(i=0); header(i): i < count ? body(i) :
-    /// exit; body(i): elem = load_dyn(src, i); [rc_inc elem]; store_dyn
-    /// (dst, i, elem); jump header(i + 1); exit: ...
+    /// exit; body(i): elem = load_dyn(src, i); store_dyn(dst, i, elem);
+    /// jump header(i + 1); exit: ...
     pub fn copy_loop(&mut self, dst: Value, src: Value, count: Value, elem_ty: ScalarType) {
         let header = self.create_block();
         let body = self.create_block();
@@ -265,9 +277,6 @@ impl Builder {
 
         self.switch_to(body);
         let elem = self.load_dyn(src, body_i, elem_ty);
-        if elem_ty.is_heap_ptr() {
-            self.rc_inc(elem);
-        }
         self.store_dyn(dst, body_i, elem);
         let one = self.const_u64(1);
         let next_i = self.binop(BinaryOp::Add, body_i, one, ScalarType::U64);

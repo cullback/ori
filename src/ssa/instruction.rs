@@ -144,13 +144,34 @@ pub enum Inst {
     /// pairs `Alloc`, emitting `Reset` + `Reuse` when the reuse is safe.
     AllocDyn(Value, Value),
     /// dest = read from `ptr` at static slot `offset`.
+    ///
+    /// When `dest.ty` is `RcPtr`, the loaded value is an *owning*
+    /// reference: eval rc-inc's it so the local SSA value gets its
+    /// own claim, independent of the slot's. The caller still needs
+    /// to release it (`rc_dec`) at end of scope. Use `MoveOut` instead
+    /// when the slot's claim should transfer to the local (no net rc
+    /// change, slot left null).
     Load(Value, Value, usize),
     /// Write `val` to `ptr` at static slot `offset`. No result.
+    ///
+    /// For RcPtr-typed slots, eval auto-balances rc:
+    /// - rc_decs the previous occupant (release slot's old claim).
+    /// - rc_incs `val` (slot mints its own claim; caller still owns
+    ///   the local). Net: rc(val) += 1, rc(old) -= 1.
     Store(Value, usize, Value),
     /// dest = read from `ptr` at dynamic slot index `idx_val`.
+    /// Auto-rc semantics match `Load`.
     LoadDyn(Value, Value, Value),
     /// Write `val` to `ptr` at dynamic slot index `idx_val`. No result.
+    /// Auto-rc semantics match `Store`.
     StoreDyn(Value, Value, Value),
+    /// dest = read from `ptr` at static slot `offset`, then write null
+    /// to the slot. No rc change — the slot's claim on the loaded
+    /// value transfers to `dest`, and the slot now holds null (so
+    /// cascade-free won't double-drop). Used for FBIP's "move out"
+    /// pattern: take a child out of a parent so the parent's storage
+    /// can be reused without the child being incidentally freed.
+    MoveOut(Value, Value, usize),
     /// Increment reference count of `ptr`.
     RcInc(Value),
     /// Decrement reference count of `ptr`, free if zero.
@@ -216,6 +237,7 @@ impl Inst {
             | Self::AllocDyn(v, _)
             | Self::Load(v, _, _)
             | Self::LoadDyn(v, _, _)
+            | Self::MoveOut(v, _, _)
             | Self::Reset(v, _, _)
             | Self::Reuse(v, _, _)
             | Self::ReuseDyn(v, _, _)
@@ -238,6 +260,7 @@ impl Inst {
             | Self::AllocDyn(v, _)
             | Self::Load(v, _, _)
             | Self::LoadDyn(v, _, _)
+            | Self::MoveOut(v, _, _)
             | Self::Reset(v, _, _)
             | Self::Reuse(v, _, _)
             | Self::ReuseDyn(v, _, _)
@@ -261,6 +284,7 @@ impl Inst {
             Self::Store(ptr, _, val) => vec![*ptr, *val],
             Self::LoadDyn(_, ptr, idx) => vec![*ptr, *idx],
             Self::StoreDyn(ptr, idx, val) => vec![*ptr, *idx, *val],
+            Self::MoveOut(_, ptr, _) => vec![*ptr],
             Self::RcInc(v) | Self::RcDec(v) | Self::Free(v) => vec![*v],
             Self::Drop(v, _) => vec![*v],
             Self::Reset(_, ptr, _) => vec![*ptr],
@@ -284,6 +308,7 @@ impl Inst {
             Self::Store(ptr, _, val) => { f(ptr); f(val); }
             Self::LoadDyn(_, ptr, idx) => { f(ptr); f(idx); }
             Self::StoreDyn(ptr, idx, val) => { f(ptr); f(idx); f(val); }
+            Self::MoveOut(_, ptr, _) => f(ptr),
             Self::RcInc(v) | Self::RcDec(v) | Self::Free(v) => f(v),
             Self::Drop(v, _) => f(v),
             Self::Reset(_, ptr, _) => f(ptr),

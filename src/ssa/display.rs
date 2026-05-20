@@ -167,6 +167,10 @@ impl fmt::Display for FmtInst<'_> {
                 write!(f, "store_dyn {} -> {}[{}]",
                     fmt_val(*val, consts), fmt_val(*ptr, consts), fmt_val(*idx, consts))
             }
+            Inst::MoveOut(d, ptr, off) => {
+                let dt = d.ty;
+                write!(f, "{d}: {dt} = move_out {}[{off}]", fmt_val(*ptr, consts))
+            }
             Inst::RcInc(ptr) => write!(f, "rc_inc {}", fmt_val(*ptr, consts)),
             Inst::RcDec(ptr) => write!(f, "rc_dec {}", fmt_val(*ptr, consts)),
             Inst::Free(ptr) => write!(f, "free {}", fmt_val(*ptr, consts)),
