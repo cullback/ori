@@ -56,8 +56,21 @@ pub struct Heap {
 
 impl Heap {
     /// Number of non-static heap objects currently live.
+    /// (Derived from alloc/free counts; reliable when no in-place
+    /// reuses bump alloc_count. For a count that ignores reuse
+    /// accounting, use `count_live_objects` instead.)
     pub fn live_count(&self) -> u64 {
         self.alloc_count - self.free_count
+    }
+
+    /// Walk the heap and count objects with rc > 0 that aren't
+    /// static. Authoritative leak check: any non-zero value here
+    /// at program end means something wasn't freed.
+    pub fn count_live_objects(&self) -> usize {
+        self.objects
+            .iter()
+            .filter(|o| o.rc > 0 && o.rc != RC_STATIC)
+            .count()
     }
 }
 

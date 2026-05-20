@@ -260,6 +260,112 @@ main = |arg| (
         heap.alloc_count, heap.fresh_alloc_count);
 }
 
+#[test]
+fn fbip_record_update_reuses_unique_base() {
+    // FBIP for record update: when `p` is uniquely owned, `{ p & x: 99 }`
+    // should reuse p's storage rather than allocating fresh.
+    let source = "\
+Point : { x : I64, y : I64 }
+main : I64 -> I64
+main = |arg| (
+    p = { x: arg, y: arg + 1 }
+    q = { p & x: 99 }
+    q.x + q.y
+)";
+    let (result, heap) = run_with_heap(source, 5);
+    // result = 99 + 6 = 105
+    assert_eq!(result, Scalar::I64(105));
+    // The record alloc should be reused: alloc_count > fresh_alloc_count.
+    assert!(heap.alloc_count > heap.fresh_alloc_count,
+        "FBIP record update regression: every alloc was fresh ({} == {})",
+        heap.alloc_count, heap.fresh_alloc_count);
+    // Every actual heap object freed by end. (alloc_count includes
+    // in-place reuses; fresh_alloc_count is real heap growth and
+    // should match free_count for no leak.)
+    assert_eq!(heap.count_live_objects(), 0,
+        "leak: {} objects still live at program end", heap.count_live_objects());
+}
+
+#[test]
+fn fbip_record_update_clones_when_shared() {
+    // FBIP shared path: when p is used after the update, the update
+    // must clone (not in-place). We force sharing by using p again
+    // after building q. Must produce correct values and free
+    // everything cleanly.
+    let source = "\
+Point : { x : I64, y : I64 }
+main : I64 -> I64
+main = |arg| (
+    p = { x: arg, y: arg + 1 }
+    q = { p & x: 99 }
+    p.x + p.y + q.x + q.y
+)";
+    let (result, heap) = run_with_heap(source, 5);
+    // p.x + p.y + q.x + q.y = 5 + 6 + 99 + 6 = 116
+    assert_eq!(result, Scalar::I64(116));
+    // Shared: two separate heap objects survive simultaneously.
+    assert!(heap.peak_live >= 2,
+        "expected at least 2 simultaneously-live records (shared base + clone); peak_live={}",
+        heap.peak_live);
+    assert_eq!(heap.count_live_objects(), 0,
+        "leak: {} objects still live at program end", heap.count_live_objects());
+}
+
+#[test]
+fn fbip_list_set_clones_when_shared() {
+    // FBIP shared path for list: xs is read after the set, so set
+    // must clone the data buffer (not in-place).
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    xs = List.repeat(arg, 5)
+    ys = xs.set(2, 99)
+    a = ys.get(2).unwrap()
+    b = xs.get(2).unwrap()
+    a + b
+)";
+    let (result, heap) = run_with_heap(source, 7);
+    // ys.get(2) = 99; xs.get(2) = 7 (unchanged). Sum = 106.
+    assert_eq!(result, Scalar::I64(106));
+    assert_eq!(heap.count_live_objects(), 0,
+        "leak: {} objects still live at program end", heap.count_live_objects());
+}
+
+#[test]
+#[ignore = "diagnostic"]
+fn fbip_inspect_record_update_with_ptr_field() {
+    let source = "\
+HasList : { xs : List(I64), n : I64 }
+main : I64 -> I64
+main = |arg| (
+    r = { xs: [1, 2, 3], n: arg }
+    s = { r & xs: [10, 20, 30, 40] }
+    s.n + s.xs.get(0).unwrap()
+)";
+    let (m, _) = compile(source);
+    eprintln!("{m}");
+}
+
+#[test]
+fn fbip_record_update_with_ptr_field_unique() {
+    // FBIP with an RcPtr-typed field: confirm rc accounting is
+    // correct when the field is a heap pointer (the auto-rc-on-Store
+    // must release the old value and claim the new).
+    let source = "\
+HasList : { xs : List(I64), n : I64 }
+main : I64 -> I64
+main = |arg| (
+    r = { xs: [1, 2, 3], n: arg }
+    s = { r & xs: [10, 20, 30, 40] }
+    s.n + s.xs.get(0).unwrap()
+)";
+    let (result, heap) = run_with_heap(source, 100);
+    // s.n = 100; s.xs.get(0) = 10. Sum = 110.
+    assert_eq!(result, Scalar::I64(110));
+    assert_eq!(heap.count_live_objects(), 0,
+        "leak: {} objects still live at program end", heap.count_live_objects());
+}
+
 // ============================================================
 // Tuples
 // ============================================================
