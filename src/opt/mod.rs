@@ -59,6 +59,8 @@ pub fn optimize(module: &mut Module) {
 pub fn run_full_pipeline(module: &mut Module) {
     static_promote::promote(module);
     optimize(module);
+    const_eval::evaluate(module);
+    optimize(module);
     rc_elide_static::run(module);
     rc_fuse::run(module);
     optimize(module);

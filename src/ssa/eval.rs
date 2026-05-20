@@ -209,7 +209,7 @@ impl Heap {
 
     /// Load a value, using the type_map to recover the original ScalarType.
     /// Falls back to the hint when no type_map entry exists.
-    fn load_auto(&self, idx: usize, byte_offset: usize, hint: ScalarType) -> Scalar {
+    pub fn load_auto(&self, idx: usize, byte_offset: usize, hint: ScalarType) -> Scalar {
         let ty = self.lookup_type(idx, byte_offset).unwrap_or(hint);
         read_scalar(&self.objects[idx].data, byte_offset, ty)
     }

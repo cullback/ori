@@ -178,12 +178,17 @@ fn heap_to_statics(
         let mut slots = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
             let off = i * 8;
-            let ty = if ptr_offs.contains(&off) {
-                ScalarType::RcPtr
+            // Use `load_auto` so the stored scalar's *actual* type is
+            // recovered from the heap's type_map (a `List(U32)`
+            // stores U32 values, but a naive `load(..., I64)` would
+            // misinterpret them and produce a U32→I64 type lie in
+            // the resulting StaticObject).
+            let scalar = if ptr_offs.contains(&off) {
+                heap.load(heap_idx, off, ScalarType::RcPtr)
             } else {
-                ScalarType::I64
+                heap.load_auto(heap_idx, off, ScalarType::I64)
             };
-            slots.push(scalar_to_slot(heap.load(heap_idx, off, ty), &heap_to_static));
+            slots.push(scalar_to_slot(scalar, &heap_to_static));
         }
         statics.push(StaticObject { slots });
     }
