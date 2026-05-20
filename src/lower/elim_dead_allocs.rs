@@ -108,6 +108,12 @@ fn elim_in_block(block: &mut crate::ssa::Block) {
                 mark(&mut escaped, r);
             }
             Inst::Cast(_, src) | Inst::BitCast(_, src) => mark(&mut escaped, src),
+            Inst::Pack(_, fields) => {
+                for f in fields {
+                    mark(&mut escaped, f);
+                }
+            }
+            Inst::Extract(_, agg, _) => mark(&mut escaped, agg),
             Inst::RcInc(v) => {
                 // RcInc on a candidate is OK if we end up removing
                 // the alloc anyway (the inc/dec pair cancels). Don't

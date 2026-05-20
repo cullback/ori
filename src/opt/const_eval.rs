@@ -210,6 +210,7 @@ fn scalar_to_slot(s: Scalar, heap_to_static: &HashMap<usize, usize>) -> StaticSl
         Scalar::U16(n) => StaticSlot::U64(n as u64),
         Scalar::I32(n) => StaticSlot::I64(n as i64),
         Scalar::F64(n) => StaticSlot::I64(n.to_bits() as i64),
+        Scalar::Agg(_) => panic!("scalar_to_slot(Agg): aggregates can't be materialized into a single static slot"),
     }
 }
 
@@ -225,5 +226,6 @@ fn scalar_to_bits(s: Scalar) -> (ScalarType, u64) {
         Scalar::U64(n) => (ScalarType::U64, n),
         Scalar::F64(n) => (ScalarType::F64, n.to_bits()),
         Scalar::Ptr(_) => (ScalarType::RcPtr, 0),
+        Scalar::Agg(_) => panic!("scalar_to_bits(Agg): aggregates have no scalar bit pattern"),
     }
 }

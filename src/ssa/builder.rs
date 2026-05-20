@@ -290,6 +290,25 @@ impl Builder {
         self.push(Inst::RcDec(ptr));
     }
 
+    // ---- Aggregate values (register-resident) ----
+
+    /// Construct an aggregate from N field values. The dest gets
+    /// type `Agg(fields.len())`.
+    pub fn pack(&mut self, fields: Vec<Value>) -> Value {
+        let v = self.fresh_value(ScalarType::Agg(fields.len()));
+        self.push(Inst::Pack(v, fields));
+        v
+    }
+
+    /// Extract field at `index` from an aggregate. Caller specifies
+    /// the destination type since `ScalarType::Agg(n)` doesn't carry
+    /// per-field types.
+    pub fn extract(&mut self, agg: Value, index: usize, ty: ScalarType) -> Value {
+        let v = self.fresh_value(ty);
+        self.push(Inst::Extract(v, agg, index));
+        v
+    }
+
     pub fn cast(&mut self, src: Value, dest_ty: ScalarType) -> Value {
         let v = self.fresh_value(dest_ty);
         self.push(Inst::Cast(v, src));
@@ -337,26 +356,6 @@ impl Builder {
         self.jump(header, vec![next_i]);
 
         self.switch_to(exit);
-    }
-
-    // ---- Aggregates ----
-    //
-    // Phase A: aggregates are always heap-allocated. `pack` desugars
-    // to Alloc + Stores; `extract` to Load. The Inst::Pack /
-    // Inst::Extract / Inst::Insert variants and `ScalarType::Agg`
-    // are gone — use these builder methods for source compatibility.
-
-    pub fn pack(&mut self, fields: Vec<Value>) -> Value {
-        let n = fields.len();
-        let ptr = self.alloc(n * 8);
-        for (i, f) in fields.into_iter().enumerate() {
-            self.store(ptr, i * 8, f);
-        }
-        ptr
-    }
-
-    pub fn extract(&mut self, agg: Value, index: usize, ty: ScalarType) -> Value {
-        self.load(agg, index * 8, ty)
     }
 
     // ---- Terminators ----

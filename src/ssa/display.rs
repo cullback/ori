@@ -173,6 +173,8 @@ impl fmt::Display for FmtInst<'_> {
             }
             Inst::RcInc(ptr) => write!(f, "rc_inc {}", fmt_val(*ptr, consts)),
             Inst::RcDec(ptr) => write!(f, "rc_dec {}", fmt_val(*ptr, consts)),
+            Inst::Pack(d, fields) => write!(f, "{d}: {} = pack {}", d.ty, fmt_args(fields, consts)),
+            Inst::Extract(d, agg, idx) => write!(f, "{d}: {} = extract {}, {idx}", d.ty, fmt_val(*agg, consts)),
             Inst::ReuseOrClone(d, src, n) => write!(f, "{d}: {} = reuse_or_clone {}, {n}", d.ty, fmt_val(*src, consts)),
             Inst::ReuseOrCloneDyn(d, src, n) => write!(f, "{d}: {} = reuse_or_clone_dyn {}, {}", d.ty, fmt_val(*src, consts), fmt_val(*n, consts)),
             Inst::StaticRef(d, id) => write!(f, "{d}: {} = static_ref @{id}", d.ty),
@@ -256,6 +258,7 @@ impl fmt::Display for ScalarType {
             Self::F64 => write!(f, "f64"),
             Self::Ptr => write!(f, "ptr"),
             Self::RcPtr => write!(f, "rcptr"),
+            Self::Agg(n) => write!(f, "agg<{n}>"),
         }
     }
 }

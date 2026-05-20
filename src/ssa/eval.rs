@@ -2,6 +2,12 @@ use crate::ssa::Module;
 use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator};
 
 /// A scalar runtime value that fits in a register.
+///
+/// `Agg(handle)` is an aggregate value whose contents live in a side
+/// table (`Scratch::aggs`). Keeping `Scalar` `Copy` is important —
+/// env is indexed thousands of times per eval and we don't want to
+/// pay clone overhead on every access. Aggregate contents are
+/// referenced indirectly via `handle`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scalar {
     I8(i8),
@@ -14,6 +20,7 @@ pub enum Scalar {
     U64(u64),
     F64(f64),
     Ptr(usize), // index into heap
+    Agg(usize), // index into Scratch::aggs
 }
 
 /// Simulated heap for the interpreter.
@@ -34,6 +41,12 @@ struct HeapObject {
 
 pub struct Heap {
     objects: Vec<HeapObject>,
+    /// Side table for aggregate-typed runtime values. `Scalar::Agg(h)`
+    /// indexes into here. No refcounting — aggregates are SSA-tracked,
+    /// not heap-managed. Currently never freed (handles accumulate
+    /// for the duration of an `eval`); lifecycle management can come
+    /// later if the cost matters.
+    aggs: Vec<Vec<Scalar>>,
     /// Free-list of indices with refcount 0, available for reuse.
     free_list: Vec<usize>,
     /// Cumulative allocation count (fresh + freelist reuse). Statics
@@ -87,6 +100,9 @@ fn scalar_type_of(val: Scalar) -> ScalarType {
         Scalar::U64(_) => ScalarType::U64,
         Scalar::F64(_) => ScalarType::F64,
         Scalar::Ptr(_) => ScalarType::RcPtr,
+        // We don't carry agg field count here; callers that need
+        // the precise type look at the SSA Value's declared type.
+        Scalar::Agg(_) => panic!("scalar_type_of(Agg): use the SSA value's declared type"),
     }
 }
 
@@ -103,6 +119,7 @@ fn write_scalar(buf: &mut [u8], offset: usize, val: Scalar) {
         Scalar::I64(n) => buf[offset..offset + 8].copy_from_slice(&n.to_le_bytes()),
         Scalar::F64(n) => buf[offset..offset + 8].copy_from_slice(&n.to_bits().to_le_bytes()),
         Scalar::Ptr(p) => buf[offset..offset + 8].copy_from_slice(&(p as u64).to_le_bytes()),
+        Scalar::Agg(_) => panic!("write_scalar: cannot store Agg to heap — spill to Pack/Extract first"),
     }
 }
 
@@ -119,6 +136,7 @@ fn read_scalar(buf: &[u8], offset: usize, ty: ScalarType) -> Scalar {
         ScalarType::I64 => Scalar::I64(i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())),
         ScalarType::F64 => Scalar::F64(f64::from_bits(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()))),
         ScalarType::Ptr | ScalarType::RcPtr => Scalar::Ptr(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()) as usize),
+        ScalarType::Agg(_) => panic!("read_scalar: Agg has no heap representation"),
     }
 }
 
@@ -127,12 +145,20 @@ impl Heap {
         // Index 0 is null
         Self {
             objects: vec![HeapObject { rc: 0, data: vec![], ptr_offsets: vec![], type_map: vec![] }],
+            aggs: Vec::new(),
             free_list: Vec::new(),
             alloc_count: 0,
             fresh_alloc_count: 0,
             free_count: 0,
             peak_live: 0,
         }
+    }
+
+    /// Allocate a new aggregate value. Returns its handle.
+    fn alloc_agg(&mut self, fields: Vec<Scalar>) -> usize {
+        let h = self.aggs.len();
+        self.aggs.push(fields);
+        h
     }
 
     pub fn alloc(&mut self, num_bytes: usize) -> usize {
@@ -665,6 +691,18 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(reuse_or_clone(heap, env[src.id], size)))
         }
 
+        Inst::Pack(_dest, fields) => {
+            let vals: Vec<Scalar> = fields.iter().map(|f| env[f.id]).collect();
+            Some(Scalar::Agg(heap.alloc_agg(vals)))
+        }
+
+        Inst::Extract(_dest, agg, idx) => {
+            let Scalar::Agg(handle) = env[agg.id] else {
+                panic!("extract from non-agg: {:?}", env[agg.id]);
+            };
+            Some(heap.aggs[handle][*idx])
+        }
+
         Inst::Cast(dest, src) => {
             // Integer widening (zero-extend) / narrowing (truncate).
             // The destination type drives the result variant.
@@ -735,6 +773,7 @@ fn bits_to_scalar(ty: ScalarType, bits: u64) -> Scalar {
         ScalarType::U64 => Scalar::U64(bits),
         ScalarType::F64 => Scalar::F64(f64::from_bits(bits)),
         ScalarType::Ptr | ScalarType::RcPtr => Scalar::Ptr(bits as usize),
+        ScalarType::Agg(_) => panic!("bits_to_scalar(Agg): aggregates can't be reconstructed from a single u64"),
     }
 }
 
@@ -750,6 +789,7 @@ fn scalar_to_u64(s: Scalar) -> u64 {
         Scalar::U64(n) => n,
         Scalar::Ptr(p) => p as u64,
         Scalar::F64(_) => panic!("switch on float"),
+        Scalar::Agg(_) => panic!("scalar_to_u64(Agg): aggregates have no scalar bit pattern"),
     }
 }
 

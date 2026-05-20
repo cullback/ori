@@ -347,6 +347,26 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 borr.push(*src);
             }
         }
+        Inst::Pack(_, fields) => {
+            // Pack consumes its fields: each field's value moves
+            // into the aggregate. Mirrors how stores into a heap
+            // alloc auto-rc_inc — but since the agg is register-
+            // resident, no rc traffic; the rc accounting falls out
+            // of normal scope rules on the field values.
+            for f in fields {
+                if is_ptr(f) {
+                    borr.push(*f);
+                }
+            }
+        }
+        Inst::Extract(_, agg, _) => {
+            // Extract reads a field from an agg; the field's scalar
+            // is conceptually a fresh value. The agg itself is
+            // borrowed.
+            if is_ptr(agg) {
+                borr.push(*agg);
+            }
+        }
     }
     (cons, borr)
 }
