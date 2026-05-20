@@ -53,6 +53,7 @@ fn fmt_const(ty: ScalarType, bits: u64) -> String {
     match ty {
         ScalarType::F64 => format!("{}_f64", f64::from_bits(bits)),
         ScalarType::Ptr => format!("0x{bits:x}_ptr"),
+        ScalarType::RcPtr => format!("0x{bits:x}_rcptr"),
         _ => format!("{bits}_{ty}"),
     }
 }
@@ -258,6 +259,7 @@ impl fmt::Display for ScalarType {
             Self::U64 => write!(f, "u64"),
             Self::F64 => write!(f, "f64"),
             Self::Ptr => write!(f, "ptr"),
+            Self::RcPtr => write!(f, "rcptr"),
         }
     }
 }

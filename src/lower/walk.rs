@@ -115,7 +115,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let result = if let Some(st) = resolved {
             let mut call_args = Vec::with_capacity(st.num_captures + 2);
             for i in 0..st.num_captures {
-                call_args.push(self.builder.load(body_step, (i + 1) * 8, ScalarType::Ptr));
+                call_args.push(self.builder.load(body_step, (i + 1) * 8, ScalarType::RcPtr));
             }
             call_args.push(body_acc);
             call_args.push(elem);
@@ -156,20 +156,20 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         direct: Option<&SingletonTarget>,
     ) -> Value {
         let len_val = self.builder.load(list_val, 0, ScalarType::U64);
-        let data_ptr = self.builder.load(list_val, 16, ScalarType::Ptr);
+        let data_ptr = self.builder.load(list_val, 16, ScalarType::RcPtr);
         let step_ty = step_val.ty;
 
         let header = self.builder.create_block();
         let i_param = self.builder.add_block_param(header, ScalarType::U64);
         let acc_param = self.builder.add_block_param(header, acc_ty);
         let len_param = self.builder.add_block_param(header, ScalarType::U64);
-        let data_param = self.builder.add_block_param(header, ScalarType::Ptr);
+        let data_param = self.builder.add_block_param(header, ScalarType::RcPtr);
         let step_param = self.builder.add_block_param(header, step_ty);
         let body_block = self.builder.create_block();
         let body_i = self.builder.add_block_param(body_block, ScalarType::U64);
         let body_acc = self.builder.add_block_param(body_block, acc_ty);
         let body_len = self.builder.add_block_param(body_block, ScalarType::U64);
-        let body_data = self.builder.add_block_param(body_block, ScalarType::Ptr);
+        let body_data = self.builder.add_block_param(body_block, ScalarType::RcPtr);
         let body_step = self.builder.add_block_param(body_block, step_ty);
         let done = self.builder.create_block();
         let done_param = self.builder.add_block_param(done, acc_ty);
@@ -185,12 +185,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .branch(cmp, done, vec![acc_param], body_block, vec![i_param, acc_param, len_param, data_param, step_param]);
 
         self.builder.switch_to(body_block);
-        let elem = self.builder.load_dyn(body_data, body_i, ScalarType::Ptr);
+        let elem = self.builder.load_dyn(body_data, body_i, ScalarType::RcPtr);
         let resolved = direct.or_else(|| self.singletons.get(apply_name));
         let result = if let Some(st) = resolved {
             let mut call_args = Vec::with_capacity(st.num_captures + 2);
             for i in 0..st.num_captures {
-                call_args.push(self.builder.load(body_step, (i + 1) * 8, ScalarType::Ptr));
+                call_args.push(self.builder.load(body_step, (i + 1) * 8, ScalarType::RcPtr));
             }
             call_args.push(body_acc);
             call_args.push(elem);

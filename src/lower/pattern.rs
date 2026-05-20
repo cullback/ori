@@ -308,7 +308,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
             if !fieldless {
                 for (fi, field_pat) in fields.iter().enumerate() {
-                    let field_ty = field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
+                    let field_ty = field_types.get(fi).copied().unwrap_or(ScalarType::RcPtr);
                     let field_val = self.builder.load(arm_scr, (fi + 1) * 8, field_ty);
                     self.bind_pattern_field(field_pat, field_val);
                 }
@@ -395,7 +395,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     let ty = elem_types
                         .get(i)
                         .map(|t| self.scalar_type(t))
-                        .unwrap_or(ScalarType::Ptr);
+                        .unwrap_or(ScalarType::RcPtr);
                     let field_val = self.builder.load(val, i * 8, ty);
                     self.lower_destructure_elem(elem, field_val);
                 }
@@ -439,7 +439,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     let ty = type_fields
                         .get(slot)
                         .map(|(_, t)| self.scalar_type(t))
-                        .unwrap_or(ScalarType::Ptr);
+                        .unwrap_or(ScalarType::RcPtr);
                     let field_val = self.builder.load(val, slot * 8, ty);
                     self.lower_destructure_elem(elem, field_val);
                 }

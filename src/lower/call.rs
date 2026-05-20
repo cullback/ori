@@ -364,7 +364,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let eq_block = self.builder.create_block();
         let gt_block = self.builder.create_block();
         let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::Ptr);
+        let merge_param = self.builder.add_block_param(merge, ScalarType::RcPtr);
 
         self.builder.branch(is_lt, lt_block, vec![], not_lt_block, vec![is_eq]);
 

@@ -146,7 +146,7 @@ fn scalar_str_to_bytes(heap: &ssa::eval::Heap, str_ptr: ssa::eval::Scalar) -> Ve
     let Scalar::U64(len) = heap.load(list_idx, 0, ssa::ScalarType::U64) else {
         panic!("expected U64 for list len");
     };
-    let Scalar::Ptr(data_idx) = heap.load(list_idx, 16, ssa::ScalarType::Ptr) else {
+    let Scalar::Ptr(data_idx) = heap.load(list_idx, 16, ssa::ScalarType::RcPtr) else {
         panic!("expected Ptr for list data");
     };
     #[expect(clippy::cast_possible_truncation)]
@@ -277,7 +277,7 @@ fn main() {
         eprintln!("unexpected tag type");
         process::exit(1);
     };
-    let payload = heap.load(result_idx, 8, ssa::ScalarType::Ptr);
+    let payload = heap.load(result_idx, 8, ssa::ScalarType::RcPtr);
 
     // Tag 0 = first constructor (Ok), Tag 1 = second (Err)
     let bytes = scalar_str_to_bytes(&heap, payload);

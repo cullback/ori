@@ -33,10 +33,10 @@ pub fn type_to_scalar(ty: &Type) -> ScalarType {
             if let Some(num) = crate::numeric::NumericType::from_name(name) {
                 num.scalar_type()
             } else {
-                ScalarType::Ptr
+                ScalarType::RcPtr
             }
         }
-        _ => ScalarType::Ptr,
+        _ => ScalarType::RcPtr,
     }
 }
 
@@ -44,7 +44,7 @@ pub fn type_to_scalar(ty: &Type) -> ScalarType {
 /// discriminant type (U8/U16/U32/U64) instead of Ptr.
 pub fn resolve_scalar_type(ty: &Type, fieldless: &HashMap<String, ScalarType>) -> ScalarType {
     let base = type_to_scalar(ty);
-    if base == ScalarType::Ptr {
+    if base.is_heap_ptr() {
         match ty {
             Type::Con(name) => {
                 if let Some(&disc) = fieldless.get(name.as_str()) {
@@ -300,12 +300,12 @@ fn register_tag_union(info: &mut DeclInfo, type_name: &str, tags: &[ast::TagDecl
             .collect();
         let fieldless = &info.fieldless_tags;
         let field_types: Vec<ScalarType> = info.constructor_schemes.get(tag.name).map_or_else(
-            || vec![ScalarType::Ptr; tag.fields.len()],
+            || vec![ScalarType::RcPtr; tag.fields.len()],
             |scheme| match &scheme.ty {
                 Type::Arrow(params, _) => {
                     params.iter().map(|t| resolve_scalar_type(t, fieldless)).collect()
                 }
-                _ => vec![ScalarType::Ptr; tag.fields.len()],
+                _ => vec![ScalarType::RcPtr; tag.fields.len()],
             },
         );
         info.constructors.insert(

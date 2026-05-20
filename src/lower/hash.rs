@@ -113,7 +113,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .binop(BinaryOp::Mul, hash, prime, ScalarType::U64);
 
         // Hash the payload (slot 1, byte offset 8) — treat as raw value.
-        let payload = self.builder.load(recv, 8, ScalarType::Ptr);
+        let payload = self.builder.load(recv, 8, ScalarType::RcPtr);
         let payload_hash = self.emit_scalar_hash(payload);
         hash = self
             .builder
@@ -153,11 +153,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             } else if let Type::Con(name) = &field_ty {
                 // Dispatch through the type's stdlib `to_str` method.
                 let mangled = format!("{name}.to_str");
-                self.builder.call(&mangled, vec![field_val], ScalarType::Ptr)
+                self.builder.call(&mangled, vec![field_val], ScalarType::RcPtr)
             } else {
                 // Fallback for unhandled cases. Should be unreachable
                 // post-mono for primitive-typed record fields.
-                self.builder.call("__num_to_str", vec![field_val], ScalarType::Ptr)
+                self.builder.call("__num_to_str", vec![field_val], ScalarType::RcPtr)
             };
             acc = self.lower_str_concat(acc, val_str);
         }
@@ -188,9 +188,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// each side in, build a new header.
     pub(super) fn lower_str_concat(&mut self, a: Value, b: Value) -> Value {
         let a_len = self.builder.load(a, 0, ScalarType::U64);
-        let a_data = self.builder.load(a, 16, ScalarType::Ptr);
+        let a_data = self.builder.load(a, 16, ScalarType::RcPtr);
         let b_len = self.builder.load(b, 0, ScalarType::U64);
-        let b_data = self.builder.load(b, 16, ScalarType::Ptr);
+        let b_data = self.builder.load(b, 16, ScalarType::RcPtr);
         let total = self
             .builder
             .binop(BinaryOp::Add, a_len, b_len, ScalarType::U64);

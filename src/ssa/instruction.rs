@@ -39,6 +39,13 @@ impl fmt::Display for BlockId {
 }
 
 /// Scalar types that fit in a register.
+///
+/// `RcPtr` is a heap pointer that participates in reference counting:
+/// every owning Load increments rc, every Store releases the previous
+/// occupant, and Drop cascades through RcPtr-typed slots. `Ptr` is a
+/// raw 8-byte heap index with no automatic rc semantics — reserved
+/// for future raw-pointer use (currently unused; all heap pointers
+/// flow as `RcPtr`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     I8,
@@ -51,6 +58,7 @@ pub enum ScalarType {
     U64,
     F64,
     Ptr,
+    RcPtr,
 }
 
 impl ScalarType {
@@ -60,8 +68,15 @@ impl ScalarType {
             Self::I8 | Self::U8 => 1,
             Self::I16 | Self::U16 => 2,
             Self::I32 | Self::U32 => 4,
-            Self::I64 | Self::U64 | Self::F64 | Self::Ptr => 8,
+            Self::I64 | Self::U64 | Self::F64 | Self::Ptr | Self::RcPtr => 8,
         }
+    }
+
+    /// True for any heap-pointer type (Ptr or RcPtr). Most code that
+    /// asked "is this a pointer?" today checks `== Ptr`; after the
+    /// split, it should use this so RcPtr is handled too.
+    pub fn is_heap_ptr(self) -> bool {
+        matches!(self, Self::Ptr | Self::RcPtr)
     }
 }
 

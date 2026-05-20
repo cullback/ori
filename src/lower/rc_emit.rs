@@ -69,7 +69,7 @@ fn compute_func_param_liveness(func: &Function) -> HashMap<Value, HashMap<BlockI
     let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
 
     for p in &func.params {
-        if p.ty != ScalarType::Ptr {
+        if !p.ty.is_heap_ptr() {
             continue;
         }
 
@@ -139,12 +139,12 @@ fn emit_block(
     let mut defined: Vec<(Value, bool)> = block
         .params
         .iter()
-        .filter(|p| p.ty == ScalarType::Ptr)
+        .filter(|p| p.ty.is_heap_ptr())
         .map(|p| (*p, false))
         .collect();
     for inst in &block.insts {
         if let Some(d) = inst.dest() {
-            if d.ty == ScalarType::Ptr {
+            if d.ty.is_heap_ptr() {
                 defined.push((d, false));
             }
         }
@@ -154,7 +154,7 @@ fn emit_block(
     // needed somewhere reachable from this block, OR they're directly
     // used in this block.
     for p in &func.params {
-        if p.ty != ScalarType::Ptr {
+        if !p.ty.is_heap_ptr() {
             continue;
         }
         let used_here = block.insts.iter().any(|i| i.operands().contains(p))
@@ -242,8 +242,8 @@ fn emit_block(
     //   the loaded SSA value.
     for (idx, inst) in block.insts.iter().enumerate() {
         let (dest, src_ptr, src_off) = match inst {
-            Inst::Load(d, p, off) if d.ty == ScalarType::Ptr => (*d, Some(*p), Some(*off)),
-            Inst::LoadDyn(d, _, _) if d.ty == ScalarType::Ptr => (*d, None, None),
+            Inst::Load(d, p, off) if d.ty.is_heap_ptr() => (*d, Some(*p), Some(*off)),
+            Inst::LoadDyn(d, _, _) if d.ty.is_heap_ptr() => (*d, None, None),
             _ => continue,
         };
         let next = block.insts.get(idx + 1);
@@ -273,7 +273,7 @@ fn emit_block(
 /// `Store(_, _, null_ptr)` immediately after a `Load` of the same
 /// slot.
 fn is_const_null(block: &super::super::ssa::Block, val: Value) -> bool {
-    if val.ty != ScalarType::Ptr {
+    if !val.ty.is_heap_ptr() {
         return false;
     }
     block.insts.iter().any(|inst| {
@@ -292,7 +292,7 @@ enum Kind {
 fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
     let mut cons = Vec::new();
     let mut borr = Vec::new();
-    let is_ptr = |v: &Value| v.ty == ScalarType::Ptr;
+    let is_ptr = |v: &Value| v.ty.is_heap_ptr();
     match inst {
         Inst::Const(..) | Inst::Alloc(..) | Inst::StaticRef(..) => {}
         Inst::AllocDyn(_, size) => {
@@ -406,7 +406,7 @@ fn classify_terminator(term: &Terminator) -> Vec<Value> {
     // edge args). Branch cond / Switch scrutinee are borrows but they
     // can't be Ptr (they're U8/U64) — so we ignore them here.
     let mut cons = Vec::new();
-    let is_ptr = |v: &Value| v.ty == ScalarType::Ptr;
+    let is_ptr = |v: &Value| v.ty.is_heap_ptr();
     match term {
         Terminator::Return(v) => {
             if is_ptr(v) {

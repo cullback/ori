@@ -145,7 +145,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         // Bind pattern fields (empty for fieldless tags)
                         for (fi, field_pat) in fields.iter().enumerate() {
                             let field_ty =
-                                field_types.get(fi).copied().unwrap_or(ScalarType::Ptr);
+                                field_types.get(fi).copied().unwrap_or(ScalarType::RcPtr);
                             let field_val =
                                 self.builder.load(scr_in_match, (fi + 1) * 8, field_ty);
                             self.bind_pattern_field(field_pat, field_val);

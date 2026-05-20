@@ -230,8 +230,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .func_return_types
             .get(name)
             .copied()
-            .unwrap_or(ScalarType::Ptr);
-        if base != ScalarType::Ptr {
+            .unwrap_or(ScalarType::RcPtr);
+        if !base.is_heap_ptr() {
             return base;
         }
         if let Some(scheme) = self.infer.func_schemes.get(name) {
@@ -258,7 +258,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ScalarType::I64 => self.builder.const_i64(0),
             ScalarType::U64 => self.builder.const_u64(0),
             ScalarType::F64 => self.builder.const_f64(0.0),
-            ScalarType::Ptr => self.builder.const_ptr_null(),
+            ScalarType::Ptr | ScalarType::RcPtr => self.builder.const_ptr_null(),
         }
     }
 
@@ -386,9 +386,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 Type::Arrow(params, _) => {
                     params.iter().map(|t| self.scalar_type(t)).collect()
                 }
-                _ => vec![ScalarType::Ptr; param_syms.len()],
+                _ => vec![ScalarType::RcPtr; param_syms.len()],
             })
-            .unwrap_or_else(|| vec![ScalarType::Ptr; param_syms.len()]);
+            .unwrap_or_else(|| vec![ScalarType::RcPtr; param_syms.len()]);
 
         for (p, ty) in param_syms.iter().zip(&param_types) {
             let v = self.builder.add_func_param(*ty);
@@ -651,7 +651,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         if let Some(upd_expr) = update_map.get(field_name) {
                             self.lower_expr(upd_expr)
                         } else {
-                            let ty = field_types.get(slot).copied().unwrap_or(ScalarType::Ptr);
+                            let ty = field_types.get(slot).copied().unwrap_or(ScalarType::RcPtr);
                             self.builder.load(base_val, slot * 8, ty)
                         }
                     })
@@ -847,7 +847,7 @@ fn lower_to_ssa<'src>(
             Type::Arrow(ps, _) => Some(ps.iter().map(|t| ctx.scalar_type(t)).collect()),
             _ => None,
         })
-        .unwrap_or_else(|| vec![ScalarType::Ptr; params.len()]);
+        .unwrap_or_else(|| vec![ScalarType::RcPtr; params.len()]);
     let main_ssa_params: Vec<Value> = params
         .iter()
         .zip(&main_param_tys)

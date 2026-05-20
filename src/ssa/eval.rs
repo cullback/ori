@@ -73,7 +73,7 @@ fn scalar_type_of(val: Scalar) -> ScalarType {
         Scalar::I64(_) => ScalarType::I64,
         Scalar::U64(_) => ScalarType::U64,
         Scalar::F64(_) => ScalarType::F64,
-        Scalar::Ptr(_) => ScalarType::Ptr,
+        Scalar::Ptr(_) => ScalarType::RcPtr,
     }
 }
 
@@ -105,7 +105,7 @@ fn read_scalar(buf: &[u8], offset: usize, ty: ScalarType) -> Scalar {
         ScalarType::U64 => Scalar::U64(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())),
         ScalarType::I64 => Scalar::I64(i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())),
         ScalarType::F64 => Scalar::F64(f64::from_bits(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()))),
-        ScalarType::Ptr => Scalar::Ptr(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()) as usize),
+        ScalarType::Ptr | ScalarType::RcPtr => Scalar::Ptr(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()) as usize),
     }
 }
 
@@ -253,7 +253,7 @@ impl Heap {
                 .ptr_offsets
                 .iter()
                 .filter_map(|&off| {
-                    match read_scalar(&self.objects[idx].data, off, ScalarType::Ptr) {
+                    match read_scalar(&self.objects[idx].data, off, ScalarType::RcPtr) {
                         Scalar::Ptr(p) if p != 0 => Some(p),
                         _ => None,
                     }
@@ -278,7 +278,7 @@ impl Heap {
         let ptr_offsets = self.objects[idx].ptr_offsets.clone();
         // The clone creates new references to all Ptr children.
         for &off in &ptr_offsets {
-            if let Scalar::Ptr(child) = read_scalar(&data, off, ScalarType::Ptr) {
+            if let Scalar::Ptr(child) = read_scalar(&data, off, ScalarType::RcPtr) {
                 if child != 0 {
                     self.rc_inc(child);
                 }
@@ -526,7 +526,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             // lowering paths use when they don't know the element type
             // (e.g. emit_list_get_checked). Recover the true type from
             // type_map. Concrete dest types are authoritative.
-            if dest.ty == ScalarType::Ptr {
+            if dest.ty.is_heap_ptr() {
                 Some(heap.load_dyn_auto(heap_idx, slot))
             } else {
                 Some(heap.load(heap_idx, offset, dest.ty))
@@ -595,7 +595,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                         heap.free_count += 1;
                         let data_len = heap.objects[idx].data.len();
                         for (i, ty) in slot_types.iter().enumerate() {
-                            if *ty == ScalarType::Ptr {
+                            if ty.is_heap_ptr() {
                                 let offset = i * 8;
                                 if offset + 8 > data_len {
                                     // slot_types over-estimated the
@@ -605,7 +605,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                                     // authoritative.
                                     break;
                                 }
-                                if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::Ptr) {
+                                if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::RcPtr) {
                                     if child != 0 {
                                         heap.rc_dec(child);
                                     }
@@ -630,9 +630,9 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                 if idx != 0 && heap.objects[idx].rc == 1 && heap.objects[idx].rc != RC_STATIC {
                     // Unique: dec pointer-typed fields, return address for reuse.
                     for (i, ty) in slot_types.iter().enumerate() {
-                        if *ty == ScalarType::Ptr {
+                        if ty.is_heap_ptr() {
                             let offset = i * 8;
-                            if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::Ptr) {
+                            if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::RcPtr) {
                                 heap.rc_dec(child);
                             }
                         }
@@ -704,7 +704,7 @@ fn eval_intrinsic(name: &str, heap: &mut Heap, args: &[Scalar]) -> Option<Scalar
                 eprintln!("crash: <malformed string>");
                 std::process::exit(1);
             };
-            let Scalar::Ptr(data_idx) = heap.load(list_idx, 16, ScalarType::Ptr) else {
+            let Scalar::Ptr(data_idx) = heap.load(list_idx, 16, ScalarType::RcPtr) else {
                 eprintln!("crash: <malformed string>");
                 std::process::exit(1);
             };
@@ -739,7 +739,7 @@ fn bits_to_scalar(ty: ScalarType, bits: u64) -> Scalar {
         ScalarType::I64 => Scalar::I64(bits as i64),
         ScalarType::U64 => Scalar::U64(bits),
         ScalarType::F64 => Scalar::F64(f64::from_bits(bits)),
-        ScalarType::Ptr => Scalar::Ptr(bits as usize),
+        ScalarType::Ptr | ScalarType::RcPtr => Scalar::Ptr(bits as usize),
     }
 }
 

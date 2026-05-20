@@ -52,7 +52,7 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
     let val = args[1];
 
     let len = builder.load(list, 0, ScalarType::U64);
-    let data = builder.load(list, 16, ScalarType::Ptr);
+    let data = builder.load(list, 16, ScalarType::RcPtr);
     let one = builder.const_u64(1);
     let new_len = builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
 
@@ -105,7 +105,7 @@ fn emit_list_set(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -
     let new_list = builder.reuse_or_clone(list, 24);
 
     let len = builder.load(new_list, 0, ScalarType::U64);
-    let old_data = builder.load(new_list, 16, ScalarType::Ptr);
+    let old_data = builder.load(new_list, 16, ScalarType::RcPtr);
 
     // Step 2: move the data ptr out of the header so cascade-free
     // won't decrement it. Safe because new_list is unique to us.
@@ -119,8 +119,8 @@ fn emit_list_set(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -
     // Step 4: replace slot `idx`. In both paths (in-place mutation
     // and copy-on-write clone), the slot currently holds the old
     // element with an owning ref; rc_dec it before overwriting.
-    if elem_ty == ScalarType::Ptr {
-        let old_at_idx = builder.load_dyn(new_data, idx, ScalarType::Ptr);
+    if elem_ty.is_heap_ptr() {
+        let old_at_idx = builder.load_dyn(new_data, idx, ScalarType::RcPtr);
         builder.rc_dec(old_at_idx);
     }
     builder.store_dyn(new_data, idx, new_val);
@@ -138,7 +138,7 @@ fn emit_list_reverse(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarTyp
     let list = args[0];
 
     let len = builder.load(list, 0, ScalarType::U64);
-    let old_data = builder.load(list, 16, ScalarType::Ptr);
+    let old_data = builder.load(list, 16, ScalarType::RcPtr);
     let eight = builder.const_u64(8);
     let byte_len = builder.binop(BinaryOp::Mul, len, eight, ScalarType::U64);
     let new_data = builder.alloc_dyn(byte_len);
@@ -158,7 +158,7 @@ fn emit_list_reverse(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarTyp
 
     builder.switch_to(body);
     let elem = builder.load_dyn(old_data, body_i, elem_ty);
-    if elem_ty == ScalarType::Ptr {
+    if elem_ty.is_heap_ptr() {
         builder.rc_inc(elem);
     }
     // dst_idx = len - 1 - i
@@ -186,7 +186,7 @@ fn emit_list_sublist(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarTyp
     let start = args[1];
     let count = args[2];
 
-    let old_data = builder.load(list, 16, ScalarType::Ptr);
+    let old_data = builder.load(list, 16, ScalarType::RcPtr);
     let eight = builder.const_u64(8);
     let byte_len = builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
     let new_data = builder.alloc_dyn(byte_len);
@@ -207,7 +207,7 @@ fn emit_list_sublist(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarTyp
     builder.switch_to(body);
     let src_idx = builder.binop(BinaryOp::Add, start, body_i, ScalarType::U64);
     let elem = builder.load_dyn(old_data, src_idx, elem_ty);
-    if elem_ty == ScalarType::Ptr {
+    if elem_ty.is_heap_ptr() {
         builder.rc_inc(elem);
     }
     builder.store_dyn(new_data, body_i, elem);
@@ -251,7 +251,7 @@ fn emit_list_repeat(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
     builder.branch(cond, body, vec![header_i], exit, vec![]);
 
     builder.switch_to(body);
-    if elem_ty == ScalarType::Ptr {
+    if elem_ty.is_heap_ptr() {
         builder.rc_inc(val);
     }
     builder.store_dyn(data, body_i, val);
@@ -341,14 +341,14 @@ fn emit_list_get_checked(builder: &mut Builder, args: Vec<Value>) -> Value {
     let ok_block = builder.create_block();
     let err_block = builder.create_block();
     let merge = builder.create_block();
-    let merge_param = builder.add_block_param(merge, ScalarType::Ptr);
+    let merge_param = builder.add_block_param(merge, ScalarType::RcPtr);
 
     builder.branch(in_bounds, ok_block, vec![], err_block, vec![]);
 
     // Ok path: get element, wrap in Ok(elem) = [tag=0, elem]
     builder.switch_to(ok_block);
-    let data = builder.load(list, 16, ScalarType::Ptr);
-    let elem = builder.load_dyn(data, idx, ScalarType::Ptr);
+    let data = builder.load(list, 16, ScalarType::RcPtr);
+    let elem = builder.load_dyn(data, idx, ScalarType::RcPtr);
     // Loading a Ptr child creates a new alias; runtime rc_inc keeps
     // the element alive past the source list's eventual drop. The
     // eval's RcInc is a no-op for non-Ptr scalars, so this is safe

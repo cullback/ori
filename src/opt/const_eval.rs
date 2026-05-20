@@ -156,7 +156,7 @@ fn heap_to_statics(
 
         // Queue child pointers via ptr_offsets.
         for &off in heap.ptr_offsets(idx) {
-            if let Scalar::Ptr(child) = heap.load(idx, off, ScalarType::Ptr) {
+            if let Scalar::Ptr(child) = heap.load(idx, off, ScalarType::RcPtr) {
                 if child != 0 && !heap_to_static.contains_key(&child) {
                     to_visit.push(child);
                 }
@@ -179,7 +179,7 @@ fn heap_to_statics(
         for i in 0..num_slots {
             let off = i * 8;
             let ty = if ptr_offs.contains(&off) {
-                ScalarType::Ptr
+                ScalarType::RcPtr
             } else {
                 ScalarType::I64
             };
@@ -219,6 +219,6 @@ fn scalar_to_bits(s: Scalar) -> (ScalarType, u64) {
         Scalar::I64(n) => (ScalarType::I64, n as u64),
         Scalar::U64(n) => (ScalarType::U64, n),
         Scalar::F64(n) => (ScalarType::F64, n.to_bits()),
-        Scalar::Ptr(_) => (ScalarType::Ptr, 0),
+        Scalar::Ptr(_) => (ScalarType::RcPtr, 0),
     }
 }

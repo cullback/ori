@@ -268,10 +268,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.switch_to(body);
         // Borrow-only read for element comparison — no rc_inc needed,
         // the elements aren't retained past the comparison.
-        let data_a = self.builder.load(lhs, 16, ScalarType::Ptr);
-        let data_b = self.builder.load(rhs, 16, ScalarType::Ptr);
-        let elem_a = self.builder.load_dyn(data_a, body_i_param, ScalarType::Ptr);
-        let elem_b = self.builder.load_dyn(data_b, body_i_param, ScalarType::Ptr);
+        let data_a = self.builder.load(lhs, 16, ScalarType::RcPtr);
+        let data_b = self.builder.load(rhs, 16, ScalarType::RcPtr);
+        let elem_a = self.builder.load_dyn(data_a, body_i_param, ScalarType::RcPtr);
+        let elem_b = self.builder.load_dyn(data_b, body_i_param, ScalarType::RcPtr);
         let elem_eq = if let Some(et) = elem_ty {
             if self.is_scalar_eq_type(et) {
                 self.builder.binop(BinaryOp::Eq, elem_a, elem_b, ScalarType::U8)

@@ -147,7 +147,7 @@ impl Builder {
     }
 
     pub fn const_ptr_null(&mut self) -> Value {
-        let v = self.fresh_value(ScalarType::Ptr);
+        let v = self.fresh_value(ScalarType::RcPtr);
         self.push(Inst::Const(v, 0));
         v
     }
@@ -171,29 +171,29 @@ impl Builder {
     // ---- Memory ----
 
     pub fn alloc(&mut self, size: usize) -> Value {
-        let v = self.fresh_value(ScalarType::Ptr);
+        let v = self.fresh_value(ScalarType::RcPtr);
         self.push(Inst::Alloc(v, size));
         v
     }
 
     pub fn alloc_dyn(&mut self, size_val: Value) -> Value {
-        let v = self.fresh_value(ScalarType::Ptr);
+        let v = self.fresh_value(ScalarType::RcPtr);
         self.push(Inst::AllocDyn(v, size_val));
         v
     }
 
-    /// FBIP `reuse_or_clone`: returns a Ptr the caller owns at rc=1.
+    /// FBIP `reuse_or_clone`: returns a RcPtr the caller owns at rc=1.
     /// In-place if `src.rc == 1` (contents preserved), cloned + src
     /// `rc_dec`'d otherwise. Consumes the caller's owning slot on
     /// `src`.
     pub fn reuse_or_clone(&mut self, src: Value, size: usize) -> Value {
-        let v = self.fresh_value(ScalarType::Ptr);
+        let v = self.fresh_value(ScalarType::RcPtr);
         self.push(Inst::ReuseOrClone(v, src, size));
         v
     }
 
     pub fn reuse_or_clone_dyn(&mut self, src: Value, size_val: Value) -> Value {
-        let v = self.fresh_value(ScalarType::Ptr);
+        let v = self.fresh_value(ScalarType::RcPtr);
         self.push(Inst::ReuseOrCloneDyn(v, src, size_val));
         v
     }
@@ -265,7 +265,7 @@ impl Builder {
 
         self.switch_to(body);
         let elem = self.load_dyn(src, body_i, elem_ty);
-        if elem_ty == ScalarType::Ptr {
+        if elem_ty.is_heap_ptr() {
             self.rc_inc(elem);
         }
         self.store_dyn(dst, body_i, elem);
