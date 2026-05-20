@@ -3730,7 +3730,7 @@ fn audit_ssa_cleanliness_inner(run_opt: bool) {
                 blocks += 1;
                 for inst in &block.insts {
                     insts += 1;
-                    if matches!(inst, crate::ssa::Inst::RcInc(..) | crate::ssa::Inst::RcDec(..) | crate::ssa::Inst::Drop(..) | crate::ssa::Inst::Free(..)) {
+                    if matches!(inst, crate::ssa::Inst::RcInc(..) | crate::ssa::Inst::RcDec(..)) {
                         rc += 1;
                     }
                 }

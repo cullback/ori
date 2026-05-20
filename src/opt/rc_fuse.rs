@@ -47,7 +47,7 @@ fn fuse_one_pair(insts: &mut Vec<Inst>) -> bool {
             // parent's child-slot cascade) invalidates the bracket.
             // Another inc/dec on v also counts as an observation.
             match &insts[j] {
-                Inst::Reset(..) | Inst::RcDec(_) => break,
+                Inst::RcDec(_) => break,
                 Inst::RcInc(w) if *w == v => break,
                 _ => {}
             }

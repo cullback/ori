@@ -637,95 +637,10 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             None
         }
 
-        Inst::Free(ptr) => {
-            // Statically-resolved free: emit_drops has proven this
-            // value is Unique and at its last use. The interpreter's
-            // rc_dec path already cascade-frees children when rc
-            // reaches 0; since static-ownership never inc'd this
-            // value past 1, rc_dec drops it the same way Free should.
-            if let Scalar::Ptr(idx) = env[ptr.id] {
-                heap.rc_dec(idx);
-            }
-            None
-        }
-
-        Inst::Drop(ptr, slot_types) => {
-            // Statically-resolved drop with an explicit slot mask:
-            // cascade decrements only slots marked Ptr in slot_types.
-            // Slots marked non-Ptr are moved-out; their children are
-            // owned by independent local SSA values, so the cascade
-            // must skip them.
-            if let Scalar::Ptr(idx) = env[ptr.id] {
-                if idx != 0 && heap.objects[idx].rc != RC_STATIC && heap.objects[idx].rc != 0 {
-                    heap.objects[idx].rc -= 1;
-                    if heap.objects[idx].rc == 0 {
-                        heap.free_count += 1;
-                        let data_len = heap.objects[idx].data.len();
-                        for (i, ty) in slot_types.iter().enumerate() {
-                            if ty.is_heap_ptr() {
-                                let offset = i * 8;
-                                if offset + 8 > data_len {
-                                    // slot_types over-estimated the
-                                    // object's size — skip the
-                                    // phantom slot. Static analysis
-                                    // is conservative; runtime is
-                                    // authoritative.
-                                    break;
-                                }
-                                if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::RcPtr) {
-                                    if child != 0 {
-                                        heap.rc_dec(child);
-                                    }
-                                }
-                            }
-                        }
-                        heap.free_list.push(idx);
-                    }
-                }
-            }
-            None
-        }
-
         Inst::StaticRef(_dest, static_id) => {
             // Statics are pre-allocated starting at heap index 1
             // (index 0 is null). static_id 0 → heap index 1, etc.
             Some(Scalar::Ptr(1 + static_id))
-        }
-
-        Inst::Reset(_dest, ptr, slot_types) => {
-            if let Scalar::Ptr(idx) = env[ptr.id] {
-                if idx != 0 && heap.objects[idx].rc == 1 && heap.objects[idx].rc != RC_STATIC {
-                    // Unique: dec pointer-typed fields, return address for reuse.
-                    for (i, ty) in slot_types.iter().enumerate() {
-                        if ty.is_heap_ptr() {
-                            let offset = i * 8;
-                            if let Scalar::Ptr(child) = heap.load(idx, offset, ScalarType::RcPtr) {
-                                heap.rc_dec(child);
-                            }
-                        }
-                    }
-                    heap.objects[idx].rc = 0;
-                    // The object is conceptually freed; the matching
-                    // Reuse will re-allocate in-place via reuse_or_alloc.
-                    heap.free_count += 1;
-                    Some(Scalar::Ptr(idx))
-                } else {
-                    // Shared: normal dec, return null.
-                    heap.rc_dec(idx);
-                    Some(Scalar::Ptr(0))
-                }
-            } else {
-                Some(Scalar::Ptr(0))
-            }
-        }
-
-        Inst::Reuse(_dest, token, num_slots) => {
-            Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.id], *num_slots)))
-        }
-
-        Inst::ReuseDyn(_dest, token, size_val) => {
-            let size = scalar_to_usize(env[size_val.id]);
-            Some(Scalar::Ptr(reuse_or_alloc(heap, env[token.id], size)))
         }
 
         Inst::ReuseOrClone(_dest, src, num_bytes) => {
@@ -823,30 +738,6 @@ fn scalar_to_u64(s: Scalar) -> u64 {
         Scalar::Ptr(p) => p as u64,
         Scalar::F64(_) => panic!("switch on float"),
     }
-}
-
-/// Reuse a Reset-produced token for a new allocation, or allocate
-/// fresh when the token is null (shared object, reuse unsafe).
-fn reuse_or_alloc(heap: &mut Heap, token: Scalar, num_bytes: usize) -> usize {
-    if let Scalar::Ptr(idx) = token {
-        if idx != 0 {
-            // In-place reuse: count as a logical alloc (so `alloc_count`
-            // reflects the program's allocation behavior) but NOT as a
-            // fresh one (so `fresh_alloc_count` reflects real memory
-            // growth).
-            heap.alloc_count += 1;
-            let live = heap.alloc_count - heap.free_count;
-            if live > heap.peak_live {
-                heap.peak_live = live;
-            }
-            heap.objects[idx].rc = 1;
-            heap.objects[idx].data.resize(num_bytes, 0);
-            heap.objects[idx].ptr_offsets.clear();
-            heap.objects[idx].type_map.clear();
-            return idx;
-        }
-    }
-    heap.alloc(num_bytes)
 }
 
 /// FBIP `reuse_or_clone`: if `src` is uniquely owned, return its

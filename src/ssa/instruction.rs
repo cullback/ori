@@ -127,7 +127,8 @@ pub enum BinaryOp {
 /// An SSA instruction.
 ///
 /// Instructions that produce a value have it as their first field.
-/// `Store`, `RcInc`, `RcDec`, and `Free` are side-effecting and produce no value.
+/// `Store`, `StoreDyn`, `RcInc`, and `RcDec` are side-effecting and
+/// produce no value.
 #[derive(Debug, Clone)]
 pub enum Inst {
     /// dest = constant (type comes from dest.ty).
@@ -136,14 +137,12 @@ pub enum Inst {
     BinOp(Value, BinaryOp, Value, Value),
     /// dest = func(args...).
     Call(Value, String, Vec<Value>),
-    /// dest = heap allocate `num_slots` scalar slots (refcount starts at 1).
+    /// dest = heap allocate `num_bytes` bytes (refcount starts at 1).
     Alloc(Value, usize),
-    /// dest = heap allocate `num_slots_val` scalar slots (runtime size).
+    /// dest = heap allocate `num_bytes_val` bytes (runtime size).
     /// Used for `List` and other data whose size isn't known at lower time.
-    /// `insert_reuse` pairs this with a preceding `RcDec` the same way it
-    /// pairs `Alloc`, emitting `Reset` + `Reuse` when the reuse is safe.
     AllocDyn(Value, Value),
-    /// dest = read from `ptr` at static slot `offset`.
+    /// dest = read from `ptr` at static byte `offset`.
     ///
     /// When `dest.ty` is `RcPtr`, the loaded value is an *owning*
     /// reference: eval rc-inc's it so the local SSA value gets its
@@ -152,7 +151,7 @@ pub enum Inst {
     /// when the slot's claim should transfer to the local (no net rc
     /// change, slot left null).
     Load(Value, Value, usize),
-    /// Write `val` to `ptr` at static slot `offset`. No result.
+    /// Write `val` to `ptr` at static byte `offset`. No result.
     ///
     /// For RcPtr-typed slots, eval auto-balances rc:
     /// - rc_decs the previous occupant (release slot's old claim).
@@ -165,7 +164,7 @@ pub enum Inst {
     /// Write `val` to `ptr` at dynamic slot index `idx_val`. No result.
     /// Auto-rc semantics match `Store`.
     StoreDyn(Value, Value, Value),
-    /// dest = read from `ptr` at static slot `offset`, then write null
+    /// dest = read from `ptr` at static byte `offset`, then write null
     /// to the slot. No rc change — the slot's claim on the loaded
     /// value transfers to `dest`, and the slot now holds null (so
     /// cascade-free won't double-drop). Used for FBIP's "move out"
@@ -174,31 +173,10 @@ pub enum Inst {
     MoveOut(Value, Value, usize),
     /// Increment reference count of `ptr`.
     RcInc(Value),
-    /// Decrement reference count of `ptr`, free if zero.
+    /// Decrement reference count of `ptr`, free if zero. On free,
+    /// cascade-decrements RcPtr-typed children (per the heap object's
+    /// recorded `ptr_offsets`).
     RcDec(Value),
-    /// Statically-resolved free: caller has proven `ptr` is Unique and
-    /// at its last use, so the object can be freed without a refcount
-    /// check. Cascade-frees Ptr children (same as RcDec at rc=0).
-    /// Emitted by `emit_drops` instead of `RcDec` when ownership
-    /// analysis resolves the lifetime statically.
-    Free(Value),
-    /// Statically-resolved drop with an explicit slot mask. Decrements
-    /// `ptr`'s refcount; if rc reaches zero, cascade-decrements only
-    /// the slots whose `ScalarType` in `slot_types` is `Ptr`. Slots
-    /// marked non-Ptr are "moved out" — their children are owned by
-    /// independent local SSA values, so the cascade must skip them.
-    Drop(Value, Vec<ScalarType>),
-    /// dest = if refcount(ptr) == 1: dec Ptr-typed fields per
-    /// `slot_types`, return ptr for reuse. Otherwise: normal dec,
-    /// return null sentinel.
-    Reset(Value, Value, Vec<ScalarType>),
-    /// dest = if token is non-null, reuse that memory. Otherwise
-    /// allocate `num_slots` fresh slots.
-    Reuse(Value, Value, usize),
-    /// dest = if token is non-null, reuse that memory (resized to
-    /// `num_slots_val`). Otherwise allocate fresh. Parallel to `Reuse`
-    /// but with a dynamic size.
-    ReuseDyn(Value, Value, Value),
     /// dest = FBIP "reuse-or-clone": if `src.rc == 1`, return `src`
     /// directly (in-place mutation path, contents preserved). If
     /// `src.rc > 1`, allocate a fresh `size`-byte object and clone
@@ -238,15 +216,12 @@ impl Inst {
             | Self::Load(v, _, _)
             | Self::LoadDyn(v, _, _)
             | Self::MoveOut(v, _, _)
-            | Self::Reset(v, _, _)
-            | Self::Reuse(v, _, _)
-            | Self::ReuseDyn(v, _, _)
             | Self::ReuseOrClone(v, _, _)
             | Self::ReuseOrCloneDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
             | Self::BitCast(v, _) => Some(*v),
-            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) | Self::Drop(..) => None,
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
         }
     }
 
@@ -261,15 +236,12 @@ impl Inst {
             | Self::Load(v, _, _)
             | Self::LoadDyn(v, _, _)
             | Self::MoveOut(v, _, _)
-            | Self::Reset(v, _, _)
-            | Self::Reuse(v, _, _)
-            | Self::ReuseDyn(v, _, _)
             | Self::ReuseOrClone(v, _, _)
             | Self::ReuseOrCloneDyn(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
             | Self::BitCast(v, _) => Some(v),
-            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) | Self::Free(_) | Self::Drop(..) => None,
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
         }
     }
 
@@ -285,11 +257,7 @@ impl Inst {
             Self::LoadDyn(_, ptr, idx) => vec![*ptr, *idx],
             Self::StoreDyn(ptr, idx, val) => vec![*ptr, *idx, *val],
             Self::MoveOut(_, ptr, _) => vec![*ptr],
-            Self::RcInc(v) | Self::RcDec(v) | Self::Free(v) => vec![*v],
-            Self::Drop(v, _) => vec![*v],
-            Self::Reset(_, ptr, _) => vec![*ptr],
-            Self::Reuse(_, token, _) => vec![*token],
-            Self::ReuseDyn(_, token, size) => vec![*token, *size],
+            Self::RcInc(v) | Self::RcDec(v) => vec![*v],
             Self::ReuseOrClone(_, src, _) => vec![*src],
             Self::ReuseOrCloneDyn(_, src, size) => vec![*src, *size],
             Self::StaticRef(..) => vec![],
@@ -309,11 +277,7 @@ impl Inst {
             Self::LoadDyn(_, ptr, idx) => { f(ptr); f(idx); }
             Self::StoreDyn(ptr, idx, val) => { f(ptr); f(idx); f(val); }
             Self::MoveOut(_, ptr, _) => f(ptr),
-            Self::RcInc(v) | Self::RcDec(v) | Self::Free(v) => f(v),
-            Self::Drop(v, _) => f(v),
-            Self::Reset(_, ptr, _) => f(ptr),
-            Self::Reuse(_, token, _) => f(token),
-            Self::ReuseDyn(_, token, size) => { f(token); f(size); }
+            Self::RcInc(v) | Self::RcDec(v) => f(v),
             Self::ReuseOrClone(_, src, _) => f(src),
             Self::ReuseOrCloneDyn(_, src, size) => { f(src); f(size); }
             Self::Cast(_, src) | Self::BitCast(_, src) => f(src),

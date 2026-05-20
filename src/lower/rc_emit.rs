@@ -320,26 +320,9 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 borr.push(*v);
             }
         }
-        Inst::RcDec(v) | Inst::Free(v) | Inst::Drop(v, _) => {
+        Inst::RcDec(v) => {
             if is_ptr(v) {
                 cons.push(*v);
-            }
-        }
-        Inst::Reset(_, ptr, _) => {
-            if is_ptr(ptr) {
-                cons.push(*ptr);
-            }
-        }
-        Inst::Reuse(_, token, _) => {
-            if is_ptr(token) {
-                borr.push(*token);
-            }
-        }
-        Inst::ReuseDyn(_, token, size) => {
-            for v in [token, size] {
-                if is_ptr(v) {
-                    borr.push(*v);
-                }
             }
         }
         Inst::ReuseOrClone(_, src, _) => {
