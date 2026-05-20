@@ -54,6 +54,7 @@ pub mod list_ops;
 pub mod boolean;
 pub mod call;
 pub mod constructor;
+pub mod elim_dead_allocs;
 pub mod eq;
 pub mod hash;
 pub mod numeric;
@@ -112,6 +113,11 @@ pub fn lower(
     // leak-free by construction. Without this flag, the existing
     // emit_drops pass (in opt/) inserts the RC traffic later.
     rc_emit::run(&mut module);
+    // Local lower-finalize: kill Alloc chains whose only uses are
+    // Stores into them + rc traffic + final RcDec. After load-
+    // forwarding, some intermediate aggregates have no observers
+    // left and the whole construction is dead.
+    elim_dead_allocs::run(&mut module);
     Ok((module, input_vals))
 }
 

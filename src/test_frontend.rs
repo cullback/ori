@@ -223,20 +223,18 @@ main = |arg| arg * 2 + 7";
 
 #[test]
 fn heap_stats_baseline_for_list_construction() {
-    // A list literal whose elements depend on a runtime value can't
-    // be promoted to a static. It allocates a data buffer + header.
-    // Both should be freed by program exit.
+    // List construction + consumption shouldn't leak. We use a list
+    // whose `.get` result actually flows into the return value so
+    // dead-alloc elimination can't kill the data buffer (it has a
+    // genuine reader). Whether or not the header survives is up to
+    // lower's optimizations; the invariant is just "no leaks."
     let source = "\
-main : I64 -> U64
-main = |arg| [1, arg, 3].len()";
-    let (_, heap) = run_with_heap(source, 0);
-    // At minimum, the list literal produces 2 allocations (data + header).
-    assert!(heap.alloc_count >= 2, "alloc_count = {}", heap.alloc_count);
-    // Both should be freed by program exit.
-    assert_eq!(
-        heap.alloc_count, heap.free_count,
-        "leak: {} allocs, {} frees", heap.alloc_count, heap.free_count
-    );
+main : I64 -> I64
+main = |arg| [1, arg, 3].get(1).unwrap()";
+    let (result, heap) = run_with_heap(source, 42);
+    assert_eq!(result, Scalar::I64(42));
+    assert_eq!(heap.count_live_objects(), 0,
+        "leak: {} live objects at exit", heap.count_live_objects());
 }
 
 #[test]
@@ -3856,8 +3854,8 @@ fn audit_ssa_cleanliness_inner(run_opt: bool) {
     eprintln!("TOTAL        funcs={t_funcs:3} blocks={t_blocks:4} insts={t_insts:5} rc={t_rc:4} warn={t_warn}");
     eprintln!("rc fraction: {:.1}%", 100.0 * t_rc as f64 / t_insts.max(1) as f64);
 
-    // Dump rec_update and walk_sum IRs for visual inspection.
-    for &i in &[2usize, 3] {
+    // Dump all IRs for visual inspection.
+    for i in 0..programs.len() {
         eprintln!("\n--- {} IR ---", programs[i].0);
         let (m, _) = if run_opt { compile(programs[i].1) } else { compile_until_lower(programs[i].1) };
         eprintln!("{m}");
