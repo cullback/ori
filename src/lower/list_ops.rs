@@ -70,35 +70,62 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
     new_list
 }
 
-/// Lower `xs.set(idx, val)`: builds a new list identical to `xs` but
-/// with slot `idx` replaced by `val`. The clone bumps refcounts on
-/// every Ptr child; we then `RcDec` the one at `idx` (it'll be
-/// overwritten) and `RcInc` the new value (ownership analysis decides
-/// — same rule as any other Store of a Ptr).
+/// Lower `xs.set(idx, val)` as FBIP: in-place mutation when xs is
+/// unique, copy-on-write otherwise. Runtime decides via `rc == 1`
+/// checks inside `ReuseOrClone`/`ReuseOrCloneDyn`.
+///
+/// The dance:
+///   1. `reuse_or_clone(list, 24)` — get a header we own (rc=1).
+///      In-place if `list.rc == 1`, fresh clone otherwise.
+///   2. Move the data ptr out of the (now-unique) header's slot 16
+///      by storing null over it — this prevents the eventual
+///      cascade-free of the header from decrementing the data
+///      buffer that we're about to mutate.
+///   3. `reuse_or_clone_dyn(old_data, len*8)` — get a data buffer
+///      we own (rc=1). In-place if data was unique.
+///   4. Mutate slot `idx` of the new buffer.
+///   5. Store the new buffer back into the header's slot 16.
+///
+/// When both the list and its data buffer are unique at runtime,
+/// this is zero heap allocations: every `reuse_or_clone` takes the
+/// in-place path. When either is shared, the runtime clones —
+/// correct copy-on-write semantics.
 fn emit_list_set(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
     use crate::ssa::instruction::BinaryOp;
     let list = args[0];
     let idx = args[1];
     let new_val = args[2];
 
-    let len = builder.load(list, 0, ScalarType::U64);
-    let old_data = builder.load(list, 16, ScalarType::Ptr);
+    // Pre-emit the null constant so the move-out's Load is
+    // immediately followed by Store(slot, null) in the inst list
+    // (so rc_emit's owning-load suppression detects it).
+    let null = builder.const_ptr_null();
+
+    // Step 1: header — reuse if unique, clone otherwise.
+    let new_list = builder.reuse_or_clone(list, 24);
+
+    let len = builder.load(new_list, 0, ScalarType::U64);
+    let old_data = builder.load(new_list, 16, ScalarType::Ptr);
+
+    // Step 2: move the data ptr out of the header so cascade-free
+    // won't decrement it. Safe because new_list is unique to us.
+    builder.store(new_list, 16, null);
+
+    // Step 3: data buffer — reuse if unique, clone otherwise.
     let eight = builder.const_u64(8);
     let byte_len = builder.binop(BinaryOp::Mul, len, eight, ScalarType::U64);
-    let new_data = builder.alloc_dyn(byte_len);
-    builder.copy_loop(new_data, old_data, len, elem_ty);
+    let new_data = builder.reuse_or_clone_dyn(old_data, byte_len);
 
+    // Step 4: replace slot `idx`. In both paths (in-place mutation
+    // and copy-on-write clone), the slot currently holds the old
+    // element with an owning ref; rc_dec it before overwriting.
     if elem_ty == ScalarType::Ptr {
-        // The clone bumped the rc of the old element at idx; we're
-        // about to overwrite it, so release that extra ref.
         let old_at_idx = builder.load_dyn(new_data, idx, ScalarType::Ptr);
         builder.rc_dec(old_at_idx);
     }
     builder.store_dyn(new_data, idx, new_val);
 
-    let new_list = builder.alloc(24);
-    builder.store(new_list, 0, len);
-    builder.store(new_list, 8, len);
+    // Step 5: install the new buffer in the header.
     builder.store(new_list, 16, new_data);
     new_list
 }

@@ -233,6 +233,27 @@ main = |arg| [1, 2, 3].len()";
     );
 }
 
+#[test]
+fn fbip_list_set_reuses_unique_buffer() {
+    // FBIP: when xs is uniquely owned (rc=1), `xs.set(i, v)` should
+    // mutate the data buffer in place — no fresh heap allocation
+    // for the data buffer. Verified via `alloc_count` (logical
+    // allocs including reuse) vs `fresh_alloc_count` (real heap
+    // growth). The gap is the in-place reuse.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    xs = List.repeat(arg, 5)
+    ys = xs.set(2, 99)
+    ys.get(2).unwrap()
+)";
+    let (_, heap) = run_with_heap(source, 0);
+    assert!(heap.alloc_count > heap.fresh_alloc_count,
+        "FBIP regression: every alloc was fresh ({} == {}). \
+         Expected `list.set` to reuse the unique data buffer in place.",
+        heap.alloc_count, heap.fresh_alloc_count);
+}
+
 // ============================================================
 // Tuples
 // ============================================================

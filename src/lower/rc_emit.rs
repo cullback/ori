@@ -231,18 +231,29 @@ fn emit_block(
     // emit RcInc(dest). This makes the loaded child an independent
     // owning slot rather than aliasing the parent's.
     //
-    // Exception: lower's `copy_loop` (for list elements) already
-    // emits `RcInc(elem)` immediately after the Load. If we see that
-    // pattern, skip — the rc traffic is already in place.
+    // Exceptions (skip the post-load RcInc):
+    // - lower's `copy_loop` (for list elements) already emits
+    //   `RcInc(elem)` immediately after the Load.
+    // - FBIP move-out pattern: `Load(ptr, off)` immediately followed
+    //   by `Store(ptr, off, null_ptr)` is a "move" — the loaded
+    //   value is being transferred out of the slot, and the parent's
+    //   slot is cleared so cascade-free won't double-drop. No rc
+    //   traffic needed; the existing slot's ownership transfers to
+    //   the loaded SSA value.
     for (idx, inst) in block.insts.iter().enumerate() {
-        let dest = match inst {
-            Inst::Load(d, _, _) | Inst::LoadDyn(d, _, _) if d.ty == ScalarType::Ptr => *d,
+        let (dest, src_ptr, src_off) = match inst {
+            Inst::Load(d, p, off) if d.ty == ScalarType::Ptr => (*d, Some(*p), Some(*off)),
+            Inst::LoadDyn(d, _, _) if d.ty == ScalarType::Ptr => (*d, None, None),
             _ => continue,
         };
-        let already_owning = block
-            .insts
-            .get(idx + 1)
-            .is_some_and(|next| matches!(next, Inst::RcInc(v) if *v == dest));
+        let next = block.insts.get(idx + 1);
+        let already_owning = next.is_some_and(|n| matches!(n, Inst::RcInc(v) if *v == dest));
+        let move_out = matches!(
+            (src_ptr, src_off, next),
+            (Some(p), Some(off), Some(Inst::Store(sp, soff, sv)))
+                if *sp == p && *soff == off && is_const_null(block, *sv)
+        );
+        let already_owning = already_owning || move_out;
         if !already_owning {
             inserts.push((idx + 1, Inst::RcInc(dest)));
         }
@@ -255,6 +266,19 @@ fn emit_block(
     for (idx, inst) in inserts {
         block_mut.insts.insert(idx, inst);
     }
+}
+
+/// Walk `block.insts` for a `Const(v, 0)` definition where `v == val`
+/// and `v.ty == Ptr`. Used to detect the FBIP move-out marker —
+/// `Store(_, _, null_ptr)` immediately after a `Load` of the same
+/// slot.
+fn is_const_null(block: &super::super::ssa::Block, val: Value) -> bool {
+    if val.ty != ScalarType::Ptr {
+        return false;
+    }
+    block.insts.iter().any(|inst| {
+        matches!(inst, Inst::Const(d, bits) if *d == val && *bits == 0)
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
