@@ -173,9 +173,9 @@ impl fmt::Display for FmtInst<'_> {
             }
             Inst::RcInc(ptr) => write!(f, "rc_inc {}", fmt_val(*ptr, consts)),
             Inst::RcDec(ptr) => write!(f, "rc_dec {}", fmt_val(*ptr, consts)),
-            Inst::ReuseOrClone(d, src, n) => write!(f, "{d}: ptr = reuse_or_clone {}, {n}", fmt_val(*src, consts)),
-            Inst::ReuseOrCloneDyn(d, src, n) => write!(f, "{d}: ptr = reuse_or_clone_dyn {}, {}", fmt_val(*src, consts), fmt_val(*n, consts)),
-            Inst::StaticRef(d, id) => write!(f, "{d}: ptr = static_ref @{id}"),
+            Inst::ReuseOrClone(d, src, n) => write!(f, "{d}: {} = reuse_or_clone {}, {n}", d.ty, fmt_val(*src, consts)),
+            Inst::ReuseOrCloneDyn(d, src, n) => write!(f, "{d}: {} = reuse_or_clone_dyn {}, {}", d.ty, fmt_val(*src, consts), fmt_val(*n, consts)),
+            Inst::StaticRef(d, id) => write!(f, "{d}: {} = static_ref @{id}", d.ty),
             Inst::Cast(d, src) => {
                 let dt = d.ty;
                 write!(f, "{d}: {dt} = cast {}", fmt_val(*src, consts))

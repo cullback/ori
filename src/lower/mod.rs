@@ -616,8 +616,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
 
             ExprKind::RecordUpdate { base, updates } => {
+                // FBIP: rather than allocate a fresh record and copy all
+                // fields from base, use `reuse_or_clone` so unchanged
+                // fields are preserved in-place when base is uniquely
+                // owned, and the runtime falls back to a clone (with
+                // rc_inc on Ptr children) otherwise. Only the actually
+                // updated slots need explicit stores; auto-rc-on-Store
+                // releases the old occupants.
                 let base_val = self.lower_expr(base);
-                // Get all field names from the base record type, sorted.
                 let all_fields: Vec<String> = match &base.ty {
                     Type::Record { fields, .. } => {
                         let mut names: Vec<String> =
@@ -627,42 +633,27 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     }
                     _ => panic!("RecordUpdate base is not a record type"),
                 };
-                // Build a map of update field name → expression.
                 let update_map: HashMap<String, &Expr> = updates
                     .iter()
                     .map(|(sym, e)| (self.fields.get(*sym).to_owned(), e))
                     .collect();
-                // Get sorted field types from the base record type.
-                let field_types: Vec<ScalarType> = match &base.ty {
-                    Type::Record { fields, .. } => {
-                        let mut sorted: Vec<(&str, &Type)> =
-                            fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
-                        sorted.sort_unstable_by_key(|(n, _)| *n);
-                        sorted.iter().map(|(_, t)| self.scalar_type(t)).collect()
-                    }
-                    _ => vec![],
-                };
                 let num_fields = all_fields.len();
-                // Collect all field values.
-                let vals: Vec<Value> = all_fields
+                // Evaluate update expressions FIRST — they may reference
+                // base (e.g. `{ p & x: p.x + 1 }`), and we need base's
+                // owning slot alive while doing so. rc_emit will insert
+                // an RcInc before reuse_or_clone if needed.
+                let new_vals: Vec<(usize, Value)> = all_fields
                     .iter()
                     .enumerate()
-                    .map(|(slot, field_name)| {
-                        if let Some(upd_expr) = update_map.get(field_name) {
-                            self.lower_expr(upd_expr)
-                        } else {
-                            let ty = field_types.get(slot).copied().unwrap_or(ScalarType::RcPtr);
-                            self.builder.load(base_val, slot * 8, ty)
-                        }
+                    .filter_map(|(slot, field_name)| {
+                        update_map.get(field_name).map(|expr| (slot, self.lower_expr(expr)))
                     })
                     .collect();
-                {
-                    let ptr = self.builder.alloc(num_fields * 8);
-                    for (slot, val) in vals.into_iter().enumerate() {
-                        self.builder.store(ptr, slot * 8, val);
-                    }
-                    ptr
+                let new_record = self.builder.reuse_or_clone(base_val, num_fields * 8);
+                for (slot, val) in new_vals {
+                    self.builder.store(new_record, slot * 8, val);
                 }
+                new_record
             }
 
             ExprKind::ListLit(elems) => {
