@@ -40,6 +40,15 @@ pub struct Builder {
     pub func: FuncBuilder,
     pub current_block: Option<BlockId>,
     functions: HashMap<String, Function>,
+    /// Per-block store-load forwarding cache: maps (ptr, byte_offset)
+    /// to the last value stored there, so subsequent `load()` calls
+    /// can return that value directly without emitting a Load.
+    ///
+    /// Cleared on `switch_to(block)` (block boundary), on `call()`
+    /// (callee may mutate), and on `store_dyn()` for the given ptr
+    /// (dynamic offset unknown). `reuse_or_clone()` propagates the
+    /// src's entries to its dest (the primitive preserves contents).
+    recent_stores: HashMap<(Value, usize), Value>,
 }
 
 impl Builder {
@@ -49,6 +58,7 @@ impl Builder {
             func: FuncBuilder::new(),
             current_block: None,
             functions: HashMap::new(),
+            recent_stores: HashMap::new(),
         }
     }
 
@@ -78,8 +88,13 @@ impl Builder {
         id
     }
 
-    pub const fn switch_to(&mut self, block: BlockId) {
+    pub fn switch_to(&mut self, block: BlockId) {
         self.current_block = Some(block);
+        // Forwarding cache is per-block — crossing a block boundary
+        // means values stored before may not be in the slot anymore
+        // (other predecessors of `block` may have written different
+        // values, or the stores may not dominate this block).
+        self.recent_stores.clear();
     }
 
     pub fn add_block_param(&mut self, block: BlockId, ty: ScalarType) -> Value {
@@ -165,6 +180,9 @@ impl Builder {
     pub fn call(&mut self, func: &str, args: Vec<Value>, ret_ty: ScalarType) -> Value {
         let v = self.fresh_value(ret_ty);
         self.push(Inst::Call(v, func.to_owned(), args));
+        // Callee may mutate any heap object reachable via its args.
+        // Conservative: clear all forwarding entries.
+        self.recent_stores.clear();
         v
     }
 
@@ -189,16 +207,46 @@ impl Builder {
     pub fn reuse_or_clone(&mut self, src: Value, size: usize) -> Value {
         let v = self.fresh_value(ScalarType::RcPtr);
         self.push(Inst::ReuseOrClone(v, src, size));
+        // The primitive preserves contents in both paths (in-place
+        // literally; clone copies). Propagate src's forwarding
+        // entries to the result so subsequent loads through `v`
+        // can forward to the same values.
+        self.propagate_recent_stores(src, v);
         v
     }
 
     pub fn reuse_or_clone_dyn(&mut self, src: Value, size_val: Value) -> Value {
         let v = self.fresh_value(ScalarType::RcPtr);
         self.push(Inst::ReuseOrCloneDyn(v, src, size_val));
+        self.propagate_recent_stores(src, v);
         v
     }
 
+    fn propagate_recent_stores(&mut self, src: Value, dest: Value) {
+        let propagations: Vec<(usize, Value)> = self
+            .recent_stores
+            .iter()
+            .filter_map(|((p, off), v)| (*p == src).then_some((*off, *v)))
+            .collect();
+        for (off, v) in propagations {
+            self.recent_stores.insert((dest, off), v);
+        }
+    }
+
     pub fn load(&mut self, ptr: Value, offset: usize, ty: ScalarType) -> Value {
+        // Store-load forwarding: if this slot was just stored to with
+        // a value of matching type, return that value directly. For
+        // RcPtr loads the auto-rc_inc would normally mint a fresh
+        // owning ref, so emit one explicitly when forwarding to keep
+        // rc accounting balanced.
+        if let Some(&stored) = self.recent_stores.get(&(ptr, offset)) {
+            if stored.ty == ty {
+                if ty == ScalarType::RcPtr {
+                    self.push(Inst::RcInc(stored));
+                }
+                return stored;
+            }
+        }
         let v = self.fresh_value(ty);
         self.push(Inst::Load(v, ptr, offset));
         v
@@ -206,6 +254,7 @@ impl Builder {
 
     pub fn store(&mut self, ptr: Value, offset: usize, val: Value) {
         self.push(Inst::Store(ptr, offset, val));
+        self.recent_stores.insert((ptr, offset), val);
     }
 
     pub fn load_dyn(&mut self, ptr: Value, idx: Value, ty: ScalarType) -> Value {
@@ -216,6 +265,9 @@ impl Builder {
 
     pub fn store_dyn(&mut self, ptr: Value, idx: Value, val: Value) {
         self.push(Inst::StoreDyn(ptr, idx, val));
+        // Dynamic offset — we don't know which slot was written.
+        // Clear all forwarding for this ptr to be safe.
+        self.recent_stores.retain(|(p, _), _| *p != ptr);
     }
 
     /// Move a value out of a slot: load it, write null back. No rc
@@ -225,6 +277,8 @@ impl Builder {
     pub fn move_out(&mut self, ptr: Value, offset: usize, ty: ScalarType) -> Value {
         let v = self.fresh_value(ty);
         self.push(Inst::MoveOut(v, ptr, offset));
+        // Slot is now null — invalidate the forwarding entry.
+        self.recent_stores.remove(&(ptr, offset));
         v
     }
 
