@@ -486,6 +486,17 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
 
         Inst::Call(_, name, args) => {
             let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.id]).collect();
+            // Auto-rc: mint a fresh owning ref for each RcPtr arg so
+            // the callee receives its own claim independent of the
+            // caller's local. Caller's local stays owning; it gets
+            // released at scope end by rc_emit's normal drop logic.
+            for (arg, val) in args.iter().zip(&arg_vals) {
+                if arg.ty == ScalarType::RcPtr {
+                    if let Scalar::Ptr(idx) = val {
+                        heap.rc_inc(*idx);
+                    }
+                }
+            }
             Some(eval_function_inner(module, heap, scratch, name, &arg_vals))
         }
 

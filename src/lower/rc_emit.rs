@@ -269,9 +269,13 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
             }
         }
         Inst::Call(_, _, args) => {
+            // Call args are a *borrow* with respect to rc_emit: eval
+            // auto-rc_incs each RcPtr arg, minting a fresh ref for
+            // the callee. Caller's local keeps its claim; rc_emit's
+            // normal end-of-scope rc_dec releases it.
             for a in args {
                 if is_ptr(a) {
-                    cons.push(*a);
+                    borr.push(*a);
                 }
             }
         }
