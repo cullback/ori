@@ -61,43 +61,13 @@ fn compile(
     Ok((ssa_module, input_vals))
 }
 
-/// Run the full SSA pipeline on a freshly-lowered module. Every pass
-/// is `Module -> Module` (or analysis-only) and the order is
-/// load-bearing; see the per-module docs in `src/ssa/*.rs` for the
-/// input/output invariants each pass relies on and establishes.
+/// Run the full SSA pipeline on a freshly-lowered module. Single
+/// canonical entry — see `opt::run_full_pipeline` for the order.
+/// Validation happens after lower (and the user can re-run after
+/// individual passes via tests).
 fn run_ssa_pipeline(module: &mut ssa::Module) {
-    // `lower` established explicit-block-params and naïve Perceus RC
-    // traffic; the SSA is well-formed and leak-free at this point.
-    // Opt passes (below) remove the redundancy this introduces.
     check(module, "lower");
-
-    opt::static_promote::promote(module);
-    check(module, "static_promote");
-
-    opt::optimize(module);
-    check(module, "optimize");
-
-    opt::inline::inline(module);
-    // inline may leave cross-block refs; re-run ssa_form to repair.
-    lower::ssa_form::run(module);
-    check(module, "inline");
-
-    opt::optimize(module);
-    check(module, "optimize (post-inline)");
-
-    opt::const_eval::evaluate(module);
-    check(module, "const_eval");
-
-    opt::optimize(module);
-    check(module, "optimize (post-const-eval)");
-
-    opt::rc_elide_static::run(module);
-    check(module, "elide_static_rc");
-
-    opt::rc_fuse::run(module);
-    check(module, "fuse_inc_dec");
-
-    opt::optimize(module);
+    opt::run_full_pipeline(module);
     check(module, "optimize (final)");
 }
 

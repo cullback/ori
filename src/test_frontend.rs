@@ -52,15 +52,9 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
 
 fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let (mut ssa_module, input_vals) = compile_until_lower(source);
-    crate::opt::static_promote::promote(&mut ssa_module);
-    validate_after(&ssa_module, "static_promote");
-    crate::opt::optimize(&mut ssa_module);
-    validate_after(&ssa_module, "optimize");
-    crate::opt::rc_elide_static::run(&mut ssa_module);
-    validate_after(&ssa_module, "elide_static_rc");
-    crate::opt::rc_fuse::run(&mut ssa_module);
-    validate_after(&ssa_module, "fuse_inc_dec");
-    crate::opt::optimize(&mut ssa_module);
+    // Match the binary's pipeline so tests and `cargo run` see the
+    // same optimized SSA. Single source of truth: `opt::run_full_pipeline`.
+    crate::opt::run_full_pipeline(&mut ssa_module);
     validate_after(&ssa_module, "optimize (final)");
     (ssa_module, input_vals)
 }
