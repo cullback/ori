@@ -200,28 +200,6 @@ impl Builder {
         v
     }
 
-    /// FBIP `reuse_or_clone`: returns a RcPtr the caller owns at rc=1.
-    /// In-place if `src.rc == 1` (contents preserved), cloned + src
-    /// `rc_dec`'d otherwise. Consumes the caller's owning slot on
-    /// `src`.
-    pub fn reuse_or_clone(&mut self, src: Value, size: usize) -> Value {
-        let v = self.fresh_value(ScalarType::RcPtr);
-        self.push(Inst::ReuseOrClone(v, src, size));
-        // The primitive preserves contents in both paths (in-place
-        // literally; clone copies). Propagate src's forwarding
-        // entries to the result so subsequent loads through `v`
-        // can forward to the same values.
-        self.propagate_recent_stores(src, v);
-        v
-    }
-
-    pub fn reuse_or_clone_dyn(&mut self, src: Value, size_val: Value) -> Value {
-        let v = self.fresh_value(ScalarType::RcPtr);
-        self.push(Inst::ReuseOrCloneDyn(v, src, size_val));
-        self.propagate_recent_stores(src, v);
-        v
-    }
-
     /// COW-aware byte-write: returns the (possibly new) Ptr where
     /// the modified data lives. If `ptr` is uniquely owned, mutates
     /// in place. Otherwise clones and modifies the clone. See
@@ -244,6 +222,16 @@ impl Builder {
         // Propagate the source's known stores at OTHER offsets;
         // the dynamic-index slot is invalidated by this op.
         self.propagate_recent_stores(ptr, v);
+        v
+    }
+
+    /// COW-aware "take child out of parent": returns an `Agg(2)`
+    /// = `(out_ptr, extracted_val)`. `out_ptr` is the (possibly
+    /// cloned) parent with slot `offset` set to null. `extracted_val`
+    /// is what was at the slot before. See `Inst::CowMoveOut`.
+    pub fn cow_move_out(&mut self, ptr: Value, offset: usize) -> Value {
+        let v = self.fresh_value(ScalarType::Agg(2));
+        self.push(Inst::CowMoveOut(v, ptr, offset));
         v
     }
 
@@ -293,18 +281,6 @@ impl Builder {
         // Dynamic offset — we don't know which slot was written.
         // Clear all forwarding for this ptr to be safe.
         self.recent_stores.retain(|(p, _), _| *p != ptr);
-    }
-
-    /// Move a value out of a slot: load it, write null back. No rc
-    /// change — the slot's claim transfers to the returned local.
-    /// Used in FBIP patterns to take a child out of a parent before
-    /// reusing the parent's storage.
-    pub fn move_out(&mut self, ptr: Value, offset: usize, ty: ScalarType) -> Value {
-        let v = self.fresh_value(ty);
-        self.push(Inst::MoveOut(v, ptr, offset));
-        // Slot is now null — invalidate the forwarding entry.
-        self.recent_stores.remove(&(ptr, offset));
-        v
     }
 
     pub fn rc_inc(&mut self, ptr: Value) {

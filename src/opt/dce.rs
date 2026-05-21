@@ -101,10 +101,8 @@ pub fn is_side_effect(inst: &Inst) -> bool {
             | Inst::StoreDyn(..)
             | Inst::RcInc(..)
             | Inst::RcDec(..)
-            | Inst::ReuseOrClone(..)
-            | Inst::ReuseOrCloneDyn(..)
             | Inst::CowStore(..)
             | Inst::CowStoreDyn(..)
-            | Inst::MoveOut(..)
+            | Inst::CowMoveOut(..)
     )
 }

@@ -88,7 +88,7 @@ fn elim_in_block(block: &mut crate::ssa::Block) {
                 mark(&mut escaped, idx);
                 mark(&mut escaped, val);
             }
-            Inst::Load(_, p, _) | Inst::LoadDyn(_, p, _) | Inst::MoveOut(_, p, _) => {
+            Inst::Load(_, p, _) | Inst::LoadDyn(_, p, _) => {
                 // Reading from a candidate observes its data — escape.
                 mark(&mut escaped, p);
             }
@@ -96,11 +96,6 @@ fn elim_in_block(block: &mut crate::ssa::Block) {
                 for a in args {
                     mark(&mut escaped, a);
                 }
-            }
-            Inst::ReuseOrClone(_, src, _) => mark(&mut escaped, src),
-            Inst::ReuseOrCloneDyn(_, src, size) => {
-                mark(&mut escaped, src);
-                mark(&mut escaped, size);
             }
             Inst::CowStore(_, ptr, _, val) => {
                 mark(&mut escaped, ptr);
@@ -111,6 +106,7 @@ fn elim_in_block(block: &mut crate::ssa::Block) {
                 mark(&mut escaped, idx);
                 mark(&mut escaped, val);
             }
+            Inst::CowMoveOut(_, ptr, _) => mark(&mut escaped, ptr),
             Inst::BinOp(_, _, l, r) => {
                 mark(&mut escaped, l);
                 mark(&mut escaped, r);

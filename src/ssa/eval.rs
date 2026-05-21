@@ -161,6 +161,15 @@ impl Heap {
         h
     }
 
+    /// Raw byte-write of null at byte offset. No rc traffic — used
+    /// by `CowMoveOut` to clear a slot whose claim has been
+    /// transferred to a local (the local "took over" the slot's
+    /// ownership; no net rc change on the moved-out value).
+    fn write_null_raw(&mut self, idx: usize, byte_offset: usize) {
+        let buf = &mut self.objects[idx].data;
+        buf[byte_offset..byte_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+    }
+
     pub fn alloc(&mut self, num_bytes: usize) -> usize {
         self.alloc_count += 1;
         let live = self.alloc_count - self.free_count;
@@ -649,19 +658,6 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             None
         }
 
-        Inst::MoveOut(_dest, ptr, offset) => {
-            let Scalar::Ptr(idx) = env[ptr.id] else {
-                panic!("move_out from non-ptr: {:?}", env[ptr.id]);
-            };
-            let loaded = heap.load_auto(idx, *offset, ScalarType::RcPtr);
-            // Write null back. Use raw write_scalar so we don't trip
-            // the type_map's "this is a Ptr slot" tracking (the slot
-            // is still semantically RcPtr — we're just clearing it).
-            heap.store(idx, *offset, Scalar::Ptr(0));
-            // No rc change: slot's prior claim transfers to the local.
-            Some(loaded)
-        }
-
         Inst::RcInc(ptr) => {
             if let Scalar::Ptr(idx) = env[ptr.id] {
                 heap.rc_inc(idx);
@@ -680,15 +676,6 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             // Statics are pre-allocated starting at heap index 1
             // (index 0 is null). static_id 0 → heap index 1, etc.
             Some(Scalar::Ptr(1 + static_id))
-        }
-
-        Inst::ReuseOrClone(_dest, src, num_bytes) => {
-            Some(Scalar::Ptr(reuse_or_clone(heap, env[src.id], *num_bytes)))
-        }
-
-        Inst::ReuseOrCloneDyn(_dest, src, size_val) => {
-            let size = scalar_to_usize(env[size_val.id]);
-            Some(Scalar::Ptr(reuse_or_clone(heap, env[src.id], size)))
         }
 
         Inst::CowStore(_dest, ptr, off, val) => {
@@ -711,6 +698,25 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             let target_idx = cow_prep(heap, idx);
             cow_write(heap, target_idx, off, new_val, val.ty);
             Some(Scalar::Ptr(target_idx))
+        }
+
+        Inst::CowMoveOut(_dest, ptr, off) => {
+            let Scalar::Ptr(idx) = env[ptr.id] else {
+                panic!("cow_move_out on non-ptr: {:?}", env[ptr.id]);
+            };
+            let new_idx = cow_prep(heap, idx);
+            // Borrowing load: the slot's claim transfers to the
+            // local — no rc traffic. (In the shared/clone path,
+            // val.rc was already bumped by the clone copying the
+            // child, so the local's claim is "the clone's slot's"
+            // claim. In the unique path, the local takes over
+            // the original slot's claim — net rc change zero.)
+            let val = heap.load(new_idx, *off, ScalarType::RcPtr);
+            // Raw null write — no auto-rc-balance.
+            heap.write_null_raw(new_idx, *off);
+            // Pack (out_ptr, val) into Agg(2) for multi-return.
+            let handle = heap.alloc_agg(vec![Scalar::Ptr(new_idx), val]);
+            Some(Scalar::Agg(handle))
         }
 
         Inst::Pack(_dest, fields) => {
@@ -813,45 +819,6 @@ fn scalar_to_u64(s: Scalar) -> u64 {
         Scalar::F64(_) => panic!("switch on float"),
         Scalar::Agg(_) => panic!("scalar_to_u64(Agg): aggregates have no scalar bit pattern"),
     }
-}
-
-/// FBIP `reuse_or_clone`: if `src` is uniquely owned, return its
-/// idx directly so the caller can mutate in place (contents
-/// preserved, rc stays 1). Otherwise allocate fresh, clone src's
-/// contents with `rc_inc` on each Ptr child, and `rc_dec(src)` to
-/// release the caller's owning slot on the original.
-fn reuse_or_clone(heap: &mut Heap, src: Scalar, num_bytes: usize) -> usize {
-    let Scalar::Ptr(idx) = src else {
-        panic!("reuse_or_clone src not a Ptr: {src:?}");
-    };
-    if idx == 0 {
-        return heap.alloc(num_bytes);
-    }
-    if heap.objects[idx].rc == RC_STATIC {
-        // Static src — can't mutate in place. Clone, no rc_dec.
-        let new_idx = heap.clone_object(idx);
-        heap.objects[new_idx].data.resize(num_bytes, 0);
-        return new_idx;
-    }
-    if heap.objects[idx].rc == 1 {
-        // Unique. Return src directly. Resize if needed (extending
-        // with zeros for the FBIP "grow" patterns like list.append).
-        heap.alloc_count += 1;
-        let live = heap.alloc_count - heap.free_count;
-        if live > heap.peak_live {
-            heap.peak_live = live;
-        }
-        if heap.objects[idx].data.len() < num_bytes {
-            heap.objects[idx].data.resize(num_bytes, 0);
-        }
-        return idx;
-    }
-    // Shared. Clone (with rc_inc on Ptr children), then drop our
-    // ref on the original.
-    let new_idx = heap.clone_object(idx);
-    heap.objects[new_idx].data.resize(num_bytes, 0);
-    heap.rc_dec(idx);
-    new_idx
 }
 
 /// CowStore prep: given an idx whose contents we want to mutate,

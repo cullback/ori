@@ -314,11 +314,6 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                         escaped = true;
                     }
                 }
-                Inst::MoveOut(_, p, _) => {
-                    if in_flow(p) {
-                        escaped = true;
-                    }
-                }
                 Inst::RcInc(_) | Inst::RcDec(_) => {
                     // OK on flow Values.
                 }
@@ -330,16 +325,6 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                         escaped = true;
                     }
                 }
-                Inst::ReuseOrClone(_, src, _) => {
-                    if in_flow(src) {
-                        escaped = true;
-                    }
-                }
-                Inst::ReuseOrCloneDyn(_, src, size) => {
-                    if in_flow(src) || in_flow(size) {
-                        escaped = true;
-                    }
-                }
                 Inst::CowStore(_, ptr, _, val) => {
                     if in_flow(ptr) || in_flow(val) {
                         escaped = true;
@@ -347,6 +332,11 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                 }
                 Inst::CowStoreDyn(_, ptr, idx, val) => {
                     if in_flow(ptr) || in_flow(idx) || in_flow(val) {
+                        escaped = true;
+                    }
+                }
+                Inst::CowMoveOut(_, ptr, _) => {
+                    if in_flow(ptr) {
                         escaped = true;
                     }
                 }
@@ -468,13 +458,13 @@ fn call_sites_safe(module: &Module, callee_name: &str) -> bool {
                             return false;
                         }
                     }
-                    Inst::ReuseOrClone(_, src, _) | Inst::ReuseOrCloneDyn(_, src, _) => {
-                        if call_results.contains(src) {
+                    Inst::CowStore(_, ptr, _, val) | Inst::CowStoreDyn(_, ptr, _, val) => {
+                        if call_results.contains(ptr) || call_results.contains(val) {
                             return false;
                         }
                     }
-                    Inst::CowStore(_, ptr, _, val) | Inst::CowStoreDyn(_, ptr, _, val) => {
-                        if call_results.contains(ptr) || call_results.contains(val) {
+                    Inst::CowMoveOut(_, ptr, _) => {
+                        if call_results.contains(ptr) {
                             return false;
                         }
                     }
@@ -488,7 +478,7 @@ fn call_sites_safe(module: &Module, callee_name: &str) -> bool {
                             return false;
                         }
                     }
-                    Inst::LoadDyn(_, p, _) | Inst::MoveOut(_, p, _) => {
+                    Inst::LoadDyn(_, p, _) => {
                         if call_results.contains(p) {
                             return false;
                         }

@@ -98,23 +98,21 @@ fn emit_list_set(builder: &mut Builder, args: Vec<Value>, _elem_ty: ScalarType) 
     // A list is two heap objects (header + data buffer). FBIP needs
     // both layers to be unique.
     //
-    //   1. reuse_or_clone(list, 24) — make the header unique. This
-    //      is necessary BEFORE MoveOut: if the header is shared,
-    //      MoveOut would write null into a shared header, corrupting
-    //      it for other observers.
-    //   2. move_out(new_list, 16) — extract the data ptr without
-    //      the auto-rc-on-Load bump that would otherwise trick
-    //      cow_store_dyn into thinking data is shared.
-    //   3. cow_store_dyn(data, idx, val) — FBIP write to the data
+    //   1. cow_move_out(list, 16) — atomic "cow-prep the header,
+    //      then extract data". Returns Agg(2) of (out_hdr, data).
+    //      out_hdr is unique. data is the (possibly bumped-by-clone)
+    //      child, with the slot it came from now null.
+    //   2. cow_store_dyn(data, idx, val) — FBIP write to the data
     //      buffer: in-place if data.rc == 1, else clone.
-    //   4. store(new_list, 16, new_data) — install the (possibly
-    //      new) data buffer back into the (unique) header. Plain
-    //      Store is sufficient since new_list is provably unique.
-    let new_list = builder.reuse_or_clone(list, 24);
-    let old_data = builder.move_out(new_list, 16, ScalarType::RcPtr);
-    let new_data = builder.cow_store_dyn(old_data, idx, new_val);
-    builder.store(new_list, 16, new_data);
-    new_list
+    //   3. store(out_hdr, 16, new_data) — install the (possibly
+    //      new) data buffer back into the (unique) out_hdr. Plain
+    //      Store is sufficient since out_hdr is provably unique.
+    let hdr_and_data = builder.cow_move_out(list, 16);
+    let out_hdr = builder.extract(hdr_and_data, 0, ScalarType::RcPtr);
+    let data = builder.extract(hdr_and_data, 1, ScalarType::RcPtr);
+    let new_data = builder.cow_store_dyn(data, idx, new_val);
+    builder.store(out_hdr, 16, new_data);
+    out_hdr
 }
 
 /// Lower `xs.reverse()`: builds a new list with elements in reverse

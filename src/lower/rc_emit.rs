@@ -310,11 +310,6 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 }
             }
         }
-        Inst::MoveOut(_, ptr, _) => {
-            if is_ptr(ptr) {
-                borr.push(*ptr);
-            }
-        }
         Inst::RcInc(v) => {
             if is_ptr(v) {
                 borr.push(*v);
@@ -323,23 +318,6 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
         Inst::RcDec(v) => {
             if is_ptr(v) {
                 cons.push(*v);
-            }
-        }
-        Inst::ReuseOrClone(_, src, _) => {
-            // ReuseOrClone consumes its src: either reuses storage
-            // in place (rc=1 path) or clones + rc_dec'es src (rc>1
-            // path). Either way the SSA's owning slot for src is
-            // transferred into the result.
-            if is_ptr(src) {
-                cons.push(*src);
-            }
-        }
-        Inst::ReuseOrCloneDyn(_, src, size) => {
-            if is_ptr(src) {
-                cons.push(*src);
-            }
-            if is_ptr(size) {
-                borr.push(*size);
             }
         }
         Inst::CowStore(_, ptr, _, val) => {
@@ -364,6 +342,12 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 if is_ptr(v) {
                     borr.push(*v);
                 }
+            }
+        }
+        Inst::CowMoveOut(_, ptr, _) => {
+            // CowMoveOut consumes ptr (cow_preps it).
+            if is_ptr(ptr) {
+                cons.push(*ptr);
             }
         }
         Inst::Cast(_, src) | Inst::BitCast(_, src) => {
