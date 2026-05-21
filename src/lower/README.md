@@ -33,9 +33,19 @@ test harness re-validates after every pass — a breakage shows up as
 3. **Leak-free RC traffic** (`rc_emit`). Every heap allocation has
    a matching `rc_dec` (or cascade from a parent's release) by
    program exit. Tests assert via `Heap::count_live_objects() == 0`.
-4. **Naive-but-correct emission.** Lower picks the natural emission
-   for each AST node, not the most optimal one. FBIP, scalarization,
-   etc. fall out of opt passes; lower doesn't second-guess.
+4. **Natural emission, including FBIP.** Lower picks the natural
+   emission for each AST node. For "build a modified version of an
+   existing structure" AST nodes (`RecordUpdate`, `list.set`, etc.),
+   the natural lowering is `ReuseOrClone(src, N)` — a primitive
+   whose runtime check (`if src.rc == 1` → mutate in place, else
+   clone) enforces FBIP semantics dynamically. **FBIP is
+   established here, by lower; it is NOT an opt pass.**
+
+   Other shape-level optimizations (scalarization of non-escaping
+   heap allocs, etc.) DO live in `opt/` and run later. The
+   distinction: FBIP is a semantic guarantee about how language
+   constructs are implemented; SROA is a performance optimization
+   that recognizes a static-analysis opportunity.
 5. **No dead let-bindings.** Ori is total/pure, so an unused `let`
    binding has no observable effect. Lower elides them before
    emitting (see `lower_block` in `mod.rs`).
