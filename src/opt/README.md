@@ -15,8 +15,10 @@ the same invariants.
 
 Every pass preserves:
 - **Structural correctness** — the validator's hard errors don't
-  fire after any pass. (Soft warnings can fire transiently; the
-  pipeline reconverges by the final pass.)
+  fire after any pass. Soft warnings (type lies between edge args
+  and dest block params, etc.) sometimes appear transiently mid-
+  pipeline; the binary exits on any warning at the end, so we'd
+  notice if they survived to the final pass.
 - **Semantic equivalence** — the program's observable behavior
   (return value, IO if any) is unchanged.
 - **RC correctness** — no leaks, no UAF. Tests verify via
@@ -52,7 +54,7 @@ major transform (each major transform unlocks new local opportunities).
 | Pass | Goal | Mechanism |
 |---|---|---|
 | `static_promote` | Move constant allocs out of the hot path. | Find `Alloc(N)` whose every store is a Const (or a pointer to another promoted alloc). Replace with `StaticRef`. |
-| `inline` | Eliminate small function-call overhead. | For each `Call` to a small callee (≤ `MAX_INLINE_INSTS` = 30), splice the body into the caller. Cross-block refs cleaned up by `ssa_form`. |
+| `inline` | Eliminate small function-call overhead. | For each `Call` to a small callee (≤ `MAX_INLINE_INSTS` = 30), splice the body into the caller. Splices in an `RcInc` for each RcPtr arg at the splice point to compensate for the removed auto-rc-on-Call (eval normally rc_inc's every RcPtr arg at Call boundary; without that bump the callee body's rc accounting over-decs). Cross-block refs cleaned up by `ssa_form`. |
 | `const_eval` | Bake out zero-arg pure computations. | For each user function `f()` (no args, not `__`-prefixed), run eval. If result is a `Scalar`, replace `Call` with `Const`; if a heap value, materialize as `StaticRef`. |
 | `sroa` | Avoid heap allocs for ephemeral aggregates. | Detect `Alloc + N stores` whose result doesn't escape (no Call args, no Store-as-val, only Load/rc/Return uses). Replace with `Pack` (register-resident `Agg`); convert `Load` → `Extract`. Handles flow through block params and Returns (sig changes verified for safety). **Distinct from FBIP** — FBIP is established by lower's emission of `ReuseOrClone` for structure-update AST nodes; SROA is a separate static-analysis optimization for non-escaping allocs in general. |
 | `rc_elide_static` | Strip no-op rc on statics. | `StaticRef` values have sentinel rc; `RcInc`/`RcDec` on them are no-ops. Remove them. |
@@ -87,10 +89,13 @@ Runs in order, each one-shot (no internal fixpoint loop):
 - **`sroa`'s escape detection is conservative.** Any single unsafe
   use of a flow value demotes ALL allocs in that function. A more
   precise per-flow-group analysis would catch more.
-- **`Heap::aggs` (SROA's side table for register Aggs) doesn't
-  free.** Aggregates accumulate over an `eval` call. For benchmarks
-  and one-shot compilation this is fine; long-running programs
-  would need lifecycle management.
+- **`Scalar::Agg` lifecycle leak.** `Scalar::Agg(handle)` indexes
+  into `eval::Heap::aggs` (a side table separate from the normal
+  rc-managed heap). Aggregates accumulate over an `eval` call and
+  never get freed. For benchmarks and one-shot compilation this is
+  fine; long-running programs would need lifecycle management.
+  This is a runtime cost, not an SROA-pass cost — SROA just emits
+  the `Pack`/`Extract` IR that eval interprets.
 - **`inline`'s threshold is 30 insts.** Larger functions don't get
   inlined regardless of whether SROA would benefit from inlining
   them. Could be made cost-based ("inline if the callee returns a

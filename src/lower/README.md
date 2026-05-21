@@ -1,9 +1,28 @@
 # lower/
 
-**AST → SSA translation.** The single place that establishes
-semantic invariants. Every downstream pass (`opt/*`) is a *strictly
-optional optimization*: delete the whole `opt/` folder and programs
-still execute correctly, just slower.
+**AST → SSA translation.** The single place that establishes the
+language's semantic invariants. Every downstream pass (`opt/*`) is
+*strictly optional optimization*: delete the whole `opt/` folder
+and programs still execute correctly, just slower.
+
+## Why this matters
+
+Anything the language guarantees — strict evaluation order, FBIP
+in-place-when-unique semantics for structural updates, total
+termination guarantees, leak-free RC, no observable side effects
+from dropped pure bindings — must be enforced **here**, by lower.
+Lower cannot rely on opt to clean up after a semantically-wrong
+emission. If lower emits "build a fresh copy" where the language
+spec says "mutate in place when unique," that's a bug even if some
+opt pass would later promote the alloc. The language's behavior
+is whatever lower produces, evaluated by the runtime; opt only
+makes it faster.
+
+This cuts both ways: lower must NOT skimp on emissions that are
+semantically required (FBIP via `ReuseOrClone`, scope-end rc_decs
+that establish leak-freedom, etc.), but it also must NOT do
+optimizations that opt's job. Lower picks the **natural** emission
+for each AST node; opt finds patterns within that emission.
 
 ## Inputs
 
@@ -76,7 +95,7 @@ Domain-specific emissions are split into focused files:
 | `pattern.rs` | `when` arm compilation, pattern flattening. |
 | `walk.rs` | `List.walk` (loop emission with `__apply_*` dispatch). |
 | `ssa_form.rs` | Post-emission pass: convert implicit cross-block refs to explicit block params. |
-| `rc_emit.rs` | Post-emission pass: insert `RcInc`/`RcDec` for ownership tracking. |
+| `rc_emit.rs` | Post-emission pass: insert end-of-scope `RcDec`s and pre-consume `RcInc`s for values whose last use is a transfer. Most rc semantics are intrinsic to eval now (auto-rc on RcPtr Load/Store/Call args), so this pass is smaller than it used to be — it mainly handles liveness-driven drops. |
 | `elim_dead_allocs.rs` | Post-emission pass: kill alloc chains with no observers. |
 
 ## Lifecycle
