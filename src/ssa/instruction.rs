@@ -233,6 +233,20 @@ pub enum Inst {
     /// Replaces the `ReuseOrClone + MoveOut` pair used for the
     /// outer step of nested-FBIP patterns like list.set.
     CowMoveOut(Value, Value, usize),
+    /// dest = COW resize: get a (possibly cloned) buffer of size
+    /// `new_size_val` bytes, with src's contents copied (or
+    /// preserved in-place). For the FBIP grow patterns —
+    /// `list.append`, `str.concat`. Combines cow_prep + resize
+    /// into one primitive.
+    ///
+    /// Eval:
+    /// - If `ptr.rc == 1`: resize the buffer in place (zero-fill
+    ///   any new bytes). Return ptr.
+    /// - If `ptr.rc > 1`: clone ptr (rc_inc Ptr children), resize
+    ///   the clone, rc_dec original. Return clone.
+    ///
+    /// Treated as CONSUME of `ptr` by rc_emit — same as CowStore.
+    CowResizeDyn(Value, Value, Value),
     /// dest = aggregate of N scalar values, in register. Used by
     /// `opt::sroa` to promote a heap alloc whose result doesn't
     /// escape. `dest.ty` is `Agg(N)`; `fields.len() == N`.
@@ -269,6 +283,7 @@ impl Inst {
             | Self::CowStore(v, _, _, _)
             | Self::CowStoreDyn(v, _, _, _)
             | Self::CowMoveOut(v, _, _)
+            | Self::CowResizeDyn(v, _, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::StaticRef(v, _)
@@ -291,6 +306,7 @@ impl Inst {
             | Self::CowStore(v, _, _, _)
             | Self::CowStoreDyn(v, _, _, _)
             | Self::CowMoveOut(v, _, _)
+            | Self::CowResizeDyn(v, _, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::StaticRef(v, _)
@@ -317,6 +333,7 @@ impl Inst {
             Self::CowStore(_, ptr, _, val) => vec![*ptr, *val],
             Self::CowStoreDyn(_, ptr, idx, val) => vec![*ptr, *idx, *val],
             Self::CowMoveOut(_, ptr, _) => vec![*ptr],
+            Self::CowResizeDyn(_, ptr, size) => vec![*ptr, *size],
             Self::StaticRef(..) => vec![],
             Self::Cast(_, src) | Self::BitCast(_, src) => vec![*src],
         }
@@ -339,6 +356,7 @@ impl Inst {
             Self::CowStore(_, ptr, _, val) => { f(ptr); f(val); }
             Self::CowStoreDyn(_, ptr, idx, val) => { f(ptr); f(idx); f(val); }
             Self::CowMoveOut(_, ptr, _) => f(ptr),
+            Self::CowResizeDyn(_, ptr, size) => { f(ptr); f(size); }
             Self::Cast(_, src) | Self::BitCast(_, src) => f(src),
         }
     }

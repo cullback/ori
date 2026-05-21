@@ -253,6 +253,29 @@ main = |arg| (
 }
 
 #[test]
+fn fbip_list_append_reuses_unique_buffer() {
+    // FBIP for list.append: when xs is uniquely owned, append should
+    // resize-in-place rather than allocate a fresh buffer + copy.
+    // Same convention as fbip_list_set: alloc_count counts logical
+    // allocs (including in-place reuse via cow_resize_dyn);
+    // fresh_alloc_count counts real heap growth. Gap > 0 means reuse.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    xs = List.repeat(arg, 5)
+    ys = xs.append(99)
+    ys.get(5).unwrap()
+)";
+    let (result, heap) = run_with_heap(source, 7);
+    assert_eq!(result, Scalar::I64(99));
+    assert!(heap.alloc_count > heap.fresh_alloc_count,
+        "FBIP regression: list.append didn't reuse unique buffer ({} == {})",
+        heap.alloc_count, heap.fresh_alloc_count);
+    assert_eq!(heap.count_live_objects(), 0,
+        "leak: {} live objects at exit", heap.count_live_objects());
+}
+
+#[test]
 fn fbip_record_update_reuses_unique_base() {
     // FBIP for record update: when `p` is uniquely owned, `{ p & x: 99 }`
     // should reuse p's storage rather than allocating fresh.

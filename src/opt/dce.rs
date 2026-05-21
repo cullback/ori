@@ -104,5 +104,6 @@ pub fn is_side_effect(inst: &Inst) -> bool {
             | Inst::CowStore(..)
             | Inst::CowStoreDyn(..)
             | Inst::CowMoveOut(..)
+            | Inst::CowResizeDyn(..)
     )
 }

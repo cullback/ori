@@ -350,6 +350,15 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 cons.push(*ptr);
             }
         }
+        Inst::CowResizeDyn(_, ptr, size) => {
+            // Same as CowStore: ptr is CONSUMED.
+            if is_ptr(ptr) {
+                cons.push(*ptr);
+            }
+            if is_ptr(size) {
+                borr.push(*size);
+            }
+        }
         Inst::Cast(_, src) | Inst::BitCast(_, src) => {
             if is_ptr(src) {
                 borr.push(*src);

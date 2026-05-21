@@ -700,6 +700,20 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(target_idx))
         }
 
+        Inst::CowResizeDyn(_dest, ptr, size_val) => {
+            let Scalar::Ptr(idx) = env[ptr.id] else {
+                panic!("cow_resize_dyn on non-ptr: {:?}", env[ptr.id]);
+            };
+            let new_size = scalar_to_usize(env[size_val.id]);
+            let target_idx = cow_prep(heap, idx);
+            // Resize the (possibly cloned) buffer. Zero-fill any
+            // grown bytes.
+            if heap.objects[target_idx].data.len() < new_size {
+                heap.objects[target_idx].data.resize(new_size, 0);
+            }
+            Some(Scalar::Ptr(target_idx))
+        }
+
         Inst::CowMoveOut(_dest, ptr, off) => {
             let Scalar::Ptr(idx) = env[ptr.id] else {
                 panic!("cow_move_out on non-ptr: {:?}", env[ptr.id]);

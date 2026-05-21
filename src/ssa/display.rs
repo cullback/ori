@@ -174,6 +174,7 @@ impl fmt::Display for FmtInst<'_> {
             Inst::CowStore(d, ptr, off, val) => write!(f, "{d}: {} = cow_store {}[{off}], {}", d.ty, fmt_val(*ptr, consts), fmt_val(*val, consts)),
             Inst::CowStoreDyn(d, ptr, idx, val) => write!(f, "{d}: {} = cow_store_dyn {}[{}], {}", d.ty, fmt_val(*ptr, consts), fmt_val(*idx, consts), fmt_val(*val, consts)),
             Inst::CowMoveOut(d, ptr, off) => write!(f, "{d}: {} = cow_move_out {}[{off}]", d.ty, fmt_val(*ptr, consts)),
+            Inst::CowResizeDyn(d, ptr, n) => write!(f, "{d}: {} = cow_resize_dyn {}, {}", d.ty, fmt_val(*ptr, consts), fmt_val(*n, consts)),
             Inst::StaticRef(d, id) => write!(f, "{d}: {} = static_ref @{id}", d.ty),
             Inst::Cast(d, src) => {
                 let dt = d.ty;

@@ -235,6 +235,16 @@ impl Builder {
         v
     }
 
+    /// COW-aware resize: get a buffer of `size_val` bytes, with the
+    /// original contents preserved. In-place if unique; clones
+    /// otherwise. For `list.append` / `str.concat`-style growing.
+    pub fn cow_resize_dyn(&mut self, ptr: Value, size_val: Value) -> Value {
+        let v = self.fresh_value(ScalarType::RcPtr);
+        self.push(Inst::CowResizeDyn(v, ptr, size_val));
+        self.propagate_recent_stores(ptr, v);
+        v
+    }
+
     fn propagate_recent_stores(&mut self, src: Value, dest: Value) {
         let propagations: Vec<(usize, Value)> = self
             .recent_stores

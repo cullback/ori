@@ -40,34 +40,35 @@ pub fn emit_list_builtin_call(
     }
 }
 
-/// Lower `list.append(val)` as SSA-level primitives: load len + data
-/// pointer, alloc new data buffer, copy old elements (with per-Ptr
-/// rc_inc when the element type is `Ptr`), store the new element,
-/// alloc new header, fill it. All visible to ownership analysis —
-/// when the input list is Unique, the new header alloc pairs with
-/// the old header for in-place reuse.
-fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
+/// Lower `list.append(val)` as FBIP: in-place when both list and
+/// data are uniquely owned; copy-on-write otherwise. Same pattern
+/// as list.set — cow_move_out the data buffer from the header,
+/// resize-or-clone the data, store the new value at the old length,
+/// reinstall the data ptr, update the header's length field.
+fn emit_list_append(builder: &mut Builder, args: Vec<Value>, _elem_ty: ScalarType) -> Value {
     use crate::ssa::instruction::BinaryOp;
     let list = args[0];
     let val = args[1];
 
-    let len = builder.load(list, 0, ScalarType::U64);
-    let data = builder.load(list, 16, ScalarType::RcPtr);
+    let hdr_and_data = builder.cow_move_out(list, 16);
+    let hdr = builder.extract(hdr_and_data, 0, ScalarType::RcPtr);
+    let data = builder.extract(hdr_and_data, 1, ScalarType::RcPtr);
+
+    let len = builder.load(hdr, 0, ScalarType::U64);
     let one = builder.const_u64(1);
     let new_len = builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
 
-    // AllocDyn needs total byte count; data buffers use 8-byte stride.
     let elem_size = builder.const_u64(8);
     let new_byte_len = builder.binop(BinaryOp::Mul, new_len, elem_size, ScalarType::U64);
-    let new_data = builder.alloc_dyn(new_byte_len);
-    builder.copy_loop(new_data, data, len, elem_ty);
+    // FBIP: cow-prep + grow. In-place if data is unique.
+    let new_data = builder.cow_resize_dyn(data, new_byte_len);
+    // hdr is unique (from cow_move_out); plain store into the new slot.
     builder.store_dyn(new_data, len, val);
-
-    let new_list = builder.alloc(24);
-    builder.store(new_list, 0, new_len);
-    builder.store(new_list, 8, new_len);
-    builder.store(new_list, 16, new_data);
-    new_list
+    // Update header's len/cap and reinstall the data pointer.
+    builder.store(hdr, 0, new_len);
+    builder.store(hdr, 8, new_len);
+    builder.store(hdr, 16, new_data);
+    hdr
 }
 
 /// Lower `xs.set(idx, val)` as FBIP: in-place mutation when xs is
