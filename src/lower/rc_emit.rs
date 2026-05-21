@@ -40,7 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ssa::instruction::{BlockId, Inst, Terminator, Value};
+use crate::ssa::instruction::{BlockId, Inst, Value};
 use crate::ssa::{Function, Module};
 
 /// Run naïve RC emission on every function in `module`.
@@ -369,54 +369,4 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
         }
     }
     (cons, borr)
-}
-
-/// Test-only helper: classify terminator operands the same way.
-/// Currently unused by the emission walk — terminator operand
-/// classification is handled implicitly via the `in_term` check.
-#[allow(dead_code)]
-fn classify_terminator(term: &Terminator) -> Vec<Value> {
-    // Every Ptr operand of a terminator is consuming (Return value,
-    // edge args). Branch cond / Switch scrutinee are borrows but they
-    // can't be Ptr (they're U8/U64) — so we ignore them here.
-    let mut cons = Vec::new();
-    let is_ptr = |v: &Value| v.ty.is_heap_ptr();
-    match term {
-        Terminator::Return(v) => {
-            if is_ptr(v) {
-                cons.push(*v);
-            }
-        }
-        Terminator::Jump(edge) => {
-            for v in &edge.args {
-                if is_ptr(v) {
-                    cons.push(*v);
-                }
-            }
-        }
-        Terminator::Branch { then_edge, else_edge, .. } => {
-            for v in then_edge.args.iter().chain(else_edge.args.iter()) {
-                if is_ptr(v) {
-                    cons.push(*v);
-                }
-            }
-        }
-        Terminator::SwitchInt { arms, default, .. } => {
-            for (_, edge) in arms {
-                for v in &edge.args {
-                    if is_ptr(v) {
-                        cons.push(*v);
-                    }
-                }
-            }
-            if let Some(edge) = default {
-                for v in &edge.args {
-                    if is_ptr(v) {
-                        cons.push(*v);
-                    }
-                }
-            }
-        }
-    }
-    cons
 }

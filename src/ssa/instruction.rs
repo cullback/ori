@@ -42,10 +42,14 @@ impl fmt::Display for BlockId {
 ///
 /// `RcPtr` is a heap pointer that participates in reference counting:
 /// every owning Load increments rc, every Store releases the previous
-/// occupant, and Drop cascades through RcPtr-typed slots. `Ptr` is a
-/// raw 8-byte heap index with no automatic rc semantics — reserved
-/// for future raw-pointer use (currently unused; all heap pointers
-/// flow as `RcPtr`).
+/// occupant, and Drop cascades through RcPtr-typed slots.
+///
+/// `Ptr` is a raw 8-byte pointer with no automatic rc semantics.
+/// Reserved for the stack-promotion future: when escape analysis
+/// proves an alloc doesn't outlive its function, we want to put it
+/// on the stack and skip rc bookkeeping entirely. Currently unused
+/// — `static_promote` produces statics typed as RcPtr (which is
+/// fine because rc on the sentinel-rc statics is a runtime no-op).
 ///
 /// `Agg(n)` is an aggregate of `n` scalar values that lives in a
 /// register (i.e. in the SSA value's slot in `env`, not on the heap).
@@ -88,9 +92,7 @@ impl ScalarType {
         }
     }
 
-    /// True for any heap-pointer type (Ptr or RcPtr). Most code that
-    /// asked "is this a pointer?" today checks `== Ptr`; after the
-    /// split, it should use this so RcPtr is handled too.
+    /// True for any heap-pointer type (`Ptr` or `RcPtr`).
     pub fn is_heap_ptr(self) -> bool {
         matches!(self, Self::Ptr | Self::RcPtr)
     }
