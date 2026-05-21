@@ -91,30 +91,28 @@ fn emit_list_append(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType
 /// in-place path. When either is shared, the runtime clones —
 /// correct copy-on-write semantics.
 fn emit_list_set(builder: &mut Builder, args: Vec<Value>, _elem_ty: ScalarType) -> Value {
-    use crate::ssa::instruction::BinaryOp;
     let list = args[0];
     let idx = args[1];
     let new_val = args[2];
 
-    // Step 1: header — reuse if unique, clone otherwise.
+    // A list is two heap objects (header + data buffer). FBIP needs
+    // both layers to be unique.
+    //
+    //   1. reuse_or_clone(list, 24) — make the header unique. This
+    //      is necessary BEFORE MoveOut: if the header is shared,
+    //      MoveOut would write null into a shared header, corrupting
+    //      it for other observers.
+    //   2. move_out(new_list, 16) — extract the data ptr without
+    //      the auto-rc-on-Load bump that would otherwise trick
+    //      cow_store_dyn into thinking data is shared.
+    //   3. cow_store_dyn(data, idx, val) — FBIP write to the data
+    //      buffer: in-place if data.rc == 1, else clone.
+    //   4. store(new_list, 16, new_data) — install the (possibly
+    //      new) data buffer back into the (unique) header. Plain
+    //      Store is sufficient since new_list is provably unique.
     let new_list = builder.reuse_or_clone(list, 24);
-
-    let len = builder.load(new_list, 0, ScalarType::U64);
-    // Step 2: take the data ptr out of the header so reuse_or_clone_dyn
-    // sees rc=1 in the in-place path (slot 16's claim transfers to
-    // old_data; slot 16 is left null so it won't double-drop).
     let old_data = builder.move_out(new_list, 16, ScalarType::RcPtr);
-
-    // Step 3: data buffer — reuse if unique, clone otherwise.
-    let eight = builder.const_u64(8);
-    let byte_len = builder.binop(BinaryOp::Mul, len, eight, ScalarType::U64);
-    let new_data = builder.reuse_or_clone_dyn(old_data, byte_len);
-
-    // Step 4: replace slot `idx`. StoreDyn auto-releases the previous
-    // occupant and auto-claims new_val (for RcPtr-typed slots).
-    builder.store_dyn(new_data, idx, new_val);
-
-    // Step 5: install the new buffer in the header.
+    let new_data = builder.cow_store_dyn(old_data, idx, new_val);
     builder.store(new_list, 16, new_data);
     new_list
 }
