@@ -101,12 +101,17 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let body_step = self.builder.add_block_param(body_block, step_ty);
         let done = self.builder.create_block();
         let done_param = self.builder.add_block_param(done, acc_ty);
+        // Thread `step` into `done` as an unused block param so rc_emit
+        // releases the closure env on loop exit. Without this, callers
+        // whose closure captures something would leak the env when the
+        // loop terminates.
+        let _done_step = self.builder.add_block_param(done, step_ty);
 
         self.builder.jump(header, vec![start, init_val, end, step_val]);
 
         self.builder.switch_to(header);
         let cmp = self.builder.binop(BinaryOp::Eq, i_param, end_param, ScalarType::U8);
-        self.builder.branch(cmp, done, vec![acc_param], body_block, vec![i_param, acc_param, end_param, step_param]);
+        self.builder.branch(cmp, done, vec![acc_param, step_param], body_block, vec![i_param, acc_param, end_param, step_param]);
 
         self.builder.switch_to(body_block);
         // The element IS the counter — no list load needed.
@@ -136,7 +141,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let break_tag = self.decls.constructors["Break"].tag_index;
             let break_val = self.builder.const_u64(break_tag);
             let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
-            self.builder.branch(is_break, done, vec![payload], header, vec![next_i, payload, body_end, body_step]);
+            self.builder.branch(is_break, done, vec![payload, body_step], header, vec![next_i, payload, body_end, body_step]);
         } else {
             self.builder.jump(header, vec![next_i, result, body_end, body_step]);
         }
@@ -173,6 +178,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let body_step = self.builder.add_block_param(body_block, step_ty);
         let done = self.builder.create_block();
         let done_param = self.builder.add_block_param(done, acc_ty);
+        // Thread `data` and `step` into `done` as unused block params so
+        // rc_emit releases them on loop exit. Without this, callers
+        // whose closure captures something would leak the env when the
+        // loop terminates.
+        let _done_data = self.builder.add_block_param(done, ScalarType::RcPtr);
+        let _done_step = self.builder.add_block_param(done, step_ty);
 
         let zero = self.builder.const_u64(0);
         self.builder.jump(header, vec![zero, init_val, len_val, data_ptr, step_val]);
@@ -182,7 +193,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .builder
             .binop(BinaryOp::Eq, i_param, len_param, ScalarType::U8);
         self.builder
-            .branch(cmp, done, vec![acc_param], body_block, vec![i_param, acc_param, len_param, data_param, step_param]);
+            .branch(cmp, done, vec![acc_param, data_param, step_param], body_block, vec![i_param, acc_param, len_param, data_param, step_param]);
 
         self.builder.switch_to(body_block);
         let elem = self.builder.load_dyn(body_data, body_i, ScalarType::RcPtr);
@@ -216,7 +227,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 .builder
                 .binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
             self.builder
-                .branch(is_break, done, vec![payload], header, vec![next_i, payload, body_len, body_data, body_step]);
+                .branch(is_break, done, vec![payload, body_data, body_step], header, vec![next_i, payload, body_len, body_data, body_step]);
         } else {
             self.builder.jump(header, vec![next_i, result, body_len, body_data, body_step]);
         }

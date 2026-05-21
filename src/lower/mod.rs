@@ -50,7 +50,6 @@
 //!   wouldn't surface as test failures — it'd surface as bugs in
 //!   passes that trust the documented invariant.
 
-pub mod list_ops;
 pub mod boolean;
 pub mod call;
 pub mod constructor;
@@ -261,17 +260,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     fn expr_repr_type(&self, expr: &Expr<'src>) -> ScalarType {
         self.repr_type(&expr.ty)
     }
-
-    /// Element scalar type of a `List(T)`, or `None` if `ty` isn't a
-    /// list. Strings — `List(U8)` — give `U8`.
-    fn list_elem_scalar_type(&self, ty: &Type) -> Option<ScalarType> {
-        let unwrapped = self.resolve_transparent(ty);
-        match &unwrapped {
-            Type::App(name, args) if name == "List" => args.first().map(|t| self.scalar_type(t)),
-            _ => None,
-        }
-    }
-
 
     /// Emit a constant for a fieldless tag index using the appropriate discriminant type.
     fn const_tag(&mut self, tag_index: u64, disc_ty: ScalarType) -> Value {

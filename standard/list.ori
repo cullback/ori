@@ -34,13 +34,6 @@ List := {}.(
     # ```
     append : List(a), a -> List(a)
 
-    # Returns a new list with the elements in reverse order.
-    # ```ori
-    # expect [1, 2, 3].reverse() == [3, 2, 1]
-    # expect [].reverse().len() == 0
-    # ```
-    reverse : List(a) -> List(a)
-
     # Reduces the list from left to right, threading an accumulator
     # through each element.
     # ```ori
@@ -48,19 +41,6 @@ List := {}.(
     # expect [].walk(100, |acc, x| acc + x) == 100
     # ```
     walk : List(a), b, (b, a -> b) -> b
-
-    # Returns a sub-list starting at index `start` with `count` elements.
-    # ```ori
-    # expect [10, 20, 30, 40, 50].sublist(1, 3) == [20, 30, 40]
-    # ```
-    sublist : List(a), U64, U64 -> List(a)
-
-    # Creates a list of `n` copies of `val`.
-    # ```ori
-    # expect List.repeat(7, 3) == [7, 7, 7]
-    # expect List.repeat(0, 0).len() == 0
-    # ```
-    repeat : a, U64 -> List(a)
 
     # Returns a list of integers from `start` (inclusive) to `end` (exclusive).
     # ```ori
@@ -89,6 +69,34 @@ List := {}.(
     # ```
     first : List(a) -> Result(a, [Empty])
     first = |xs| if xs.is_empty() then Err(Empty) else Ok(xs.get(0).unwrap())
+
+    # Returns a new list with the elements in reverse order.
+    # ```ori
+    # expect [1, 2, 3].reverse() == [3, 2, 1]
+    # expect [].reverse().len() == 0
+    # ```
+    reverse : List(a) -> List(a)
+    reverse = |xs| (
+        n = xs.len()
+        List.range(0, n).walk([], |acc, i| acc.append(xs.get(n - 1 - i).unwrap()))
+    )
+
+    # Returns a sub-list starting at index `start` with `count` elements.
+    # ```ori
+    # expect [10, 20, 30, 40, 50].sublist(1, 3) == [20, 30, 40]
+    # ```
+    sublist : List(a), U64, U64 -> List(a)
+    sublist = |xs, start, count|
+        List.range(start, start + count).walk([], |acc, i| acc.append(xs.get(i).unwrap()))
+
+    # Creates a list of `n` copies of `val`.
+    # ```ori
+    # expect List.repeat(7, 3) == [7, 7, 7]
+    # expect List.repeat(0, 0).len() == 0
+    # ```
+    repeat : a, U64 -> List(a)
+    repeat = |val, count|
+        List.range(0, count).walk([], |acc, _| acc.append(val))
 
     # Element-wise equality. Two lists are equal if they have the same
     # length and every element at the same index compares equal.
