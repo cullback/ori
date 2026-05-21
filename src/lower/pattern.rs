@@ -10,9 +10,7 @@
 //! `lower_destructure` handles `let (a, b) = pair` and
 //! `let { x, y } = record` bindings.
 
-use std::collections::HashMap;
-
-use crate::ast::{self, BinOp, Expr, ExprKind};
+use crate::ast::{self, Expr, ExprKind};
 use crate::ssa::Value;
 use crate::ssa::instruction::{BinaryOp, BlockId, ScalarType};
 use crate::types::engine::Type;

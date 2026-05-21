@@ -63,8 +63,6 @@ pub mod ssa_form;
 pub mod pattern;
 pub mod walk;
 
-pub(crate) use walk::{classify_walk, walk_apply_name};
-
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Stmt};
@@ -73,7 +71,7 @@ use crate::passes::mono::Monomorphized;
 use crate::error::CompileError;
 use crate::ssa::Module;
 use crate::ssa::builder::Builder;
-use crate::ssa::instruction::{BinaryOp, BlockId, ScalarType, Value};
+use crate::ssa::instruction::{BinaryOp, ScalarType, Value};
 use crate::symbol::{FieldInterner, SymbolId, SymbolTable};
 use crate::types::engine::{Type, TypeVar};
 use crate::types::infer::InferResult;

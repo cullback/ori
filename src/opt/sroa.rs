@@ -221,8 +221,6 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
             }
         }
     }
-    let _ = name_unused();
-
     // Fixpoint on block param propagation.
     let predecessors = build_predecessors(func);
     loop {
@@ -422,8 +420,6 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
         new_return,
     }
 }
-
-fn name_unused() {}
 
 /// Verify every call site to `callee_name` uses the call result in
 /// ways compatible with the result being `Agg`-typed: Load (becomes

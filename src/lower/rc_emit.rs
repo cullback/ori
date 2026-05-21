@@ -40,7 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ssa::instruction::{BlockId, Inst, ScalarType, Terminator, Value};
+use crate::ssa::instruction::{BlockId, Inst, Terminator, Value};
 use crate::ssa::{Function, Module};
 
 /// Run naïve RC emission on every function in `module`.

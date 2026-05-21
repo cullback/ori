@@ -4,7 +4,6 @@
 //! /`>`/`>=` on numeric types.
 
 use crate::ast::{Expr, ExprKind};
-use crate::passes::decl_info::method_key;
 use crate::ssa::Value;
 use crate::ssa::instruction::{BinaryOp, ScalarType};
 use crate::symbol::SymbolId;

@@ -46,7 +46,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ssa::instruction::{BlockEdge, BlockId, Inst, Terminator, Value};
+use crate::ssa::instruction::{BlockEdge, BlockId, Inst, ScalarType, Terminator, Value};
 use crate::ssa::{Block, Function, Module};
 
 /// Maximum number of instructions in a callee for it to be inlined.
@@ -276,6 +276,23 @@ fn perform_inline(
         &mut caller.blocks.get_mut(&block_id).unwrap().terminator,
         new_terminator,
     );
+
+    // Compensate for the removed Call's auto-rc-on-Call semantics.
+    // Eval would have rc_inc'd each RcPtr arg before transferring
+    // control to the callee, minting a fresh owning ref for the
+    // callee's local. The callee body's rc accounting was emitted
+    // assuming that bump. Splice in an RcInc for each RcPtr arg now
+    // that the Call (and its implicit bump) is gone.
+    for arg in &call_args {
+        if arg.ty == ScalarType::RcPtr {
+            caller
+                .blocks
+                .get_mut(&block_id)
+                .unwrap()
+                .insts
+                .push(Inst::RcInc(*arg));
+        }
+    }
 
     for inst in &callee_entry.insts {
         let remapped = remap_inst(inst, &val_map);

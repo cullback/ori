@@ -86,7 +86,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         args: &[Value],
         ctx_ty: Option<&Type>,
     ) -> Value {
-        let (tag_index, max_fields, field_types) = self.con_layout(name, ctx_ty);
+        let (tag_index, max_fields, _field_types) = self.con_layout(name, ctx_ty);
         // Fieldless tag union: represent as a bare discriminant integer.
         if max_fields == 0 {
             let disc_ty = ctx_ty

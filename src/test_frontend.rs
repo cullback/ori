@@ -2984,7 +2984,11 @@ main = |arg| (
 /// SSA module. Use this helper to assert specific specialization
 /// names appear in the output.
 fn compile_to_ssa(source: &str) -> crate::ssa::Module {
-    compile(source).0
+    // Stop at lower so mono / lambda-specialize / etc. produce
+    // their distinctive output without opt (especially `inline`)
+    // collapsing it. Tests that introspect SSA structure rely on
+    // this to inspect the front-end's choices directly.
+    compile_until_lower(source).0
 }
 
 fn ssa_has_function(ssa: &crate::ssa::Module, name: &str) -> bool {

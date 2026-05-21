@@ -77,17 +77,16 @@ fn elim_in_block(block: &mut crate::ssa::Block) {
                     mark(&mut escaped, size);
                 }
             }
-            Inst::Store(p, _, val) => {
-                // `p` as a Store target is OK — that's a write *into*
-                // the candidate's slot, exactly what we're trying to
-                // detect. But `val` flowing into a Store is the value
-                // escaping into someone else's slot.
+            Inst::Store(_p, _, val) => {
+                // `_p` as a Store target is OK — that's a write
+                // *into* the candidate's slot, exactly what we're
+                // trying to detect. But `val` flowing into a Store
+                // is the value escaping into someone else's slot.
                 mark(&mut escaped, val);
             }
-            Inst::StoreDyn(p, idx, val) => {
+            Inst::StoreDyn(_p, idx, val) => {
                 mark(&mut escaped, idx);
                 mark(&mut escaped, val);
-                let _ = p;
             }
             Inst::Load(_, p, _) | Inst::LoadDyn(_, p, _) | Inst::MoveOut(_, p, _) => {
                 // Reading from a candidate observes its data — escape.

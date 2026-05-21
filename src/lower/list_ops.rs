@@ -11,7 +11,7 @@
 
 use crate::ssa::Value;
 use crate::ssa::builder::Builder;
-use crate::ssa::instruction::{BinaryOp, ScalarType};
+use crate::ssa::instruction::ScalarType;
 
 pub fn emit_list_builtin_call(
     builder: &mut Builder,
@@ -211,7 +211,7 @@ fn emit_list_sublist(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarTyp
 /// Lower `List.repeat(val, count)`: builds a length-`count` list with
 /// every slot equal to `val`. For `Ptr` elements, emits an `RcInc`
 /// per iteration so the heap refcounts match the eventual cascade.
-fn emit_list_repeat(builder: &mut Builder, args: Vec<Value>, elem_ty: ScalarType) -> Value {
+fn emit_list_repeat(builder: &mut Builder, args: Vec<Value>, _elem_ty: ScalarType) -> Value {
     use crate::ssa::instruction::BinaryOp;
     let val = args[0];
     let count = args[1];
