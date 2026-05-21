@@ -63,18 +63,29 @@ pub fn run(func: &mut Function) -> bool {
                 let Some(next) = redirects.get(&next_target) else {
                     break;
                 };
+                // Composition direction: `indices`/`args` apply at A→B;
+                // `indices2`/`args2` apply at B→C. The composed mapping
+                // produces C's args. Length = C's arity = indices2.len()
+                // for ParamForward, args2.len() for FixedArgs.
                 current = match (&current, next) {
                     (Redirect::ParamForward(_, indices), Redirect::ParamForward(t2, indices2)) => {
-                        Redirect::ParamForward(*t2, indices.iter().map(|&i| indices2[i]).collect())
+                        // C's k-th arg = B's params[indices2[k]] = A's
+                        // params[indices[indices2[k]]].
+                        Redirect::ParamForward(*t2, indices2.iter().map(|&i| indices[i]).collect())
                     }
-                    (Redirect::ParamForward(_, indices), Redirect::FixedArgs(t2, args2)) => {
-                        Redirect::FixedArgs(*t2, indices.iter().map(|&i| args2[i]).collect())
+                    (Redirect::ParamForward(_, _), Redirect::FixedArgs(t2, args2)) => {
+                        // B replaces all args with args2 — A's mapping
+                        // is irrelevant past B.
+                        Redirect::FixedArgs(*t2, args2.clone())
                     }
                     (Redirect::FixedArgs(_, args), Redirect::ParamForward(t2, indices2)) => {
+                        // B's params receive A's fixed args; C's k-th
+                        // arg = B's params[indices2[k]] = args[indices2[k]].
                         Redirect::FixedArgs(*t2, indices2.iter().map(|&i| args[i]).collect())
                     }
-                    (Redirect::FixedArgs(_, args), Redirect::FixedArgs(t2, _)) => {
-                        Redirect::FixedArgs(*t2, args.clone())
+                    (Redirect::FixedArgs(_, _), Redirect::FixedArgs(t2, args2)) => {
+                        // B replaces with args2.
+                        Redirect::FixedArgs(*t2, args2.clone())
                     }
                 };
             }
