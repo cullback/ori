@@ -222,6 +222,31 @@ impl Builder {
         v
     }
 
+    /// COW-aware byte-write: returns the (possibly new) Ptr where
+    /// the modified data lives. If `ptr` is uniquely owned, mutates
+    /// in place. Otherwise clones and modifies the clone. See
+    /// `Inst::CowStore` for full semantics.
+    pub fn cow_store(&mut self, ptr: Value, offset: usize, val: Value) -> Value {
+        let v = self.fresh_value(ScalarType::RcPtr);
+        self.push(Inst::CowStore(v, ptr, offset, val));
+        // The new value carries the same logical contents as ptr,
+        // minus the modified slot. Propagate forwarding entries
+        // and override the modified slot.
+        self.propagate_recent_stores(ptr, v);
+        self.recent_stores.insert((v, offset), val);
+        v
+    }
+
+    pub fn cow_store_dyn(&mut self, ptr: Value, idx: Value, val: Value) -> Value {
+        let v = self.fresh_value(ScalarType::RcPtr);
+        self.push(Inst::CowStoreDyn(v, ptr, idx, val));
+        // Dynamic index — can't track per-slot forwarding.
+        // Propagate the source's known stores at OTHER offsets;
+        // the dynamic-index slot is invalidated by this op.
+        self.propagate_recent_stores(ptr, v);
+        v
+    }
+
     fn propagate_recent_stores(&mut self, src: Value, dest: Value) {
         let propagations: Vec<(usize, Value)> = self
             .recent_stores

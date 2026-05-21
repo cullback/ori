@@ -340,6 +340,16 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                         escaped = true;
                     }
                 }
+                Inst::CowStore(_, ptr, _, val) => {
+                    if in_flow(ptr) || in_flow(val) {
+                        escaped = true;
+                    }
+                }
+                Inst::CowStoreDyn(_, ptr, idx, val) => {
+                    if in_flow(ptr) || in_flow(idx) || in_flow(val) {
+                        escaped = true;
+                    }
+                }
                 Inst::BinOp(_, _, l, r) => {
                     if in_flow(l) || in_flow(r) {
                         escaped = true;
@@ -460,6 +470,11 @@ fn call_sites_safe(module: &Module, callee_name: &str) -> bool {
                     }
                     Inst::ReuseOrClone(_, src, _) | Inst::ReuseOrCloneDyn(_, src, _) => {
                         if call_results.contains(src) {
+                            return false;
+                        }
+                    }
+                    Inst::CowStore(_, ptr, _, val) | Inst::CowStoreDyn(_, ptr, _, val) => {
+                        if call_results.contains(ptr) || call_results.contains(val) {
                             return false;
                         }
                     }

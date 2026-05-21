@@ -209,6 +209,32 @@ pub enum Inst {
     /// the byte count at runtime. Used for data buffer reuse where
     /// list length isn't statically known.
     ReuseOrCloneDyn(Value, Value, Value),
+    /// dest = COW write: byte-write `val` into `ptr[off]`, with FBIP
+    /// semantics built into the runtime. If `ptr.rc == 1`, mutates
+    /// in place and returns `ptr`. If `ptr.rc > 1`, clones `ptr`'s
+    /// contents into a fresh heap object, writes `val` into the
+    /// clone, rc_dec's the original, and returns the clone.
+    ///
+    /// Auto-rc on the write itself: like `Store`, releases the old
+    /// occupant of the slot (rc_dec if RcPtr) and claims the new
+    /// val (rc_inc if RcPtr).
+    ///
+    /// Replaces the `ReuseOrClone + Store` two-step for any
+    /// single-level "modify through ptr" pattern. Lower can emit
+    /// this as the default for `RecordUpdate` and similar; opt can
+    /// promote to plain `Store` when uniqueness is statically
+    /// provable.
+    ///
+    /// Treated as CONSUME of `ptr` by rc_emit — the original's
+    /// ownership transfers (either reused as the result, or
+    /// rc_dec'd after cloning). If the caller still needs `ptr`
+    /// after this op, rc_emit emits an `rc_inc(ptr)` before, which
+    /// makes the rc check see >1 and forces the clone path —
+    /// preserving the original for the later use.
+    CowStore(Value, Value, usize, Value),
+    /// Dynamic-index version of `CowStore`. The store goes to
+    /// slot `idx_val` (8-byte stride, like `StoreDyn`).
+    CowStoreDyn(Value, Value, Value, Value),
     /// dest = aggregate of N scalar values, in register. Used by
     /// `opt::sroa` to promote a heap alloc whose result doesn't
     /// escape. `dest.ty` is `Agg(N)`; `fields.len() == N`.
@@ -245,6 +271,8 @@ impl Inst {
             | Self::MoveOut(v, _, _)
             | Self::ReuseOrClone(v, _, _)
             | Self::ReuseOrCloneDyn(v, _, _)
+            | Self::CowStore(v, _, _, _)
+            | Self::CowStoreDyn(v, _, _, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::StaticRef(v, _)
@@ -267,6 +295,8 @@ impl Inst {
             | Self::MoveOut(v, _, _)
             | Self::ReuseOrClone(v, _, _)
             | Self::ReuseOrCloneDyn(v, _, _)
+            | Self::CowStore(v, _, _, _)
+            | Self::CowStoreDyn(v, _, _, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
             | Self::StaticRef(v, _)
@@ -292,6 +322,8 @@ impl Inst {
             Self::Pack(_, fields) => fields.clone(),
             Self::Extract(_, agg, _) => vec![*agg],
             Self::ReuseOrClone(_, src, _) => vec![*src],
+            Self::CowStore(_, ptr, _, val) => vec![*ptr, *val],
+            Self::CowStoreDyn(_, ptr, idx, val) => vec![*ptr, *idx, *val],
             Self::ReuseOrCloneDyn(_, src, size) => vec![*src, *size],
             Self::StaticRef(..) => vec![],
             Self::Cast(_, src) | Self::BitCast(_, src) => vec![*src],
@@ -314,6 +346,8 @@ impl Inst {
             Self::Pack(_, fields) => fields.iter_mut().for_each(&mut f),
             Self::Extract(_, agg, _) => f(agg),
             Self::ReuseOrClone(_, src, _) => f(src),
+            Self::CowStore(_, ptr, _, val) => { f(ptr); f(val); }
+            Self::CowStoreDyn(_, ptr, idx, val) => { f(ptr); f(idx); f(val); }
             Self::ReuseOrCloneDyn(_, src, size) => { f(src); f(size); }
             Self::Cast(_, src) | Self::BitCast(_, src) => f(src),
         }

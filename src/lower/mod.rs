@@ -678,13 +678,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
 
             ExprKind::RecordUpdate { base, updates } => {
-                // FBIP: rather than allocate a fresh record and copy all
-                // fields from base, use `reuse_or_clone` so unchanged
-                // fields are preserved in-place when base is uniquely
-                // owned, and the runtime falls back to a clone (with
-                // rc_inc on Ptr children) otherwise. Only the actually
-                // updated slots need explicit stores; auto-rc-on-Store
-                // releases the old occupants.
+                // Emit a chain of CowStores. Each CowStore: if its
+                // input ptr is uniquely owned at runtime, mutates
+                // in place; otherwise clones-then-writes. FBIP is
+                // intrinsic to the runtime semantic — lower doesn't
+                // think about it. The first CowStore may clone (if
+                // base is shared); subsequent ones see a unique
+                // intermediate result.
                 let base_val = self.lower_expr(base);
                 let all_fields: Vec<String> = match &base.ty {
                     Type::Record { fields, .. } => {
@@ -699,11 +699,9 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     .iter()
                     .map(|(sym, e)| (self.fields.get(*sym).to_owned(), e))
                     .collect();
-                let num_fields = all_fields.len();
-                // Evaluate update expressions FIRST — they may reference
-                // base (e.g. `{ p & x: p.x + 1 }`), and we need base's
-                // owning slot alive while doing so. rc_emit will insert
-                // an RcInc before reuse_or_clone if needed.
+                // Evaluate update expressions first so they can
+                // reference base. (rc_emit will rc_inc base if it's
+                // used later than the CowStore consumes it.)
                 let new_vals: Vec<(usize, Value)> = all_fields
                     .iter()
                     .enumerate()
@@ -711,11 +709,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                         update_map.get(field_name).map(|expr| (slot, self.lower_expr(expr)))
                     })
                     .collect();
-                let new_record = self.builder.reuse_or_clone(base_val, num_fields * 8);
+                let mut p = base_val;
                 for (slot, val) in new_vals {
-                    self.builder.store(new_record, slot * 8, val);
+                    p = self.builder.cow_store(p, slot * 8, val);
                 }
-                new_record
+                p
             }
 
             ExprKind::ListLit(elems) => {

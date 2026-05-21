@@ -342,6 +342,30 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 borr.push(*size);
             }
         }
+        Inst::CowStore(_, ptr, _, val) => {
+            // ptr is CONSUMED: either reused as the result (in-place
+            // path) or rc_dec'd inside the eval (clone path). Caller
+            // gets a new SSA value for the result. If caller wants
+            // to use ptr after, rc_emit inserts rc_inc(ptr) before,
+            // which makes the rc check see >1 and forces clone path.
+            if is_ptr(ptr) {
+                cons.push(*ptr);
+            }
+            // val: borrow (auto-rc on the cow_write inside).
+            if is_ptr(val) {
+                borr.push(*val);
+            }
+        }
+        Inst::CowStoreDyn(_, ptr, idx, val) => {
+            if is_ptr(ptr) {
+                cons.push(*ptr);
+            }
+            for v in [idx, val] {
+                if is_ptr(v) {
+                    borr.push(*v);
+                }
+            }
+        }
         Inst::Cast(_, src) | Inst::BitCast(_, src) => {
             if is_ptr(src) {
                 borr.push(*src);

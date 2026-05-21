@@ -691,6 +691,28 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(reuse_or_clone(heap, env[src.id], size)))
         }
 
+        Inst::CowStore(_dest, ptr, off, val) => {
+            let Scalar::Ptr(idx) = env[ptr.id] else {
+                panic!("cow_store on non-ptr: {:?}", env[ptr.id]);
+            };
+            let new_val = env[val.id];
+            let target_idx = cow_prep(heap, idx);
+            cow_write(heap, target_idx, *off, new_val, val.ty);
+            Some(Scalar::Ptr(target_idx))
+        }
+
+        Inst::CowStoreDyn(_dest, ptr, idx_val, val) => {
+            let Scalar::Ptr(idx) = env[ptr.id] else {
+                panic!("cow_store_dyn on non-ptr: {:?}", env[ptr.id]);
+            };
+            let slot = scalar_to_usize(env[idx_val.id]);
+            let off = slot * 8;
+            let new_val = env[val.id];
+            let target_idx = cow_prep(heap, idx);
+            cow_write(heap, target_idx, off, new_val, val.ty);
+            Some(Scalar::Ptr(target_idx))
+        }
+
         Inst::Pack(_dest, fields) => {
             let vals: Vec<Scalar> = fields.iter().map(|f| env[f.id]).collect();
             Some(Scalar::Agg(heap.alloc_agg(vals)))
@@ -830,6 +852,53 @@ fn reuse_or_clone(heap: &mut Heap, src: Scalar, num_bytes: usize) -> usize {
     heap.objects[new_idx].data.resize(num_bytes, 0);
     heap.rc_dec(idx);
     new_idx
+}
+
+/// CowStore prep: given an idx whose contents we want to mutate,
+/// return the idx to actually write into (same idx if unique;
+/// clone otherwise). Mirrors `reuse_or_clone` but without the
+/// `num_bytes` parameter — CowStore doesn't resize.
+fn cow_prep(heap: &mut Heap, idx: usize) -> usize {
+    if idx == 0 {
+        panic!("cow_store on null ptr");
+    }
+    if heap.objects[idx].rc == RC_STATIC {
+        // Static — can't mutate in place. Clone, no rc_dec.
+        return heap.clone_object(idx);
+    }
+    if heap.objects[idx].rc == 1 {
+        // Unique. Mutate in place. Count as a logical alloc (the
+        // user's expression semantically produced a new value) but
+        // not a fresh one — same metric convention as
+        // `reuse_or_clone` in-place.
+        heap.alloc_count += 1;
+        let live = heap.alloc_count - heap.free_count;
+        if live > heap.peak_live {
+            heap.peak_live = live;
+        }
+        return idx;
+    }
+    // Shared. Clone (rc_inc children), drop original.
+    let new_idx = heap.clone_object(idx);
+    heap.rc_dec(idx);
+    new_idx
+}
+
+/// CowStore write: like `Inst::Store`'s auto-rc-balance behavior.
+/// Releases old occupant if it was RcPtr; claims new val if RcPtr;
+/// writes the bytes.
+fn cow_write(heap: &mut Heap, idx: usize, off: usize, new_val: Scalar, val_ty: ScalarType) {
+    if val_ty == ScalarType::RcPtr {
+        if let Scalar::Ptr(c) = new_val {
+            heap.rc_inc(c);
+        }
+    }
+    if heap.lookup_type(idx, off) == Some(ScalarType::RcPtr) {
+        if let Scalar::Ptr(prev) = heap.load(idx, off, ScalarType::RcPtr) {
+            heap.rc_dec(prev);
+        }
+    }
+    heap.store(idx, off, new_val);
 }
 
 fn scalar_to_usize(s: Scalar) -> usize {

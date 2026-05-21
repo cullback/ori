@@ -102,6 +102,15 @@ fn elim_in_block(block: &mut crate::ssa::Block) {
                 mark(&mut escaped, src);
                 mark(&mut escaped, size);
             }
+            Inst::CowStore(_, ptr, _, val) => {
+                mark(&mut escaped, ptr);
+                mark(&mut escaped, val);
+            }
+            Inst::CowStoreDyn(_, ptr, idx, val) => {
+                mark(&mut escaped, ptr);
+                mark(&mut escaped, idx);
+                mark(&mut escaped, val);
+            }
             Inst::BinOp(_, _, l, r) => {
                 mark(&mut escaped, l);
                 mark(&mut escaped, r);
