@@ -1,0 +1,13 @@
+# Build "abcdef" + i.to_str() per iteration; sum first byte of each.
+# Skips the MD5 work entirely, so isolates string concat / to_str / to_utf8.
+bench : U64 -> U8
+bench = |n| (
+    prefix = "abcdef".to_utf8()
+    List.range(0, n).walk(0, |acc, i| (
+        buf = prefix.concat(i.to_str().to_utf8())
+        acc + buf.get(0).unwrap()
+    ))
+)
+
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| Ok(U64.from_u8(bench(5000)).to_str())

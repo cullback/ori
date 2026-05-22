@@ -1,0 +1,9 @@
+# Just List.range + walk over 0..N, summing low byte of i. Isolates
+# the range/walk machinery — no strings, no hashing, no allocation.
+bench : U64 -> U8
+bench = |n| (
+    List.range(0, n).walk(0, |acc, i| acc + i.to_u8())
+)
+
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| Ok(U64.from_u8(bench(5000)).to_str())

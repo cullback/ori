@@ -1,0 +1,15 @@
+import md5
+
+# Hash the same fixed 7-byte buffer N times. Isolates MD5 work
+# from per-iteration string-building / list allocation.
+bench : U64 -> U8
+bench = |n| (
+    buf = "abcdef0".to_utf8()
+    List.range(0, n).walk(0, |acc, _| (
+        hsh = md5_hash(buf)
+        acc + hsh.get(0).unwrap()
+    ))
+)
+
+main : List(Str), Str -> Result(Str, Str)
+main = |args, input| Ok(U64.from_u8(bench(5000)).to_str())
