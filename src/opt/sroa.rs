@@ -87,34 +87,62 @@ pub fn run(module: &mut Module) {
     // Phase B.5: verify each candidate sig change is safe — every
     // call site in the module must use the result in a way that
     // tolerates an Agg-typed return (Load + rc_dec patterns only,
-    // no escape into Call args / Stores / etc).
-    let candidates: HashMap<String, Vec<ScalarType>> = per_func
+    // no escape into Call args / Stores / etc). Param changes are
+    // verified separately: each caller's arg-feeding Value must be
+    // promoted in the caller's own analysis with matching shape.
+    let return_candidates: HashMap<String, Vec<ScalarType>> = per_func
         .iter()
         .filter_map(|(n, a)| a.new_return.as_ref().map(|tys| (n.clone(), tys.clone())))
         .collect();
-    let sig_changes: HashMap<String, Vec<ScalarType>> = candidates
+    let return_sigs: HashMap<String, Vec<ScalarType>> = return_candidates
         .into_iter()
-        .filter(|(callee_name, _)| call_sites_safe(module, callee_name))
+        // __main is the program entry — its return type is the ABI to
+        // the Rust-side eval driver, which expects an RcPtr Result.
+        // Keep that signature stable even when the Result alloc is
+        // otherwise promotable.
+        .filter(|(name, _)| name != "__main")
+        .filter(|(callee_name, tys)| call_sites_safe(module, &per_func, callee_name, tys.len()))
+        .collect();
+    let param_candidates: HashMap<String, HashMap<usize, Vec<ScalarType>>> = per_func
+        .iter()
+        .filter(|(_, a)| !a.new_params.is_empty())
+        .map(|(n, a)| (n.clone(), a.new_params.clone()))
+        .collect();
+    let param_sigs: HashMap<String, HashMap<usize, Vec<ScalarType>>> = param_candidates
+        .into_iter()
+        .filter(|(name, _)| name != "__main")
+        .filter(|(callee_name, new_params)| {
+            arg_promotion_call_sites_safe(module, &per_func, callee_name, new_params)
+        })
         .collect();
 
-    // If we rejected ANY sig change, the analyses of functions that
-    // assumed those callees would be sig-changed are now incorrect.
-    // Demote the rejected functions' own analyses too — clear their
-    // promotable so we don't rewrite their bodies.
+    // If we rejected a candidate, the function's own body still
+    // expects to be rewritten assuming the promotion — that would
+    // produce inconsistent SSA. Demote rejected functions: clear
+    // their promotable so the body stays as-is.
     for (name, a) in per_func.iter_mut() {
-        if a.new_return.is_some() && !sig_changes.contains_key(name) {
+        let return_rejected = a.new_return.is_some() && !return_sigs.contains_key(name);
+        let params_rejected = !a.new_params.is_empty() && !param_sigs.contains_key(name);
+        if return_rejected || params_rejected {
             a.promotable.clear();
             a.alloc_layouts.clear();
             a.new_return = None;
+            a.new_params.clear();
         }
     }
     for (name, func) in module.functions.iter_mut() {
         let a = &per_func[name];
-        rewrite(func, a, &sig_changes);
+        rewrite(func, a, &return_sigs);
         // If this function's own return type changed, update the
         // Function::return_type to match.
         if let Some(tys) = &a.new_return {
             func.return_type = ScalarType::Agg(tys.len());
+        }
+        // Same for its own params.
+        for (i, tys) in &a.new_params {
+            if let Some(p) = func.params.get_mut(*i) {
+                p.ty = ScalarType::Agg(tys.len());
+            }
         }
     }
 }
@@ -131,6 +159,11 @@ struct FuncAnalysis {
     /// If the function's Return value is promotable, the new return
     /// layout (per-field scalar types).
     new_return: Option<Vec<ScalarType>>,
+    /// For each function parameter index that should be promoted from
+    /// `RcPtr` to `Agg(n)`, the per-field scalar types (inferred from
+    /// the Loads on that param inside this function). Empty when no
+    /// params change.
+    new_params: HashMap<usize, Vec<ScalarType>>,
 }
 
 fn analyze(func: &crate::ssa::Function) -> FuncAnalysis {
@@ -220,6 +253,24 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                 }
             }
         }
+    }
+    // Seed function params that are loaded at a dense {0, 8, …} run
+    // of offsets — tentative candidates for promotion from RcPtr to
+    // Agg(n). If the escape check later catches an unsafe use of the
+    // param, the whole flow group collapses and the param stays as-is.
+    let param_load_offsets = collect_param_load_offsets(func);
+    for p in &func.params {
+        if p.ty != ScalarType::RcPtr {
+            continue;
+        }
+        let Some(offsets) = param_load_offsets.get(p) else {
+            continue;
+        };
+        let Some(n) = dense_shape(offsets) else {
+            continue;
+        };
+        shape.insert(*p, n);
+        flow.insert(*p, Vec::new());
     }
     // Fixpoint on block param propagation.
     let predecessors = build_predecessors(func);
@@ -317,12 +368,25 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                 Inst::RcInc(_) | Inst::RcDec(_) => {
                     // OK on flow Values.
                 }
-                Inst::Call(_, _, args) => {
+                Inst::Call(_, callee_name, args) => {
                     // A flow Value passed as Call arg escapes —
-                    // unless we'd also rewrite the callee's
-                    // signature, which we don't (yet).
-                    if args.iter().any(in_flow) {
-                        escaped = true;
+                    // unless the callee has that arg position
+                    // promoted to a matching Agg shape (cross-fn
+                    // arg SROA), in which case the call site will
+                    // pass the Pack value instead of an alloc.
+                    for (i, arg) in args.iter().enumerate() {
+                        if !in_flow(arg) {
+                            continue;
+                        }
+                        let accepted = callees
+                            .get(callee_name)
+                            .and_then(|a| a.new_params.get(&i))
+                            .map(|tys| tys.len())
+                            == shape.get(arg).copied();
+                        if !accepted {
+                            escaped = true;
+                            break;
+                        }
                     }
                 }
                 Inst::CowStore(_, ptr, _, val) => {
@@ -371,6 +435,7 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                 Inst::Const(..) | Inst::StaticRef(..) => {}
             }
         }
+        if escaped { break; }
         // Terminator: Returns are fine (we'll promote return type).
         // For Jump/Branch/SwitchInt edge args, the destination block
         // param at the matching position must also be in flow — if a
@@ -397,6 +462,7 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
             promotable: HashMap::new(),
             alloc_layouts: HashMap::new(),
             new_return: None,
+            new_params: HashMap::new(),
         };
     }
 
@@ -419,22 +485,48 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
         }
     }
 
+    // For each function param that survived the escape check, infer
+    // its new Agg layout from the types of the Loads on it.
+    let mut new_params: HashMap<usize, Vec<ScalarType>> = HashMap::new();
+    for (i, p) in func.params.iter().enumerate() {
+        let Some(&n) = shape.get(p) else { continue; };
+        // Only count params seeded from offsets (not ones that happen
+        // to share a shape map with an alloc — which can't happen for
+        // function params, but stay defensive).
+        if p.ty != ScalarType::RcPtr {
+            continue;
+        }
+        let tys = field_types_from_loads(func, *p, n);
+        new_params.insert(i, tys);
+    }
+
     FuncAnalysis {
         promotable: shape,
         alloc_layouts,
         new_return,
+        new_params,
     }
 }
 
 /// Verify every call site to `callee_name` uses the call result in
-/// ways compatible with the result being `Agg`-typed: Load (becomes
-/// Extract), RcInc/RcDec (dropped). Anything else means we can't
-/// safely change the callee's signature.
-fn call_sites_safe(module: &Module, callee_name: &str) -> bool {
-    for func in module.functions.values() {
+/// ways compatible with the result being `Agg(expected_shape)`-typed.
+/// Direct safe uses: `Load` (becomes `Extract`), `RcInc`/`RcDec`
+/// (dropped). Cross-block: the call result threading into a block
+/// param is fine as long as the destination param is already in the
+/// caller's promotable set with matching shape (cross-fn return SROA
+/// then chains into the caller's intra-fn block-param SROA). Likewise
+/// for Return when the caller itself has a matching `new_return`.
+fn call_sites_safe(
+    module: &Module,
+    per_func: &HashMap<String, FuncAnalysis>,
+    callee_name: &str,
+    expected_shape: usize,
+) -> bool {
+    for (caller_name, caller_func) in &module.functions {
+        let caller_a = &per_func[caller_name];
         // Collect call-result Values for this callee.
         let mut call_results: HashSet<Value> = HashSet::new();
-        for block in func.blocks.values() {
+        for block in caller_func.blocks.values() {
             for inst in &block.insts {
                 if let Inst::Call(d, n, _) = inst {
                     if n == callee_name {
@@ -446,9 +538,7 @@ fn call_sites_safe(module: &Module, callee_name: &str) -> bool {
         if call_results.is_empty() {
             continue;
         }
-        // Walk uses. Anything other than Load (with this as ptr),
-        // RcInc, RcDec is unsafe.
-        for block in func.blocks.values() {
+        for block in caller_func.blocks.values() {
             for inst in &block.insts {
                 match inst {
                     Inst::Load(_, p, _) if call_results.contains(p) => {} // ok
@@ -506,17 +596,140 @@ fn call_sites_safe(module: &Module, callee_name: &str) -> bool {
                     _ => {}
                 }
             }
-            // Terminator operands: passing as edge arg or returning.
-            // For now treat both as unsafe (we'd need to track through
-            // block params, which is non-trivial cross-function).
-            for op in block.terminator.operands() {
-                if call_results.contains(&op) {
-                    return false;
+            // Edge args: OK if the destination block param is itself
+            // promoted to a matching shape in the caller's analysis —
+            // the rewrite will retype the param and the threading
+            // chain together. Otherwise (param not promoted) the
+            // rewrite would feed an Agg into an RcPtr param.
+            for edge in block.terminator.successors() {
+                let dest_block = &caller_func.blocks[&edge.target];
+                for (pi, arg) in edge.args.iter().enumerate() {
+                    if !call_results.contains(arg) {
+                        continue;
+                    }
+                    let Some(dest_param) = dest_block.params.get(pi) else {
+                        return false;
+                    };
+                    let Some(&n) = caller_a.promotable.get(dest_param) else {
+                        return false;
+                    };
+                    if n != expected_shape {
+                        return false;
+                    }
+                }
+            }
+            // Return: OK only if caller's own return is also being
+            // promoted to a matching shape.
+            if let Terminator::Return(v) = &block.terminator {
+                if call_results.contains(v) {
+                    let Some(tys) = &caller_a.new_return else {
+                        return false;
+                    };
+                    if tys.len() != expected_shape {
+                        return false;
+                    }
                 }
             }
         }
     }
     true
+}
+
+/// Verify that every call site to `callee_name` can supply an Agg
+/// value at each newly-promoted arg position: the arg-feeding Value
+/// must be in the caller's own promotable set with the expected
+/// shape. If any call site can't, we'd be passing an RcPtr alloc
+/// where the callee now expects an Agg — so reject the promotion.
+fn arg_promotion_call_sites_safe(
+    module: &Module,
+    per_func: &HashMap<String, FuncAnalysis>,
+    callee_name: &str,
+    new_params: &HashMap<usize, Vec<ScalarType>>,
+) -> bool {
+    for (caller_name, caller_func) in &module.functions {
+        let caller_a = &per_func[caller_name];
+        for block in caller_func.blocks.values() {
+            for inst in &block.insts {
+                let Inst::Call(_, n, args) = inst else { continue; };
+                if n != callee_name {
+                    continue;
+                }
+                for (i, expected_tys) in new_params {
+                    let Some(arg) = args.get(*i) else { return false; };
+                    let Some(&shape_n) = caller_a.promotable.get(arg) else {
+                        return false;
+                    };
+                    if shape_n != expected_tys.len() {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// For each rcptr-typed function param, collect the byte offsets at
+/// which it's `Load`ed inside the function body. Other uses (rc
+/// traffic, edge args, etc.) are ignored here — they're checked by
+/// the escape pass later.
+fn collect_param_load_offsets(func: &crate::ssa::Function) -> HashMap<Value, Vec<usize>> {
+    let params: HashSet<Value> = func.params.iter().copied().collect();
+    let mut offsets: HashMap<Value, Vec<usize>> = HashMap::new();
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Load(_, p, off) = inst {
+                if params.contains(p) {
+                    offsets.entry(*p).or_default().push(*off);
+                }
+            }
+        }
+    }
+    offsets
+}
+
+/// Given a multiset of byte offsets, return `Some(n)` if they form a
+/// dense run `{0, 8, …, (n-1)*8}` (each offset appearing at least
+/// once), else `None`. Sparse / non-stride-8 layouts can't be packed
+/// into an Agg.
+fn dense_shape(offsets: &[usize]) -> Option<usize> {
+    if offsets.is_empty() {
+        return None;
+    }
+    let max = *offsets.iter().max().unwrap();
+    if max % 8 != 0 {
+        return None;
+    }
+    let n = max / 8 + 1;
+    let seen: HashSet<usize> = offsets.iter().copied().collect();
+    for i in 0..n {
+        if !seen.contains(&(i * 8)) {
+            return None;
+        }
+    }
+    Some(n)
+}
+
+/// Field types for a promoted function param: for each slot index,
+/// the scalar type of any `Load` on that param at offset `slot*8`.
+/// All loads at the same offset agree on type by SSA construction.
+fn field_types_from_loads(func: &crate::ssa::Function, p: Value, n: usize) -> Vec<ScalarType> {
+    let mut tys: Vec<Option<ScalarType>> = vec![None; n];
+    for block in func.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Load(d, ptr, off) = inst {
+                if *ptr == p {
+                    let slot = off / 8;
+                    if slot < n {
+                        tys[slot] = Some(d.ty);
+                    }
+                }
+            }
+        }
+    }
+    tys.into_iter()
+        .map(|t| t.unwrap_or(ScalarType::I64))
+        .collect()
 }
 
 fn field_types_for(
