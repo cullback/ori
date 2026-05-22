@@ -139,6 +139,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             // after monomorphization).
             self.resolve_method_at_lower_time(method, &receiver.ty)
         };
+        // Peephole: `<list>.get(idx).unwrap()` lowers to a bounds-
+        // checked load with a __crash on the err arm — no Result alloc
+        // or destructuring. Without this fusion, SROA can't promote
+        // the alloc because the err-side static `Err(OutOfBounds)`
+        // doesn't unify with the ok-side fresh alloc at the merge.
+        if let Some(v) = self.try_fuse_list_get_unwrap(method, receiver, args, outer) {
+            return v;
+        }
         // Deforestation: check for List.range(a,b).walk(...) BEFORE
         // lowering the receiver to avoid materializing the range list.
         if let Some(walk) = classify_walk(&mangled) {
@@ -492,6 +500,68 @@ fn emit_list_range(builder: &mut Builder, args: &[Value]) -> Value {
     builder.store(list, 8, count);
     builder.store(list, 16, data);
     list
+}
+
+impl<'a, 'src> LowerCtx<'a, 'src> {
+    /// Match the AST `<list>.get(idx).unwrap()` and emit it as a fused
+    /// bounds-check + indexed load with crash-on-out-of-bounds. Returns
+    /// `None` and leaves emission untouched if the shape doesn't match,
+    /// so the caller can fall through to the normal lowering.
+    fn try_fuse_list_get_unwrap(
+        &mut self,
+        method: &str,
+        receiver: &Expr<'src>,
+        args: &[Expr<'src>],
+        outer: &Expr<'src>,
+    ) -> Option<Value> {
+        if method != "unwrap" || !args.is_empty() {
+            return None;
+        }
+        let ExprKind::MethodCall {
+            receiver: inner_recv,
+            method: inner_method,
+            args: get_args,
+            ..
+        } = &receiver.kind
+        else {
+            return None;
+        };
+        if *inner_method != "get" || get_args.len() != 1 {
+            return None;
+        }
+        let is_list = matches!(&inner_recv.ty, Type::App(name, _) if name == "List");
+        if !is_list {
+            return None;
+        }
+
+        let elem_ty = self.expr_scalar_type(outer);
+        let list = self.lower_expr(inner_recv);
+        let idx = self.lower_expr(&get_args[0]);
+
+        let len = self.builder.load(list, 0, ScalarType::U64);
+        let in_bounds = self.builder.binop(BinaryOp::Lt, idx, len, ScalarType::U8);
+
+        let ok_block = self.builder.create_block();
+        let err_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, elem_ty);
+
+        self.builder
+            .branch(in_bounds, ok_block, vec![], err_block, vec![]);
+
+        self.builder.switch_to(ok_block);
+        let data = self.builder.load(list, 16, ScalarType::RcPtr);
+        let elem = self.builder.load_dyn(data, idx, elem_ty);
+        self.builder.jump(merge, vec![elem]);
+
+        self.builder.switch_to(err_block);
+        let msg = self.lower_str_literal(b"called unwrap on Err");
+        let crash_val = self.builder.call("__crash", vec![msg], elem_ty);
+        self.builder.jump(merge, vec![crash_val]);
+
+        self.builder.switch_to(merge);
+        Some(merge_param)
+    }
 }
 
 /// Emit a bounds-checked List.get that returns `Result(a, [OutOfBounds])`.
