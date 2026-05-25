@@ -266,15 +266,33 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
     }
     // Also: allocs that have NO stores aren't promotable.
     alloc_layouts.retain(|_, v| !v.is_empty());
-    // Reject allocs whose stored fields include any RcPtr value. The
-    // SROA rewrite folds `alloc + Store(ptr_val)` into `Pack`, losing
-    // the implicit `rc_inc` that Store performs on RcPtr stores. The
-    // matching `rc_dec` later in the body stays, so the ptr would
-    // underflow and be freed prematurely. A correct fix would require
-    // either Pack/Extract to carry rc semantics or SROA to identify
-    // and drop the corresponding rc_decs — both substantial. For now
-    // only promote allocs with non-pointer fields.
-    alloc_layouts.retain(|_, fields| fields.iter().all(|f| f.ty != ScalarType::RcPtr));
+    // For allocs whose fields include any RcPtr, we need to emit
+    // per-field `rc_dec` at the position where the original alloc's
+    // rc_dec would have cascade-freed its children. When the alloc's
+    // Pack value flows only within its defining block, that rc_dec
+    // is on the alloc Value itself and the rewrite can look up the
+    // field Values from `alloc_layouts`. But when the Pack value
+    // crosses a block boundary (becoming a new block-param Value),
+    // the rc_dec lands on the block param — for which we have only a
+    // shape and not the original field Values. Synthesizing Extracts
+    // there to dec each field would work but needs fresh-Value
+    // plumbing we don't have today. Conservative: skip the promotion
+    // in that case.
+    let alloc_crosses_block: HashSet<Value> = {
+        let mut crossing: HashSet<Value> = HashSet::new();
+        for block in func.blocks.values() {
+            for op in block.terminator.operands() {
+                if alloc_layouts.contains_key(&op) {
+                    crossing.insert(op);
+                }
+            }
+        }
+        crossing
+    };
+    alloc_layouts.retain(|alloc, fields| {
+        let has_rcptr = fields.iter().any(|f| f.ty == ScalarType::RcPtr);
+        !has_rcptr || !alloc_crosses_block.contains(alloc)
+    });
 
     // Step 2: track values that are part of the flow. Start with the
     // Allocs themselves. Then propagate through block params: a block
@@ -972,6 +990,25 @@ fn rewrite(
                 }
             }
         }
+        // RC traffic for promoted Aggs with RcPtr fields.
+        //
+        // The lower stage emits `Store(alloc, off, ptr_val)` with an
+        // implicit `rc_inc(ptr_val)` (target gains a claim); the
+        // alloc's eventual `rc_dec` cascades to dec the held ptrs.
+        // After SROA folds alloc+Stores into Pack, none of that
+        // happens automatically. We re-emit it explicitly:
+        //
+        //   Pack with RcPtr field      → emit `rc_inc(field)`
+        //   Extract producing RcPtr    → emit `rc_inc(dest)`
+        //   rc_dec on promoted value   → emit `rc_dec(field)` per
+        //                                RcPtr field of the layout
+        //   rc_inc on promoted value   → emit `rc_inc(field)` per
+        //                                RcPtr field of the layout
+        //
+        // The Pack rc_inc balances the local's rc_dec on the stored
+        // value; the Extract rc_inc balances the consumer's rc_dec
+        // on the loaded value; the per-field decs at the promoted
+        // value's death replace the cascade-free.
         for (i, inst) in block.insts.iter().enumerate() {
             match inst {
                 Inst::Alloc(v, _) if a.alloc_layouts.contains_key(v) => {
@@ -983,6 +1020,13 @@ fn rewrite(
                         let mut packed = *p;
                         packed.ty = ScalarType::Agg(fields.len());
                         new_insts.push(Inst::Pack(packed, fields.clone()));
+                        // Pack-owns claim on each RcPtr field —
+                        // emit the rc_inc the original Store did.
+                        for field in fields {
+                            if field.ty == ScalarType::RcPtr {
+                                new_insts.push(Inst::RcInc(*field));
+                            }
+                        }
                     }
                     // Earlier stores into the alloc: drop.
                 }
@@ -994,10 +1038,40 @@ fn rewrite(
                     let mut agg = *p;
                     agg.ty = ScalarType::Agg(n);
                     new_insts.push(Inst::Extract(*d, agg, idx));
+                    // Mirror Load's auto-rc-inc on RcPtr extractions.
+                    if d.ty == ScalarType::RcPtr {
+                        new_insts.push(Inst::RcInc(*d));
+                    }
                 }
-                Inst::RcInc(v) | Inst::RcDec(v) if a.promotable.contains_key(v) || call_result_agg.contains_key(v) => {
-                    // Drop rc traffic on promoted aggs and call
-                    // results whose callee was sig-changed.
+                Inst::RcInc(v) if a.promotable.contains_key(v) || call_result_agg.contains_key(v) => {
+                    // The promoted Agg held N field claims via its
+                    // Pack/Extract rc_incs. An rc_inc on the Agg
+                    // means "I'm sharing this Agg" — equivalent to
+                    // rc_inc'ing each RcPtr field. (Non-RcPtr fields
+                    // don't carry rc, so nothing to do for them.)
+                    if let Some(fields) = a.alloc_layouts.get(v) {
+                        for field in fields {
+                            if field.ty == ScalarType::RcPtr {
+                                new_insts.push(Inst::RcInc(*field));
+                            }
+                        }
+                    }
+                    // For call_result_agg without local layout info,
+                    // we'd need to Extract each field first. Skip
+                    // for now — callees returning Aggs with RcPtr
+                    // fields are excluded by the param/return
+                    // promotion verifier in practice.
+                }
+                Inst::RcDec(v) if a.promotable.contains_key(v) || call_result_agg.contains_key(v) => {
+                    // Symmetric to RcInc above: cascade-dec the
+                    // RcPtr fields.
+                    if let Some(fields) = a.alloc_layouts.get(v) {
+                        for field in fields {
+                            if field.ty == ScalarType::RcPtr {
+                                new_insts.push(Inst::RcDec(*field));
+                            }
+                        }
+                    }
                 }
                 Inst::Call(d, callee, args) => {
                     // If the callee's return type changed, the call
@@ -1017,3 +1091,4 @@ fn rewrite(
         block.insts = new_insts;
     }
 }
+
