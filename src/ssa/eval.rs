@@ -659,15 +659,40 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
         }
 
         Inst::RcInc(ptr) => {
-            if let Scalar::Ptr(idx) = env[ptr.id] {
-                heap.rc_inc(idx);
+            match env[ptr.id] {
+                Scalar::Ptr(idx) => heap.rc_inc(idx),
+                // RcInc on an Agg-typed value cascades through its
+                // RcPtr fields — the Agg "owns" claims on each Ptr
+                // field (placed there by Pack / cow_move_out / etc.),
+                // and sharing the Agg means sharing those claims.
+                Scalar::Agg(handle) => {
+                    let len = heap.aggs[handle].len();
+                    for i in 0..len {
+                        if let Scalar::Ptr(child) = heap.aggs[handle][i] {
+                            heap.rc_inc(child);
+                        }
+                    }
+                }
+                _ => {}
             }
             None
         }
 
         Inst::RcDec(ptr) => {
-            if let Scalar::Ptr(idx) = env[ptr.id] {
-                heap.rc_dec(idx);
+            match env[ptr.id] {
+                Scalar::Ptr(idx) => heap.rc_dec(idx),
+                // RcDec on an Agg-typed value cascade-rc_decs its
+                // RcPtr fields, mirroring the cascade-free that
+                // happens when a heap alloc with Ptr children dies.
+                Scalar::Agg(handle) => {
+                    let len = heap.aggs[handle].len();
+                    for i in 0..len {
+                        if let Scalar::Ptr(child) = heap.aggs[handle][i] {
+                            heap.rc_dec(child);
+                        }
+                    }
+                }
+                _ => {}
             }
             None
         }
@@ -735,14 +760,34 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
 
         Inst::Pack(_dest, fields) => {
             let vals: Vec<Scalar> = fields.iter().map(|f| env[f.id]).collect();
+            // Pack owns claims on its RcPtr fields, same as a heap
+            // alloc whose Stores would have auto-rc-inc'd. The
+            // matching releases happen at Extract (mints a fresh
+            // claim) and at RcDec on the Agg (cascade-frees the
+            // owned claims).
+            for (val, decl) in vals.iter().zip(fields.iter()) {
+                if decl.ty == ScalarType::RcPtr {
+                    if let Scalar::Ptr(child) = val {
+                        heap.rc_inc(*child);
+                    }
+                }
+            }
             Some(Scalar::Agg(heap.alloc_agg(vals)))
         }
 
-        Inst::Extract(_dest, agg, idx) => {
+        Inst::Extract(dest, agg, idx) => {
             let Scalar::Agg(handle) = env[agg.id] else {
                 panic!("extract from non-agg: {:?}", env[agg.id]);
             };
-            Some(heap.aggs[handle][*idx])
+            let val = heap.aggs[handle][*idx];
+            // Mint a fresh claim for the consumer, mirroring Load's
+            // auto-rc-inc on RcPtr reads.
+            if dest.ty == ScalarType::RcPtr {
+                if let Scalar::Ptr(child) = val {
+                    heap.rc_inc(child);
+                }
+            }
+            Some(val)
         }
 
         Inst::Cast(dest, src) => {

@@ -40,8 +40,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ssa::instruction::{BlockId, Inst, Value};
+use crate::ssa::instruction::{BlockId, Inst, ScalarType, Value};
 use crate::ssa::{Function, Module};
+
+/// Values whose lifetime rc_emit must track: heap pointers (`Ptr`,
+/// `RcPtr`) and aggregates (`Agg(_)`). Aggs carry rc on behalf of
+/// their RcPtr fields — `Pack` auto-rc-incs them, `RcDec` on an Agg
+/// cascade-rc_decs them, so an Agg-typed local needs an end-of-life
+/// `rc_dec` just like a Ptr-typed one.
+fn needs_rc_emit(ty: ScalarType) -> bool {
+    matches!(ty, ScalarType::Ptr | ScalarType::RcPtr | ScalarType::Agg(_))
+}
 
 /// Run naïve RC emission on every function in `module`.
 pub fn run(module: &mut Module) {
@@ -69,7 +78,7 @@ fn compute_func_param_liveness(func: &Function) -> HashMap<Value, HashMap<BlockI
     let block_ids: Vec<BlockId> = func.blocks.keys().copied().collect();
 
     for p in &func.params {
-        if !p.ty.is_heap_ptr() {
+        if !needs_rc_emit(p.ty) {
             continue;
         }
 
@@ -139,12 +148,12 @@ fn emit_block(
     let mut defined: Vec<(Value, bool)> = block
         .params
         .iter()
-        .filter(|p| p.ty.is_heap_ptr())
+        .filter(|p| needs_rc_emit(p.ty))
         .map(|p| (*p, false))
         .collect();
     for inst in &block.insts {
         if let Some(d) = inst.dest() {
-            if d.ty.is_heap_ptr() {
+            if needs_rc_emit(d.ty) {
                 defined.push((d, false));
             }
         }
@@ -154,7 +163,7 @@ fn emit_block(
     // needed somewhere reachable from this block, OR they're directly
     // used in this block.
     for p in &func.params {
-        if !p.ty.is_heap_ptr() {
+        if !needs_rc_emit(p.ty) {
             continue;
         }
         let used_here = block.insts.iter().any(|i| i.operands().contains(p))
@@ -253,7 +262,7 @@ enum Kind {
 fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
     let mut cons = Vec::new();
     let mut borr = Vec::new();
-    let is_ptr = |v: &Value| v.ty.is_heap_ptr();
+    let is_ptr = |v: &Value| needs_rc_emit(v.ty);
     match inst {
         Inst::Const(..) | Inst::Alloc(..) | Inst::StaticRef(..) => {}
         Inst::AllocDyn(_, size) => {
