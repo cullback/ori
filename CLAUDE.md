@@ -30,14 +30,16 @@ optimization but as the runtime model.
 
 ## SSA representation
 
-- Two value kinds: **`RcPtr`** (heap object) and **`Agg(N)`** (register-
-  resident tuple; `Pack` and static-index-only `Extract`). Lists and
-  Strs are always `RcPtr` — two-tier `[len, cap, data_ptr]` header plus
-  a dynamic data buffer. `Str = List(U8)`; there is no separate string
-  primitive.
-- Interpreter at `src/ssa/eval.rs`. Heap objects in `heap.objects[idx]`
-  (rc-tracked, slot-reused via `free_list`). Aggs in `heap.aggs[handle]`
-  (no rc, no lifecycle).
+- Two value kinds: **`RcPtr`** (heap object, rc-tracked) and **`Agg(N)`**
+  (register-resident tuple; `Pack` and static-index-only `Extract`).
+  Lists and Strs are always `RcPtr` — two-tier `[len, cap, data_ptr]`
+  header plus a dynamic data buffer. `Str = List(U8)`; there is no
+  separate string primitive.
+- **Aggs have no rc and no lifecycle.** Pack copies values in; Extract
+  copies them out. Nothing automatically releases the RcPtr fields an
+  Agg holds when it goes out of scope — opt passes that promote an
+  RcPtr-holding alloc to Pack must explicitly emit the rc_decs the
+  vanished alloc-free would have cascaded.
 - `__main` is the ABI boundary to the Rust eval driver. Its return
   type must stay `RcPtr` (a `Result`); sig-changing optimizations must
   exclude it.
