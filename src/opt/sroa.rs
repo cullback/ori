@@ -84,52 +84,99 @@ pub fn run(module: &mut Module) {
         }
     }
 
-    // Phase B.5: verify each candidate sig change is safe — every
-    // call site in the module must use the result in a way that
-    // tolerates an Agg-typed return (Load + rc_dec patterns only,
-    // no escape into Call args / Stores / etc). Param changes are
-    // verified separately: each caller's arg-feeding Value must be
-    // promoted in the caller's own analysis with matching shape.
-    let return_candidates: HashMap<String, Vec<ScalarType>> = per_func
-        .iter()
-        .filter_map(|(n, a)| a.new_return.as_ref().map(|tys| (n.clone(), tys.clone())))
-        .collect();
-    let return_sigs: HashMap<String, Vec<ScalarType>> = return_candidates
-        .into_iter()
-        // __main is the program entry — its return type is the ABI to
-        // the Rust-side eval driver, which expects an RcPtr Result.
-        // Keep that signature stable even when the Result alloc is
-        // otherwise promotable.
-        .filter(|(name, _)| name != "__main")
-        .filter(|(callee_name, tys)| call_sites_safe(module, &per_func, callee_name, tys.len()))
-        .collect();
-    let param_candidates: HashMap<String, HashMap<usize, Vec<ScalarType>>> = per_func
-        .iter()
-        .filter(|(_, a)| !a.new_params.is_empty())
-        .map(|(n, a)| (n.clone(), a.new_params.clone()))
-        .collect();
-    let param_sigs: HashMap<String, HashMap<usize, Vec<ScalarType>>> = param_candidates
-        .into_iter()
-        .filter(|(name, _)| name != "__main")
-        .filter(|(callee_name, new_params)| {
-            arg_promotion_call_sites_safe(module, &per_func, callee_name, new_params)
-        })
-        .collect();
-
-    // If we rejected a candidate, the function's own body still
-    // expects to be rewritten assuming the promotion — that would
-    // produce inconsistent SSA. Demote rejected functions: clear
-    // their promotable so the body stays as-is.
-    for (name, a) in per_func.iter_mut() {
-        let return_rejected = a.new_return.is_some() && !return_sigs.contains_key(name);
-        let params_rejected = !a.new_params.is_empty() && !param_sigs.contains_key(name);
-        if return_rejected || params_rejected {
-            a.promotable.clear();
-            a.alloc_layouts.clear();
-            a.new_return = None;
-            a.new_params.clear();
+    // Phase B.5: verify each candidate sig change is safe and demote
+    // rejections. Verification is iterative — rejecting one callee's
+    // sig invalidates callers' analyses (their flow set assumed the
+    // callee accepted Agg args). We maintain monotonic `denied` sets:
+    // once a function's return/param promotion is rejected, force it
+    // empty for the rest of the run so the fixpoint can't restore it.
+    // Each round only adds to denied, bounded by function count.
+    let mut denied_r: HashSet<String> = HashSet::new();
+    let mut denied_p: HashSet<String> = HashSet::new();
+    // `_param_sigs` is computed for the verification loop's
+    // termination check (no new denials) but the actual rewrite uses
+    // `promotable` and the per-function `new_params` recorded in
+    // `per_func` after the fixpoint converges.
+    let (return_sigs, _param_sigs) = loop {
+        // Re-run the Phase B fixpoint with denied sigs zeroed out.
+        loop {
+            let mut changed = false;
+            for (name, func) in &module.functions {
+                let mut a = analyze_with_callee_sigs(func, &per_func);
+                if denied_r.contains(name) {
+                    a.new_return = None;
+                }
+                if denied_p.contains(name) {
+                    a.new_params.clear();
+                }
+                if a != per_func[name] {
+                    per_func.insert(name.clone(), a);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
         }
-    }
+
+        let return_sigs: HashMap<String, Vec<ScalarType>> = per_func
+            .iter()
+            .filter_map(|(n, a)| a.new_return.as_ref().map(|tys| (n.clone(), tys.clone())))
+            // __main is the program entry — its return type is the ABI
+            // to the Rust-side eval driver, which expects an RcPtr
+            // Result. Keep that signature stable even when the Result
+            // alloc is otherwise promotable.
+            .filter(|(name, _)| name != "__main")
+            .filter(|(name, tys)| call_sites_safe(module, &per_func, name, tys.len()))
+            .collect();
+        let param_sigs: HashMap<String, HashMap<usize, Vec<ScalarType>>> = per_func
+            .iter()
+            .filter(|(_, a)| !a.new_params.is_empty())
+            .map(|(n, a)| (n.clone(), a.new_params.clone()))
+            .filter(|(name, _)| name != "__main")
+            .filter(|(name, params)| {
+                arg_promotion_call_sites_safe(module, &per_func, name, params)
+            })
+            .collect();
+
+        // Any candidate we just rejected gets added to denied; force
+        // the next round of fixpoint to keep it empty.
+        let mut grew = false;
+        let mut new_denied_r: Vec<String> = Vec::new();
+        let mut new_denied_p: Vec<String> = Vec::new();
+        for (name, a) in per_func.iter() {
+            if a.new_return.is_some()
+                && !return_sigs.contains_key(name)
+                && !denied_r.contains(name)
+            {
+                new_denied_r.push(name.clone());
+                grew = true;
+            }
+            if !a.new_params.is_empty()
+                && !param_sigs.contains_key(name)
+                && !denied_p.contains(name)
+            {
+                new_denied_p.push(name.clone());
+                grew = true;
+            }
+        }
+        denied_r.extend(new_denied_r);
+        denied_p.extend(new_denied_p);
+        if !grew {
+            // Final pass: a rejected function's body still has stale
+            // promotable / alloc_layouts entries from its own analysis
+            // — clear them so the body isn't rewritten.
+            for (name, a) in per_func.iter_mut() {
+                if denied_r.contains(name) || denied_p.contains(name) {
+                    a.promotable.clear();
+                    a.alloc_layouts.clear();
+                    a.new_return = None;
+                    a.new_params.clear();
+                }
+            }
+            break (return_sigs, param_sigs);
+        }
+    };
     for (name, func) in module.functions.iter_mut() {
         let a = &per_func[name];
         rewrite(func, a, &return_sigs);
@@ -219,6 +266,15 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
     }
     // Also: allocs that have NO stores aren't promotable.
     alloc_layouts.retain(|_, v| !v.is_empty());
+    // Reject allocs whose stored fields include any RcPtr value. The
+    // SROA rewrite folds `alloc + Store(ptr_val)` into `Pack`, losing
+    // the implicit `rc_inc` that Store performs on RcPtr stores. The
+    // matching `rc_dec` later in the body stays, so the ptr would
+    // underflow and be freed prematurely. A correct fix would require
+    // either Pack/Extract to carry rc semantics or SROA to identify
+    // and drop the corresponding rc_decs — both substantial. For now
+    // only promote allocs with non-pointer fields.
+    alloc_layouts.retain(|_, fields| fields.iter().all(|f| f.ty != ScalarType::RcPtr));
 
     // Step 2: track values that are part of the flow. Start with the
     // Allocs themselves. Then propagate through block params: a block
@@ -330,15 +386,47 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
         }
     }
 
-    // Step 3: check uses. Any flow Value used unsafely → mark the
-    // whole "flow group" as escaped. A flow group is the transitive
-    // closure linked by shared block params.
+    // Step 3: connected-component escape analysis.
     //
-    // For simplicity: if ANY flow Value escapes, demote ALL flow
-    // Values to non-promotable. This is conservative but correct.
-    // (A precise impl would do connected components.)
-    let mut escaped = false;
+    // Group flow values into components that must succeed-or-fail
+    // together: when a block param P is in flow, it's the *same*
+    // component as every pred-edge-arg flowing into P, because at
+    // rewrite time they all need to agree on the new Agg type. Then
+    // any unsafe use of a value escapes its whole component, but
+    // leaves other components untouched. This lets us promote `v_a`
+    // even when an unrelated `v_b` in the same function is stranded
+    // — without it, the analysis was whole-function: one bad alloc
+    // (e.g. a buffer threaded through the outer walk loop) would
+    // poison every other promotable alloc in that function.
+    let mut uf = UnionFind::new();
+    for v in shape.keys() {
+        uf.add(*v);
+    }
+    for (&bid, block) in &func.blocks {
+        for (pi, param) in block.params.iter().enumerate() {
+            if !shape.contains_key(param) {
+                continue;
+            }
+            let Some(preds) = predecessors.get(&bid) else { continue };
+            for pred_bid in preds {
+                let pred_block = &func.blocks[pred_bid];
+                for edge_args in edges_to(pred_block, bid) {
+                    let Some(arg) = edge_args.get(pi) else { continue };
+                    if shape.contains_key(arg) {
+                        uf.union(*param, *arg);
+                    }
+                }
+            }
+        }
+    }
+
     let in_flow = |v: &Value| shape.contains_key(v);
+    let mut escaped: HashSet<Value> = HashSet::new();
+    let escape = |v: &Value, uf: &mut UnionFind, set: &mut HashSet<Value>| {
+        if in_flow(v) {
+            set.insert(uf.find(*v));
+        }
+    };
     for block in func.blocks.values() {
         for inst in &block.insts {
             match inst {
@@ -346,24 +434,20 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                 Inst::Store(_, _, val) => {
                     // Storing a flow Value as the *val* into another
                     // object means it escapes onto the heap.
-                    if in_flow(val) {
-                        escaped = true;
-                    }
+                    escape(val, &mut uf, &mut escaped);
                 }
                 Inst::StoreDyn(p, idx, val) => {
-                    if in_flow(p) || in_flow(idx) || in_flow(val) {
-                        escaped = true;
-                    }
+                    escape(p, &mut uf, &mut escaped);
+                    escape(idx, &mut uf, &mut escaped);
+                    escape(val, &mut uf, &mut escaped);
                 }
                 Inst::Load(_, _, _) => {
                     // Loads on a flow Value are fine — will become
-                    // Extract. (And we already know the load's source
-                    // type is an alloc.)
+                    // Extract.
                 }
                 Inst::LoadDyn(_, p, idx) => {
-                    if in_flow(p) || in_flow(idx) {
-                        escaped = true;
-                    }
+                    escape(p, &mut uf, &mut escaped);
+                    escape(idx, &mut uf, &mut escaped);
                 }
                 Inst::RcInc(_) | Inst::RcDec(_) => {
                     // OK on flow Values.
@@ -384,87 +468,85 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
                             .map(|tys| tys.len())
                             == shape.get(arg).copied();
                         if !accepted {
-                            escaped = true;
-                            break;
+                            escape(arg, &mut uf, &mut escaped);
                         }
                     }
                 }
                 Inst::CowStore(_, ptr, _, val) => {
-                    if in_flow(ptr) || in_flow(val) {
-                        escaped = true;
-                    }
+                    escape(ptr, &mut uf, &mut escaped);
+                    escape(val, &mut uf, &mut escaped);
                 }
                 Inst::CowStoreDyn(_, ptr, idx, val) => {
-                    if in_flow(ptr) || in_flow(idx) || in_flow(val) {
-                        escaped = true;
-                    }
+                    escape(ptr, &mut uf, &mut escaped);
+                    escape(idx, &mut uf, &mut escaped);
+                    escape(val, &mut uf, &mut escaped);
                 }
                 Inst::CowMoveOut(_, ptr, _) => {
-                    if in_flow(ptr) {
-                        escaped = true;
-                    }
+                    escape(ptr, &mut uf, &mut escaped);
                 }
                 Inst::CowResizeDyn(_, ptr, size) => {
-                    if in_flow(ptr) || in_flow(size) {
-                        escaped = true;
-                    }
+                    escape(ptr, &mut uf, &mut escaped);
+                    escape(size, &mut uf, &mut escaped);
                 }
                 Inst::BinOp(_, _, l, r) => {
-                    if in_flow(l) || in_flow(r) {
-                        escaped = true;
-                    }
+                    escape(l, &mut uf, &mut escaped);
+                    escape(r, &mut uf, &mut escaped);
                 }
                 Inst::Cast(_, src) | Inst::BitCast(_, src) => {
-                    if in_flow(src) {
-                        escaped = true;
-                    }
+                    escape(src, &mut uf, &mut escaped);
                 }
                 Inst::Pack(_, fields) => {
-                    if fields.iter().any(in_flow) {
-                        escaped = true;
+                    for f in fields {
+                        escape(f, &mut uf, &mut escaped);
                     }
                 }
                 Inst::Extract(_, agg, _) => {
-                    if in_flow(agg) {
-                        // Extract on an alloc-derived flow Value is
-                        // weird — it'd already be an Agg. Treat as
-                        // escape to be safe.
-                        escaped = true;
-                    }
+                    // Extract on an alloc-derived flow Value is
+                    // weird — it'd already be an Agg. Treat as
+                    // escape to be safe.
+                    escape(agg, &mut uf, &mut escaped);
                 }
                 Inst::Const(..) | Inst::StaticRef(..) => {}
             }
         }
-        if escaped { break; }
-        // Terminator: Returns are fine (we'll promote return type).
-        // For Jump/Branch/SwitchInt edge args, the destination block
-        // param at the matching position must also be in flow — if a
-        // promoted Value lands on an RcPtr-typed param, there's a
-        // type mismatch and we have to back out.
+        // Terminator edge args: if the arg is in flow but the dest
+        // block param isn't, there's no way to align types — at
+        // rewrite the arg becomes Agg while the param stays RcPtr.
+        // Escape the arg's component. (Returns are handled below
+        // when we build new_return.)
         for edge in block.terminator.successors() {
             let dest = &func.blocks[&edge.target];
             for (pi, arg) in edge.args.iter().enumerate() {
-                if in_flow(arg) {
-                    let Some(dest_param) = dest.params.get(pi) else {
-                        escaped = true;
-                        continue;
-                    };
-                    if !in_flow(dest_param) {
-                        escaped = true;
-                    }
+                if !in_flow(arg) {
+                    continue;
                 }
+                let dest_param_in_flow = dest
+                    .params
+                    .get(pi)
+                    .map(|p| in_flow(p))
+                    .unwrap_or(false);
+                if !dest_param_in_flow {
+                    escape(arg, &mut uf, &mut escaped);
+                }
+            }
+        }
+        // __main is the program entry — its return type is part of
+        // the ABI to the Rust eval driver, which expects RcPtr. We
+        // can't change that signature, so escape any Return value's
+        // component to prevent the body from rewriting the Return to
+        // produce an Agg (which would mismatch the unchanged sig).
+        if func.name == "__main" {
+            if let Terminator::Return(v) = &block.terminator {
+                escape(v, &mut uf, &mut escaped);
             }
         }
     }
 
-    if escaped {
-        return FuncAnalysis {
-            promotable: HashMap::new(),
-            alloc_layouts: HashMap::new(),
-            new_return: None,
-            new_params: HashMap::new(),
-        };
-    }
+    // Drop every value whose component escaped.
+    let in_escaped_component =
+        |v: &Value, uf: &mut UnionFind| escaped.contains(&uf.find(*v));
+    shape.retain(|v, _| !in_escaped_component(v, &mut uf));
+    alloc_layouts.retain(|v, _| !in_escaped_component(v, &mut uf));
 
     // Determine the new return type: if any Return value is in flow,
     // the function returns Agg. (All return values must agree on
@@ -775,6 +857,40 @@ fn edges_to(block: &crate::ssa::Block, target: BlockId) -> Vec<Vec<Value>> {
         .filter(|e| e.target == target)
         .map(|e| e.args.clone())
         .collect()
+}
+
+/// Plain disjoint-set with path compression. Used to group flow
+/// values that share an SROA promotion fate: when a block param ends
+/// up in flow, it's the same component as every pred-edge-arg that
+/// brought a flow value to it. An unsafe use then escapes the whole
+/// component, but other components survive.
+struct UnionFind {
+    parent: HashMap<Value, Value>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        Self { parent: HashMap::new() }
+    }
+    fn add(&mut self, v: Value) {
+        self.parent.entry(v).or_insert(v);
+    }
+    fn find(&mut self, v: Value) -> Value {
+        let p = self.parent[&v];
+        if p == v {
+            return v;
+        }
+        let root = self.find(p);
+        self.parent.insert(v, root);
+        root
+    }
+    fn union(&mut self, a: Value, b: Value) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.parent.insert(ra, rb);
+        }
+    }
 }
 
 fn rewrite(
