@@ -2057,6 +2057,76 @@ main = |arg| classify(\"purple\")";
 }
 
 #[test]
+fn list_pattern_arm_with_guard_and_return_falls_through_on_guard_fail() {
+    // Regression: when a list-pattern arm has both guards and `return`,
+    // a guard-failure must fall through to the next arm — not return
+    // the fall-through value from the enclosing function.
+    //
+    // For xs = [-5]:
+    //   - Arm 1 pattern `[x]` matches but guard `x > 0` fails.
+    //   - Should fall through to `else 100`.
+    //   - result = 100, function returns result + 1 = 101.
+    let source = "\
+f : List(I64) -> I64
+f = |xs| (
+    result = if xs
+        : [x] and x > 0 return x
+        else 100
+    result + 1
+)
+
+main : I64 -> I64
+main = |arg| f([-5])";
+    assert_eq!(run_i64(source, 0), 101);
+}
+
+#[test]
+fn list_is_exact_length() {
+    let source = "\
+check : List(I64) -> I64
+check = |xs| if (xs is [a, b]) then 1 else 0
+
+main : I64 -> I64
+main = |arg| check([10, 20])";
+    assert_eq!(run_i64(source, 0), 1);
+}
+
+#[test]
+fn list_is_exact_length_mismatch() {
+    let source = "\
+check : List(I64) -> I64
+check = |xs| if (xs is [a, b]) then 1 else 0
+
+main : I64 -> I64
+main = |arg| check([10, 20, 30])";
+    assert_eq!(run_i64(source, 0), 0);
+}
+
+#[test]
+fn list_is_spread_n2_rejects_shorter() {
+    // Regression: `is [a, b, ..rest]` (n=2 with spread) was emitting
+    // `len != 1` only, so len=0 would falsely satisfy the pattern.
+    let source = "\
+check : List(I64) -> I64
+check = |xs| if (xs is [a, b, ..rest]) then 1 else 0
+
+main : I64 -> I64
+main = |arg| check([])";
+    assert_eq!(run_i64(source, 0), 0);
+}
+
+#[test]
+fn list_is_spread_n2_accepts_long_enough() {
+    let source = "\
+check : List(I64) -> I64
+check = |xs| if (xs is [a, b, ..rest]) then 1 else 0
+
+main : I64 -> I64
+main = |arg| check([10, 20, 30, 40])";
+    assert_eq!(run_i64(source, 0), 1);
+}
+
+#[test]
 fn literal_pattern_negative() {
     let source = "\
 sign : I64 -> I64

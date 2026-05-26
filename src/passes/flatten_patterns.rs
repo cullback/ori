@@ -913,9 +913,19 @@ fn desugar_list_match<'src>(
         let bindings = list_element_bindings(ctx, scr_sym, len_sym, &elems, span);
         let stmts = bindings;
 
-        // Add any guards from the arm as guard clauses (or condition checks).
-        // For simplicity, if there are guards, wrap in an inner if.
-        // TODO: handle arm.is_return properly
+        // Add any guards from the arm as guard clauses. When the
+        // original arm uses `return`, the `is_return` must apply only
+        // to the guard-pass branch — a guard-failure falls through to
+        // the next arm and must NOT cause the function to return the
+        // fall-through value. So we put `is_return` on the inner
+        // True branch (guard satisfied) and leave the outer wrapping
+        // is_return = false; without guards there's no inner if and
+        // is_return propagates to the outer True branch unchanged.
+        let outer_is_return = if arm.guards.is_empty() {
+            arm.is_return
+        } else {
+            false
+        };
         let body = if arm.guards.is_empty() {
             arm.body
         } else {
@@ -944,7 +954,7 @@ fn desugar_list_match<'src>(
                             },
                             guards: vec![],
                             body: arm.body,
-                            is_return: false,
+                            is_return: arm.is_return,
                         },
                         MatchArm {
                             pattern: Pattern::Constructor {
@@ -982,7 +992,7 @@ fn desugar_list_match<'src>(
                         },
                         guards: vec![],
                         body: arm_body,
-                        is_return: arm.is_return,
+                        is_return: outer_is_return,
                     },
                     MatchArm {
                         pattern: Pattern::Constructor {
@@ -1047,48 +1057,46 @@ fn desugar_list_is<'src>(
     let info = analyse_list_pattern(elems);
     let n = min_len(&info);
 
-    // For `is` expressions, we emit a length check as a comparison
-    // on List.len(scrutinee). Bindings from list elements don't flow
-    // through `is` — use match arms for list patterns that bind.
-    let sp = ctx.fresh_span(span);
-    let len_expr = list_call("len", vec![scrutinee], sp);
-    let n_lit = Expr::new(ExprKind::IntLit(n as i64), sp);
-    if !info.has_spread {
-        // Exact: len == n
-        Expr::new(
-            ExprKind::BinOp {
-                op: BinOp::Eq,
-                lhs: Box::new(len_expr),
-                rhs: Box::new(n_lit),
-            },
-            sp,
-        )
-    } else if n == 0 {
-        // >= 0 is always true
-        Expr::new(
+    // Always >= 0: True regardless of scrutinee.
+    if info.has_spread && n == 0 {
+        let sp = ctx.fresh_span(span);
+        return Expr::new(
             ExprKind::QualifiedCall {
                 segments: vec!["Bool", "True"],
                 args: vec![],
                 resolved: None,
             },
             sp,
-        )
-    } else {
-        // >= n: len != 0 and len != 1 and ... and len != (n-1)
-        // But len_expr was already consumed. For is-expressions,
-        // the scrutinee is pure so re-evaluating List.len is fine.
-        // However we only have one len_expr. Let's use != for n==1.
-        Expr::new(
-            ExprKind::BinOp {
-                op: BinOp::Neq,
-                lhs: Box::new(len_expr),
-                rhs: Box::new(Expr::new(ExprKind::IntLit((n - 1) as i64), sp)),
-            },
-            sp,
-        )
-        // Note: this is only correct for n==1 (len != 0 means len >= 1).
-        // For n > 1, this would incorrectly accept some shorter lists.
-        // TODO: for n > 1 in `is` with spread, bind a temp and use len_check_sym.
+        );
     }
+
+    // For everything else we need a length comparison. Bind
+    // `List.len(scrutinee)` to a fresh symbol once, then reuse the
+    // existing `len_check_sym` helper (which inference handles
+    // correctly because the operand is a Name with a known U64 type).
+    // Constructing `BinOp::{Eq,Neq}` directly against a Call result
+    // and an IntLit doesn't always unify the IntLit's polymorphic
+    // numeric type with the call's U64 return, producing a runtime
+    // U64-vs-I64 mismatch.
+    let len_sym = ctx.fresh_local(span);
+    let sp_len = ctx.fresh_span(span);
+    let len_call = list_call("len", vec![scrutinee], sp_len);
+
+    // `exact` flag: for non-spread, require `len == n`; for spread,
+    // require `len >= n`. `len_check_sym` chains `len != 0 and ... and
+    // len != (n-1)` for the `>=` case — a correct decomposition.
+    let check = len_check_sym(ctx, len_sym, n, !info.has_spread, span);
+
+    let bsp = ctx.fresh_span(span);
+    Expr::new(
+        ExprKind::Block(
+            vec![Stmt::Let {
+                name: len_sym,
+                val: len_call,
+            }],
+            Box::new(check),
+        ),
+        bsp,
+    )
 }
 
