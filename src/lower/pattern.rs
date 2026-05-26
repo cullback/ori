@@ -172,6 +172,18 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let merge = self.builder.create_block();
         let merge_param = self.builder.add_block_param(merge, result_ty);
 
+        // Cache `__eq__Str` once if any arm is a string-literal —
+        // generating the same recursive equality helper per arm
+        // would be redundant.
+        let str_eq_fn: Option<String> = if arms
+            .iter()
+            .any(|a| matches!(a.pattern, ast::Pattern::StrLit(_)))
+        {
+            Some(self.ensure_eq_func(&scrutinee_expr.ty))
+        } else {
+            None
+        };
+
         let mut current_scr = scr_val;
         for arm in arms {
             let next_block = self.builder.create_block();
@@ -181,25 +193,32 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 self.builder.add_block_param(next_block, scr_ty)
             };
             let body_block = self.builder.create_block();
-            let lit_val = match &arm.pattern {
-                ast::Pattern::IntLit(n) => match scr_ty {
-                    ScalarType::I8 => self.builder.const_i8(*n as i8),
-                    ScalarType::U8 => self.builder.const_u8(*n as u8),
-                    ScalarType::I16 => self.builder.const_i16(*n as i16),
-                    ScalarType::U16 => self.builder.const_u16(*n as u16),
-                    ScalarType::I32 => self.builder.const_i32(*n as i32),
-                    ScalarType::U32 => self.builder.const_u32(*n as u32),
-                    ScalarType::U64 => self.builder.const_u64(*n as u64),
-                    _ => self.builder.const_i64(*n),
-                },
-                ast::Pattern::StrLit(_) => {
-                    panic!("string literal pattern matching not yet supported in lowering")
+            let eq = match &arm.pattern {
+                ast::Pattern::IntLit(n) => {
+                    let lit_val = match scr_ty {
+                        ScalarType::I8 => self.builder.const_i8(*n as i8),
+                        ScalarType::U8 => self.builder.const_u8(*n as u8),
+                        ScalarType::I16 => self.builder.const_i16(*n as i16),
+                        ScalarType::U16 => self.builder.const_u16(*n as u16),
+                        ScalarType::I32 => self.builder.const_i32(*n as i32),
+                        ScalarType::U32 => self.builder.const_u32(*n as u32),
+                        ScalarType::U64 => self.builder.const_u64(*n as u64),
+                        _ => self.builder.const_i64(*n),
+                    };
+                    self.builder
+                        .binop(BinaryOp::Eq, current_scr, lit_val, ScalarType::U8)
+                }
+                ast::Pattern::StrLit(bytes) => {
+                    // Str is List(U8) — pointer-equality (BinOp::Eq)
+                    // would compare List header addresses. Use the
+                    // generic structural equality helper instead.
+                    let lit_val = self.lower_str_literal(bytes);
+                    let eq_name = str_eq_fn.as_ref().expect("str eq fn cached above");
+                    self.builder
+                        .call(eq_name, vec![current_scr, lit_val], ScalarType::U8)
                 }
                 _ => unreachable!(),
             };
-            let eq = self
-                .builder
-                .binop(BinaryOp::Eq, current_scr, lit_val, ScalarType::U8);
             let next_args = if scr_is_func_param { vec![] } else { vec![current_scr] };
             self.builder.branch(eq, body_block, vec![], next_block, next_args);
 

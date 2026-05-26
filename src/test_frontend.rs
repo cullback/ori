@@ -2026,6 +2026,37 @@ main = |arg| (
 }
 
 #[test]
+fn literal_pattern_str() {
+    // String-literal patterns dispatch via content equality (Str =
+    // List(U8) → ensure_eq_func), not pointer equality.
+    let source = "\
+classify : Str -> I64
+classify = |s| if s
+    : \"red\" then 1
+    : \"green\" then 2
+    : \"blue\" then 3
+    else 0
+
+main : I64 -> I64
+main = |arg| classify(\"green\")";
+    assert_eq!(run_i64(source, 0), 2);
+}
+
+#[test]
+fn literal_pattern_str_no_match_falls_through() {
+    let source = "\
+classify : Str -> I64
+classify = |s| if s
+    : \"red\" then 1
+    : \"green\" then 2
+    else 99
+
+main : I64 -> I64
+main = |arg| classify(\"purple\")";
+    assert_eq!(run_i64(source, 0), 99);
+}
+
+#[test]
 fn literal_pattern_negative() {
     let source = "\
 sign : I64 -> I64
