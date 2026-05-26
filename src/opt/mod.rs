@@ -46,17 +46,6 @@ pub fn optimize(module: &mut Module) {
 /// Full SSA optimization pipeline. Single canonical entry point so
 /// the binary and the test harness can't drift apart. Validation
 /// between passes is the caller's responsibility.
-///
-/// **Disabled passes** (correctness bugs uncovered when this was
-/// unified — the test harness previously skipped them, hiding the
-/// bugs):
-/// - `inline::inline` — produces wrong results on several list and
-///   trail tests (e.g. `builtin_list_map`); also triggers an index-
-///   out-of-bounds in `jump_threading` for some patterns.
-/// - `const_eval::evaluate` — same suite of failures.
-///
-/// Re-enable each as the bugs are fixed. Until then both the binary
-/// and the test harness see the same (smaller, correct) pipeline.
 pub fn run_full_pipeline(module: &mut Module) {
     static_promote::promote(module);
     optimize(module);
