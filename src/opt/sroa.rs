@@ -73,7 +73,8 @@ pub fn run(module: &mut Module) {
         let mut changed = false;
         for (name, func) in &module.functions {
             // Inject knowledge of other functions' new return types.
-            let a = analyze_with_callee_sigs(func, &per_func);
+            // No denials yet — Phase B is the pre-verification pass.
+            let a = analyze_with_callee_sigs(func, &per_func, &HashSet::new(), &HashSet::new());
             if a != per_func[name] {
                 per_func.insert(name.clone(), a);
                 changed = true;
@@ -98,17 +99,14 @@ pub fn run(module: &mut Module) {
     // `promotable` and the per-function `new_params` recorded in
     // `per_func` after the fixpoint converges.
     let (return_sigs, _param_sigs) = loop {
-        // Re-run the Phase B fixpoint with denied sigs zeroed out.
+        // Re-run the Phase B fixpoint. analyze_with_callee_sigs
+        // consults `denied_r` / `denied_p` directly, so the
+        // resulting per_func entries are already consistent with the
+        // denials — no post-clear needed.
         loop {
             let mut changed = false;
             for (name, func) in &module.functions {
-                let mut a = analyze_with_callee_sigs(func, &per_func);
-                if denied_r.contains(name) {
-                    a.new_return = None;
-                }
-                if denied_p.contains(name) {
-                    a.new_params.clear();
-                }
+                let a = analyze_with_callee_sigs(func, &per_func, &denied_r, &denied_p);
                 if a != per_func[name] {
                     per_func.insert(name.clone(), a);
                     changed = true;
@@ -163,17 +161,6 @@ pub fn run(module: &mut Module) {
         denied_r.extend(new_denied_r);
         denied_p.extend(new_denied_p);
         if !grew {
-            // Final pass: a rejected function's body still has stale
-            // promotable / alloc_layouts entries from its own analysis
-            // — clear them so the body isn't rewritten.
-            for (name, a) in per_func.iter_mut() {
-                if denied_r.contains(name) || denied_p.contains(name) {
-                    a.promotable.clear();
-                    a.alloc_layouts.clear();
-                    a.new_return = None;
-                    a.new_params.clear();
-                }
-            }
             break (return_sigs, param_sigs);
         }
     };
@@ -214,13 +201,32 @@ struct FuncAnalysis {
 }
 
 fn analyze(func: &crate::ssa::Function) -> FuncAnalysis {
-    analyze_with_callee_sigs(func, &HashMap::new())
+    analyze_with_callee_sigs(func, &HashMap::new(), &HashSet::new(), &HashSet::new())
 }
 
 /// Map from function name to its new (post-sroa) return layout.
 type CalleeSigs = HashMap<String, FuncAnalysis>;
 
-fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -> FuncAnalysis {
+/// Analyze `func` under the assumption that:
+/// - `callees` holds the committed (post-verification) sig changes
+///   of other functions in the module — used to seed call results
+///   and to decide whether Call args at promoted-arg positions are
+///   escape.
+/// - `denied_r` / `denied_p` name functions whose return / param
+///   promotion has been rejected by the verifier. For *this*
+///   function, we use these to suppress proposals up-front — e.g.
+///   don't seed our own params into the flow if we're in `denied_p`
+///   — so the resulting `promotable` / `alloc_layouts` don't contain
+///   flow that would only make sense if the rejected promotion
+///   applied.
+fn analyze_with_callee_sigs(
+    func: &crate::ssa::Function,
+    callees: &CalleeSigs,
+    denied_r: &HashSet<String>,
+    denied_p: &HashSet<String>,
+) -> FuncAnalysis {
+    let self_denied_r = denied_r.contains(&func.name);
+    let self_denied_p = denied_p.contains(&func.name);
     // Step 1: classify each Alloc by layout.
     //
     // `alloc_layout`: for each Alloc Value, the ordered list of
@@ -266,15 +272,6 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
     }
     // Also: allocs that have NO stores aren't promotable.
     alloc_layouts.retain(|_, v| !v.is_empty());
-    // Reject allocs whose stored fields include any RcPtr value. The
-    // SROA rewrite folds `alloc + Store(ptr_val)` into `Pack`, losing
-    // the implicit `rc_inc` that Store performs on RcPtr stores. The
-    // matching `rc_dec` later in the body stays, so the ptr would
-    // underflow and be freed prematurely. A correct fix would require
-    // either Pack/Extract to carry rc semantics or SROA to identify
-    // and drop the corresponding rc_decs — both substantial. For now
-    // only promote allocs with non-pointer fields.
-    alloc_layouts.retain(|_, fields| fields.iter().all(|f| f.ty != ScalarType::RcPtr));
 
     // Step 2: track values that are part of the flow. Start with the
     // Allocs themselves. Then propagate through block params: a block
@@ -314,19 +311,27 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
     // of offsets — tentative candidates for promotion from RcPtr to
     // Agg(n). If the escape check later catches an unsafe use of the
     // param, the whole flow group collapses and the param stays as-is.
-    let param_load_offsets = collect_param_load_offsets(func);
-    for p in &func.params {
-        if p.ty != ScalarType::RcPtr {
-            continue;
+    //
+    // When this function's param promotion has been denied by the
+    // verifier, skip the seeding entirely — otherwise the flow set
+    // would include param-derived values whose promotion can't
+    // actually be committed, leaving stale entries in `promotable` /
+    // `alloc_layouts` that the rewrite would then apply.
+    if !self_denied_p {
+        let param_load_offsets = collect_param_load_offsets(func);
+        for p in &func.params {
+            if p.ty != ScalarType::RcPtr {
+                continue;
+            }
+            let Some(offsets) = param_load_offsets.get(p) else {
+                continue;
+            };
+            let Some(n) = dense_shape(offsets) else {
+                continue;
+            };
+            shape.insert(*p, n);
+            flow.insert(*p, Vec::new());
         }
-        let Some(offsets) = param_load_offsets.get(p) else {
-            continue;
-        };
-        let Some(n) = dense_shape(offsets) else {
-            continue;
-        };
-        shape.insert(*p, n);
-        flow.insert(*p, Vec::new());
     }
     // Fixpoint on block param propagation.
     let predecessors = build_predecessors(func);
@@ -549,32 +554,28 @@ fn analyze_with_callee_sigs(func: &crate::ssa::Function, callees: &CalleeSigs) -
     alloc_layouts.retain(|v, _| !in_escaped_component(v, &mut uf));
 
     // Determine the new return type: if any Return value is in flow,
-    // the function returns Agg. (All return values must agree on
-    // shape — already enforced by shape propagation.)
+    // the function returns Agg. Skip the proposal entirely if this
+    // function's return is already denied — keeps per_func aligned
+    // with the verifier's decision without a separate cleanup pass.
     let mut new_return: Option<Vec<ScalarType>> = None;
-    for block in func.blocks.values() {
-        if let Terminator::Return(v) = &block.terminator {
-            if let Some(&n) = shape.get(v) {
-                // Derive field scalar types from the canonical layout.
-                // We don't always have alloc_layouts for block params
-                // / call results, so fall back to the alloc's stores
-                // by walking back. For simplicity: if v is an Alloc,
-                // use alloc_layouts; else, we infer from any reachable
-                // alloc's stored value types.
-                let tys = field_types_for(*v, &alloc_layouts, &flow, n);
-                new_return = Some(tys);
+    if !self_denied_r {
+        for block in func.blocks.values() {
+            if let Terminator::Return(v) = &block.terminator {
+                if let Some(&n) = shape.get(v) {
+                    let tys = field_types_for(*v, &alloc_layouts, &flow, n);
+                    new_return = Some(tys);
+                }
             }
         }
     }
 
     // For each function param that survived the escape check, infer
-    // its new Agg layout from the types of the Loads on it.
+    // its new Agg layout from the types of the Loads on it. If
+    // params were denied, the seed step above was skipped, so this
+    // loop won't find anything in `shape` for them.
     let mut new_params: HashMap<usize, Vec<ScalarType>> = HashMap::new();
     for (i, p) in func.params.iter().enumerate() {
         let Some(&n) = shape.get(p) else { continue; };
-        // Only count params seeded from offsets (not ones that happen
-        // to share a shape map with an alloc — which can't happen for
-        // function params, but stay defensive).
         if p.ty != ScalarType::RcPtr {
             continue;
         }
@@ -994,10 +995,6 @@ fn rewrite(
                     let mut agg = *p;
                     agg.ty = ScalarType::Agg(n);
                     new_insts.push(Inst::Extract(*d, agg, idx));
-                }
-                Inst::RcInc(v) | Inst::RcDec(v) if a.promotable.contains_key(v) || call_result_agg.contains_key(v) => {
-                    // Drop rc traffic on promoted aggs and call
-                    // results whose callee was sig-changed.
                 }
                 Inst::Call(d, callee, args) => {
                     // If the callee's return type changed, the call
