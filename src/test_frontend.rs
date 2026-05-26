@@ -64,6 +64,16 @@ fn validate_after(module: &crate::ssa::Module, pass: &str) {
     if !r.is_clean() {
         panic!("SSA validation failed after '{pass}':\n{}", r.error_summary());
     }
+    // Soft warnings are type lies that eval tolerates today but
+    // signal real bugs (SROA inconsistency, lowering type drift,
+    // etc.). The CLI exits on them — the test harness should too,
+    // otherwise regressions land silently.
+    if !r.warnings.is_empty() {
+        panic!(
+            "SSA soft-validation warnings after '{pass}':\n{}",
+            r.warnings.join("\n")
+        );
+    }
 }
 
 // ---- Test runners ----
