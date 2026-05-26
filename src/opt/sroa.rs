@@ -535,12 +535,14 @@ fn analyze_with_callee_sigs(
                 }
             }
         }
-        // __main is the program entry — its return type is part of
-        // the ABI to the Rust eval driver, which expects RcPtr. We
-        // can't change that signature, so escape any Return value's
-        // component to prevent the body from rewriting the Return to
-        // produce an Agg (which would mismatch the unchanged sig).
-        if func.name == "__main" {
+        // When this function's return signature is fixed — either
+        // because it's `__main` (the ABI to the Rust eval driver,
+        // which expects RcPtr) or because the verifier has denied
+        // its return promotion — escape any Return value's component
+        // so the body's rewrite can't produce an Agg-typed Return
+        // that mismatches the unchanged function signature.
+        let return_sig_locked = func.name == "__main" || self_denied_r;
+        if return_sig_locked {
             if let Terminator::Return(v) = &block.terminator {
                 escape(v, &mut uf, &mut escaped);
             }

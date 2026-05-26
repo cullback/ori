@@ -2067,6 +2067,34 @@ main = |arg| classify(\"purple\")";
 }
 
 #[test]
+fn tuple_returning_fn_threaded_through_trail() {
+    // Regression: SROA proposed promoting `step`'s `(I64, I64)` return
+    // to Agg(2), the verifier denied it (the trail accumulator needs
+    // the result as an RcPtr), and the body's alloc was incorrectly
+    // promoted anyway — yielding a Return(Agg(2)) in a function still
+    // declaring RcPtr. Caught only by soft-validation; now strict.
+    let source = "\
+step : (I64, I64), U8 -> (I64, I64)
+step = |(x, y), ch|
+    if ch
+      : 'r' then (x + 1, y)
+      : 'l' then (x - 1, y)
+      else (x, y)
+
+main : I64 -> I64
+main = |arg| (
+    moves = \"rrlrr\".to_utf8()
+    trail = moves.trail((0, 0), step)
+    n : I64
+    n = arg
+    n
+)";
+    // Just compile & run — the failure mode is validator panicking,
+    // not a wrong value.
+    assert_eq!(run_i64(source, 7), 7);
+}
+
+#[test]
 fn list_pattern_arm_with_guard_and_return_falls_through_on_guard_fail() {
     // Regression: when a list-pattern arm has both guards and `return`,
     // a guard-failure must fall through to the next arm — not return
