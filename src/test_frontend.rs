@@ -2067,6 +2067,26 @@ main = |arg| classify(\"purple\")";
 }
 
 #[test]
+#[ignore = "known bug: flatten_patterns drops type info on hoisted tuple destructures inside constructor patterns"]
+fn nested_tuple_in_constructor_pattern_with_dynamic_args() {
+    // Construct a tagged value carrying a tuple; match on it. With
+    // constant constructor args, eval const-folds and hides the bug.
+    // With dynamic args, the destructure's val.ty is the placeholder
+    // type-var that flatten_patterns left behind, so lower defaults
+    // each tuple slot to RcPtr — yielding `Add on Ptr, I64` at eval.
+    let source = "\
+Wrap : [MkWrap((I64, I64))]
+
+main : I64 -> I64
+main = |arg| (
+    w = MkWrap((arg, arg + 1))
+    if w
+        : MkWrap((a, b)) then a + b
+)";
+    assert_eq!(run_i64(source, 5), 11);
+}
+
+#[test]
 fn tuple_returning_fn_threaded_through_trail() {
     // Regression: SROA proposed promoting `step`'s `(I64, I64)` return
     // to Agg(2), the verifier denied it (the trail accumulator needs
