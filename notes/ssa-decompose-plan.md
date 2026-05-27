@@ -32,30 +32,36 @@ Cranelift as the strictest constraint (no aggregate types in IR).
 ### The decomposition principle
 
 **Fixed-shape data is decomposed into parallel Values; dynamically-
-sized buffers stay heap.** Everything that exists today as a "heap
-header pointing at variable data" (Lists, Strs, closure envs) gets
-its header decomposed — only the dynamic buffer stays as an `RcPtr`.
-Tuples and records (which have no dynamic part) decompose entirely
-into parallel Values.
+sized buffers stay heap.** The goal is C/Rust-style representation:
+the in-memory layout for a value mirrors its decomposed shape, and
+heap allocation only happens for things with dynamic size or shared
+ownership.
 
 Concretely:
 
 - **Tuples / records** (anonymous structural data): decomposed
   entirely into N parallel Values. No heap object exists if the data
   doesn't escape.
-- **List(T) / Str**: header `(len, cap, data: RcPtr)` decomposes into
-  three parallel Values; only the data buffer stays heap. This
-  eliminates the "two-tier header" special case.
+- **List(T) / Str**: header `(len: U64, cap: U64, data: RcPtr)`
+  decomposes into three parallel Values. **The buffer's elements are
+  laid out inline using each element's decomposed shape** (C-style
+  `Vec<T>`). A `List(Record{a: I64, b: I64})` buffer has 16-byte
+  slots holding two I64s; a `List(Str)` buffer has 24-byte slots
+  holding `(len, cap, data)` inline. No per-element heap header.
 - **Closure environments**: a closure becomes `(fn_id, capture1,
   capture2, ...)` as parallel Values; no env-header heap object.
-- **Tag-union payloads** (e.g. `Ok(x)`, `Cons(h, t)`): payloads still
-  live in a heap object because tags need RC-tracked identity (you
-  pattern-match on `Ok` vs `Err`, which means the variant tag itself
-  needs to be in memory you can read). Tag objects stay as one RcPtr.
+  Long-lived (escaping) closures heap-materialize their env.
+- **Tag unions** (e.g. `Ok(x)`, `Cons(h, t)`): decomposed to
+  `(tag: U8, payload: RcPtr)` — two parallel Values. The tag check
+  is a register switch; the payload heap object holds variant-
+  specific data with no tag slot inside (the tag's already in the
+  register). Void variants use a null `RcPtr` payload — the
+  runtime skips rc-touching null.
 
 Heap stays for:
-- Variable-length data (list/str data buffers)
-- Tag union values (because of RC-tracked variant identity)
+- Variable-length buffers (list/str data buffers)
+- Tag union payload objects (variant-dependent shape; uniform heap
+  representation; layout known after a tag switch)
 - Anything escaped, shared, or that needs lifetime beyond a function
 
 ### Today's SSA, in one paragraph
@@ -120,14 +126,21 @@ Two distinct worries to separate:
 
 - **Bulk collections (lists, "1000-element arrays").** Ori doesn't have
   a fixed-size array type. Collections are `List(T)`. The principled
-  decomposition treats `List(T)` as a **fixed-shape header** — three
-  parallel Values `(len: U64, cap: U64, data: RcPtr<buffer>)` — with
-  only the dynamic data buffer staying heap-managed. A 1000-element
-  list is `(1000, cap, buffer_ptr)` at the SSA layer: three Values,
-  one RcPtr to the buffer that holds the elements. The "header heap
-  object" that exists today goes away entirely.
+  decomposition treats `List(T)` as `(len: U64, cap: U64, data: RcPtr)`
+  — three parallel Values — with only the dynamic data buffer staying
+  heap-managed. A 1000-element list is `(1000, cap, buffer_ptr)` at
+  the SSA layer.
 
-  This means `Str` (= `List(U8)`) also decomposes the same way.
+  **Buffer slots are laid out per-element-type, inline (no per-element
+  header).** `List(I64)` has 8-byte slots; `List(Record{a:I64, b:I64})`
+  has 16-byte slots holding two inline I64s; `List(Str)` has 24-byte
+  slots holding `(len, cap, data)` inline. This is `Vec<T>` in Rust.
+  `Str = List(U8)` is unchanged at 1-byte slots.
+
+  Today's buffers are already element-typed for scalars (`Str` has
+  1-byte slots). The generalization is to *also* inline non-scalar
+  elements via their decomposed shape, instead of indirecting through
+  per-element heap headers.
 - **Large records (say, 30 fields).** Decomposition produces 30
   parallel `Value`s. At the SSA layer this is fine — `Function::params`
   is just a longer `Vec<Value>`, env has 30 more entries, no semantic
@@ -503,36 +516,60 @@ at each stage boundary and confirm with the user before proceeding.**
 5. **Decompose records in lower.** Same treatment for non-escaping
    record literals.
 
-6. **Decompose List/Str headers.** This is its own stage because it
-   touches every List/Str stdlib method and the `__main` ABI. Each
-   `List(T)` becomes 3 Values: `(len: U64, cap: U64, data: RcPtr)`.
-   Only the data buffer stays heap. Method signatures (`List.len`,
-   `List.append`, `List.set`, etc.) all expand their `List(T)` slots
-   to 3 slots. `__main`'s `args: List(Str)` becomes 3 expanded slots
-   (the Str inside the List has its OWN 3-slot expansion at the
-   element level, but elements are stored in the buffer as bytes —
-   `List(Str)` elements are pointers to Str headers, so each element
-   slot in the buffer is an RcPtr). The eval driver materializes
-   accordingly. Same treatment for Str (= List(U8)).
+6. **Decompose List/Str headers.** Each `List(T)` becomes 3 Values:
+   `(len: U64, cap: U64, data: RcPtr)`. Only the data buffer stays
+   heap. Method signatures (`List.len`, `List.append`, `List.set`,
+   etc.) all expand their `List(T)` slots to 3 slots. `__main`'s
+   `args: List(Str)` becomes 3 expanded slots. Same treatment for Str.
 
-7. **Closures and `lambda_specialize`.** Update capture shapes.
+   At this stage, element layouts are still "one buffer slot per
+   element" — for non-scalar elements (e.g. Records), each element
+   is still a heap object the buffer points at. Inline element
+   layouts come in stage 7.
+
+7. **Inline non-scalar list element layouts.** Buffer slot stride
+   adapts to the element's decomposed shape. `List(Record{a:I64, b:I64})`
+   becomes a buffer of 16-byte slots holding two inline I64s. `List(Str)`
+   becomes a buffer of 24-byte slots holding `(len, cap, data)` inline.
+   `Str = List(U8)` is unchanged (1-byte slots).
+
+   Lower emits a sequence of scalar `LoadDyn`/`StoreDyn` per element
+   field, using offsets derived from the element layout. No new
+   instruction shape needed. The buffer's rc-cascade metadata
+   generalizes from "one ptr_offsets list" to "one per-element layout
+   applied `len` times."
+
+8. **Decompose tag unions to `(tag, payload)`.** Tag unions become
+   2 Values: `(tag: U8, payload: RcPtr)`. The payload heap object
+   holds variant-specific data with no tag slot inside. Pattern
+   matching becomes `SwitchInt(tag) → ...arms`, with each arm
+   Load'ing from `payload` using the variant's known layout. Void
+   variants use a null `RcPtr` payload — runtime skips rc-touching
+   null. Construction (`Ok(42)`, `Cons(h, t)`) emits `(TAG_OK,
+   heap_alloc_with_payload)`.
+
+   Affects `__main`'s return type — `Result(Str, Str)` becomes
+   `(U8, RcPtr)`. Eval driver materializes accordingly.
+
+9. **Closures and `lambda_specialize`.** Update capture shapes.
    Closure becomes `(fn_id, capture1, capture2, ...)` parallel Values;
    no env-header heap object. Decide per-closure whether to keep heap
-   env for long-lived closures (see "Risk areas" below).
+   env for long-lived (escaping) closures.
 
-8. **Delete `ScalarType::Agg`, `Pack`, `Extract`, `Scalar::Agg`.**
-   At this point nothing should produce them; the deletion is just
-   removing dead code. Update `dests()` to lose the Pack/Extract
-   arms. Update `display.rs` similarly.
+10. **Delete `ScalarType::Agg`, `Pack`, `Extract`, `Scalar::Agg`.**
+    At this point nothing should produce them; the deletion is just
+    removing dead code. Update `dests()` to lose the Pack/Extract
+    arms. Update `display.rs` similarly.
 
-9. **SROA: survey and either shrink to materialize-on-escape or
-   delete entirely.** Depends on what lower's emission decision
-   already covers.
+11. **SROA: survey and either shrink to materialize-on-escape or
+    delete entirely.** Depends on what lower's emission decision
+    already covers.
 
-10. **Update `CLAUDE.md`, `src/lower/README.md`, `src/opt/README.md`.**
+12. **Update `CLAUDE.md`, `src/lower/README.md`, `src/opt/README.md`.**
     Document the new model. CLAUDE.md's "two-tier `[len, cap,
     data_ptr]` header" description is now historical; rewrite the
-    "Lists and Strs are always RcPtr" line.
+    "Lists and Strs are always RcPtr" line. Add a section on tag
+    union representation `(tag, payload)` and inline element layouts.
 
 ## Verification beyond `cargo test`
 
