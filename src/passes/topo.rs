@@ -424,7 +424,7 @@ fn reorder_decls<'src>(
 
 /// A dummy decl used while rotating slots during [`reorder_decls`].
 /// Never observed from outside the function.
-const fn placeholder_decl<'src>() -> Decl<'src> {
+fn placeholder_decl<'src>() -> Decl<'src> {
     let dummy_span = ast::Span {
         file: crate::source::FileId(0),
         start: 0,

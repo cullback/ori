@@ -1321,29 +1321,17 @@ fn unescape_char(s: &str) -> i64 {
     }
 }
 
-/// Mint a unique synthetic span that won't collide with any real
-/// source span or with other synthetic spans.
-fn synth_span(file: FileId) -> Span {
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Span {
-        file,
-        start: usize::MAX - id,
-        end: usize::MAX - id,
-    }
-}
-
 /// Wrap an interpolated expression in `.to_str()` for automatic
-/// string conversion. Uses a synthetic span so the `MethodCall`
-/// doesn't collide with the inner expression in span-keyed maps.
-fn wrap_to_str(expr: Expr<'_>, file: FileId) -> Expr<'_> {
+/// string conversion.
+fn wrap_to_str(expr: Expr<'_>, _file: FileId) -> Expr<'_> {
+    let span = expr.span;
     Expr::new(
         ExprKind::MethodCall {
             receiver: Box::new(expr),
             method: "to_str",
             args: vec![],
         },
-        synth_span(file),
+        span,
     )
 }
 
@@ -1358,13 +1346,14 @@ fn concat_string_segments(segments: Vec<Expr<'_>>, span: Span) -> Expr<'_> {
     let mut iter = segments.into_iter();
     let first = iter.next().unwrap();
     iter.fold(first, |acc, seg| {
+        let chain_span = acc.span;
         Expr::new(
             ExprKind::MethodCall {
                 receiver: Box::new(acc),
                 method: "concat",
                 args: vec![seg],
             },
-            synth_span(span.file),
+            chain_span,
         )
     })
 }

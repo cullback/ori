@@ -132,6 +132,9 @@ pub struct Constraint {
     /// Source span of the expression that generated this constraint.
     /// `None` for constraints generated during scheme instantiation.
     pub span: Option<crate::ast::Span>,
+    /// `ExprId` of the call expression that generated this constraint.
+    /// Same null-when-instantiation rule as `span`.
+    pub expr_id: Option<crate::ast::ExprId>,
 }
 
 #[derive(Debug, Clone)]
@@ -698,6 +701,7 @@ impl TypeEngine {
                 method_name: c.method_name.clone(),
                 method_type: Self::apply_mapping(&c.method_type, &mapping),
                 span: None,
+                expr_id: None,
             });
         }
         Self::apply_mapping(&scheme.ty, &mapping)

@@ -404,7 +404,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let elem_types = match val_ty {
                     Type::Tuple(tys) => tys.as_slice(),
                     other => {
-                        eprintln!("BUG: tuple destructure got val_ty={other:?}");
+                        eprintln!("BUG: tuple destructure got val_ty={other:?} (fn={})",
+                            self.current_fn_name);
                         &[]
                     }
                 };

@@ -186,6 +186,8 @@ struct LowerCtx<'a, 'src> {
     /// of a concrete type field-by-field. Generated on first use
     /// by `ensure_eq_func`.
     eq_func_cache: HashSet<String>,
+    /// Name of the function currently being lowered (diagnostic only).
+    current_fn_name: String,
     // Immutable references:
     decls: &'a DeclInfo,
     infer: &'a InferResult,
@@ -209,6 +211,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             builder: Builder::new(),
             vars: HashMap::new(),
             eq_func_cache: HashSet::new(),
+            current_fn_name: String::new(),
             decls,
             infer,
             symbols,
@@ -419,6 +422,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     // ---- Function lowering ----
 
     fn lower_function(&mut self, name: &str, param_syms: &[SymbolId], body: &Expr<'src>) {
+        let saved_name = std::mem::replace(&mut self.current_fn_name, name.to_string());
         let saved_vars = self.vars.clone();
         let saved_func = std::mem::replace(&mut self.builder.func, crate::ssa::builder::FuncBuilder::new());
         let saved_current = self.builder.current_block.take();
@@ -471,6 +475,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.func = saved_func;
         self.builder.current_block = saved_current;
         self.vars = saved_vars;
+        self.current_fn_name = saved_name;
     }
 
     // ---- Expression lowering ----

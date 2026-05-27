@@ -69,15 +69,6 @@
 //! rewritten tree. Running pre-inference means the pass doesn't have to
 //! maintain concrete types on its output.
 //!
-//! ## Why unique synthetic spans
-//!
-//! Inference still side-tables `is`-expression bindings by span (see
-//! `infer.rs::is_bindings`). Two synthesized `Is` nodes that share a
-//! span would collide in that map — the second insert would overwrite
-//! the first, losing bindings. Each synthesized `Is` and `BinOp::And`
-//! node gets a fresh span via `fresh_span` so the side table stays
-//! unambiguous.
-//!
 //! ## Out of scope
 //!
 //! - Top-level tuple/record match arms (no discriminator to switch on).
@@ -107,7 +98,6 @@ fn flatten_module<'src>(
 ) -> Result<Module<'src>, CompileError> {
     let mut ctx = FlattenCtx {
         temp_counter: 0,
-        synth_span_offset: SPAN_OFFSET_BASE,
         symbols,
     };
     for decl in &mut module.decls {
@@ -116,15 +106,8 @@ fn flatten_module<'src>(
     Ok(module)
 }
 
-/// Starting point for synthetic span offsets. Sits near the middle of
-/// `usize` so it can't collide with real source offsets (which live at
-/// the low end) or with `fold_lift`'s synthetic spans (which start at
-/// `usize::MAX` and count down).
-const SPAN_OFFSET_BASE: usize = usize::MAX >> 1;
-
 struct FlattenCtx<'a> {
     temp_counter: usize,
-    synth_span_offset: usize,
     symbols: &'a mut SymbolTable,
 }
 
@@ -133,16 +116,6 @@ impl FlattenCtx<'_> {
         let display = format!("__pat_{}", self.temp_counter);
         self.temp_counter = self.temp_counter.saturating_add(1);
         self.symbols.fresh(display, span, SymbolKind::Local)
-    }
-
-    const fn fresh_span(&mut self, base: Span) -> Span {
-        let off = self.synth_span_offset;
-        self.synth_span_offset = self.synth_span_offset.saturating_sub(1);
-        Span {
-            file: base.file,
-            start: off,
-            end: off,
-        }
     }
 }
 
@@ -365,8 +338,8 @@ fn flatten_field<'src>(
                 }
             }
 
-            let name_span = ctx.fresh_span(span);
-            let is_span = ctx.fresh_span(span);
+            let name_span = span;
+            let is_span = span;
             let is_expr = Expr::new(
                 ExprKind::Is {
                     expr: Box::new(Expr::new(ExprKind::Name(tmp), name_span)),
@@ -389,7 +362,7 @@ fn flatten_field<'src>(
             // expression's type) to clobber the Name's resolved type,
             // which made the downstream destructure see the wrong
             // val.ty at lower.
-            let name_span = ctx.fresh_span(span);
+            let name_span = span;
             destructures.push(Stmt::Destructure {
                 pattern: nested,
                 val: Expr::new(ExprKind::Name(tmp), name_span),
@@ -488,7 +461,7 @@ fn build_flattened_is<'src>(
         "is_pattern_flattenable guards against tuple/record nesting"
     );
 
-    let outer_span = ctx.fresh_span(base_span);
+    let outer_span = base_span;
     let outer_is = Expr::new(
         ExprKind::Is {
             expr: Box::new(scrutinee),
@@ -498,7 +471,7 @@ fn build_flattened_is<'src>(
     );
 
     let combined = extra_guards.into_iter().fold(outer_is, |acc, g| {
-        let and_span = ctx.fresh_span(base_span);
+        let and_span = base_span;
         Expr::new(
             ExprKind::BinOp {
                 op: BinOp::And,
@@ -603,16 +576,15 @@ fn list_call<'src>(method: &'static str, args: Vec<Expr<'src>>, span: Span) -> E
 /// for `is`-expression desugaring where no temp is bound yet.
 #[expect(clippy::cast_possible_wrap)]
 fn len_check_sym<'src>(
-    ctx: &mut FlattenCtx<'_>,
     len_sym: SymbolId,
     n: usize,
     exact: bool,
     span: Span,
 ) -> Expr<'src> {
     if exact {
-        let sp_name = ctx.fresh_span(span);
-        let sp_lit = ctx.fresh_span(span);
-        let sp_eq = ctx.fresh_span(span);
+        let sp_name = span;
+        let sp_lit = span;
+        let sp_eq = span;
         let len_ref = Expr::new(ExprKind::Name(len_sym), sp_name);
         let n_lit = Expr::new(ExprKind::IntLit(n as i64), sp_lit);
         Expr::new(
@@ -687,7 +659,7 @@ fn len_check_sym<'src>(
         // But for N=0, >= 0 is always true.
         if n == 0 {
             // Always matches — just produce True
-            let sp_true = ctx.fresh_span(span);
+            let sp_true = span;
             Expr::new(
                 ExprKind::QualifiedCall {
                     segments: vec!["Bool", "True"],
@@ -702,9 +674,9 @@ fn len_check_sym<'src>(
             // Each sub-expression gets its own span to avoid span-keyed
             // type collisions in inference.
             let mut chain = {
-                let sp_name = ctx.fresh_span(span);
-                let sp_lit = ctx.fresh_span(span);
-                let sp_neq = ctx.fresh_span(span);
+                let sp_name = span;
+                let sp_lit = span;
+                let sp_neq = span;
                 let len2 = Expr::new(ExprKind::Name(len_sym), sp_name);
                 Expr::new(
                     ExprKind::BinOp {
@@ -716,10 +688,10 @@ fn len_check_sym<'src>(
                 )
             };
             for i in 1..n {
-                let sp_name = ctx.fresh_span(span);
-                let sp_lit = ctx.fresh_span(span);
-                let sp_neq = ctx.fresh_span(span);
-                let sp_and = ctx.fresh_span(span);
+                let sp_name = span;
+                let sp_lit = span;
+                let sp_neq = span;
+                let sp_and = span;
                 let len3 = Expr::new(ExprKind::Name(len_sym), sp_name);
                 let neq = Expr::new(
                     ExprKind::BinOp {
@@ -759,19 +731,19 @@ fn list_element_bindings<'src>(
     for elem in elems {
         match elem {
             ListPatternElem::Pattern(pat) => {
-                let sp_scr = ctx.fresh_span(span);
+                let sp_scr = span;
                 let scr_ref = Expr::new(ExprKind::Name(scr_sym), sp_scr);
                 let idx_expr = if elem_idx < info.prefix_len {
                     // Before the spread: index from front
-                    let sp_idx = ctx.fresh_span(span);
+                    let sp_idx = span;
                     Expr::new(ExprKind::IntLit(elem_idx as i64), sp_idx)
                 } else {
                     // suffix position: index = len - remaining
                     let suffix_offset = elem_idx - info.prefix_len;
                     let remaining = info.suffix_len - suffix_offset;
-                    let sp_len = ctx.fresh_span(span);
-                    let sp_rem = ctx.fresh_span(span);
-                    let sp_sub = ctx.fresh_span(span);
+                    let sp_len = span;
+                    let sp_rem = span;
+                    let sp_sub = span;
                     let len_ref = Expr::new(ExprKind::Name(len_sym), sp_len);
                     Expr::new(
                         ExprKind::BinOp {
@@ -782,10 +754,10 @@ fn list_element_bindings<'src>(
                         sp_sub,
                     )
                 };
-                let sp_get = ctx.fresh_span(span);
+                let sp_get = span;
                 let get_result = list_call("get", vec![scr_ref, idx_expr], sp_get);
                 // List.get returns Result — unwrap since length was already checked.
-                let sp_unwrap = ctx.fresh_span(span);
+                let sp_unwrap = span;
                 let get_call = Expr::new(
                     ExprKind::MethodCall {
                         receiver: Box::new(get_result),
@@ -815,7 +787,7 @@ fn list_element_bindings<'src>(
                             name: tmp,
                             val: get_call,
                         });
-                        let sp_tmp = ctx.fresh_span(span);
+                        let sp_tmp = span;
                         stmts.push(Stmt::Destructure {
                             pattern: pat.clone(),
                             val: Expr::new(ExprKind::Name(tmp), sp_tmp),
@@ -827,12 +799,12 @@ fn list_element_bindings<'src>(
             ListPatternElem::Spread(maybe_sym) => {
                 if let Some(sym) = maybe_sym {
                     // Bind the middle portion: List.sublist(scr, prefix_len, len - prefix_len - suffix_len)
-                    let sp_scr = ctx.fresh_span(span);
-                    let sp_start = ctx.fresh_span(span);
-                    let sp_len = ctx.fresh_span(span);
-                    let sp_fixed = ctx.fresh_span(span);
-                    let sp_sub = ctx.fresh_span(span);
-                    let sp_call = ctx.fresh_span(span);
+                    let sp_scr = span;
+                    let sp_start = span;
+                    let sp_len = span;
+                    let sp_fixed = span;
+                    let sp_sub = span;
+                    let sp_call = span;
                     let scr_ref = Expr::new(ExprKind::Name(scr_sym), sp_scr);
                     let start = Expr::new(ExprKind::IntLit(info.prefix_len as i64), sp_start);
                     let total_fixed = (info.prefix_len + info.suffix_len) as i64;
@@ -882,8 +854,8 @@ fn desugar_list_match<'src>(
 
     // Bind List.len(scr) to a temp.
     let len_sym = ctx.fresh_local(span);
-    let sp_name = ctx.fresh_span(span);
-    let sp_len = ctx.fresh_span(span);
+    let sp_name = span;
+    let sp_len = span;
     let scr_ref_for_len = Expr::new(ExprKind::Name(scr_sym), sp_name);
     let len_call = list_call("len", vec![scr_ref_for_len], sp_len);
 
@@ -915,7 +887,7 @@ fn desugar_list_match<'src>(
         let min = min_len(&info);
 
         // Condition: exact length or minimum length.
-        let condition = len_check_sym(ctx, len_sym, min, !info.has_spread, span);
+        let condition = len_check_sym(len_sym, min, !info.has_spread, span);
 
         // Build the body: let-bind each element, then the arm's original body.
         let bindings = list_element_bindings(ctx, scr_sym, len_sym, &elems, span);
@@ -940,7 +912,7 @@ fn desugar_list_match<'src>(
             // Combine guards into an and-chain, then wrap as
             // `if guard then body else <fall-through>`.
             let guard_expr = arm.guards.into_iter().reduce(|acc, g| {
-                let gsp = ctx.fresh_span(span);
+                let gsp = span;
                 Expr::new(
                     ExprKind::BinOp {
                         op: BinOp::And,
@@ -950,7 +922,7 @@ fn desugar_list_match<'src>(
                     gsp,
                 )
             }).unwrap();
-            let gsp = ctx.fresh_span(span);
+            let gsp = span;
             Expr::new(
                 ExprKind::If {
                     expr: Box::new(guard_expr),
@@ -983,12 +955,12 @@ fn desugar_list_match<'src>(
         let arm_body = if stmts.is_empty() {
             body
         } else {
-            let bsp = ctx.fresh_span(span);
+            let bsp = span;
             Expr::new(ExprKind::Block(stmts, Box::new(body)), bsp)
         };
 
         // Build: if condition then arm_body else <previous result>
-        let if_sp = ctx.fresh_span(span);
+        let if_sp = span;
         result = Expr::new(
             ExprKind::If {
                 expr: Box::new(condition),
@@ -1019,7 +991,7 @@ fn desugar_list_match<'src>(
     }
 
     // Wrap everything in a block: let scr = scrutinee; let len = List.len(scr); <chain>
-    let bsp = ctx.fresh_span(span);
+    let bsp = span;
     Ok(Expr::new(
         ExprKind::Block(
             vec![
@@ -1067,7 +1039,7 @@ fn desugar_list_is<'src>(
 
     // Always >= 0: True regardless of scrutinee.
     if info.has_spread && n == 0 {
-        let sp = ctx.fresh_span(span);
+        let sp = span;
         return Expr::new(
             ExprKind::QualifiedCall {
                 segments: vec!["Bool", "True"],
@@ -1087,15 +1059,15 @@ fn desugar_list_is<'src>(
     // numeric type with the call's U64 return, producing a runtime
     // U64-vs-I64 mismatch.
     let len_sym = ctx.fresh_local(span);
-    let sp_len = ctx.fresh_span(span);
+    let sp_len = span;
     let len_call = list_call("len", vec![scrutinee], sp_len);
 
     // `exact` flag: for non-spread, require `len == n`; for spread,
     // require `len >= n`. `len_check_sym` chains `len != 0 and ... and
     // len != (n-1)` for the `>=` case — a correct decomposition.
-    let check = len_check_sym(ctx, len_sym, n, !info.has_spread, span);
+    let check = len_check_sym(len_sym, n, !info.has_spread, span);
 
-    let bsp = ctx.fresh_span(span);
+    let bsp = span;
     Expr::new(
         ExprKind::Block(
             vec![Stmt::Let {

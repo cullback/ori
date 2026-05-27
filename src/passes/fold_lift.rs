@@ -33,7 +33,6 @@ fn lift_module<'src>(mut module: ast::Module<'src>, symbols: &mut SymbolTable) -
 
     let mut ctx = LiftCtx {
         counter: 0,
-        synth_span_counter: 0,
         synthesized: Vec::new(),
         recursive_fields: &recursive_fields,
         symbols,
@@ -50,12 +49,6 @@ fn lift_module<'src>(mut module: ast::Module<'src>, symbols: &mut SymbolTable) -
 
 struct LiftCtx<'a, 'src> {
     counter: usize,
-    /// Counter used to mint unique synthetic spans. Multiple synthesized
-    /// nodes (the scrutinee `Name` ref, recursive calls, helper body)
-    /// would otherwise all share the original fold's span, and
-    /// `write_types_back` keys on span — so collisions cause type
-    /// info to bleed between unrelated synthesized nodes in snapshots.
-    synth_span_counter: usize,
     synthesized: Vec<ast::Decl<'src>>,
     /// Per-constructor recursive-field flags: `recursive_fields[con]` is
     /// a vector of booleans, one per field of that constructor.
@@ -63,21 +56,6 @@ struct LiftCtx<'a, 'src> {
     /// Owns symbol IDs for synthesized helpers AND for the synthesized
     /// parameters/local bindings inside each helper.
     symbols: &'a mut SymbolTable,
-}
-
-impl LiftCtx<'_, '_> {
-    /// Mint a fresh synthetic span derived from `base.file`. Uses
-    /// high-offset values (`usize::MAX - n`) so it cannot collide with
-    /// real source offsets in any plausible file.
-    const fn fresh_span(&mut self, base: ast::Span) -> ast::Span {
-        let off = usize::MAX - self.synth_span_counter;
-        self.synth_span_counter = self.synth_span_counter.saturating_add(1);
-        ast::Span {
-            file: base.file,
-            start: off,
-            end: off,
-        }
-    }
 }
 
 // ---- Pre-pass: collect metadata ----
@@ -326,8 +304,8 @@ fn build_lifted_call<'src>(
     // Helper body: `if __fold_scrutinee ...arms...`. Use distinct
     // synthetic spans for every new node so `write_types_back` doesn't
     // overwrite each one with the same entry.
-    let scrut_span = ctx.fresh_span(span);
-    let if_span = ctx.fresh_span(span);
+    let scrut_span = span;
+    let if_span = span;
     let scrut_ref = ast::Expr::new(ast::ExprKind::Name(scrut_param_sym), scrut_span);
     let helper_body = ast::Expr::new(
         ast::ExprKind::If {
@@ -353,7 +331,7 @@ fn build_lifted_call<'src>(
     let mut call_args: Vec<ast::Expr<'src>> = Vec::with_capacity(captures.len().saturating_add(1));
     call_args.push(scrutinee);
     for &cap in &captures {
-        let cap_span = ctx.fresh_span(span);
+        let cap_span = span;
         call_args.push(ast::Expr::new(ast::ExprKind::Name(cap), cap_span));
     }
     let call_kind = ast::ExprKind::Call {
@@ -391,7 +369,7 @@ fn collect_captures(arms: &[ast::MatchArm<'_>], symbols: &SymbolTable) -> Vec<Sy
 /// arm body so the user's code sees the recursed value instead of the
 /// raw sub-tree. Wildcard fields are skipped (no name to rebind).
 fn transform_arm<'src>(
-    ctx: &mut LiftCtx<'_, 'src>,
+    ctx: &LiftCtx<'_, 'src>,
     arm: ast::MatchArm<'src>,
     helper_sym: SymbolId,
     capture_param_syms: &[SymbolId],
@@ -469,13 +447,13 @@ fn transform_arm<'src>(
     for &binding_sym in &rec_bindings {
         let mut call_args: Vec<ast::Expr<'src>> =
             Vec::with_capacity(capture_param_syms.len().saturating_add(1));
-        let bind_span = ctx.fresh_span(base_span);
+        let bind_span = base_span;
         call_args.push(ast::Expr::new(ast::ExprKind::Name(binding_sym), bind_span));
         for &cap_sym in capture_param_syms {
-            let cap_span = ctx.fresh_span(base_span);
+            let cap_span = base_span;
             call_args.push(ast::Expr::new(ast::ExprKind::Name(cap_sym), cap_span));
         }
-        let call_span = ctx.fresh_span(base_span);
+        let call_span = base_span;
         let call = ast::Expr::new(
             ast::ExprKind::Call {
                 target: helper_sym,
@@ -488,7 +466,7 @@ fn transform_arm<'src>(
             val: call,
         });
     }
-    let block_span = ctx.fresh_span(base_span);
+    let block_span = base_span;
     let new_body = ast::Expr::new(ast::ExprKind::Block(stmts, Box::new(body)), block_span);
 
     ast::MatchArm {

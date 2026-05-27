@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{self, Decl, Expr, ExprKind, Module, Span, Stmt};
+use crate::ast::{self, Decl, Expr, ExprId, ExprKind, Module, Stmt};
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 use crate::types::engine::Type;
 
@@ -33,9 +33,9 @@ pub enum EtaInfo {
 ///    explicit `Lambda` wrappers.
 pub fn rewrite(
     module: &mut Module<'_>,
-    expr_types: &HashMap<Span, Type>,
-    resolutions: &HashMap<Span, String>,
-    eta: &HashMap<Span, EtaInfo>,
+    expr_types: &HashMap<ExprId, Type>,
+    resolutions: &HashMap<ExprId, String>,
+    eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
 ) {
     for decl in &mut module.decls {
@@ -45,9 +45,9 @@ pub fn rewrite(
 
 fn rewrite_decl(
     decl: &mut Decl<'_>,
-    expr_types: &HashMap<Span, Type>,
-    resolutions: &HashMap<Span, String>,
-    eta: &HashMap<Span, EtaInfo>,
+    expr_types: &HashMap<ExprId, Type>,
+    resolutions: &HashMap<ExprId, String>,
+    eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
 ) {
     match decl {
@@ -62,13 +62,13 @@ fn rewrite_decl(
 
 fn rewrite_expr(
     expr: &mut Expr<'_>,
-    expr_types: &HashMap<Span, Type>,
-    resolutions: &HashMap<Span, String>,
-    eta: &HashMap<Span, EtaInfo>,
+    expr_types: &HashMap<ExprId, Type>,
+    resolutions: &HashMap<ExprId, String>,
+    eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
 ) {
     // Step 1: write resolved type onto this node.
-    if let Some(ty) = expr_types.get(&expr.span) {
+    if let Some(ty) = expr_types.get(&expr.id) {
         expr.ty = ty.clone();
     }
 
@@ -77,7 +77,7 @@ fn rewrite_expr(
     match &mut expr.kind {
         ExprKind::QualifiedCall { resolved, .. }
         | ExprKind::MethodCall { resolved, .. } => {
-            if let Some(r) = resolutions.get(&expr.span) {
+            if let Some(r) = resolutions.get(&expr.id) {
                 *resolved = Some(r.clone());
             }
         }
@@ -166,7 +166,7 @@ fn rewrite_expr(
     }
 
     // Step 3 (post-order): eta-expand marked callable references.
-    if let Some(info) = eta.get(&expr.span)
+    if let Some(info) = eta.get(&expr.id)
         && matches!(
             &expr.kind,
             ExprKind::Name(_) | ExprKind::FieldAccess { .. }
@@ -179,9 +179,9 @@ fn rewrite_expr(
 
 fn rewrite_arm(
     arm: &mut ast::MatchArm<'_>,
-    expr_types: &HashMap<Span, Type>,
-    resolutions: &HashMap<Span, String>,
-    eta: &HashMap<Span, EtaInfo>,
+    expr_types: &HashMap<ExprId, Type>,
+    resolutions: &HashMap<ExprId, String>,
+    eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
 ) {
     for g in &mut arm.guards {
@@ -192,9 +192,9 @@ fn rewrite_arm(
 
 fn rewrite_stmt(
     stmt: &mut Stmt<'_>,
-    expr_types: &HashMap<Span, Type>,
-    resolutions: &HashMap<Span, String>,
-    eta: &HashMap<Span, EtaInfo>,
+    expr_types: &HashMap<ExprId, Type>,
+    resolutions: &HashMap<ExprId, String>,
+    eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
 ) {
     match stmt {

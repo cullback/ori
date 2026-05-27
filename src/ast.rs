@@ -128,20 +128,40 @@ pub struct TagDecl<'src> {
 
 // ---- Expressions ----
 
+/// Unique identifier for an `Expr` node, distinct from its `Span`.
+///
+/// Pre-inference passes (parser, `fold_lift`, `flatten_patterns`)
+/// mint a fresh `ExprId` for every node they construct. Inference
+/// uses these as keys for its side tables (per-expr types, method
+/// resolutions, etc.) so that synthesized nodes sharing a `Span` with
+/// a parent expression of a different type don't clobber each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExprId(u32);
+
+impl ExprId {
+    pub fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Expr<'src> {
     pub kind: ExprKind<'src>,
     pub span: Span,
+    pub id: ExprId,
     /// Placeholder until inference fills it in.
     pub ty: Type,
 }
 
 impl<'src> Expr<'src> {
     #[allow(dead_code, reason = "used by rewrite passes starting in Step 4")]
-    pub const fn new(kind: ExprKind<'src>, span: Span) -> Self {
+    pub fn new(kind: ExprKind<'src>, span: Span) -> Self {
         Self {
             kind,
             span,
+            id: ExprId::fresh(),
             ty: placeholder_type(),
         }
     }
@@ -1016,6 +1036,7 @@ impl<'src> Resolver<'_, 'src> {
         Expr {
             kind,
             span,
+            id: ExprId::fresh(),
             ty: placeholder_type(),
         }
     }

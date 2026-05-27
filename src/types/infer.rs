@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ast::{self, BinOp, Decl, Expr, ExprKind, Span, Stmt, TypeDeclKind, TypeExpr};
+use crate::ast::{self, BinOp, Decl, Expr, ExprId, ExprKind, Span, Stmt, TypeDeclKind, TypeExpr};
 use crate::error::CompileError;
 use crate::symbol::{FieldInterner, SymbolId, SymbolKind, SymbolTable};
 use crate::types::engine::{Constraint, Scheme, Type, TypeEngine, TypeVar};
@@ -36,9 +36,9 @@ pub struct InferResult {
     /// Used by the lowerer to unwrap nominal types to their underlying representation.
     pub transparent: HashMap<String, (Vec<TypeVar>, Type)>,
     /// Resolved method names for `==`/`!=` on concrete types (keyed by
-    /// the BinOp expression's span). Populated when the type checker
+    /// the BinOp expression's id). Populated when the type checker
     /// resolves equality to an `equals` method.
-    pub binop_method: HashMap<crate::syntax::raw::Span, String>,
+    pub binop_method: HashMap<ExprId, String>,
 }
 
 // ---- Inference context ----
@@ -68,15 +68,15 @@ struct InferCtx<'a, 'src> {
 
     // -- Output side tables (consumed by post_infer::rewrite) --
     /// Per-expression types, resolved to concrete types at end of inference.
-    expr_types: HashMap<Span, Type>,
-    /// Bindings from `is` expressions, indexed by the Is expression's span.
-    is_bindings: HashMap<Span, Vec<(String, Type)>>,
-    /// Resolved method calls: span → mangled method name.
-    method_resolutions: HashMap<Span, String>,
-    /// Resolved `==`/`!=` on concrete types: span → equals method name.
-    binop_equals: HashMap<Span, String>,
+    expr_types: HashMap<ExprId, Type>,
+    /// Bindings from `is` expressions, indexed by the Is expression's id.
+    is_bindings: HashMap<ExprId, Vec<(String, Type)>>,
+    /// Resolved method calls: expr id → mangled method name.
+    method_resolutions: HashMap<ExprId, String>,
+    /// Resolved `==`/`!=` on concrete types: expr id → equals method name.
+    binop_equals: HashMap<ExprId, String>,
     /// Constructor references to eta-expand in post-inference rewrite.
-    eta_expansions: HashMap<Span, EtaInfo>,
+    eta_expansions: HashMap<ExprId, EtaInfo>,
 
     // -- Borrowed context --
     symbols: &'a SymbolTable,
@@ -116,8 +116,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         }
     }
 
-    fn push_constraint(&mut self, mut constraint: Constraint, span: Span) {
+    fn push_constraint(&mut self, mut constraint: Constraint, expr_id: ExprId, span: Span) {
         constraint.span = Some(span);
+        constraint.expr_id = Some(expr_id);
         self.engine.constraints.push(constraint);
     }
 
@@ -411,7 +412,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
 
     fn infer_expr(&mut self, expr: &Expr<'src>) -> Result<Type, CompileError> {
         let ty = self.infer_expr_inner(expr)?;
-        self.expr_types.insert(expr.span, ty.clone());
+        self.expr_types.insert(expr.id, ty.clone());
         Ok(ty)
     }
 
@@ -446,6 +447,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         &mut self,
         func: &str,
         args: &[Expr<'src>],
+        _expr_id: ExprId,
         span: Span,
     ) -> Result<Option<Type>, CompileError> {
         if args.is_empty() {
@@ -494,7 +496,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             && self.symbols.get(*sym).kind == SymbolKind::Constructor
             && matches!(self.engine.resolve(expected), Type::Arrow(_, _))
         {
-            return self.check_con_as_function(*sym, expr.span, expected);
+            return self.check_con_as_function(*sym, expr.id, expr.span, expected);
         }
 
         // Lambda against arrow: push expected param types into env
@@ -566,6 +568,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     fn check_con_as_function(
         &mut self,
         con_sym: SymbolId,
+        expr_id: ExprId,
         span: Span,
         expected: &Type,
     ) -> Result<Type, CompileError> {
@@ -600,9 +603,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
 
         self.unify_at(&con_arrow, expected, span)?;
         let resolved = self.engine.resolve(&con_arrow);
-        self.expr_types.insert(span, resolved.clone());
+        self.expr_types.insert(expr_id, resolved.clone());
         self.eta_expansions
-            .insert(span, EtaInfo::Constructor { con_sym });
+            .insert(expr_id, EtaInfo::Constructor { con_sym });
         Ok(resolved)
     }
 
@@ -630,17 +633,17 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             ExprKind::BinOp { op, lhs, rhs } => match op {
                 BinOp::And => self.infer_bool_binop(lhs, rhs, true),
                 BinOp::Or => self.infer_bool_binop(lhs, rhs, false),
-                _ => self.infer_binop(*op, lhs, rhs, expr.span),
+                _ => self.infer_binop(*op, lhs, rhs, expr.id, expr.span),
             },
 
             ExprKind::Call { target, args, .. } => {
                 let func = self.symbols.display(*target).to_owned();
-                self.infer_call(&func, args, expr.span)
+                self.infer_call(&func, args, expr.id, expr.span)
             }
 
             ExprKind::QualifiedCall { segments, args, .. } => {
                 let mangled = segments.join(".");
-                self.infer_call(&mangled, args, expr.span)
+                self.infer_call(&mangled, args, expr.id, expr.span)
             }
 
             ExprKind::Block(stmts, result) => self.infer_block(stmts, result),
@@ -670,7 +673,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
 
             ExprKind::FieldAccess { record, field } => {
-                self.infer_field_access(record, *field, expr.span)
+                self.infer_field_access(record, *field, expr.id, expr.span)
             }
 
             ExprKind::Lambda { params, body } => self.infer_lambda(params, body),
@@ -697,7 +700,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 method,
                 args,
                 ..
-            } => self.infer_method_call(receiver, method, args, expr.span),
+            } => self.infer_method_call(receiver, method, args, expr.id, expr.span),
 
             ExprKind::Is {
                 expr: inner,
@@ -712,7 +715,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     .into_iter()
                     .map(|(sym, ty)| (self.symbols.display(sym).to_owned(), ty))
                     .collect();
-                self.is_bindings.insert(expr.span, named);
+                self.is_bindings.insert(expr.id, named);
                 Ok(Type::Con("Bool".to_owned()))
             }
 
@@ -957,6 +960,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         &mut self,
         record: &Expr<'src>,
         field: crate::symbol::FieldSym,
+        expr_id: ExprId,
         span: Span,
     ) -> Result<Type, CompileError> {
         // Method reference via `Type.method`: if the record is a
@@ -973,9 +977,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             let mangled = format!("{type_name}.{field_name}");
             if let Some(scheme) = self.env.get(&mangled).cloned() {
                 let method_ty = self.engine.instantiate(&scheme);
-                self.expr_types.insert(span, method_ty.clone());
+                self.expr_types.insert(expr_id, method_ty.clone());
                 self.eta_expansions.insert(
-                    span,
+                    expr_id,
                     EtaInfo::Method {
                         type_name,
                         method_name: field_name,
@@ -1058,6 +1062,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         &mut self,
         func: &str,
         args: &[Expr<'src>],
+        expr_id: ExprId,
         span: Span,
     ) -> Result<Type, CompileError> {
         // Bidirectional path: if the callee has a known scheme whose
@@ -1067,8 +1072,8 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         // extended) flow with context. Falls through to the legacy
         // synthesize-first path for zero-arg calls, structural
         // constructors, and method-on-var dispatch.
-        if let Some(result) = self.try_infer_call_bidir(func, args, span)? {
-            self.maybe_mark_numeric_builtin(func, span);
+        if let Some(result) = self.try_infer_call_bidir(func, args, expr_id, span)? {
+            self.maybe_mark_numeric_builtin(func, expr_id, span);
             return Ok(result);
         }
 
@@ -1088,7 +1093,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             }
             let expected = Type::Arrow(arg_types, Box::new(ret.clone()));
             self.unify_at(&func_ty, &expected, span)?;
-            self.maybe_mark_numeric_builtin(func, span);
+            self.maybe_mark_numeric_builtin(func, expr_id, span);
             return Ok(ret);
         }
 
@@ -1109,7 +1114,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             let method_name = &func[dot_pos + 1..];
             if let Some(scheme) = self.env.get(var_name).cloned() {
                 let var_ty = self.engine.instantiate(&scheme);
-                return self.resolve_method(var_ty, method_name, arg_types, span);
+                return self.resolve_method(var_ty, method_name, arg_types, expr_id, span);
             }
         }
 
@@ -1126,6 +1131,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         op: BinOp,
         lhs: &Expr<'src>,
         rhs: &Expr<'src>,
+        expr_id: ExprId,
         span: Span,
     ) -> Result<Type, CompileError> {
         let lt = self.infer_expr(lhs)?;
@@ -1194,7 +1200,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     method_name: method_name.to_owned(),
                     method_type,
                     span: None,
+                    expr_id: None,
                 },
+                expr_id,
                 span,
             );
         } else if is_eq {
@@ -1204,9 +1212,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             // tuples, lists, etc. resolve via their type's method.
             // Store in binop_equals (not method_resolutions) since
             // BinOp has no `resolved` AST field.
-            if self.resolve_method(resolved, "equals", vec![rt], span).is_ok() {
-                if let Some(resolution) = self.method_resolutions.remove(&span) {
-                    self.binop_equals.insert(span, resolution);
+            if self.resolve_method(resolved, "equals", vec![rt], expr_id, span).is_ok() {
+                if let Some(resolution) = self.method_resolutions.remove(&expr_id) {
+                    self.binop_equals.insert(expr_id, resolution);
                 }
             }
         }
@@ -1225,6 +1233,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         receiver: &Expr<'src>,
         method: &'src str,
         args: &[Expr<'src>],
+        expr_id: ExprId,
         span: Span,
     ) -> Result<Type, CompileError> {
         let recv_ty = self.infer_expr(receiver)?;
@@ -1232,7 +1241,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         for a in args {
             arg_types.push(self.infer_expr(a)?);
         }
-        self.resolve_method(recv_ty, method, arg_types, span)
+        self.resolve_method(recv_ty, method, arg_types, expr_id, span)
     }
 
     /// Shared method dispatch: given a receiver type, method name, and
@@ -1245,6 +1254,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         recv_ty: Type,
         method: &str,
         arg_types: Vec<Type>,
+        expr_id: ExprId,
         span: Span,
     ) -> Result<Type, CompileError> {
         let ret = self.engine.fresh();
@@ -1263,7 +1273,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 } else {
                     mangled
                 };
-                self.method_resolutions.insert(span, resolution);
+                self.method_resolutions.insert(expr_id, resolution);
                 return Ok(ret);
             }
         }
@@ -1275,21 +1285,21 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     let bool_ty = Type::Con("Bool".to_owned());
                     self.unify_at(&ret, &bool_ty, span)?;
                     self.method_resolutions
-                        .insert(span, "__record_equals".to_owned());
+                        .insert(expr_id, "__record_equals".to_owned());
                     return Ok(ret);
                 }
                 "to_str" => {
                     let str_ty = Type::Con("Str".to_owned());
                     self.unify_at(&ret, &str_ty, span)?;
                     self.method_resolutions
-                        .insert(span, "__record_to_str".to_owned());
+                        .insert(expr_id, "__record_to_str".to_owned());
                     return Ok(ret);
                 }
                 "hash" => {
                     let u64_ty = Type::Con("U64".to_owned());
                     self.unify_at(&ret, &u64_ty, span)?;
                     self.method_resolutions
-                        .insert(span, "__record_hash".to_owned());
+                        .insert(expr_id, "__record_hash".to_owned());
                     return Ok(ret);
                 }
                 _ => {}
@@ -1303,14 +1313,14 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     let bool_ty = Type::Con("Bool".to_owned());
                     self.unify_at(&ret, &bool_ty, span)?;
                     self.method_resolutions
-                        .insert(span, "__tuple_equals".to_owned());
+                        .insert(expr_id, "__tuple_equals".to_owned());
                     return Ok(ret);
                 }
                 "hash" => {
                     let u64_ty = Type::Con("U64".to_owned());
                     self.unify_at(&ret, &u64_ty, span)?;
                     self.method_resolutions
-                        .insert(span, "__tuple_hash".to_owned());
+                        .insert(expr_id, "__tuple_hash".to_owned());
                     return Ok(ret);
                 }
                 _ => {}
@@ -1323,7 +1333,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 let u64_ty = Type::Con("U64".to_owned());
                 self.unify_at(&ret, &u64_ty, span)?;
                 self.method_resolutions
-                    .insert(span, "__tag_hash".to_owned());
+                    .insert(expr_id, "__tag_hash".to_owned());
                 return Ok(ret);
             }
         }
@@ -1338,7 +1348,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     method_name: method.to_owned(),
                     method_type,
                     span: None,
+                    expr_id: None,
                 },
+                expr_id,
                 span,
             );
             return Ok(ret);
@@ -1581,7 +1593,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     fn collect_is_bindings(&mut self, expr: &Expr<'src>) {
         match &expr.kind {
             ExprKind::Is { .. } => {
-                if let Some(bindings) = self.is_bindings.get(&expr.span).cloned() {
+                if let Some(bindings) = self.is_bindings.get(&expr.id).cloned() {
                     for (name, ty) in bindings {
                         self.env.insert(name, Scheme::mono(ty));
                     }
@@ -1693,13 +1705,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
     /// `method_resolutions` at `span`. Called after `infer_call` /
     /// `try_infer_call_bidir` resolve a `QualifiedCall` via env so
     /// the lowerer routes it through the intrinsic path.
-    fn maybe_mark_numeric_builtin(&mut self, func: &str, span: Span) {
+    fn maybe_mark_numeric_builtin(&mut self, func: &str, expr_id: ExprId, _span: Span) {
         if let Some(dot) = func.find('.') {
             let type_name = &func[..dot];
             let method = &func[dot + 1..];
             if super::post_infer::is_numeric_builtin(type_name, method) {
                 self.method_resolutions
-                    .insert(span, format!("__builtin.{method}"));
+                    .insert(expr_id, format!("__builtin.{method}"));
             }
         }
     }
@@ -1717,14 +1729,15 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 let c = self.engine.constraints[i].clone();
                 let resolved = self.engine.resolve(&Type::Var(c.type_var));
                 let maybe_span = c.span;
+                let maybe_id = c.expr_id;
 
                 // Record types: compiler-generated equals/to_str/hash.
                 if let Type::Record { .. } = &resolved
                     && matches!(c.method_name.as_str(), "equals" | "to_str" | "hash")
                 {
-                    if let Some(s) = maybe_span {
+                    if let Some(id) = maybe_id {
                         self.method_resolutions
-                            .insert(s, format!("__record_{}", c.method_name));
+                            .insert(id, format!("__record_{}", c.method_name));
                     }
                     progress = true;
                     continue;
@@ -1734,9 +1747,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 if let Type::Tuple(_) = &resolved
                     && matches!(c.method_name.as_str(), "equals" | "hash")
                 {
-                    if let Some(s) = maybe_span {
+                    if let Some(id) = maybe_id {
                         self.method_resolutions
-                            .insert(s, format!("__tuple_{}", c.method_name));
+                            .insert(id, format!("__tuple_{}", c.method_name));
                     }
                     progress = true;
                     continue;
@@ -1746,9 +1759,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 if let Type::TagUnion { .. } = &resolved
                     && c.method_name == "hash"
                 {
-                    if let Some(s) = maybe_span {
+                    if let Some(id) = maybe_id {
                         self.method_resolutions
-                            .insert(s, "__tag_hash".to_owned());
+                            .insert(id, "__tag_hash".to_owned());
                     }
                     progress = true;
                     continue;
@@ -1762,13 +1775,13 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 if let Some(scheme) = self.env.get(&mangled).cloned() {
                     let actual_ty = self.engine.instantiate(&scheme);
                     drop(self.engine.unify(&c.method_type, &actual_ty));
-                    if let Some(s) = maybe_span {
+                    if let Some(id) = maybe_id {
                         let resolution = if super::post_infer::is_numeric_builtin(type_name, &c.method_name) {
                             format!("__builtin.{}", c.method_name)
                         } else {
                             mangled
                         };
-                        self.method_resolutions.insert(s, resolution);
+                        self.method_resolutions.insert(id, resolution);
                     }
                 } else if let Some(s) = maybe_span {
                     return Err(CompileError::at(
@@ -2111,10 +2124,10 @@ pub fn check(
     ctx.resolve_and_verify()?;
 
     // Resolve all expression types now that inference is complete.
-    let expr_types: HashMap<Span, Type> = ctx
+    let expr_types: HashMap<ExprId, Type> = ctx
         .expr_types
         .iter()
-        .map(|(span, ty)| (*span, ctx.engine.resolve(ty)))
+        .map(|(id, ty)| (*id, ctx.engine.resolve(ty)))
         .collect();
 
     // Collect resolved function/method schemes for monomorphization.
