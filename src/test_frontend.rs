@@ -2067,7 +2067,6 @@ main = |arg| classify(\"purple\")";
 }
 
 #[test]
-#[ignore = "known bug: flatten_patterns drops type info on hoisted tuple destructures inside constructor patterns"]
 fn nested_tuple_in_constructor_pattern_with_dynamic_args() {
     // Construct a tagged value carrying a tuple; match on it. With
     // constant constructor args, eval const-folds and hides the bug.

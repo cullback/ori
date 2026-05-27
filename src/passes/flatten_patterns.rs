@@ -382,9 +382,17 @@ fn flatten_field<'src>(
         Pattern::Tuple(_) | Pattern::Record { .. } => {
             let tmp = ctx.fresh_local(span);
             let nested = std::mem::replace(field, Pattern::Binding(tmp));
+            // Fresh span: inference keys `expr_types` by span, and the
+            // arm's body shares `span` with anything else built using
+            // it. Reusing `span` for the synthesized Name caused the
+            // last-written type at that span (typically the body
+            // expression's type) to clobber the Name's resolved type,
+            // which made the downstream destructure see the wrong
+            // val.ty at lower.
+            let name_span = ctx.fresh_span(span);
             destructures.push(Stmt::Destructure {
                 pattern: nested,
-                val: Expr::new(ExprKind::Name(tmp), span),
+                val: Expr::new(ExprKind::Name(tmp), name_span),
             });
         }
     }
