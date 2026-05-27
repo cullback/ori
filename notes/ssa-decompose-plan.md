@@ -91,10 +91,19 @@ Two distinct worries to separate:
 
 - **Bulk collections (lists, "1000-element arrays").** Ori doesn't have
   a fixed-size array type. Collections are `List(T)`, which is *always*
-  a single `RcPtr` to a heap-allocated header + data buffer.
-  Decomposition doesn't touch lists. A 1000-element list is one
-  `RcPtr` Value at the SSA layer regardless. So "what about a 1000-
-  element array" is a non-issue — it's already heap.
+  a single `RcPtr` to a heap-allocated `[len, cap, data_ptr]` header
+  plus a dynamic data buffer. A 1000-element list is one `RcPtr` Value
+  at the SSA layer regardless. **Decomposition does NOT touch lists**
+  — they stay as one RcPtr per list.
+
+  (Note: one could in principle decompose the List *header* into three
+  register Values — `len: U64`, `cap: U64`, `data_ptr: RcPtr` to the
+  data buffer — saving the header allocation. This would shift FBIP's
+  "is this uniquely owned" check from the header's rc to the data
+  buffer's rc, which is a load-bearing semantic change. **That's a
+  separate, future refactor**, not part of this plan. This plan only
+  decomposes anonymous structural data (tuples, records); it leaves
+  List/Str/other RC-managed runtime objects as one RcPtr each.)
 - **Large records (say, 30 fields).** Decomposition produces 30
   parallel `Value`s. At the SSA layer this is fine — `Function::params`
   is just a longer `Vec<Value>`, env has 30 more entries, no semantic
