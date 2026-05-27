@@ -43,10 +43,15 @@ optimization but as the runtime model.
 - **`expect <bool>`** lines at module level are inline test
   assertions, executed by `ori test foo.ori`.
 
-Note: `infer.transparent` / `resolve_transparent` in the compiler are
-slight misnomers — they unwrap both `:=` (transparent) and `::`
-(opaque) declarations. The "transparent inside the `.()` block"
-behavior of opaque newtypes is what the unwrap captures.
+Implementation note: the "opaque outside / transparent inside"
+semantics is implemented in inference, not lowering. `::` types are
+registered in `engine.transparent` only for the duration of their own
+method-body inference and removed immediately after. By the time
+`InferResult.transparent` is exposed to lower/mono, only `:=` types
+remain — so the field name is accurate (it is in fact transparent
+types only), and `resolve_transparent` correctly returns the input
+unchanged for opaque types at lower time. The "inside the `.()`
+block" view never escapes inference.
 
 ## Memory and RC
 
