@@ -29,6 +29,35 @@ There is no codegen backend yet. The plan is to eventually add:
 This plan reshapes the SSA layer to be friendly to all three, with
 Cranelift as the strictest constraint (no aggregate types in IR).
 
+### The decomposition principle
+
+**Fixed-shape data is decomposed into parallel Values; dynamically-
+sized buffers stay heap.** Everything that exists today as a "heap
+header pointing at variable data" (Lists, Strs, closure envs) gets
+its header decomposed — only the dynamic buffer stays as an `RcPtr`.
+Tuples and records (which have no dynamic part) decompose entirely
+into parallel Values.
+
+Concretely:
+
+- **Tuples / records** (anonymous structural data): decomposed
+  entirely into N parallel Values. No heap object exists if the data
+  doesn't escape.
+- **List(T) / Str**: header `(len, cap, data: RcPtr)` decomposes into
+  three parallel Values; only the data buffer stays heap. This
+  eliminates the "two-tier header" special case.
+- **Closure environments**: a closure becomes `(fn_id, capture1,
+  capture2, ...)` as parallel Values; no env-header heap object.
+- **Tag-union payloads** (e.g. `Ok(x)`, `Cons(h, t)`): payloads still
+  live in a heap object because tags need RC-tracked identity (you
+  pattern-match on `Ok` vs `Err`, which means the variant tag itself
+  needs to be in memory you can read). Tag objects stay as one RcPtr.
+
+Heap stays for:
+- Variable-length data (list/str data buffers)
+- Tag union values (because of RC-tracked variant identity)
+- Anything escaped, shared, or that needs lifetime beyond a function
+
 ### Today's SSA, in one paragraph
 
 Two value kinds: **`RcPtr`** (heap object, rc-tracked) and **`Agg(N)`**
@@ -90,20 +119,15 @@ Perceus/FBIP doesn't change this:
 Two distinct worries to separate:
 
 - **Bulk collections (lists, "1000-element arrays").** Ori doesn't have
-  a fixed-size array type. Collections are `List(T)`, which is *always*
-  a single `RcPtr` to a heap-allocated `[len, cap, data_ptr]` header
-  plus a dynamic data buffer. A 1000-element list is one `RcPtr` Value
-  at the SSA layer regardless. **Decomposition does NOT touch lists**
-  — they stay as one RcPtr per list.
+  a fixed-size array type. Collections are `List(T)`. The principled
+  decomposition treats `List(T)` as a **fixed-shape header** — three
+  parallel Values `(len: U64, cap: U64, data: RcPtr<buffer>)` — with
+  only the dynamic data buffer staying heap-managed. A 1000-element
+  list is `(1000, cap, buffer_ptr)` at the SSA layer: three Values,
+  one RcPtr to the buffer that holds the elements. The "header heap
+  object" that exists today goes away entirely.
 
-  (Note: one could in principle decompose the List *header* into three
-  register Values — `len: U64`, `cap: U64`, `data_ptr: RcPtr` to the
-  data buffer — saving the header allocation. This would shift FBIP's
-  "is this uniquely owned" check from the header's rc to the data
-  buffer's rc, which is a load-bearing semantic change. **That's a
-  separate, future refactor**, not part of this plan. This plan only
-  decomposes anonymous structural data (tuples, records); it leaves
-  List/Str/other RC-managed runtime objects as one RcPtr each.)
+  This means `Str` (= `List(U8)`) also decomposes the same way.
 - **Large records (say, 30 fields).** Decomposition produces 30
   parallel `Value`s. At the SSA layer this is fine — `Function::params`
   is just a longer `Vec<Value>`, env has 30 more entries, no semantic
@@ -479,21 +503,36 @@ at each stage boundary and confirm with the user before proceeding.**
 5. **Decompose records in lower.** Same treatment for non-escaping
    record literals.
 
-6. **Closures and `lambda_specialize`.** Update capture shapes.
-   Decide per-closure whether to use decomposed or heap env (see
-   "Risk areas" below).
+6. **Decompose List/Str headers.** This is its own stage because it
+   touches every List/Str stdlib method and the `__main` ABI. Each
+   `List(T)` becomes 3 Values: `(len: U64, cap: U64, data: RcPtr)`.
+   Only the data buffer stays heap. Method signatures (`List.len`,
+   `List.append`, `List.set`, etc.) all expand their `List(T)` slots
+   to 3 slots. `__main`'s `args: List(Str)` becomes 3 expanded slots
+   (the Str inside the List has its OWN 3-slot expansion at the
+   element level, but elements are stored in the buffer as bytes —
+   `List(Str)` elements are pointers to Str headers, so each element
+   slot in the buffer is an RcPtr). The eval driver materializes
+   accordingly. Same treatment for Str (= List(U8)).
 
-7. **Delete `ScalarType::Agg`, `Pack`, `Extract`, `Scalar::Agg`.**
+7. **Closures and `lambda_specialize`.** Update capture shapes.
+   Closure becomes `(fn_id, capture1, capture2, ...)` parallel Values;
+   no env-header heap object. Decide per-closure whether to keep heap
+   env for long-lived closures (see "Risk areas" below).
+
+8. **Delete `ScalarType::Agg`, `Pack`, `Extract`, `Scalar::Agg`.**
    At this point nothing should produce them; the deletion is just
    removing dead code. Update `dests()` to lose the Pack/Extract
    arms. Update `display.rs` similarly.
 
-8. **SROA: survey and either shrink to materialize-on-escape or
+9. **SROA: survey and either shrink to materialize-on-escape or
    delete entirely.** Depends on what lower's emission decision
    already covers.
 
-9. **Update `CLAUDE.md`, `src/lower/README.md`, `src/opt/README.md`.**
-   Document the new model.
+10. **Update `CLAUDE.md`, `src/lower/README.md`, `src/opt/README.md`.**
+    Document the new model. CLAUDE.md's "two-tier `[len, cap,
+    data_ptr]` header" description is now historical; rewrite the
+    "Lists and Strs are always RcPtr" line.
 
 ## Verification beyond `cargo test`
 
@@ -583,6 +622,11 @@ Use `cargo test --quiet -- --ignored` to also run the audit tests
   side either).
 - **Honest FBIP scope.** COW machinery applies only to genuinely-shared
   heap data; in-flight value updates are just substitutions.
+- **Eliminates the List/Str "two-tier header" special case.** Today's
+  `RcPtr → [len, cap, data_ptr] → buffer` becomes `(len, cap, buffer_rcptr)`
+  trio — the header is no longer a special heap object with a
+  hardcoded layout. `List.len(list)` is the `len` Value directly;
+  zero instructions for what was a heap load.
 
 ## What this doesn't enable
 
