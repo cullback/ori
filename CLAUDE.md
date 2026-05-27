@@ -16,6 +16,38 @@ optimization but as the runtime model.
   the time SSA runs. Call graph is acyclic except for self-loops from
   structural recursion — no mutual recursion across user functions.
 
+## Surface syntax
+
+- **Three type-declaration kinds**, distinguished by the operator:
+  - `Foo : T` — **alias**, sugar with no nominal identity.
+  - `Foo := T` — **transparent** newtype: nominal, but `T`'s internals
+    are visible everywhere `Foo` is.
+  - `Foo :: T` — **opaque** newtype: callers see `Foo` as its own
+    type; `T` is hidden outside the methods block.
+- **`.( methods )` block on a type decl.** `Foo := T.(...)` or
+  `Foo :: T.(...)` attaches methods. Inside the block, *parameters and
+  return values typed `Foo` auto-unwrap to `T`* — "opaque outside,
+  transparent inside." This is the only way to define methods on a
+  newtype.
+- **Pattern matching** is `if expr : pat then body : pat then body
+  else default`. There is no separate `match` keyword.
+- **Guards** are introduced with `and` after a pattern:
+  `: [x] and x > 0 then body`.
+- **Return arms.** An arm can end in `return` instead of `then`. The
+  body's value then returns from the *enclosing function*, not the
+  match expression. (`?` desugars to a match where the `Err` arm is
+  `return`.)
+- **`?` operator** on a `Result` desugars to
+  `if expr : Ok(v) then v : Err(e) return Err(e)` — yields the Ok
+  payload, returns the function on Err.
+- **`expect <bool>`** lines at module level are inline test
+  assertions, executed by `ori test foo.ori`.
+
+Note: `infer.transparent` / `resolve_transparent` in the compiler are
+slight misnomers — they unwrap both `:=` (transparent) and `::`
+(opaque) declarations. The "transparent inside the `.()` block"
+behavior of opaque newtypes is what the unwrap captures.
+
 ## Memory and RC
 
 - **Perceus refcounting.** Each heap object carries an `rc`; reaching 0
@@ -35,11 +67,17 @@ optimization but as the runtime model.
   Lists and Strs are always `RcPtr` — two-tier `[len, cap, data_ptr]`
   header plus a dynamic data buffer. `Str = List(U8)`; there is no
   separate string primitive.
-- **Aggs have no rc and no lifecycle.** Pack copies values in; Extract
-  copies them out. Nothing automatically releases the RcPtr fields an
-  Agg holds when it goes out of scope — opt passes that promote an
-  RcPtr-holding alloc to Pack must explicitly emit the rc_decs the
-  vanished alloc-free would have cascaded.
+- **Aggs carry rc on behalf of their RcPtr fields**, in symmetry with
+  how heap allocs carry rc on behalf of their Ptr-typed slots:
+  - `Pack(d, fields)` `rc_inc`s every RcPtr field (mirrors `Store`'s
+    auto-rc-inc).
+  - `Extract(d, agg, idx)` `rc_inc`s the extracted value if `d.ty ==
+    RcPtr` (mirrors `Load`'s auto-rc-inc).
+  - `RcInc`/`RcDec` on an Agg-typed value cascade through every Ptr
+    field stored in the Agg (mirrors alloc-free's cascade).
+  `rc_emit` places end-of-life `rc_dec` on Agg-typed locals the same
+  way it does on RcPtr-typed locals — `cow_move_out`'s Agg result
+  is no longer leaked.
 - `__main` is the ABI boundary to the Rust eval driver. Its return
   type must stay `RcPtr` (a `Result`); sig-changing optimizations must
   exclude it.
