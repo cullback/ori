@@ -188,6 +188,34 @@ pub enum ScalarType {
 `total_byte_size` are unchanged (they're about heap layout). `is_heap_ptr()`
 unchanged.
 
+**`Ptr` (raw pointer, no auto-rc) stays.** Today's CLAUDE.md/docstring
+calls it "reserved for stack-promotion future, currently unused." That
+undersells it. Real uses exist or are imminent:
+
+- **Statics should be `Ptr`, not `RcPtr`-with-sentinel.** Today
+  `static_promote` produces `RcPtr`s whose rc field is a sentinel that
+  makes RC ops no-op. That's a type lie — switch statics to `Ptr` as
+  part of stage 6/7 cleanup. Honest representation, no sentinel
+  special-casing.
+- **Local borrow optimization (future).** `BitCast(rcptr_val) → Ptr`
+  downgrades an RcPtr to a non-RC borrow within a function scope. The
+  parent's rc claim covers the borrow window. Loads through the `Ptr`
+  skip auto-rc-inc; no rc_dec at end of scope. Already expressible
+  via existing `BitCast` (same width, reinterpret as different type)
+  — no new instruction needed. *Not in scope for this refactor*; it's
+  a future Perceus opt pass. But document the pattern so the agent
+  doesn't delete `Ptr` thinking it's dead.
+
+### Other IDs (Rust-side newtypes, not ScalarType variants)
+
+Closure dispatch needs a `fn_id` Value flowing through the IR. Model
+this as `pub struct FuncId(u32)` — a Rust newtype alongside
+`SymbolId`, `BlockId`, `ExprId`, `FieldSym`. At the SSA layer the
+`fn_id` slot is just `ScalarType::U32` holding the raw index; no new
+`ScalarType` variant. Closure dispatch (`__apply_K`) reads the
+U32-typed Value and `SwitchInt`s to dispatch. Compiler-side code
+uses `FuncId(u32)` for type safety; eval / SSA see it as `U32`.
+
 ### `Inst`
 
 ```rust
