@@ -85,6 +85,40 @@ Perceus/FBIP doesn't change this:
 - In-place field update on a decomposed record is just value substitution
   (`replace value_k with newval`). No store, no RC, no COW machinery.
 
+### What about large data / register pressure?
+
+Two distinct worries to separate:
+
+- **Bulk collections (lists, "1000-element arrays").** Ori doesn't have
+  a fixed-size array type. Collections are `List(T)`, which is *always*
+  a single `RcPtr` to a heap-allocated header + data buffer.
+  Decomposition doesn't touch lists. A 1000-element list is one
+  `RcPtr` Value at the SSA layer regardless. So "what about a 1000-
+  element array" is a non-issue — it's already heap.
+- **Large records (say, 30 fields).** Decomposition produces 30
+  parallel `Value`s. At the SSA layer this is fine — `Function::params`
+  is just a longer `Vec<Value>`, env has 30 more entries, no semantic
+  problem. At the *backend* layer (Cranelift, LLVM, native), the
+  register allocator spills to stack when out of physical registers.
+  That's the backend's job, not the SSA layer's. Ori's SSA has
+  unlimited Values by design.
+
+So **stack slots are a backend concern, not an SSA concern.** When
+Ori's SSA → CLIF lowering is written, the CLIF emitter synthesizes
+Cranelift stack slots for Values that don't fit in real registers.
+The SSA doesn't need to model that.
+
+If Ori ever grows fixed-size arrays (`[I64; N]`), the natural choice
+is "always heap" like Lists — not "decompose into N register Values"
+which would be silly for large N. That decision lives in front-end
+type design, not in the SSA layer.
+
+If a real workload later demands stack slots in SSA (e.g., a 100-field
+record updated in a tight loop where both heap and decomposition are
+wasteful), they're an *additive* extension: add `StackAlloc`,
+`StackLoad`, `StackStore` instructions later. No impact on existing
+SSA. Defer until a real program needs it.
+
 ## Target IR shape — concrete enum diff
 
 ### `ScalarType`
