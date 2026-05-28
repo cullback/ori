@@ -433,7 +433,15 @@ main = |arg| (
     ((a, b), (c, d)) = t
     a + b + c + d
 )";
-    assert_eq!(run_i64(source, 0), 10);
+    let (result, heap) = run_with_heap(source, 0);
+    assert_eq!(result, Scalar::I64(10));
+    // The outer tuple is Multi (no header). Inner tuples materialize
+    // via lower_expr on each element, but elim_dead_allocs kills them
+    // since their only readers are the destructure's Loads at fixed
+    // offsets. Net result: zero heap allocs.
+    assert_eq!(heap.alloc_count, 0,
+        "expected zero allocs for nested tuple roundtrip, got {}",
+        heap.alloc_count);
 }
 
 // ============================================================
