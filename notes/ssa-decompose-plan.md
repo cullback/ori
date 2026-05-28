@@ -354,6 +354,120 @@ Scalar. The env is `HashMap<Value, Scalar>` — multi-result instructions
 just insert N entries, one per result Value. Search eval for `Scalar::Agg`,
 `is_agg`, `Pack`, `Extract` and remove each handler.
 
+## Memory layout: target design (codegen-targeted)
+
+This section describes the byte-level layout for heap objects that
+codegen will commit to. **Today's eval doesn't need this** — it uses
+a Rust `HeapObject` struct that abstracts over actual memory layout.
+But the layout is the eventual target, and parts of it (rc field
+width, sentinel handling) are cheap to align in eval as part of
+phase F cleanup.
+
+### RcPtr layout: header at negative offset
+
+```
+ -8        -4         0
+[ pad:u32 | rc:u32 ] [ user data starts here, 8-byte aligned ]
+                      ↑ RcPtr Value holds this address
+```
+
+- 8-byte header. RC at `rcptr - 4`, accessed by simple load/store.
+- Data starts at `rcptr + 0`, 8-byte aligned. Field accesses are
+  `Load(rcptr, offset)` with no header skip.
+- `pad: u32` is reserved (alignment + future use: generation
+  counter for use-after-free debugging, etc.). Keep it zero for
+  now; don't claim it for a single purpose prematurely.
+
+This is the C++ `shared_ptr` / Rust `Rc<T>` convention: control
+block before the object, pointer to the object. Trade-off: rc pays
+the -4 offset on access; data access is free.
+
+### `rc: u32`, sentinel via saturation
+
+- u32 (4 bytes). 4 billion refs is far more than any pure-FP
+  program produces; u64 is overkill.
+- Sentinel for statics: `rc = u32::MAX`. RC ops saturate — `inc`
+  doesn't go past MAX, `dec` on MAX is a no-op. Statics become
+  immortal naturally without special-case branches.
+
+### No per-object type tag — static dispatch on free
+
+Today's eval carries `ptr_offsets` and `type_map` as per-object
+metadata so `rc_dec` can cascade. In codegen, this becomes
+**static dispatch**: each `RcDec` site knows the destinee's
+concrete type (Ori is lambda-lifted and monomorphized), so the
+compiler emits a direct call to a type-specific cleanup routine
+— like Rust's `Drop::drop` glue. No type tag in the header.
+
+For tag union payload objects: cleanup dispatch happens after the
+`SwitchInt(tag)` that pattern-match emits — each arm knows the
+variant and its payload's concrete type. Still static.
+
+### No weak count
+
+Pure FP can't form cycles (immutability prevents the back-edge), so
+weak references are vestigial. Skip the weak counter — saves 4
+bytes vs Rust's `RcBox<T>` (which uses `{ strong: usize, weak: usize, data: T }`,
+16-byte header).
+
+### List buffer layout
+
+Buffers use the same header shape:
+
+```
+ -8        -4
+[ pad:u32 | rc:u32 ] [ elem0 | elem1 | ... | elem(len-1) ] [ unused up to cap ]
+                      ↑ data: RcPtr in the (len, cap, data) trio points here
+```
+
+One allocation per buffer (no separate header allocation). Elements
+laid out inline per their decomposed shape — `Vec<T>` in Rust.
+`LoadDyn(buffer, idx, scalar)` indexes by element stride; the rc
+field is `*(buffer - 4)`.
+
+### Per-object overhead comparison
+
+| Design | Header bytes |
+|---|---|
+| **Ori target** | 8 (4 rc + 4 pad/align) |
+| Rust `Rc<T>` | 16 (8 strong + 8 weak) |
+| Rust `Arc<T>` | 16 (atomic strong + atomic weak) |
+| C++ `make_shared<T>` | 16+ (impl-defined control block) |
+
+8 bytes is competitive — what you'd write if you knew you didn't
+need weak refs or atomics. Ori has both: no cycles (pure FP) and
+single-threaded (eval is, codegen targets stay single-threaded
+unless we add concurrency primitives much later).
+
+### FBIP hot path under this layout
+
+The hottest path in the language: "rc == 1?" check. Under this
+layout it's:
+
+```
+LOAD  rc, [rcptr - 4]    ; one cycle
+CMP   rc, 1              ; one cycle
+JE    in_place_path
+```
+
+Two instructions on the hot path. The rc load is on the same cache
+line as the data (8-byte header + data in one allocation), so the
+rc load is effectively free if you're about to touch the data
+anyway.
+
+### What gets aligned in eval during phase F
+
+The byte layout above is for future codegen; eval doesn't need it.
+But the *invariants* can align cheaply:
+
+- `HeapObject::rc: usize` → `rc: u32` (matches target sentinel).
+- Sentinel constant moves from `usize::MAX` to `u32::MAX`.
+- Drop any fields that won't exist in the byte layout (Ori today
+  has none beyond what's needed; just verify).
+
+This is half a day's work, lives in phase F (`F3`). The actual
+byte layout commits at codegen time, not in this refactor.
+
 ## Lower's emission decision (the key piece)
 
 Lower picks emission mode for each tuple/record construction based on
@@ -519,85 +633,117 @@ only as a syntactic grouping at the source level.**
 
 ## Order of operations
 
-Each stage must compile and tests must pass before moving on. **Stop
-at each stage boundary and confirm with the user before proceeding.**
+Each phase must compile and tests must pass before moving on. **Stop
+at each phase boundary and confirm with the user before proceeding.**
+Within a phase, stages can be done in any order or in parallel since
+they don't depend on each other.
 
-1. **Multi-result `Inst::Call` infrastructure.** Change `Inst::Call`
-   to struct-style with `results: Vec<Value>`. Update eval, builder,
-   validator, display. **Don't change any callsites yet** — keep them
-   producing single-element `results: vec![v]`. Verify test suite
-   still passes. This is pure plumbing.
+### Phase A: IR plumbing (no semantic changes)
 
-2. **`Function::return_type: Vec<ScalarType>` and `Terminator::Return(Vec<Value>)`.**
-   Pure plumbing, single-element for now.
+Pure shape changes to `Inst`/`Function`/`Terminator`. Existing
+callsites continue producing single-result/single-value shapes
+wrapped in the new multi-shape containers. Test suite still passes
+unchanged at the end of this phase.
 
-3. **`Inst::CowMoveOut` to struct-style with `[Value; 2]`.** Update
-   the one site that emits it and the one site in eval. Verify tests.
+- **A1.** `Inst::Call` to struct-style with `results: Vec<Value>`.
+  Update eval, builder, validator, display. Callsites produce
+  `results: vec![v]`.
+- **A2.** `Function::return_type: Vec<ScalarType>` and
+  `Terminator::Return(Vec<Value>)`. Single-element for now.
+- **A3.** `Inst::CowMoveOut` to struct-style with `[Value; 2]`.
 
-4. **Decompose tuples in lower.** Tuple literal lowering produces N
-   parallel Values. Tuple destructuring binds to those Values. Tuple
-   field access (where source is decomposed) is name resolution, no
-   instruction emitted. Tuple-passed-as-arg / tuple-as-return:
-   expand into multi-slot. Test suite should still pass with the
-   new shape.
+### Phase B: Decompose tuples and records
 
-5. **Decompose records in lower.** Same treatment for non-escaping
-   record literals.
+These have nearly identical logic; do them together as one phase
+since the lower emission table covers both uniformly.
 
-6. **Decompose List/Str headers.** Each `List(T)` becomes 3 Values:
-   `(len: U64, cap: U64, data: RcPtr)`. Only the data buffer stays
-   heap. Method signatures (`List.len`, `List.append`, `List.set`,
-   etc.) all expand their `List(T)` slots to 3 slots. `__main`'s
-   `args: List(Str)` becomes 3 expanded slots. Same treatment for Str.
+- **B1.** Tuple literal lowering produces N parallel Values. Tuple
+  destructuring binds to those Values. Tuple field access on
+  decomposed source is name resolution, no instruction emitted.
+  Tuple-passed-as-arg / tuple-as-return: expand into multi-slot.
+- **B2.** Same treatment for non-escaping record literals.
 
-   At this stage, element layouts are still "one buffer slot per
-   element" — for non-scalar elements (e.g. Records), each element
-   is still a heap object the buffer points at. Inline element
-   layouts come in stage 7.
+### Phase C: Decompose List/Str headers
 
-7. **Inline non-scalar list element layouts.** Buffer slot stride
-   adapts to the element's decomposed shape. `List(Record{a:I64, b:I64})`
-   becomes a buffer of 16-byte slots holding two inline I64s. `List(Str)`
-   becomes a buffer of 24-byte slots holding `(len, cap, data)` inline.
-   `Str = List(U8)` is unchanged (1-byte slots).
+- **C1.** Each `List(T)` becomes 3 Values: `(len: U64, cap: U64, data: RcPtr)`.
+  Only the data buffer stays heap. Method signatures (`List.len`,
+  `List.append`, `List.set`, etc.) all expand their `List(T)` slots
+  to 3 slots. `__main`'s `args: List(Str)` becomes 3 expanded slots.
+  Same treatment for Str. At this point element layouts are still
+  "one buffer slot per element" — non-scalar elements (Records) are
+  still heap objects the buffer points at.
 
-   Lower emits a sequence of scalar `LoadDyn`/`StoreDyn` per element
-   field, using offsets derived from the element layout. No new
-   instruction shape needed. The buffer's rc-cascade metadata
-   generalizes from "one ptr_offsets list" to "one per-element layout
-   applied `len` times."
+### Phase D: Parallel — inline elements & tag unions
 
-8. **Decompose tag unions to `(tag, payload)`.** Tag unions become
-   2 Values: `(tag: U8, payload: RcPtr)`. The payload heap object
-   holds variant-specific data with no tag slot inside. Pattern
-   matching becomes `SwitchInt(tag) → ...arms`, with each arm
-   Load'ing from `payload` using the variant's known layout. Void
-   variants use a null `RcPtr` payload — runtime skips rc-touching
-   null. Construction (`Ok(42)`, `Cons(h, t)`) emits `(TAG_OK,
-   heap_alloc_with_payload)`.
+These two are independent of each other. Can be done in either order
+or by separate agents in parallel.
 
-   Affects `__main`'s return type — `Result(Str, Str)` becomes
-   `(U8, RcPtr)`. Eval driver materializes accordingly.
+- **D1.** Inline non-scalar list element layouts. Buffer slot stride
+  adapts to the element's decomposed shape. `List(Record{a:I64, b:I64})`
+  becomes a buffer of 16-byte slots holding two inline I64s.
+  `List(Str)` becomes a buffer of 24-byte slots holding
+  `(len, cap, data)` inline. `Str = List(U8)` is unchanged (1-byte
+  slots). Lower emits a sequence of scalar `LoadDyn`/`StoreDyn` per
+  element field; no new instruction shape needed. Buffer's
+  rc-cascade metadata generalizes from "one ptr_offsets list" to
+  "one per-element layout applied `len` times."
+- **D2.** Decompose tag unions to `(tag: U8, payload: RcPtr)`. The
+  payload heap object holds variant-specific data with no tag slot
+  inside. Pattern matching becomes `SwitchInt(tag) → ...arms`. Void
+  variants use a null `RcPtr` payload. Affects `__main`'s return
+  type — `Result(Str, Str)` becomes `(U8, RcPtr)`.
 
-9. **Closures and `lambda_specialize`.** Update capture shapes.
-   Closure becomes `(fn_id, capture1, capture2, ...)` parallel Values;
-   no env-header heap object. Decide per-closure whether to keep heap
-   env for long-lived (escaping) closures.
+### Phase E: Closures
 
-10. **Delete `ScalarType::Agg`, `Pack`, `Extract`, `Scalar::Agg`.**
-    At this point nothing should produce them; the deletion is just
-    removing dead code. Update `dests()` to lose the Pack/Extract
-    arms. Update `display.rs` similarly.
+- **E1.** Closure becomes `(fn_id: U32, capture1, capture2, ...)`
+  parallel Values; no env-header heap object. `fn_id` is `U32` at
+  the SSA layer; corresponds to a compiler-side `FuncId(u32)`
+  newtype. `__apply_K` reads the fn_id Value and SwitchInts to
+  dispatch. Decide per-closure whether to keep heap env for
+  long-lived (escaping) closures.
 
-11. **SROA: survey and either shrink to materialize-on-escape or
-    delete entirely.** Depends on what lower's emission decision
-    already covers.
+### Phase F: Cleanup
 
-12. **Update `CLAUDE.md`, `src/lower/README.md`, `src/opt/README.md`.**
-    Document the new model. CLAUDE.md's "two-tier `[len, cap,
-    data_ptr]` header" description is now historical; rewrite the
-    "Lists and Strs are always RcPtr" line. Add a section on tag
-    union representation `(tag, payload)` and inline element layouts.
+- **F1.** Delete `ScalarType::Agg`, `Pack`, `Extract`, `Scalar::Agg`.
+  Nothing produces them at this point; deletion is just removing
+  dead code. Update `dests()` to lose the Pack/Extract arms;
+  update `display.rs` similarly.
+- **F2.** Statics → `Ptr` instead of `RcPtr`-with-sentinel-rc.
+  `static_promote` produces `Ptr` Values; eval handles `Ptr`-typed
+  loads without auto-rc-inc.
+- **F3.** Eval `HeapObject` cosmetic alignment with the target
+  byte layout (see "Memory layout: target design" below):
+  `rc: usize → rc: u32`, sentinel constant becomes `u32::MAX`,
+  drop any unused fields. Does not change byte addressing (still
+  struct-based); just aligns the field types so future codegen
+  can use the byte layout directly.
+- **F4.** SROA: survey what lower's emission decision already
+  covers. Either shrink the pass to "materialize-on-escape" or
+  delete entirely.
+
+### Phase G: Documentation
+
+- **G1.** Update `CLAUDE.md`, `src/lower/README.md`,
+  `src/opt/README.md`. CLAUDE.md's "two-tier `[len, cap, data_ptr]`
+  header" description is historical; rewrite the "Lists and Strs
+  are always RcPtr" line. Add a section on tag union representation
+  `(tag, payload)` and inline element layouts.
+
+### Dependency summary
+
+```
+A (plumbing)
+  └→ B (tuples + records)
+       └→ C (List/Str headers)
+            └→ D1 (inline elements) ─┐
+       └→ D2 (tag unions, ∥ with D1) ┤
+            E (closures, after B) ───┤
+                                     ├→ F (cleanup) → G (docs)
+```
+
+D2 can start as soon as B finishes (doesn't need C). E can start
+as soon as B finishes (closures may capture tuples/records, but
+not lists). C → D1 is the only long-pole dependency chain.
 
 ## Verification beyond `cargo test`
 
