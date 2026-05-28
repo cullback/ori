@@ -419,20 +419,27 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
             "List.get" => {
                 let slots = self.list_slots(&args[0]);
+                let elem_ty = list_element_type(&args[0].ty);
                 let idx = self.lower_expr(&args[1]);
-                Some(self.emit_list_get_expanded(slots[0], slots[2], idx))
+                Some(self.emit_list_get_expanded(slots[0], slots[2], idx, &elem_ty))
             }
             "List.append" => {
                 let slots = self.list_slots(&args[0]);
-                let val = self.lower_expr(&args[1]);
-                let new_slots = self.emit_list_append_expanded(slots[0], slots[1], slots[2], val);
+                let elem_ty = list_element_type(&args[0].ty);
+                let val_lv = self.lower_expr_lv(&args[1]);
+                let new_slots = self.emit_list_append_expanded(
+                    slots[0], slots[1], slots[2], val_lv, &elem_ty,
+                );
                 Some(super::lowered_value::LoweredValue::Multi(new_slots))
             }
             "List.set" => {
                 let slots = self.list_slots(&args[0]);
+                let elem_ty = list_element_type(&args[0].ty);
                 let idx = self.lower_expr(&args[1]);
-                let val = self.lower_expr(&args[2]);
-                let new_slots = self.emit_list_set_expanded(slots[0], slots[1], slots[2], idx, val);
+                let val_lv = self.lower_expr_lv(&args[2]);
+                let new_slots = self.emit_list_set_expanded(
+                    slots[0], slots[1], slots[2], idx, val_lv, &elem_ty,
+                );
                 Some(super::lowered_value::LoweredValue::Multi(new_slots))
             }
             "List.range" => {
@@ -464,20 +471,27 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
             "List.get" => {
                 let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
+                let elem_ty = list_element_type(receiver_ty);
                 let idx = self.lower_expr(&args[0]);
-                Some(self.emit_list_get_expanded(slots[0], slots[2], idx))
+                Some(self.emit_list_get_expanded(slots[0], slots[2], idx, &elem_ty))
             }
             "List.append" => {
                 let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
-                let val = self.lower_expr(&args[0]);
-                let new_slots = self.emit_list_append_expanded(slots[0], slots[1], slots[2], val);
+                let elem_ty = list_element_type(receiver_ty);
+                let val_lv = self.lower_expr_lv(&args[0]);
+                let new_slots = self.emit_list_append_expanded(
+                    slots[0], slots[1], slots[2], val_lv, &elem_ty,
+                );
                 Some(super::lowered_value::LoweredValue::Multi(new_slots))
             }
             "List.set" => {
                 let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
+                let elem_ty = list_element_type(receiver_ty);
                 let idx = self.lower_expr(&args[0]);
-                let val = self.lower_expr(&args[1]);
-                let new_slots = self.emit_list_set_expanded(slots[0], slots[1], slots[2], idx, val);
+                let val_lv = self.lower_expr_lv(&args[1]);
+                let new_slots = self.emit_list_set_expanded(
+                    slots[0], slots[1], slots[2], idx, val_lv, &elem_ty,
+                );
                 Some(super::lowered_value::LoweredValue::Multi(new_slots))
             }
             _ => None,
@@ -496,7 +510,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// idx. Returns `Multi(tag, payload)` per D2's tag-union shape —
     /// `Ok(elem)` payload heap object holds the element at offset 0;
     /// `Err(OutOfBounds)` payload holds the OOB discriminant at 0.
-    fn emit_list_get_expanded(&mut self, len: Value, data: Value, idx: Value) -> super::lowered_value::LoweredValue {
+    ///
+    /// Note: this helper passes elements as a single 8-byte slot
+    /// (matching the `Ok(elem)` payload heap layout). For aggregate
+    /// element types under D1 inline layouts, the caller is
+    /// responsible for materializing into the payload's 8-byte slot.
+    fn emit_list_get_expanded(&mut self, len: Value, data: Value, idx: Value, elem_ty: &Type) -> super::lowered_value::LoweredValue {
         let in_bounds = self.builder.binop(BinaryOp::Lt, idx, len, ScalarType::U8);
         let ok_block = self.builder.create_block();
         let err_block = self.builder.create_block();
@@ -506,7 +525,24 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.branch(in_bounds, ok_block, vec![], err_block, vec![]);
 
         self.builder.switch_to(ok_block);
-        let elem = self.builder.load_dyn(data, idx, ScalarType::RcPtr);
+        // For inlined elements, load all slots from the data buffer
+        // and re-materialize into a single payload-friendly aggregate
+        // ptr. For scalar / heap-pointer elements, a single load
+        // suffices.
+        let elem = if self.element_is_inlined(elem_ty) {
+            let stride_units = self.element_stride(elem_ty) / 8;
+            let stride_units_const = self.builder.const_u64(stride_units as u64);
+            let unit_base = self.builder.binop(BinaryOp::Mul, idx, stride_units_const, ScalarType::U64);
+            let slot_tys = self.expand_slots(elem_ty);
+            let slot_vals: Vec<Value> = slot_tys.iter().enumerate().map(|(j, &ty)| {
+                let j_const = self.builder.const_u64(j as u64);
+                let unit_idx = self.builder.binop(BinaryOp::Add, unit_base, j_const, ScalarType::U64);
+                self.builder.load_dyn(data, unit_idx, ty)
+            }).collect();
+            self.materialize_lv(super::lowered_value::LoweredValue::Multi(slot_vals), elem_ty)
+        } else {
+            self.builder.load_dyn(data, idx, ScalarType::RcPtr)
+        };
         let ok_tag = self.builder.const_u64(0);
         let ok_payload = self.builder.alloc(8);
         self.builder.store(ok_payload, 0, elem);
@@ -524,37 +560,76 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     /// `List.append` on expanded slots: FBIP on the data buffer
-    /// directly (no header to cow-prep). Returns the new
-    /// `(new_len, new_cap, new_data)` trio.
+    /// directly. Honors D1's inline-element layout — aggregate
+    /// elements are stored as N slots back-to-back at the new tail.
     fn emit_list_append_expanded(
         &mut self,
         len: Value,
         _cap: Value,
         data: Value,
-        val: Value,
+        val_lv: super::lowered_value::LoweredValue,
+        elem_ty: &Type,
     ) -> Vec<Value> {
+        let stride = self.element_stride(elem_ty);
+        let stride_units = stride / 8;
         let one = self.builder.const_u64(1);
         let new_len = self.builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
-        let elem_size = self.builder.const_u64(8);
-        let new_byte_len = self.builder.binop(BinaryOp::Mul, new_len, elem_size, ScalarType::U64);
+        let stride_bytes_const = self.builder.const_u64(stride as u64);
+        let new_byte_len = self.builder.binop(BinaryOp::Mul, new_len, stride_bytes_const, ScalarType::U64);
         let new_data = self.builder.cow_resize_dyn(data, new_byte_len);
-        self.builder.store_dyn(new_data, len, val);
-        // cap = new_len in the simplified growth strategy (matches
-        // the legacy header layout's `store new_len -> hdr[8]`).
+
+        // Byte-offset-in-8-byte-units of element `len` (the tail).
+        let stride_units_const = self.builder.const_u64(stride_units as u64);
+        let elem_unit_base = self.builder.binop(BinaryOp::Mul, len, stride_units_const, ScalarType::U64);
+
+        if self.element_is_inlined(elem_ty) {
+            let slot_tys = self.expand_slots(elem_ty);
+            let slot_vals = self.to_slots(val_lv, elem_ty, &slot_tys);
+            for (j, slot_val) in slot_vals.into_iter().enumerate() {
+                let j_const = self.builder.const_u64(j as u64);
+                let idx = self.builder.binop(BinaryOp::Add, elem_unit_base, j_const, ScalarType::U64);
+                self.builder.store_dyn(new_data, idx, slot_val);
+            }
+        } else {
+            let val = self.materialize_lv(val_lv, elem_ty);
+            self.builder.store_dyn(new_data, elem_unit_base, val);
+        }
         vec![new_len, new_len, new_data]
     }
 
-    /// `List.set` on expanded slots: cow on the data buffer.
+    /// `List.set` on expanded slots: cow on the data buffer, writing
+    /// per-element slots for inlined aggregate elements.
     fn emit_list_set_expanded(
         &mut self,
         len: Value,
         cap: Value,
         data: Value,
         idx: Value,
-        val: Value,
+        val_lv: super::lowered_value::LoweredValue,
+        elem_ty: &Type,
     ) -> Vec<Value> {
-        let new_data = self.builder.cow_store_dyn(data, idx, val);
-        vec![len, cap, new_data]
+        let stride_units = self.element_stride(elem_ty) / 8;
+        let stride_units_const = self.builder.const_u64(stride_units as u64);
+        let elem_unit_base = self.builder.binop(BinaryOp::Mul, idx, stride_units_const, ScalarType::U64);
+
+        if self.element_is_inlined(elem_ty) {
+            let slot_tys = self.expand_slots(elem_ty);
+            let slot_vals = self.to_slots(val_lv, elem_ty, &slot_tys);
+            // cow_store_dyn each slot in turn. The first call
+            // cow-preps the buffer; subsequent calls operate on the
+            // (now-unique) clone.
+            let mut current_data = data;
+            for (j, slot_val) in slot_vals.into_iter().enumerate() {
+                let j_const = self.builder.const_u64(j as u64);
+                let unit_idx = self.builder.binop(BinaryOp::Add, elem_unit_base, j_const, ScalarType::U64);
+                current_data = self.builder.cow_store_dyn(current_data, unit_idx, slot_val);
+            }
+            vec![len, cap, current_data]
+        } else {
+            let val = self.materialize_lv(val_lv, elem_ty);
+            let new_data = self.builder.cow_store_dyn(data, elem_unit_base, val);
+            vec![len, cap, new_data]
+        }
     }
 
     /// `List.range(start, end)` on expanded slots: build a fresh
@@ -752,6 +827,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
         let is_list = matches!(&inner_recv.ty, Type::App(name, _) if name == "List");
         if !is_list {
+            return None;
+        }
+        // For inlined aggregate elements, the data buffer's stride
+        // is no longer 8 bytes — the simple `load_dyn(data, idx, ty)`
+        // peephole below would step into wrong slots. Bail out and
+        // let the regular `List.get` + `unwrap` path handle this.
+        let source_elem_ty = list_element_type(&inner_recv.ty);
+        if self.element_is_inlined(&source_elem_ty) {
             return None;
         }
 

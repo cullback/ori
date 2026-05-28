@@ -138,8 +138,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.branch(cmp, done, done_args, body_block, body_args);
 
         self.builder.switch_to(body_block);
-        let elem = body_i; // element IS the counter for range-walk
-        let result = self.emit_walk_step_call(direct, apply_name, body_step, &body_acc, elem, &elem_ty, &acc_slots);
+        let elem_vals = vec![body_i]; // element IS the counter for range-walk
+        let result = self.emit_walk_step_call(direct, apply_name, body_step, &body_acc, elem_vals, &elem_ty, &acc_slots);
 
         let one = self.builder.const_u64(1);
         let next_i = self.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
@@ -234,8 +234,26 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.branch(cmp, done, done_args, body_block, body_args);
 
         self.builder.switch_to(body_block);
-        let elem = self.builder.load_dyn(body_data, body_i, ScalarType::RcPtr);
-        let result = self.emit_walk_step_call(direct, apply_name, body_step, &body_acc, elem, elem_ty, &acc_slots);
+        // Load element slots from the data buffer. For aggregate
+        // elements under D1, the buffer stores N slots back-to-back
+        // per element; we emit explicit byte-math to pick each slot.
+        // For scalar / heap-pointer elements, the legacy 8-byte
+        // stride applies — single load.
+        let elem_vals = if self.element_is_inlined(elem_ty) {
+            let stride = self.element_stride(elem_ty);
+            let stride_units = (stride / 8) as u64;
+            let stride_const = self.builder.const_u64(stride_units);
+            let unit_base = self.builder.binop(BinaryOp::Mul, body_i, stride_const, ScalarType::U64);
+            let slot_tys = self.expand_slots(elem_ty);
+            slot_tys.iter().enumerate().map(|(j, &ty)| {
+                let off_const = self.builder.const_u64(j as u64);
+                let idx = self.builder.binop(BinaryOp::Add, unit_base, off_const, ScalarType::U64);
+                self.builder.load_dyn(body_data, idx, ty)
+            }).collect::<Vec<_>>()
+        } else {
+            vec![self.builder.load_dyn(body_data, body_i, ScalarType::RcPtr)]
+        };
+        let result = self.emit_walk_step_call(direct, apply_name, body_step, &body_acc, elem_vals, elem_ty, &acc_slots);
 
         let one = self.builder.const_u64(1);
         let next_i = self.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
@@ -267,29 +285,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         LoweredValue::from_slots(done_params)
     }
 
-    /// Emit the apply call inside a walk's body block. Splats `acc`
-    /// and `elem` into the call args and uses `call_multi` when the
-    /// callee returns multiple slots.
+    /// Emit the apply call inside a walk's body block. Caller is
+    /// responsible for loading the element's slots (D1 inline
+    /// layouts mean a multi-slot load per aggregate element).
     fn emit_walk_step_call(
         &mut self,
         direct: Option<&SingletonTarget>,
         apply_name: &str,
         body_step: Value,
         body_acc: &[Value],
-        elem: Value,
-        elem_ty: &Type,
+        elem_vals: Vec<Value>,
+        _elem_ty: &Type,
         _acc_slots: &[ScalarType],
     ) -> Vec<Value> {
-        // Splat elem into its expanded slots. For scalar elements
-        // (range counter, scalar list elements), this is a no-op.
-        // For aggregate elements (tuple/record), the elem is a heap
-        // ptr loaded from the data buffer; emit Loads to fan it out.
-        let elem_slots = self.expand_slots(elem_ty);
-        let elem_vals = self.to_slots(
-            super::lowered_value::LoweredValue::single(elem),
-            elem_ty,
-            &elem_slots,
-        );
 
         let resolved = direct.or_else(|| self.singletons.get(apply_name));
         if let Some(st) = resolved {

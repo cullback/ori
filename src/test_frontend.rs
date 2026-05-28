@@ -130,6 +130,32 @@ fn run_i64(source: &str, input: i64) -> i64 {
     }
 }
 
+#[test]
+fn d1_inline_tuple_list_elements() {
+    // Phase D1: List(Tuple(I64, I64)) stores each tuple as two
+    // inline I64 slots (16-byte stride) in the data buffer rather
+    // than allocating a separate heap object per element. The
+    // 3-element list literal allocates exactly the data buffer
+    // (3 * 16 = 48 bytes) plus the 24-byte list header — no
+    // per-element heap objects.
+    let source = "\
+main : I64 -> I64
+main = |_| (
+    pairs = [(1, 2), (3, 4), (5, 6)]
+    (a, b) = pairs.get(1).unwrap()
+    a + b
+)";
+    let (result, heap) = run_with_heap(source, 0);
+    assert_eq!(result, Scalar::I64(7));
+    // Allocs: data buffer (1) + list header (1) + Ok payload (1) +
+    // tag union shell (1) + tuple materialized for payload (1) = 5.
+    // The key D1 win: no per-element tuple heap object inside the
+    // data buffer.
+    assert!(heap.alloc_count <= 5,
+        "expected ≤5 allocs (no per-element tuple heap), got {}",
+        heap.alloc_count);
+}
+
 
 
 

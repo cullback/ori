@@ -322,13 +322,44 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             Type::Tuple(tys) => (0..tys.len()).map(|i| i * 8).collect(),
             Type::Record { fields, .. } => (0..fields.len()).map(|i| i * 8).collect(),
             Type::App(name, _) if name == "List" => vec![0, 8, 16],
-            // Non-fieldless tag union: materializes to tag@0, payload@8.
             Type::TagUnion { tags, .. }
                 if tags.iter().any(|(_, fields)| !fields.is_empty()) =>
             {
                 vec![0, 8]
             }
             _ => vec![0],
+        }
+    }
+
+    /// Byte stride for one element when storing values of `elem_ty`
+    /// inline in a list's data buffer. Scalars and heap-pointer types
+    /// use 8 bytes (legacy List(T) layout). Aggregate element types
+    /// (tuple, record, inner List) are inlined: stride equals the
+    /// total byte width of the element's expanded slots, so a
+    /// `List(Record{a:I64, b:I64})` buffer has 16-byte stride and a
+    /// `List(Str)` (i.e. `List(List(U8))` after transparent unwrap)
+    /// buffer has 24-byte stride. Tag-union element types stay
+    /// heap-resident — 8-byte stride storing a pointer.
+    pub(super) fn element_stride(&self, elem_ty: &Type) -> usize {
+        let unwrapped = self.resolve_transparent(elem_ty);
+        match &unwrapped {
+            Type::Tuple(_) | Type::Record { .. } => {
+                self.expand_slots(elem_ty).len() * 8
+            }
+            Type::App(name, _) if name == "List" => 24,
+            _ => 8,
+        }
+    }
+
+    /// True when an element of `elem_ty` is stored as N inline slots
+    /// (one per `expand_slots` entry) rather than a single heap
+    /// pointer to a materialized aggregate.
+    pub(super) fn element_is_inlined(&self, elem_ty: &Type) -> bool {
+        let unwrapped = self.resolve_transparent(elem_ty);
+        match &unwrapped {
+            Type::Tuple(_) | Type::Record { .. } => true,
+            Type::App(name, _) if name == "List" => true,
+            _ => false,
         }
     }
 
@@ -1044,10 +1075,30 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
             ExprKind::ListLit(elems) => {
                 let len = elems.len();
-                let data = self.builder.alloc(len * 8);
-                for (i, elem) in elems.iter().enumerate() {
-                    let val = self.lower_expr(elem);
-                    self.builder.store(data, i * 8, val);
+                // D1: pick element stride based on the list's element
+                // type so aggregate elements (tuples, records, nested
+                // Lists) inline their slots back-to-back instead of
+                // going through per-element heap objects.
+                let elem_ty = list_element_type_of(&expr.ty);
+                let stride = self.element_stride(&elem_ty);
+                let inlined = self.element_is_inlined(&elem_ty);
+                let data = self.builder.alloc(len * stride);
+                if inlined {
+                    let slot_tys = self.expand_slots(&elem_ty);
+                    let slot_offsets: Vec<usize> =
+                        (0..slot_tys.len()).map(|j| j * 8).collect();
+                    for (i, elem) in elems.iter().enumerate() {
+                        let elem_lv = self.lower_expr_lv(elem);
+                        let slots = self.to_slots(elem_lv, &elem_ty, &slot_tys);
+                        for (j, slot_val) in slots.into_iter().enumerate() {
+                            self.builder.store(data, i * stride + slot_offsets[j], slot_val);
+                        }
+                    }
+                } else {
+                    for (i, elem) in elems.iter().enumerate() {
+                        let val = self.lower_expr(elem);
+                        self.builder.store(data, i * stride, val);
+                    }
                 }
                 let header = self.builder.alloc(24);
                 let len_val = self.builder.const_u64(len as u64);
@@ -1265,6 +1316,19 @@ fn lower_to_ssa<'src>(
 /// Compute layout info for a structural constructor from a closed
 
 /// Replace all occurrences of `var` in `ty` with `replacement`.
+/// The `T` of a `List(T)` type. Falls back to a placeholder when the
+/// type isn't a `List(_)` shape. Used by `ListLit` and walk emitters
+/// to compute the buffer's element stride.
+fn list_element_type_of(ty: &Type) -> Type {
+    match ty {
+        Type::App(name, args) if name == "List" => args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Type::Con("__none".to_owned())),
+        _ => Type::Con("__none".to_owned()),
+    }
+}
+
 pub(super) fn substitute_type_var(ty: &Type, var: TypeVar, replacement: &Type) -> Type {
     match ty {
         Type::Var(v) if *v == var => replacement.clone(),
