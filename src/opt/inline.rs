@@ -257,7 +257,12 @@ fn perform_inline(
     // The continuation block receives the return value as a parameter.
     let cont_block_id = BlockId(caller.next_block);
     caller.next_block += 1;
-    let cont_param = Value { id: next_val, ty: callee.return_type };
+    debug_assert_eq!(
+        callee.return_type.len(),
+        1,
+        "inline: multi-value return not yet supported"
+    );
+    let cont_param = Value { id: next_val, ty: callee.return_type[0] };
 
     // Split the caller block: instructions after the call go into the continuation.
     let remaining_insts: Vec<Inst> = caller.blocks.get_mut(&block_id).unwrap()
@@ -390,11 +395,16 @@ fn remap_terminator(
     cont_block: BlockId,
 ) -> Terminator {
     match term {
-        Terminator::Return(v) => {
+        Terminator::Return(vs) => {
+            debug_assert_eq!(
+                vs.len(),
+                1,
+                "inline: multi-value Return not yet supported"
+            );
             // Return becomes a jump to the continuation block.
             Terminator::Jump(BlockEdge {
                 target: cont_block,
-                args: vec![remap_value(*v, val_map)],
+                args: vec![remap_value(vs[0], val_map)],
             })
         }
         Terminator::Jump(edge) => Terminator::Jump(BlockEdge {

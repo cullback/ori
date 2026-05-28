@@ -24,7 +24,10 @@ pub struct Function {
     pub name: String,
     pub params: Vec<Value>,
     pub blocks: std::collections::BTreeMap<BlockId, Block>,
-    pub return_type: ScalarType,
+    /// One entry per returned Value. Single-value returns (the only
+    /// shape today) have a one-element Vec; decomposed multi-value
+    /// returns will have more entries.
+    pub return_type: Vec<ScalarType>,
     /// Entry block ID (always the first block created).
     pub entry: BlockId,
     /// Counter for generating fresh BlockIds.

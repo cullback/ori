@@ -170,7 +170,10 @@ pub fn run(module: &mut Module) {
         // If this function's own return type changed, update the
         // Function::return_type to match.
         if let Some(tys) = &a.new_return {
-            func.return_type = ScalarType::Agg(tys.len());
+            // SROA's existing model promotes the whole return to a
+            // single Agg(n); preserve that until the SROA rewrite
+            // catches up with multi-value returns.
+            func.return_type = vec![ScalarType::Agg(tys.len())];
         }
         // Same for its own params.
         for (i, tys) in &a.new_params {
@@ -544,8 +547,10 @@ fn analyze_with_callee_sigs(
         // that mismatches the unchanged function signature.
         let return_sig_locked = func.name == "__main" || self_denied_r;
         if return_sig_locked {
-            if let Terminator::Return(v) = &block.terminator {
-                escape(v, &mut uf, &mut escaped);
+            if let Terminator::Return(vs) = &block.terminator {
+                for v in vs {
+                    escape(v, &mut uf, &mut escaped);
+                }
             }
         }
     }
@@ -563,10 +568,15 @@ fn analyze_with_callee_sigs(
     let mut new_return: Option<Vec<ScalarType>> = None;
     if !self_denied_r {
         for block in func.blocks.values() {
-            if let Terminator::Return(v) = &block.terminator {
-                if let Some(&n) = shape.get(v) {
-                    let tys = field_types_for(*v, &alloc_layouts, &flow, n);
-                    new_return = Some(tys);
+            if let Terminator::Return(vs) = &block.terminator {
+                // SROA still models single-Agg returns; ignore the
+                // multi-value path until it's actually emitted.
+                if vs.len() == 1 {
+                    let v = vs[0];
+                    if let Some(&n) = shape.get(&v) {
+                        let tys = field_types_for(v, &alloc_layouts, &flow, n);
+                        new_return = Some(tys);
+                    }
                 }
             }
         }
@@ -708,7 +718,14 @@ fn call_sites_safe(
             }
             // Return: OK only if caller's own return is also being
             // promoted to a matching shape.
-            if let Terminator::Return(v) = &block.terminator {
+            if let Terminator::Return(vs) = &block.terminator {
+                // SROA's existing rewrite assumes single-value returns.
+                // Multi-value returns aren't emitted yet, so just bail
+                // out on the safety check if we ever see one.
+                if vs.len() != 1 {
+                    return false;
+                }
+                let v = &vs[0];
                 if call_results.contains(v) {
                     let Some(tys) = &caller_a.new_return else {
                         return false;

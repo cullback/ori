@@ -380,7 +380,7 @@ impl Builder {
     }
 
     pub fn ret(&mut self, value: Value) {
-        self.seal(Terminator::Return(value));
+        self.seal(Terminator::Return(vec![value]));
     }
 
     pub fn jump(&mut self, target: BlockId, args: Vec<Value>) {
@@ -443,7 +443,7 @@ impl Builder {
                 name: name.to_owned(),
                 params: fb.params,
                 blocks: fb.finished,
-                return_type: declared_ret,
+                return_type: vec![declared_ret],
                 entry: BlockId(0),
                 next_block: fb.next_block,
             },

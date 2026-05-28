@@ -87,7 +87,19 @@ impl fmt::Display for Function {
             }
             write!(f, "{p}: {}", p.ty)?;
         }
-        write!(f, ") -> {}:", self.return_type)?;
+        write!(f, ") -> ")?;
+        match self.return_type.as_slice() {
+            [ty] => write!(f, "{ty}")?,
+            tys => {
+                write!(f, "(")?;
+                for (i, ty) in tys.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{ty}")?;
+                }
+                write!(f, ")")?;
+            }
+        }
+        write!(f, ":")?;
         writeln!(f)?;
         for (&bid, block) in &self.blocks {
             write!(f, "  {bid}")?;
@@ -210,7 +222,7 @@ impl fmt::Display for FmtTerm<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let consts = self.1;
         match self.0 {
-            Terminator::Return(v) => write!(f, "ret {}", fmt_val(*v, consts)),
+            Terminator::Return(vs) => write!(f, "ret {}", fmt_args(vs, consts)),
             Terminator::Jump(edge) => {
                 write!(f, "jump {}", edge.target)?;
                 if !edge.args.is_empty() {

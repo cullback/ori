@@ -170,16 +170,28 @@ fn validate_function(
             }
         }
 
-        // Return type agreement is soft (warning): the lowering
-        // sometimes declares a return type that doesn't match what
-        // the body actually produces (e.g., closures typed as Ptr
-        // that return raw scalars).
-        if let Terminator::Return(v) = &block.terminator {
-            if v.ty != func.return_type {
-                r.warnings.push(format!(
-                    "{prefix}: b{} Return({v}) has type {:?} but function returns {:?}",
-                    bid.0, v.ty, func.return_type
+        // Return arity must match the function's declared return
+        // arity; per-position type agreement is soft (warning) — the
+        // lowering sometimes declares a return type that doesn't
+        // match what the body actually produces (e.g., closures typed
+        // as Ptr that return raw scalars).
+        if let Terminator::Return(vs) = &block.terminator {
+            if vs.len() != func.return_type.len() {
+                r.errors.push(format!(
+                    "{prefix}: b{} Return arity {} but function declares {} return values",
+                    bid.0,
+                    vs.len(),
+                    func.return_type.len()
                 ));
+            } else {
+                for (i, (v, ty)) in vs.iter().zip(&func.return_type).enumerate() {
+                    if v.ty != *ty {
+                        r.warnings.push(format!(
+                            "{prefix}: b{} Return value #{i} ({v}) has type {:?} but function returns {:?} at that position",
+                            bid.0, v.ty, ty
+                        ));
+                    }
+                }
             }
         }
     }

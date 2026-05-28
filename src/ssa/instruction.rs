@@ -399,7 +399,7 @@ impl Terminator {
     /// All values used as operands in the terminator.
     pub fn operands(&self) -> Vec<Value> {
         match self {
-            Self::Return(v) => vec![*v],
+            Self::Return(vs) => vs.clone(),
             Self::Jump(edge) => edge.args.clone(),
             Self::Branch {
                 cond,
@@ -431,7 +431,7 @@ impl Terminator {
     /// Apply `f` to every value operand in place (including edge args).
     pub fn map_operands_mut(&mut self, mut f: impl FnMut(&mut Value)) {
         match self {
-            Self::Return(v) => f(v),
+            Self::Return(vs) => vs.iter_mut().for_each(&mut f),
             Self::Jump(edge) => edge.args.iter_mut().for_each(&mut f),
             Self::Branch { cond, then_edge, else_edge } => {
                 f(cond);
@@ -480,8 +480,12 @@ pub struct BlockEdge {
 /// How a basic block ends.
 #[derive(Debug, Clone)]
 pub enum Terminator {
-    /// Return a value from the function.
-    Return(Value),
+    /// Return one or more values from the function. Arity must match
+    /// `Function::return_type.len()`. Today's lowering always emits
+    /// single-value returns (`values.len() == 1`); the multi-value
+    /// shape is in place so decomposed records/tuples can return as
+    /// parallel Values without another IR shape change.
+    Return(Vec<Value>),
     /// Unconditional jump with block arguments.
     Jump(BlockEdge),
     /// Conditional branch: nonzero → then, zero → else.

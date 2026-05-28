@@ -480,8 +480,12 @@ fn eval_function_inner(
         }
 
         match &block.terminator {
-            Terminator::Return(v) => {
-                let result = env[v.id];
+            Terminator::Return(vs) => {
+                // Eval is single-result today: every `Return` carries
+                // a single Value. The multi-value shape exists in the
+                // IR but isn't yet emitted by lower.
+                debug_assert_eq!(vs.len(), 1, "eval: multi-value Return not yet supported");
+                let result = env[vs[0].id];
                 scratch.release(env);
                 return result;
             }
