@@ -79,8 +79,8 @@ pub fn dead_functions(module: &mut Module) {
     for func in module.functions.values() {
         for block in func.blocks.values() {
             for inst in &block.insts {
-                if let Inst::Call(_, name, _) = inst {
-                    called.insert(name.clone());
+                if let Inst::Call { target, .. } = inst {
+                    called.insert(target.clone());
                 }
             }
         }
@@ -94,7 +94,7 @@ pub fn dead_functions(module: &mut Module) {
 pub fn is_side_effect(inst: &Inst) -> bool {
     matches!(
         inst,
-        Inst::Call(..)
+        Inst::Call { .. }
             | Inst::Alloc(..)
             | Inst::AllocDyn(..)
             | Inst::Store(..)

@@ -92,7 +92,7 @@ fn elim_in_block(block: &mut crate::ssa::Block) {
                 // Reading from a candidate observes its data — escape.
                 mark(&mut escaped, p);
             }
-            Inst::Call(_, _, args) => {
+            Inst::Call { args, .. } => {
                 for a in args {
                     mark(&mut escaped, a);
                 }

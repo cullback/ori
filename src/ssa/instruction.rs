@@ -153,8 +153,16 @@ pub enum Inst {
     Const(Value, u64),
     /// dest = lhs op rhs (same scalar type).
     BinOp(Value, BinaryOp, Value, Value),
-    /// dest = func(args...).
-    Call(Value, String, Vec<Value>),
+    /// `results = target(args...)`. Multi-result: the callee returns
+    /// `results.len()` values, one per entry in `results`. Today the
+    /// only producer is single-result (`results.len() == 1`); the
+    /// struct shape is in place so multi-value returns can land
+    /// without another IR shape change.
+    Call {
+        results: Vec<Value>,
+        target: String,
+        args: Vec<Value>,
+    },
     /// dest = heap allocate `num_bytes` bytes (refcount starts at 1).
     Alloc(Value, usize),
     /// dest = heap allocate `num_bytes_val` bytes (runtime size).
@@ -270,12 +278,13 @@ pub enum Inst {
 }
 
 impl Inst {
-    /// Returns the destination value, if any.
-    pub fn dest(&self) -> Option<Value> {
+    /// All Values defined by this instruction. Empty slice for
+    /// side-effecting ops. For currently single-result variants this
+    /// is a one-element slice; `Call` returns its `results` vec.
+    pub fn dests(&self) -> &[Value] {
         match self {
             Self::Const(v, _)
             | Self::BinOp(v, _, _, _)
-            | Self::Call(v, _, _)
             | Self::Alloc(v, _)
             | Self::AllocDyn(v, _)
             | Self::Load(v, _, _)
@@ -288,17 +297,17 @@ impl Inst {
             | Self::Extract(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
-            | Self::BitCast(v, _) => Some(*v),
-            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
+            | Self::BitCast(v, _) => std::slice::from_ref(v),
+            Self::Call { results, .. } => results,
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => &[],
         }
     }
 
-    /// Mutable reference to the destination slot, if any.
-    pub fn dest_mut(&mut self) -> Option<&mut Value> {
+    /// Mutable view of the Values defined by this instruction.
+    pub fn dests_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Const(v, _)
             | Self::BinOp(v, _, _, _)
-            | Self::Call(v, _, _)
             | Self::Alloc(v, _)
             | Self::AllocDyn(v, _)
             | Self::Load(v, _, _)
@@ -311,8 +320,32 @@ impl Inst {
             | Self::Extract(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
-            | Self::BitCast(v, _) => Some(v),
-            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => None,
+            | Self::BitCast(v, _) => std::slice::from_mut(v),
+            Self::Call { results, .. } => results,
+            Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => &mut [],
+        }
+    }
+
+    /// Single-result convenience. Panics if the instruction defines
+    /// zero or more than one Value — most call sites still expect
+    /// exactly one dest while phase A is in flight.
+    pub fn dest(&self) -> Option<Value> {
+        let ds = self.dests();
+        match ds.len() {
+            0 => None,
+            1 => Some(ds[0]),
+            _ => panic!("dest() on multi-result instruction; use dests()"),
+        }
+    }
+
+    /// Mutable single-result convenience; same single-result rule as
+    /// `dest()`.
+    pub fn dest_mut(&mut self) -> Option<&mut Value> {
+        let ds = self.dests_mut();
+        match ds.len() {
+            0 => None,
+            1 => Some(&mut ds[0]),
+            _ => panic!("dest_mut() on multi-result instruction; use dests_mut()"),
         }
     }
 
@@ -322,7 +355,7 @@ impl Inst {
             Self::Const(..) | Self::Alloc(..) => vec![],
             Self::AllocDyn(_, size) => vec![*size],
             Self::BinOp(_, _, lhs, rhs) => vec![*lhs, *rhs],
-            Self::Call(_, _, args) => args.clone(),
+            Self::Call { args, .. } => args.clone(),
             Self::Load(_, ptr, _) => vec![*ptr],
             Self::Store(ptr, _, val) => vec![*ptr, *val],
             Self::LoadDyn(_, ptr, idx) => vec![*ptr, *idx],
@@ -345,7 +378,7 @@ impl Inst {
             Self::Const(..) | Self::Alloc(..) | Self::StaticRef(..) => {}
             Self::AllocDyn(_, size) => f(size),
             Self::BinOp(_, _, lhs, rhs) => { f(lhs); f(rhs); }
-            Self::Call(_, _, args) => args.iter_mut().for_each(&mut f),
+            Self::Call { args, .. } => args.iter_mut().for_each(&mut f),
             Self::Load(_, ptr, _) => f(ptr),
             Self::Store(ptr, _, val) => { f(ptr); f(val); }
             Self::LoadDyn(_, ptr, idx) => { f(ptr); f(idx); }

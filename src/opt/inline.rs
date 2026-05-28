@@ -105,7 +105,7 @@ fn cyclic_functions(module: &Module) -> HashSet<String> {
         let mut cs = HashSet::new();
         for block in func.blocks.values() {
             for inst in &block.insts {
-                if let Inst::Call(_, callee, _) = inst {
+                if let Inst::Call { target: callee, .. } = inst {
                     if module.functions.contains_key(callee) {
                         cs.insert(callee.as_str());
                     }
@@ -161,9 +161,9 @@ fn find_inline_site(
 ) -> Option<(BlockId, usize, String)> {
     for (&bid, block) in &caller.blocks {
         for (ii, inst) in block.insts.iter().enumerate() {
-            if let Inst::Call(_, name, _) = inst {
-                if snapshots.contains_key(name) && name != &caller.name {
-                    return Some((bid, ii, name.clone()));
+            if let Inst::Call { target, .. } = inst {
+                if snapshots.contains_key(target) && target != &caller.name {
+                    return Some((bid, ii, target.clone()));
                 }
             }
         }
@@ -178,11 +178,12 @@ fn perform_inline(
     inst_idx: usize,
     callee: &Function,
 ) {
-    let Inst::Call(call_dest, _, ref call_args) = caller.blocks[&block_id].insts[inst_idx] else {
+    let Inst::Call { ref results, ref args, .. } = caller.blocks[&block_id].insts[inst_idx] else {
         panic!("expected Call instruction at inline site");
     };
-    let call_dest = call_dest;
-    let call_args: Vec<Value> = call_args.clone();
+    debug_assert_eq!(results.len(), 1, "inline: multi-result Call not yet supported");
+    let call_dest = results[0];
+    let call_args: Vec<Value> = args.clone();
 
     // --- Step 1: compute remapping for Values and BlockIds ---
 

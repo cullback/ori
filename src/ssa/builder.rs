@@ -179,7 +179,11 @@ impl Builder {
 
     pub fn call(&mut self, func: &str, args: Vec<Value>, ret_ty: ScalarType) -> Value {
         let v = self.fresh_value(ret_ty);
-        self.push(Inst::Call(v, func.to_owned(), args));
+        self.push(Inst::Call {
+            results: vec![v],
+            target: func.to_owned(),
+            args,
+        });
         // Callee may mutate any heap object reachable via its args.
         // Conservative: clear all forwarding entries.
         self.recent_stores.clear();

@@ -532,7 +532,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
 
         Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs.id], env[rhs.id])),
 
-        Inst::Call(_, name, args) => {
+        Inst::Call { target, args, .. } => {
             let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.id]).collect();
             // Auto-rc: mint a fresh owning ref for each RcPtr arg so
             // the callee receives its own claim independent of the
@@ -545,7 +545,7 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
                     }
                 }
             }
-            Some(eval_function_inner(module, heap, scratch, name, &arg_vals))
+            Some(eval_function_inner(module, heap, scratch, target, &arg_vals))
         }
 
         Inst::Alloc(_, size) => {

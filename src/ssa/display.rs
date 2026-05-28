@@ -140,9 +140,24 @@ impl fmt::Display for FmtInst<'_> {
                 let dt = d.ty;
                 write!(f, "{d}: {dt} = {op} {}, {}", fmt_val(*l, consts), fmt_val(*r, consts))
             }
-            Inst::Call(d, name, args) => {
-                let dt = d.ty;
-                write!(f, "{d}: {dt} = call {name}({})", fmt_args(args, consts))
+            Inst::Call { results, target, args } => {
+                // Most calls today still produce a single result;
+                // multi-result is a "(r0, r1, ...)" tuple in the dump.
+                match results.as_slice() {
+                    [] => write!(f, "call {target}({})", fmt_args(args, consts)),
+                    [d] => {
+                        let dt = d.ty;
+                        write!(f, "{d}: {dt} = call {target}({})", fmt_args(args, consts))
+                    }
+                    rs => {
+                        write!(f, "(")?;
+                        for (i, r) in rs.iter().enumerate() {
+                            if i > 0 { write!(f, ", ")?; }
+                            write!(f, "{r}: {}", r.ty)?;
+                        }
+                        write!(f, ") = call {target}({})", fmt_args(args, consts))
+                    }
+                }
             }
             Inst::Alloc(d, size) => {
                 let dt = d.ty;

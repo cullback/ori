@@ -82,16 +82,17 @@ pub fn evaluate(module: &mut Module) {
     for func in module.functions.values_mut() {
         for block in func.blocks.values_mut() {
             for inst in &mut block.insts {
-                if let Inst::Call(dest, name, args) = inst {
-                    if args.is_empty() {
-                        if let Some(repl) = replacements.get(name.as_str()) {
+                if let Inst::Call { results, target, args } = inst {
+                    if args.is_empty() && results.len() == 1 {
+                        let dest = results[0];
+                        if let Some(repl) = replacements.get(target.as_str()) {
                             match repl {
                                 Replacement::Static(static_id) => {
-                                    *inst = Inst::StaticRef(*dest, *static_id);
+                                    *inst = Inst::StaticRef(dest, *static_id);
                                 }
                                 Replacement::Scalar(scalar) => {
                                     let (_, bits) = scalar_to_bits(*scalar);
-                                    *inst = Inst::Const(*dest, bits);
+                                    *inst = Inst::Const(dest, bits);
                                 }
                             }
                         }

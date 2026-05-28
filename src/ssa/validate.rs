@@ -112,7 +112,7 @@ fn validate_function(
                     ));
                 }
             }
-            if let Inst::Call(_, callee, _) = inst {
+            if let Inst::Call { target: callee, .. } = inst {
                 if !callee.starts_with("__") && !module.functions.contains_key(callee) {
                     r.errors.push(format!(
                         "{prefix}: b{}:{idx} calls unknown function '{callee}'",

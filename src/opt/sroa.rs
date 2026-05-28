@@ -293,14 +293,15 @@ fn analyze_with_callee_sigs(
             // Find Call instructions targeting this callee in this func.
             for block in func.blocks.values() {
                 for inst in &block.insts {
-                    if let Inst::Call(d, n, _) = inst {
+                    if let Inst::Call { results, target: n, .. } = inst {
                         if n == name {
-                            shape.insert(*d, tys.len());
+                            let d = results[0];
+                            shape.insert(d, tys.len());
                             // For call results, we don't have
                             // alloc_layouts (they come from the
                             // callee's Pack at runtime). Use an
                             // empty placeholder.
-                            flow.insert(*d, Vec::new());
+                            flow.insert(d, Vec::new());
                         }
                     }
                 }
@@ -457,7 +458,7 @@ fn analyze_with_callee_sigs(
                 Inst::RcInc(_) | Inst::RcDec(_) => {
                     // OK on flow Values.
                 }
-                Inst::Call(_, callee_name, args) => {
+                Inst::Call { target: callee_name, args, .. } => {
                     // A flow Value passed as Call arg escapes —
                     // unless the callee has that arg position
                     // promoted to a matching Agg shape (cross-fn
@@ -613,9 +614,11 @@ fn call_sites_safe(
         let mut call_results: HashSet<Value> = HashSet::new();
         for block in caller_func.blocks.values() {
             for inst in &block.insts {
-                if let Inst::Call(d, n, _) = inst {
+                if let Inst::Call { results, target: n, .. } = inst {
                     if n == callee_name {
-                        call_results.insert(*d);
+                        for d in results {
+                            call_results.insert(*d);
+                        }
                     }
                 }
             }
@@ -628,7 +631,7 @@ fn call_sites_safe(
                 match inst {
                     Inst::Load(_, p, _) if call_results.contains(p) => {} // ok
                     Inst::RcInc(v) | Inst::RcDec(v) if call_results.contains(v) => {} // ok
-                    Inst::Call(_, _, args) => {
+                    Inst::Call { args, .. } => {
                         if args.iter().any(|a| call_results.contains(a)) {
                             return false;
                         }
@@ -735,7 +738,7 @@ fn arg_promotion_call_sites_safe(
         let caller_a = &per_func[caller_name];
         for block in caller_func.blocks.values() {
             for inst in &block.insts {
-                let Inst::Call(_, n, args) = inst else { continue; };
+                let Inst::Call { target: n, args, .. } = inst else { continue; };
                 if n != callee_name {
                     continue;
                 }
@@ -904,7 +907,7 @@ fn rewrite(
     // Short-circuit if there's nothing to do: no own promotable
     // values and no calls to sig-changed callees.
     let calls_sig_changed_callee = func.blocks.values().any(|b| {
-        b.insts.iter().any(|i| matches!(i, Inst::Call(_, n, _) if sig_changes.contains_key(n)))
+        b.insts.iter().any(|i| matches!(i, Inst::Call { target: n, .. } if sig_changes.contains_key(n)))
     });
     if a.promotable.is_empty() && !calls_sig_changed_callee {
         return;
@@ -933,10 +936,11 @@ fn rewrite(
     let mut call_result_agg: HashMap<Value, usize> = HashMap::new();
     for block in func.blocks.values() {
         for inst in &block.insts {
-            if let Inst::Call(d, callee, _) = inst {
+            if let Inst::Call { results, target: callee, .. } = inst {
                 if let Some(tys) = sig_changes.get(callee) {
+                    let d = results[0];
                     new_ty.insert(d.id, ScalarType::Agg(tys.len()));
-                    call_result_agg.insert(*d, tys.len());
+                    call_result_agg.insert(d, tys.len());
                 }
             }
         }
@@ -998,16 +1002,16 @@ fn rewrite(
                     agg.ty = ScalarType::Agg(n);
                     new_insts.push(Inst::Extract(*d, agg, idx));
                 }
-                Inst::Call(d, callee, args) => {
+                Inst::Call { results, target: callee, args } => {
                     // If the callee's return type changed, the call
                     // result is now Agg-typed.
                     let mut new_inst = inst.clone();
                     if let Some(tys) = sig_changes.get(callee) {
-                        if let Inst::Call(d_mut, _, _) = &mut new_inst {
-                            d_mut.ty = ScalarType::Agg(tys.len());
+                        if let Inst::Call { results: rs, .. } = &mut new_inst {
+                            rs[0].ty = ScalarType::Agg(tys.len());
                         }
                     }
-                    let _ = (d, args);
+                    let _ = (results, args);
                     new_insts.push(new_inst);
                 }
                 other => new_insts.push(other.clone()),
