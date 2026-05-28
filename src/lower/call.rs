@@ -14,6 +14,18 @@ use super::LowerCtx;
 use super::numeric;
 use super::walk::{classify_walk, walk_apply_name};
 
+/// The `T` of a `List(T)` type. Returns a fallback `Type::Con("__none")`
+/// when the receiver isn't actually a `List(T)` shape.
+fn list_element_type(ty: &Type) -> Type {
+    match ty {
+        Type::App(name, args) if name == "List" => args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Type::Con("__none".to_owned())),
+        _ => Type::Con("__none".to_owned()),
+    }
+}
+
 impl<'a, 'src> LowerCtx<'a, 'src> {
     pub(super) fn lower_call_by_sym(
         &mut self,
@@ -156,15 +168,17 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         if let Some(walk) = classify_walk(&mangled) {
             if let Some((start, end)) = self.as_range_call(receiver) {
                 assert!(args.len() == 2, "List.walk* method form takes 2 args");
-                let init_val = self.lower_expr(&args[0]);
-                let acc_ty = self.expr_scalar_type(&args[0]);
+                let init_lv = self.lower_expr_lv(&args[0]);
+                let acc_slots = self.expand_slots(&args[0].ty);
+                let init_vals = self.to_slots(init_lv, &args[0].ty, &acc_slots);
                 let direct = self.resolve_closure_target(&args[1]);
                 let closure_val = self.lower_expr(&args[1]);
                 let apply_name = walk_apply_name(&mangled, &args[1].ty);
-                return self.lower_range_walk(
-                    start, end, init_val, closure_val, &apply_name,
-                    walk.until, acc_ty, direct,
+                let result_lv = self.lower_range_walk(
+                    start, end, init_vals, closure_val, &apply_name,
+                    walk.until, acc_slots, &args[0].ty, direct,
                 );
+                return self.materialize_lv(result_lv, &args[0].ty);
             }
         }
         let recv_val = self.lower_expr(receiver);
@@ -212,25 +226,54 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let ty = self.expr_scalar_type(receiver);
             return self.lower_builtin_op(op_name, recv_val, rhs, ty);
         }
-        // List walks: the walk loop needs untyped Values, so build
-        // them positionally.
+        // List walks: thread the multi-slot accumulator through the
+        // generated loop.
         if let Some(walk) = classify_walk(&mangled) {
             assert!(args.len() == 2, "List.walk* method form takes 2 args");
-            let init_val = self.lower_expr(&args[0]);
-            let acc_ty = self.expr_scalar_type(&args[0]);
+            let init_lv = self.lower_expr_lv(&args[0]);
+            let acc_slots = self.expand_slots(&args[0].ty);
+            let init_vals = self.to_slots(init_lv, &args[0].ty, &acc_slots);
             let direct = self.resolve_closure_target(&args[1]);
             let closure_val = self.lower_expr(&args[1]);
             let apply_name = walk_apply_name(&mangled, &args[1].ty);
-            return self.lower_list_walk(
+            let elem_ty = list_element_type(&receiver.ty);
+            let result_lv = self.lower_list_walk(
                 recv_val,
-                init_val,
+                init_vals,
                 closure_val,
                 &apply_name,
                 walk.until,
-                acc_ty,
+                acc_slots,
+                &args[0].ty,
+                &elem_ty,
                 direct,
             );
+            return self.materialize_lv(result_lv, &args[0].ty);
         }
+        // Plain user-defined method call. Splat receiver + each arg
+        // into the callee's expanded sig.
+        if self.decls.funcs.contains(&mangled) {
+            let per_param_slots = self.callee_param_slots(&mangled, args.len() + 1);
+            let recv_lv = super::lowered_value::LoweredValue::single(recv_val);
+            let mut arg_vals = self.to_slots(recv_lv, &receiver.ty, &per_param_slots[0]);
+            for (a, slots) in args.iter().zip(per_param_slots.iter().skip(1)) {
+                let lv = self.lower_expr_lv(a);
+                arg_vals.extend(self.to_slots(lv, &a.ty, slots));
+            }
+            let ret_slots = self.callee_return_slots(&mangled);
+            let result_lv = if ret_slots.len() == 1 {
+                super::lowered_value::LoweredValue::single(
+                    self.builder.call(&mangled, arg_vals, ret_slots[0]),
+                )
+            } else {
+                super::lowered_value::LoweredValue::from_slots(
+                    self.builder.call_multi(&mangled, arg_vals, &ret_slots),
+                )
+            };
+            return self.materialize_lv(result_lv, &outer.ty);
+        }
+        // Intrinsic or list-builtin fallback. Args are passed
+        // unexpanded — these helpers don't take aggregate args today.
         let mut arg_vals = Vec::with_capacity(args.len() + 1);
         arg_vals.push(recv_val);
         for a in args {
@@ -257,28 +300,34 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     ) -> Value {
         if let Some(walk) = classify_walk(func) {
             assert!(args.len() >= 3, "List.walk* takes 3 arguments");
-            let init_val = self.lower_expr(&args[1]);
-            let acc_ty = self.expr_scalar_type(&args[1]);
+            let init_lv = self.lower_expr_lv(&args[1]);
+            let acc_slots = self.expand_slots(&args[1].ty);
+            let init_vals = self.to_slots(init_lv, &args[1].ty, &acc_slots);
             let direct = self.resolve_closure_target(&args[2]);
             let closure_val = self.lower_expr(&args[2]);
             let apply_name = walk_apply_name(func, &args[2].ty);
             // Deforestation: List.walk(List.range(a, b), init, f) → counter loop.
             if let Some((start, end)) = self.as_range_call(&args[0]) {
-                return self.lower_range_walk(
-                    start, end, init_val, closure_val, &apply_name,
-                    walk.until, acc_ty, direct,
+                let result_lv = self.lower_range_walk(
+                    start, end, init_vals, closure_val, &apply_name,
+                    walk.until, acc_slots, &args[1].ty, direct,
                 );
+                return self.materialize_lv(result_lv, &args[1].ty);
             }
             let list_val = self.lower_expr(&args[0]);
-            return self.lower_list_walk(
+            let elem_ty = list_element_type(&args[0].ty);
+            let result_lv = self.lower_list_walk(
                 list_val,
-                init_val,
+                init_vals,
                 closure_val,
                 &apply_name,
                 walk.until,
-                acc_ty,
+                acc_slots,
+                &args[1].ty,
+                &elem_ty,
                 direct,
             );
+            return self.materialize_lv(result_lv, &args[1].ty);
         }
         if func == "crash" {
             // Crash diverges, so its return is never observed at
@@ -288,16 +337,18 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let ret_ty = self.scalar_type(result_ty);
             return self.builder.call("__crash", vec![msg_val], ret_ty);
         }
+        // User-defined function: respect expanded sig (multi-slot
+        // params/returns). This path lowers args itself.
+        if self.decls.funcs.contains(func) {
+            let lv = self.lower_user_call(func, args, result_ty);
+            return self.materialize_lv(lv, result_ty);
+        }
         let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
         if let Some(v) = try_emit_list_builtin(&mut self.builder, func, &arg_vals) {
             return v;
         }
         if self.decls.constructors.contains_key(func) {
             return self.lower_constructor_call(func, &arg_vals, Some(result_ty));
-        }
-        if self.decls.funcs.contains(func) {
-            let ret_ty = self.func_ret_type(func);
-            return self.builder.call(func, arg_vals, ret_ty);
         }
         // Structural constructor (not in decl_info). Layout is
         // derived from `result_ty` which inference closed to a
@@ -306,6 +357,32 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             return self.lower_constructor_call(func, &arg_vals, Some(result_ty));
         }
         panic!("undefined function or constructor: {func}")
+    }
+
+    /// Lower a call to a known user-defined function, respecting its
+    /// expanded sig from the inferred scheme. Returns LoweredValue so
+    /// callers that can consume Multi (destructure, immediate field
+    /// access) avoid heap materialization on the return.
+    pub(super) fn lower_user_call(
+        &mut self,
+        func: &str,
+        args: &[Expr<'src>],
+        _result_ty: &Type,
+    ) -> super::lowered_value::LoweredValue {
+        let per_param_slots = self.callee_param_slots(func, args.len());
+        let mut arg_vals: Vec<Value> = Vec::new();
+        for (a, slots) in args.iter().zip(&per_param_slots) {
+            let lv = self.lower_expr_lv(a);
+            arg_vals.extend(self.to_slots(lv, &a.ty, slots));
+        }
+        let ret_slots = self.callee_return_slots(func);
+        if ret_slots.len() == 1 {
+            let v = self.builder.call(func, arg_vals, ret_slots[0]);
+            super::lowered_value::LoweredValue::single(v)
+        } else {
+            let vs = self.builder.call_multi(func, arg_vals, &ret_slots);
+            super::lowered_value::LoweredValue::from_slots(vs)
+        }
     }
 
     // ---- Builtin arithmetic dispatch ----

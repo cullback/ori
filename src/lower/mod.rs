@@ -273,6 +273,70 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.repr_type(&expr.ty)
     }
 
+    /// Expand a source-level type into its SSA-level slot types.
+    /// Tuples and records fan out shallowly; lists, strings, tag
+    /// unions, and scalars stay single-slot. Inner aggregate fields
+    /// stay heap-resident — only the outermost layer decomposes.
+    pub(super) fn expand_slots(&self, ty: &Type) -> Vec<ScalarType> {
+        let unwrapped = self.resolve_transparent(ty);
+        match &unwrapped {
+            Type::Tuple(tys) => tys.iter().map(|t| self.scalar_type(t)).collect(),
+            Type::Record { fields, .. } => {
+                let mut sorted: Vec<(&str, &Type)> =
+                    fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                sorted.sort_by_key(|(n, _)| *n);
+                sorted.into_iter().map(|(_, t)| self.scalar_type(t)).collect()
+            }
+            _ => vec![self.scalar_type(&unwrapped)],
+        }
+    }
+
+    /// Byte offsets of each slot in the materialized heap layout of
+    /// an expandable type. Tuples and records use 8-byte stride;
+    /// other types collapse to a single offset 0.
+    pub(super) fn slot_offsets(&self, ty: &Type) -> Vec<usize> {
+        let unwrapped = self.resolve_transparent(ty);
+        match &unwrapped {
+            Type::Tuple(tys) => (0..tys.len()).map(|i| i * 8).collect(),
+            Type::Record { fields, .. } => (0..fields.len()).map(|i| i * 8).collect(),
+            _ => vec![0],
+        }
+    }
+
+    /// Convert a `LoweredValue` to slot Values matching
+    /// `expected_slots`. Materializes a Multi when a single slot is
+    /// expected; unmaterializes a heap-resident Single via Loads when
+    /// a multi shape is expected.
+    pub(super) fn to_slots(&mut self, lv: LoweredValue, src_ty: &Type, expected_slots: &[ScalarType]) -> Vec<Value> {
+        match lv {
+            LoweredValue::Multi(vs) if vs.len() == expected_slots.len() => vs,
+            LoweredValue::Multi(vs) if expected_slots.len() == 1 => {
+                let ptr = self.materialize_lv(LoweredValue::Multi(vs), src_ty);
+                vec![ptr]
+            }
+            LoweredValue::Multi(vs) => panic!(
+                "to_slots: Multi shape {} doesn't match expected {} (src_ty={src_ty:?})",
+                vs.len(),
+                expected_slots.len(),
+            ),
+            LoweredValue::Single(v) if expected_slots.len() == 1 => vec![v],
+            LoweredValue::Single(v) => {
+                let offsets = self.slot_offsets(src_ty);
+                if offsets.len() != expected_slots.len() {
+                    // Defensive: the src_ty doesn't carry enough shape
+                    // info to splat (e.g. a TypeVar that survived
+                    // through specialization). Pass the single ptr
+                    // and let downstream Loads pick it up.
+                    return vec![v];
+                }
+                offsets.into_iter()
+                    .zip(expected_slots.iter())
+                    .map(|(off, &ty)| self.builder.load(v, off, ty))
+                    .collect()
+            }
+        }
+    }
+
     /// Emit a constant for a fieldless tag index using the appropriate discriminant type.
     fn const_tag(&mut self, tag_index: u64, disc_ty: ScalarType) -> Value {
         match disc_ty {
@@ -299,6 +363,49 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             return self.repr_type(ret);
         }
         base
+    }
+
+    /// Callee's expanded return slot types. Falls back to a single
+    /// `RcPtr` slot when no scheme is available.
+    pub(super) fn callee_return_slots(&self, func: &str) -> Vec<ScalarType> {
+        self.infer
+            .func_schemes
+            .get(func)
+            .map(|scheme| match &scheme.ty {
+                Type::Arrow(_, ret) => self.expand_slots(ret),
+                other => self.expand_slots(other),
+            })
+            .unwrap_or_else(|| vec![ScalarType::RcPtr])
+    }
+
+    /// Callee's per-source-param expanded slot types. Falls back to
+    /// one `RcPtr` slot per source-level arg when no scheme is
+    /// available.
+    pub(super) fn callee_param_slots(&self, func: &str, num_args: usize) -> Vec<Vec<ScalarType>> {
+        self.infer
+            .func_schemes
+            .get(func)
+            .map(|scheme| match &scheme.ty {
+                Type::Arrow(params, _) => {
+                    params.iter().map(|t| self.expand_slots(t)).collect()
+                }
+                _ => vec![vec![ScalarType::RcPtr]; num_args],
+            })
+            .unwrap_or_else(|| vec![vec![ScalarType::RcPtr]; num_args])
+    }
+
+    /// Callee's source-level param Types in declaration order. Used
+    /// to drive `to_slots` for unmaterializing closure captures and
+    /// other heap-materialized args. Empty vec when no scheme.
+    pub(super) fn callee_param_types(&self, func: &str) -> Vec<Type> {
+        self.infer
+            .func_schemes
+            .get(func)
+            .map(|scheme| match &scheme.ty {
+                Type::Arrow(params, _) => params.clone(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default()
     }
 
     /// Emit a dummy value of the given scalar type for statically
@@ -436,50 +543,56 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let saved_func = std::mem::replace(&mut self.builder.func, crate::ssa::builder::FuncBuilder::new());
         let saved_current = self.builder.current_block.take();
 
-        // Parameter scalar types come from the function's inferred
-        // scheme when available. Synthesized `__apply_K` functions
-        // don't have schemes — they default to all-`Ptr`, which is
-        // correct since closures carry type-erased captures and
-        // arguments.
-        let param_types: Vec<ScalarType> = self
+        // Per-source-param expanded slot types. Tuple/record params
+        // fan out to N slots; everything else stays single. Schemes
+        // are authoritative; synthesized callees default to one
+        // RcPtr per source-level arg.
+        let per_param_slots: Vec<Vec<ScalarType>> = self
             .infer
             .func_schemes
             .get(name)
             .map(|scheme| match &scheme.ty {
-                Type::Arrow(params, _) => {
-                    params.iter().map(|t| self.scalar_type(t)).collect()
-                }
-                _ => vec![ScalarType::RcPtr; param_syms.len()],
+                Type::Arrow(params, _) => params.iter().map(|t| self.expand_slots(t)).collect(),
+                _ => vec![vec![ScalarType::RcPtr]; param_syms.len()],
             })
-            .unwrap_or_else(|| vec![ScalarType::RcPtr; param_syms.len()]);
+            .unwrap_or_else(|| vec![vec![ScalarType::RcPtr]; param_syms.len()]);
 
-        for (p, ty) in param_syms.iter().zip(&param_types) {
-            let v = self.builder.add_func_param(*ty);
-            self.vars.insert(*p, LoweredValue::single(v));
+        for (p, slots) in param_syms.iter().zip(&per_param_slots) {
+            let vs: Vec<Value> = slots.iter()
+                .map(|&ty| self.builder.add_func_param(ty))
+                .collect();
+            self.vars.insert(*p, LoweredValue::from_slots(vs));
         }
 
-        // Set the return type BEFORE lowering the body so `ret` can
-        // coerce its operand when it fires from inside nested
-        // expressions. Use repr_type so packable composites stay as
-        // Agg through returns — Pack is first-class at runtime.
-        let scheme_ret_ty = self.repr_type(&body.ty);
         let has_scheme = self.infer.func_schemes.contains_key(name);
-        self.builder.set_return_type(scheme_ret_ty);
+        let scheme_ret_slots: Vec<ScalarType> = if has_scheme {
+            self.expand_slots(&body.ty)
+        } else {
+            vec![self.scalar_type(&body.ty)]
+        };
+        self.builder.set_return_types(scheme_ret_slots.clone());
 
         let entry = self.builder.create_block();
         self.builder.switch_to(entry);
-        let result = self.lower_expr(body);
-        let return_type = if has_scheme {
-            scheme_ret_ty
+        let result_lv = self.lower_expr_lv(body);
+        // Refine for scheme-less synth functions: their declared
+        // return slot types come from the body's lowered shape.
+        let return_slots: Vec<ScalarType> = if has_scheme {
+            scheme_ret_slots
         } else {
-            result.ty
+            match &result_lv {
+                LoweredValue::Single(v) => vec![v.ty],
+                LoweredValue::Multi(vs) => vs.iter().map(|v| v.ty).collect(),
+            }
         };
-        // Refine the declared return type for scheme-less synth
-        // functions before emitting the final `ret`, so `ret`'s
-        // coercion check uses the same type the function claims.
-        self.builder.set_return_type(return_type);
-        self.builder.ret(result);
-        self.builder.finish_function(name, return_type);
+        self.builder.set_return_types(return_slots.clone());
+        let result_vals = self.to_slots(result_lv, &body.ty, &return_slots);
+        if result_vals.len() == 1 {
+            self.builder.ret(result_vals.into_iter().next().unwrap());
+        } else {
+            self.builder.ret_multi(result_vals);
+        }
+        self.builder.finish_function_multi(name, return_slots);
 
         self.builder.func = saved_func;
         self.builder.current_block = saved_current;
@@ -611,7 +724,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     /// Heap-materialize a `Multi` into a single RcPtr. Emits
     /// `Alloc + Store_i` for each slot at offset `i*8`. `Single`
-    /// passes through.
+    /// passes through. Used when the source type's slot layout is
+    /// uniform 8-byte stride (the default for tuples/records).
     fn materialize(&mut self, lv: LoweredValue) -> Value {
         match lv {
             LoweredValue::Single(v) => v,
@@ -619,6 +733,29 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let ptr = self.builder.alloc(vs.len() * 8);
                 for (i, v) in vs.into_iter().enumerate() {
                     self.builder.store(ptr, i * 8, v);
+                }
+                ptr
+            }
+        }
+    }
+
+    /// Type-aware materialize: uses `slot_offsets` for the source
+    /// type. Equivalent to `materialize` for tuples/records (same
+    /// 8-byte stride), but explicit so future Phase C lists/strs can
+    /// use 0/8/16 trio layout.
+    pub(super) fn materialize_lv(&mut self, lv: LoweredValue, src_ty: &Type) -> Value {
+        match lv {
+            LoweredValue::Single(v) => v,
+            LoweredValue::Multi(vs) => {
+                let offsets = self.slot_offsets(src_ty);
+                if offsets.len() != vs.len() {
+                    // Defensive fallback: use uniform 8-byte stride.
+                    return self.materialize(LoweredValue::Multi(vs));
+                }
+                let total = offsets.iter().copied().max().unwrap_or(0) + 8;
+                let ptr = self.builder.alloc(total);
+                for (v, off) in vs.into_iter().zip(offsets) {
+                    self.builder.store(ptr, off, v);
                 }
                 ptr
             }

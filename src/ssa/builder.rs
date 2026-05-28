@@ -16,10 +16,11 @@ pub struct FuncBuilder {
     /// Function parameters, in declaration order. Each Value carries
     /// its type. Populated via `add_func_param`.
     pub params: Vec<Value>,
-    /// Function return type, set before lowering the body so `ret`
-    /// can coerce the returned value if its type doesn't match.
-    /// `None` during the brief window between `new` and `start_function`.
-    pub return_type: Option<ScalarType>,
+    /// Function return type(s). Vec length matches the number of
+    /// returned slots — single-element for scalars and heap pointers,
+    /// longer for decomposed tuple/record returns. `None` during the
+    /// brief window between `new` and `start_function`.
+    pub return_type: Option<Vec<ScalarType>>,
 }
 
 impl FuncBuilder {
@@ -188,6 +189,20 @@ impl Builder {
         // Conservative: clear all forwarding entries.
         self.recent_stores.clear();
         v
+    }
+
+    /// Multi-result Call. Returns N parallel result Values, one per
+    /// slot in `ret_tys`. Used when the callee's return type is a
+    /// decomposed tuple/record.
+    pub fn call_multi(&mut self, func: &str, args: Vec<Value>, ret_tys: &[ScalarType]) -> Vec<Value> {
+        let results: Vec<Value> = ret_tys.iter().map(|&ty| self.fresh_value(ty)).collect();
+        self.push(Inst::Call {
+            results: results.clone(),
+            target: func.to_owned(),
+            args,
+        });
+        self.recent_stores.clear();
+        results
     }
 
     // ---- Memory ----
@@ -382,11 +397,19 @@ impl Builder {
     // ---- Terminators ----
 
     pub fn set_return_type(&mut self, ty: ScalarType) {
-        self.func.return_type = Some(ty);
+        self.func.return_type = Some(vec![ty]);
+    }
+
+    pub fn set_return_types(&mut self, tys: Vec<ScalarType>) {
+        self.func.return_type = Some(tys);
     }
 
     pub fn ret(&mut self, value: Value) {
         self.seal(Terminator::Return(vec![value]));
+    }
+
+    pub fn ret_multi(&mut self, values: Vec<Value>) {
+        self.seal(Terminator::Return(values));
     }
 
     pub fn jump(&mut self, target: BlockId, args: Vec<Value>) {
@@ -428,20 +451,23 @@ impl Builder {
 
     // ---- Function building ----
 
-    /// Finalize the current function. Params are the ones added via
-    /// `add_func_param` (in order); each carries its type.
-    /// The caller only supplies the return type.
+    /// Finalize the current function with a single-value return.
     pub fn finish_function(&mut self, name: &str, return_type: ScalarType) {
+        self.finish_function_multi(name, vec![return_type]);
+    }
+
+    /// Finalize the current function with N return slots.
+    pub fn finish_function_multi(&mut self, name: &str, return_types: Vec<ScalarType>) {
         assert!(
             self.func.pending.is_empty(),
             "finish_function({name}): {} blocks still pending terminators",
             self.func.pending.len(),
         );
         let fb = std::mem::replace(&mut self.func, FuncBuilder::new());
-        let declared_ret = fb.return_type.unwrap_or(return_type);
+        let declared_ret = fb.return_type.unwrap_or_else(|| return_types.clone());
         debug_assert!(
-            declared_ret == return_type,
-            "finish_function({name}): return type mismatch (set_return_type={declared_ret:?}, finish_function arg={return_type:?})"
+            declared_ret == return_types,
+            "finish_function({name}): return type mismatch (set_return_type={declared_ret:?}, finish_function arg={return_types:?})"
         );
         self.functions.insert(
             name.to_owned(),
@@ -449,7 +475,7 @@ impl Builder {
                 name: name.to_owned(),
                 params: fb.params,
                 blocks: fb.finished,
-                return_type: vec![declared_ret],
+                return_type: declared_ret,
                 entry: BlockId(0),
                 next_block: fb.next_block,
             },

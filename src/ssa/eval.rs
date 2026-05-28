@@ -435,7 +435,9 @@ pub fn new_heap() -> Heap {
 
 pub fn eval_function(module: &Module, heap: &mut Heap, name: &str, args: &[Scalar]) -> Scalar {
     let mut scratch = Scratch::new();
-    eval_function_inner(module, heap, &mut scratch, name, args)
+    let results = eval_function_inner(module, heap, &mut scratch, name, args);
+    debug_assert!(!results.is_empty(), "eval_function({name}): no results");
+    results.into_iter().next().unwrap()
 }
 
 fn eval_function_inner(
@@ -444,10 +446,10 @@ fn eval_function_inner(
     scratch: &mut Scratch,
     name: &str,
     args: &[Scalar],
-) -> Scalar {
+) -> Vec<Scalar> {
     // Check for runtime intrinsics
     if let Some(result) = eval_intrinsic(name, heap, args) {
-        return result;
+        return vec![result];
     }
 
     let func = module
@@ -471,15 +473,37 @@ fn eval_function_inner(
         }
 
         for inst in &block.insts {
-            // CowMoveOut writes two env slots; route it through a
-            // dedicated multi-result handler. Everything else has a
-            // single dest (or none) and goes through eval_inst.
+            // Multi-result instructions write N env slots; route them
+            // through dedicated handlers. Single-result goes through
+            // eval_inst.
             if let Inst::CowMoveOut { results, src, offset } = inst {
                 let [out_ptr_dest, val_dest] = results;
                 let (out_scalar, val_scalar) =
                     eval_cow_move_out(heap, &env, *src, *offset);
                 env[out_ptr_dest.id] = out_scalar;
                 env[val_dest.id] = val_scalar;
+                continue;
+            }
+            if let Inst::Call { results, target, args: call_args } = inst {
+                let arg_vals: Vec<Scalar> = call_args.iter().map(|v| env[v.id]).collect();
+                for (arg, val) in call_args.iter().zip(&arg_vals) {
+                    if arg.ty == ScalarType::RcPtr {
+                        if let Scalar::Ptr(idx) = val {
+                            heap.rc_inc(*idx);
+                        }
+                    }
+                }
+                let call_results = eval_function_inner(module, heap, scratch, target, &arg_vals);
+                debug_assert_eq!(
+                    results.len(),
+                    call_results.len(),
+                    "Call {target}: expected {} results, got {}",
+                    results.len(),
+                    call_results.len()
+                );
+                for (slot, val) in results.iter().zip(call_results) {
+                    env[slot.id] = val;
+                }
                 continue;
             }
             let val = eval_inst(module, heap, scratch, &env, inst);
@@ -492,11 +516,7 @@ fn eval_function_inner(
 
         match &block.terminator {
             Terminator::Return(vs) => {
-                // Eval is single-result today: every `Return` carries
-                // a single Value. The multi-value shape exists in the
-                // IR but isn't yet emitted by lower.
-                debug_assert_eq!(vs.len(), 1, "eval: multi-value Return not yet supported");
-                let result = env[vs[0].id];
+                let result: Vec<Scalar> = vs.iter().map(|v| env[v.id]).collect();
                 scratch.release(env);
                 return result;
             }
@@ -541,26 +561,15 @@ fn eval_function_inner(
     }
 }
 
-fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env, inst: &Inst) -> Option<Scalar> {
+fn eval_inst(_module: &Module, heap: &mut Heap, _scratch: &mut Scratch, env: &Env, inst: &Inst) -> Option<Scalar> {
     match inst {
         Inst::Const(dest, bits) => Some(bits_to_scalar(dest.ty, *bits)),
 
         Inst::BinOp(_, op, lhs, rhs) => Some(eval_binop(*op, env[lhs.id], env[rhs.id])),
 
-        Inst::Call { target, args, .. } => {
-            let arg_vals: Vec<Scalar> = args.iter().map(|v| env[v.id]).collect();
-            // Auto-rc: mint a fresh owning ref for each RcPtr arg so
-            // the callee receives its own claim independent of the
-            // caller's local. Caller's local stays owning; it gets
-            // released at scope end by rc_emit's normal drop logic.
-            for (arg, val) in args.iter().zip(&arg_vals) {
-                if arg.ty == ScalarType::RcPtr {
-                    if let Scalar::Ptr(idx) = val {
-                        heap.rc_inc(*idx);
-                    }
-                }
-            }
-            Some(eval_function_inner(module, heap, scratch, target, &arg_vals))
+        Inst::Call { .. } => {
+            // Handled in the multi-result branch in eval_function_inner.
+            unreachable!("Call routed via dedicated handler");
         }
 
         Inst::Alloc(_, size) => {

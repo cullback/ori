@@ -161,7 +161,18 @@ fn find_inline_site(
 ) -> Option<(BlockId, usize, String)> {
     for (&bid, block) in &caller.blocks {
         for (ii, inst) in block.insts.iter().enumerate() {
-            if let Inst::Call { target, .. } = inst {
+            if let Inst::Call { target, results, .. } = inst {
+                // Skip multi-result Calls: the inline splice expects
+                // a single continuation param, not N.
+                if results.len() != 1 {
+                    continue;
+                }
+                if let Some(snap) = snapshots.get(target) {
+                    // Skip callees that declare multi-value returns.
+                    if snap.return_type.len() != 1 {
+                        continue;
+                    }
+                }
                 if snapshots.contains_key(target) && target != &caller.name {
                     return Some((bid, ii, target.clone()));
                 }

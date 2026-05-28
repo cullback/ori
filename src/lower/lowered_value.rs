@@ -34,4 +34,15 @@ impl LoweredValue {
     pub(super) fn single(v: Value) -> Self {
         Self::Single(v)
     }
+
+    /// Wrap a Vec of Values as Multi, or as Single if the Vec has one
+    /// element. Used at call sites that build slot lists from
+    /// `call_multi` returns.
+    pub(super) fn from_slots(vs: Vec<Value>) -> Self {
+        if vs.len() == 1 {
+            Self::Single(vs.into_iter().next().unwrap())
+        } else {
+            Self::Multi(vs)
+        }
+    }
 }

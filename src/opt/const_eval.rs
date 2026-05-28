@@ -114,7 +114,10 @@ enum Replacement {
 }
 
 /// Find zero-argument functions eligible for compile-time evaluation.
-/// Excludes the entry function and intrinsics.
+/// Excludes the entry function and intrinsics. Multi-value returns
+/// are also excluded because the rewrite path only handles single-
+/// result Calls (removing the function while leaving the multi-result
+/// Call would break validation).
 fn find_eligible(module: &Module) -> Vec<String> {
     module
         .functions
@@ -123,6 +126,7 @@ fn find_eligible(module: &Module) -> Vec<String> {
             func.params.is_empty()
                 && *name != &module.entry
                 && !name.starts_with("__")
+                && func.return_type.len() == 1
         })
         .map(|(name, _)| name.clone())
         .collect()

@@ -130,6 +130,7 @@ fn run_i64(source: &str, input: i64) -> i64 {
     }
 }
 
+
 #[allow(dead_code, reason = "used by structural-tag inference tests")]
 fn infer_func_type(source: &str, func: &str) -> String {
     let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
@@ -421,7 +422,14 @@ main = |arg| (
     (x, y) = swap(3, 7)
     x * 10 + y
 )";
-    assert_eq!(run_i64(source, 0), 73);
+    let (result, heap) = run_with_heap(source, 0);
+    assert_eq!(result, Scalar::I64(73));
+    // Sig expansion: swap's return is decomposed at the boundary —
+    // the call produces two parallel result Values and main binds
+    // them directly. No heap roundtrip.
+    assert_eq!(heap.alloc_count, 0,
+        "expected zero allocs on decomposed tuple-returning call, got {}",
+        heap.alloc_count);
 }
 
 #[test]

@@ -10,6 +10,7 @@ use crate::ssa::instruction::{BinaryOp, ScalarType};
 use crate::types::engine::Type;
 
 use super::LowerCtx;
+use super::lowered_value::LoweredValue;
 
 pub struct WalkKind {
     pub until: bool,
@@ -75,164 +76,372 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
-    /// Emit a range-walk loop: counter from start to end, no list allocation.
+    /// Emit a range-walk loop: counter from start to end, no list
+    /// allocation. Accumulator threaded through `acc_slots`-many
+    /// parallel block params.
     pub(super) fn lower_range_walk(
         &mut self,
         start: Value,
         end: Value,
-        init_val: Value,
+        init_vals: Vec<Value>,
         step_val: Value,
         apply_name: &str,
         until: bool,
-        acc_ty: ScalarType,
+        acc_slots: Vec<ScalarType>,
+        acc_ty: &Type,
         direct: Option<&SingletonTarget>,
-    ) -> Value {
+    ) -> LoweredValue {
         let step_ty = step_val.ty;
+        // Range-walk's element is the counter itself, always U64.
+        let elem_ty = Type::Con("U64".to_string());
 
         let header = self.builder.create_block();
         let i_param = self.builder.add_block_param(header, ScalarType::U64);
-        let acc_param = self.builder.add_block_param(header, acc_ty);
+        let acc_params: Vec<Value> = acc_slots.iter()
+            .map(|&ty| self.builder.add_block_param(header, ty))
+            .collect();
         let end_param = self.builder.add_block_param(header, ScalarType::U64);
         let step_param = self.builder.add_block_param(header, step_ty);
         let body_block = self.builder.create_block();
         let body_i = self.builder.add_block_param(body_block, ScalarType::U64);
-        let body_acc = self.builder.add_block_param(body_block, acc_ty);
+        let body_acc: Vec<Value> = acc_slots.iter()
+            .map(|&ty| self.builder.add_block_param(body_block, ty))
+            .collect();
         let body_end = self.builder.add_block_param(body_block, ScalarType::U64);
         let body_step = self.builder.add_block_param(body_block, step_ty);
         let done = self.builder.create_block();
-        let done_param = self.builder.add_block_param(done, acc_ty);
+        let done_params: Vec<Value> = acc_slots.iter()
+            .map(|&ty| self.builder.add_block_param(done, ty))
+            .collect();
         // Thread `step` into `done` as an unused block param so rc_emit
         // releases the closure env on loop exit. Without this, callers
         // whose closure captures something would leak the env when the
         // loop terminates.
         let _done_step = self.builder.add_block_param(done, step_ty);
 
-        self.builder.jump(header, vec![start, init_val, end, step_val]);
+        let mut entry_args = Vec::with_capacity(2 + acc_slots.len() + 2);
+        entry_args.push(start);
+        entry_args.extend(init_vals.iter().copied());
+        entry_args.push(end);
+        entry_args.push(step_val);
+        self.builder.jump(header, entry_args);
 
         self.builder.switch_to(header);
         let cmp = self.builder.binop(BinaryOp::Eq, i_param, end_param, ScalarType::U8);
-        self.builder.branch(cmp, done, vec![acc_param, step_param], body_block, vec![i_param, acc_param, end_param, step_param]);
+        let mut done_args = acc_params.clone();
+        done_args.push(step_param);
+        let mut body_args = Vec::with_capacity(2 + acc_slots.len() + 2);
+        body_args.push(i_param);
+        body_args.extend(acc_params.iter().copied());
+        body_args.push(end_param);
+        body_args.push(step_param);
+        self.builder.branch(cmp, done, done_args, body_block, body_args);
 
         self.builder.switch_to(body_block);
-        // The element IS the counter — no list load needed.
-        let elem = body_i;
-        let resolved = direct.or_else(|| self.singletons.get(apply_name));
-        let result = if let Some(st) = resolved {
-            let mut call_args = Vec::with_capacity(st.num_captures + 2);
-            for i in 0..st.num_captures {
-                call_args.push(self.builder.load(body_step, (i + 1) * 8, ScalarType::RcPtr));
-            }
-            call_args.push(body_acc);
-            call_args.push(elem);
-            let ret_ty = self.func_ret_type(&st.target_func);
-            self.builder.call(&st.target_func, call_args, ret_ty)
-        } else {
-            let ret_ty = self.func_ret_type(apply_name);
-            self.builder.call(apply_name, vec![body_step, body_acc, elem], ret_ty)
-        };
+        let elem = body_i; // element IS the counter for range-walk
+        let result = self.emit_walk_step_call(direct, apply_name, body_step, &body_acc, elem, &elem_ty, &acc_slots);
 
         let one = self.builder.const_u64(1);
         let next_i = self.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
 
         if until {
-            let tag = self.builder.load(result, 0, ScalarType::U64);
-            let payload_load_ty = acc_ty;
-            let payload = self.builder.load(result, 8, payload_load_ty);
-            let break_tag = self.decls.constructors["Break"].tag_index;
-            let break_val = self.builder.const_u64(break_tag);
-            let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
-            self.builder.branch(is_break, done, vec![payload, body_step], header, vec![next_i, payload, body_end, body_step]);
+            // result is a Continue/Break tag union (single RcPtr,
+            // since tag unions don't decompose in this phase). The
+            // payload IS the acc (multi-slot) stored after the tag.
+            self.emit_walk_until_branch(
+                result,
+                next_i,
+                &body_acc,
+                body_end,
+                body_step,
+                done,
+                header,
+                &acc_slots,
+                acc_ty,
+            );
         } else {
-            self.builder.jump(header, vec![next_i, result, body_end, body_step]);
+            let mut jump_args = Vec::with_capacity(2 + result.len() + 2);
+            jump_args.push(next_i);
+            jump_args.extend(result.iter().copied());
+            jump_args.push(body_end);
+            jump_args.push(body_step);
+            self.builder.jump(header, jump_args);
         }
 
         self.builder.switch_to(done);
-        done_param
+        LoweredValue::from_slots(done_params)
     }
 
     pub(super) fn lower_list_walk(
         &mut self,
         list_val: Value,
-        init_val: Value,
+        init_vals: Vec<Value>,
         step_val: Value,
         apply_name: &str,
         until: bool,
-        acc_ty: ScalarType,
+        acc_slots: Vec<ScalarType>,
+        acc_ty: &Type,
+        elem_ty: &Type,
         direct: Option<&SingletonTarget>,
-    ) -> Value {
+    ) -> LoweredValue {
         let len_val = self.builder.load(list_val, 0, ScalarType::U64);
         let data_ptr = self.builder.load(list_val, 16, ScalarType::RcPtr);
         let step_ty = step_val.ty;
 
         let header = self.builder.create_block();
         let i_param = self.builder.add_block_param(header, ScalarType::U64);
-        let acc_param = self.builder.add_block_param(header, acc_ty);
+        let acc_params: Vec<Value> = acc_slots.iter()
+            .map(|&ty| self.builder.add_block_param(header, ty))
+            .collect();
         let len_param = self.builder.add_block_param(header, ScalarType::U64);
         let data_param = self.builder.add_block_param(header, ScalarType::RcPtr);
         let step_param = self.builder.add_block_param(header, step_ty);
         let body_block = self.builder.create_block();
         let body_i = self.builder.add_block_param(body_block, ScalarType::U64);
-        let body_acc = self.builder.add_block_param(body_block, acc_ty);
+        let body_acc: Vec<Value> = acc_slots.iter()
+            .map(|&ty| self.builder.add_block_param(body_block, ty))
+            .collect();
         let body_len = self.builder.add_block_param(body_block, ScalarType::U64);
         let body_data = self.builder.add_block_param(body_block, ScalarType::RcPtr);
         let body_step = self.builder.add_block_param(body_block, step_ty);
         let done = self.builder.create_block();
-        let done_param = self.builder.add_block_param(done, acc_ty);
-        // Thread `data` and `step` into `done` as unused block params so
-        // rc_emit releases them on loop exit. Without this, callers
-        // whose closure captures something would leak the env when the
-        // loop terminates.
+        let done_params: Vec<Value> = acc_slots.iter()
+            .map(|&ty| self.builder.add_block_param(done, ty))
+            .collect();
         let _done_data = self.builder.add_block_param(done, ScalarType::RcPtr);
         let _done_step = self.builder.add_block_param(done, step_ty);
 
         let zero = self.builder.const_u64(0);
-        self.builder.jump(header, vec![zero, init_val, len_val, data_ptr, step_val]);
+        let mut entry_args = Vec::with_capacity(2 + acc_slots.len() + 3);
+        entry_args.push(zero);
+        entry_args.extend(init_vals.iter().copied());
+        entry_args.push(len_val);
+        entry_args.push(data_ptr);
+        entry_args.push(step_val);
+        self.builder.jump(header, entry_args);
 
         self.builder.switch_to(header);
-        let cmp = self
-            .builder
-            .binop(BinaryOp::Eq, i_param, len_param, ScalarType::U8);
-        self.builder
-            .branch(cmp, done, vec![acc_param, data_param, step_param], body_block, vec![i_param, acc_param, len_param, data_param, step_param]);
+        let cmp = self.builder.binop(BinaryOp::Eq, i_param, len_param, ScalarType::U8);
+        let mut done_args = acc_params.clone();
+        done_args.push(data_param);
+        done_args.push(step_param);
+        let mut body_args = Vec::with_capacity(2 + acc_slots.len() + 3);
+        body_args.push(i_param);
+        body_args.extend(acc_params.iter().copied());
+        body_args.push(len_param);
+        body_args.push(data_param);
+        body_args.push(step_param);
+        self.builder.branch(cmp, done, done_args, body_block, body_args);
 
         self.builder.switch_to(body_block);
         let elem = self.builder.load_dyn(body_data, body_i, ScalarType::RcPtr);
-        let resolved = direct.or_else(|| self.singletons.get(apply_name));
-        let result = if let Some(st) = resolved {
-            let mut call_args = Vec::with_capacity(st.num_captures + 2);
-            for i in 0..st.num_captures {
-                call_args.push(self.builder.load(body_step, (i + 1) * 8, ScalarType::RcPtr));
-            }
-            call_args.push(body_acc);
-            call_args.push(elem);
-            let ret_ty = self.func_ret_type(&st.target_func);
-            self.builder.call(&st.target_func, call_args, ret_ty)
-        } else {
-            let ret_ty = self.func_ret_type(apply_name);
-            self.builder.call(apply_name, vec![body_step, body_acc, elem], ret_ty)
-        };
+        let result = self.emit_walk_step_call(direct, apply_name, body_step, &body_acc, elem, elem_ty, &acc_slots);
 
         let one = self.builder.const_u64(1);
-        let next_i = self
-            .builder
-            .binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+        let next_i = self.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
 
         if until {
-            let tag = self.builder.load(result, 0, ScalarType::U64);
-            let payload_load_ty = acc_ty;
-            let payload = self.builder.load(result, 8, payload_load_ty);
-            let break_tag = self.decls.constructors["Break"].tag_index;
-            let break_val = self.builder.const_u64(break_tag);
-            let is_break = self
-                .builder
-                .binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
-            self.builder
-                .branch(is_break, done, vec![payload, body_data, body_step], header, vec![next_i, payload, body_len, body_data, body_step]);
+            self.emit_walk_until_branch_with_data(
+                result,
+                next_i,
+                &body_acc,
+                body_len,
+                body_data,
+                body_step,
+                done,
+                header,
+                &acc_slots,
+                acc_ty,
+            );
         } else {
-            self.builder.jump(header, vec![next_i, result, body_len, body_data, body_step]);
+            let mut jump_args = Vec::with_capacity(2 + result.len() + 3);
+            jump_args.push(next_i);
+            jump_args.extend(result.iter().copied());
+            jump_args.push(body_len);
+            jump_args.push(body_data);
+            jump_args.push(body_step);
+            self.builder.jump(header, jump_args);
         }
 
         self.builder.switch_to(done);
-        done_param
+        LoweredValue::from_slots(done_params)
+    }
+
+    /// Emit the apply call inside a walk's body block. Splats `acc`
+    /// and `elem` into the call args and uses `call_multi` when the
+    /// callee returns multiple slots.
+    fn emit_walk_step_call(
+        &mut self,
+        direct: Option<&SingletonTarget>,
+        apply_name: &str,
+        body_step: Value,
+        body_acc: &[Value],
+        elem: Value,
+        elem_ty: &Type,
+        _acc_slots: &[ScalarType],
+    ) -> Vec<Value> {
+        // Splat elem into its expanded slots. For scalar elements
+        // (range counter, scalar list elements), this is a no-op.
+        // For aggregate elements (tuple/record), the elem is a heap
+        // ptr loaded from the data buffer; emit Loads to fan it out.
+        let elem_slots = self.expand_slots(elem_ty);
+        let elem_vals = self.to_slots(
+            super::lowered_value::LoweredValue::single(elem),
+            elem_ty,
+            &elem_slots,
+        );
+
+        let resolved = direct.or_else(|| self.singletons.get(apply_name));
+        if let Some(st) = resolved {
+            // Captures occupy one slot each in the closure record at
+            // offsets 8, 16, 24, ... — they are heap-materialized at
+            // capture time. Each capture's *source-level* Type tells
+            // us (a) the scalar type to load it as and (b) whether to
+            // splat it into multi-slots for the callee.
+            let target_param_slots = self.callee_param_slots(&st.target_func, body_acc.len() + elem_vals.len() + st.num_captures);
+            let target_param_types = self.callee_param_types(&st.target_func);
+            let mut call_args = Vec::with_capacity(st.num_captures + body_acc.len() + elem_vals.len());
+            for i in 0..st.num_captures {
+                let slots: &[ScalarType] = target_param_slots
+                    .get(i)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[ScalarType::RcPtr]);
+                // Aggregate captures were materialized into one
+                // RcPtr slot at capture time; scalars use their
+                // direct scalar type.
+                let single_load_ty = if slots.len() == 1 { slots[0] } else { ScalarType::RcPtr };
+                let v = self.builder.load(body_step, (i + 1) * 8, single_load_ty);
+                if slots.len() > 1 {
+                    let cap_ty = target_param_types
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| Type::Con("__none".to_owned()));
+                    let expanded = self.to_slots(
+                        super::lowered_value::LoweredValue::single(v),
+                        &cap_ty,
+                        slots,
+                    );
+                    call_args.extend(expanded);
+                } else {
+                    call_args.push(v);
+                }
+            }
+            call_args.extend(body_acc.iter().copied());
+            call_args.extend(elem_vals);
+            let ret_slots = self.callee_return_slots(&st.target_func);
+            if ret_slots.len() == 1 {
+                vec![self.builder.call(&st.target_func, call_args, ret_slots[0])]
+            } else {
+                self.builder.call_multi(&st.target_func, call_args, &ret_slots)
+            }
+        } else {
+            let mut call_args = Vec::with_capacity(body_acc.len() + 1 + elem_vals.len());
+            call_args.push(body_step);
+            call_args.extend(body_acc.iter().copied());
+            call_args.extend(elem_vals);
+            let ret_slots = self.callee_return_slots(apply_name);
+            if ret_slots.len() == 1 {
+                vec![self.builder.call(apply_name, call_args, ret_slots[0])]
+            } else {
+                self.builder.call_multi(apply_name, call_args, &ret_slots)
+            }
+        }
+    }
+
+    /// Load the (multi-slot) acc payload out of a Continue/Break tag
+    /// union. The payload is stored as a single materialized RcPtr at
+    /// offset 8 (constructor allocated `2*8` bytes: tag + one
+    /// materialized acc ptr). Unmaterialize via `to_slots`.
+    fn load_walk_payload(&mut self, result_ptr: Value, acc_slots: &[ScalarType], acc_ty: &Type) -> Vec<Value> {
+        if acc_slots.len() == 1 {
+            return vec![self.builder.load(result_ptr, 8, acc_slots[0])];
+        }
+        let payload_ptr = self.builder.load(result_ptr, 8, ScalarType::RcPtr);
+        self.to_slots(
+            super::lowered_value::LoweredValue::single(payload_ptr),
+            acc_ty,
+            acc_slots,
+        )
+    }
+
+    /// walk_until branch (range version). `result` is a single RcPtr
+    /// pointing at a Continue/Break tag union whose payload is the
+    /// (multi-slot) acc.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_walk_until_branch(
+        &mut self,
+        result: Vec<Value>,
+        next_i: Value,
+        body_acc: &[Value],
+        body_end: Value,
+        body_step: Value,
+        done: crate::ssa::instruction::BlockId,
+        header: crate::ssa::instruction::BlockId,
+        acc_slots: &[ScalarType],
+        acc_ty: &Type,
+    ) {
+        // The apply for walk_until returns Continue(Acc)|Break(Acc),
+        // which expand_slots leaves as a single RcPtr. So result has
+        // length 1.
+        debug_assert_eq!(
+            result.len(),
+            1,
+            "walk_until apply should return a single tag-union ptr"
+        );
+        let result_ptr = result[0];
+        let tag = self.builder.load(result_ptr, 0, ScalarType::U64);
+        let payload = self.load_walk_payload(result_ptr, acc_slots, acc_ty);
+        let _ = body_acc;
+        let break_tag = self.decls.constructors["Break"].tag_index;
+        let break_val = self.builder.const_u64(break_tag);
+        let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
+        let mut done_args = payload.clone();
+        done_args.push(body_step);
+        let mut header_args = Vec::with_capacity(2 + payload.len() + 2);
+        header_args.push(next_i);
+        header_args.extend(payload.iter().copied());
+        header_args.push(body_end);
+        header_args.push(body_step);
+        self.builder.branch(is_break, done, done_args, header, header_args);
+    }
+
+    /// walk_until branch (list version) — same as range except the
+    /// header threads `data` as well.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_walk_until_branch_with_data(
+        &mut self,
+        result: Vec<Value>,
+        next_i: Value,
+        body_acc: &[Value],
+        body_len: Value,
+        body_data: Value,
+        body_step: Value,
+        done: crate::ssa::instruction::BlockId,
+        header: crate::ssa::instruction::BlockId,
+        acc_slots: &[ScalarType],
+        acc_ty: &Type,
+    ) {
+        debug_assert_eq!(
+            result.len(),
+            1,
+            "walk_until apply should return a single tag-union ptr"
+        );
+        let result_ptr = result[0];
+        let tag = self.builder.load(result_ptr, 0, ScalarType::U64);
+        let payload = self.load_walk_payload(result_ptr, acc_slots, acc_ty);
+        let _ = body_acc;
+        let break_tag = self.decls.constructors["Break"].tag_index;
+        let break_val = self.builder.const_u64(break_tag);
+        let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
+        let mut done_args = payload.clone();
+        done_args.push(body_data);
+        done_args.push(body_step);
+        let mut header_args = Vec::with_capacity(2 + payload.len() + 3);
+        header_args.push(next_i);
+        header_args.extend(payload.iter().copied());
+        header_args.push(body_len);
+        header_args.push(body_data);
+        header_args.push(body_step);
+        self.builder.branch(is_break, done, done_args, header, header_args);
     }
 }
