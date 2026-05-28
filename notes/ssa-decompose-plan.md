@@ -195,7 +195,7 @@ undersells it. Real uses exist or are imminent:
 - **Statics should be `Ptr`, not `RcPtr`-with-sentinel.** Today
   `static_promote` produces `RcPtr`s whose rc field is a sentinel that
   makes RC ops no-op. That's a type lie — switch statics to `Ptr` as
-  part of stage 6/7 cleanup. Honest representation, no sentinel
+  part of phase F (F2). Honest representation, no sentinel
   special-casing.
 - **Local borrow optimization (future).** `BitCast(rcptr_val) → Ptr`
   downgrades an RcPtr to a non-RC borrow within a function scope. The
@@ -780,7 +780,7 @@ Use `cargo test --quiet -- --ignored` to also run the audit tests
 
 - **Closure capture expansion.** A closure capturing a 4-tuple env
   becomes a `__apply_K` with 4 expanded param slots. Two design points
-  to confirm during stage 6:
+  to confirm during phase E:
   - **Does this blow up the closure dispatch table?** Each closure
     shape specializes. If a function captures 5 different tuples-of-3,
     that's 5 specializations. Probably fine — `lambda_specialize`
@@ -846,22 +846,55 @@ Use `cargo test --quiet -- --ignored` to also run the audit tests
 - **No language-level changes.** Source-level tuples, records, opaque
   types behave identically. Only the SSA layer changes.
 
+## Migration discipline
+
+A few invariants the implementing agent should hold to:
+
+- **Stop at phase boundaries.** Within a phase, do the listed stages
+  in any order. Between phases, get user confirmation before
+  proceeding. Phase boundaries exist precisely because they're
+  decision points where intermediate observation matters.
+- **Tests pass at every phase boundary.** If `cargo test --quiet` is
+  red at the end of a phase, the phase isn't done. Don't move on with
+  failures parked for later.
+- **Don't relax `validate_after` to hide warnings.** During a phase,
+  intermediate SSA may produce soft-validation warnings — that's
+  expected. By the *end* of a phase, those warnings must be resolved
+  (either the offending code is updated or the validator's warning
+  is itself stale and gets removed). Suppressing the warning to
+  "make tests green" leaves the next phase guessing whether the
+  warning was a real signal.
+- **Don't merge incrementally to main.** This refactor leaves the
+  codebase in inconsistent states between phases. Land on a branch;
+  merge to main when complete. Otherwise contributors hit weird
+  "why does my tuple work but my record doesn't" intermediate states.
+- **Commit at every stage.** Each stage in each phase is its own
+  commit, so the history reads as a clean progression. If
+  bisecting a regression later, granular commits help.
+
 ## Getting started in a fresh session
 
 1. Read this file (the whole thing).
 2. Read `CLAUDE.md` for language overview — note that the "SSA
    representation" section is about to change.
-3. Read `src/ssa/instruction.rs` for current ScalarType / Inst shape.
-4. Read `src/ssa/mod.rs` for Function/Block/Terminator.
-5. Read `src/ssa/eval.rs` for Scalar and the eval handlers that need
+3. Read `src/ssa/instruction.rs` for current `ScalarType`/`Inst` shape.
+4. Read `src/ssa/mod.rs` for `Function`/`Block`/`Terminator`.
+5. Read `src/ssa/eval.rs` for `Scalar` and the eval handlers that need
    updating.
 6. Read `src/lower/README.md` for lower's semantic guarantees.
 7. Read `src/opt/sroa.rs` since it's the biggest pass affected (and
    may be deleted at the end).
-8. Run `cargo test --quiet` to confirm 229 passing baseline.
-9. Start stage 1 (`Inst::Call` to struct-style). Land it. Confirm
-   with user before moving to stage 2.
+8. Look at `notes/tuples.md`, `notes/records.md`, `notes/tags.md` for
+   language-level docs on the things being refactored.
+9. Run `cargo test --quiet` to confirm baseline passes
+   (229 passing, 4 ignored audit tests at time of writing).
+10. Start phase A (IR plumbing — see "Order of operations"). Land all
+    three plumbing stages (A1, A2, A3) before confirming with the
+    user; they form a coherent batch with tests passing throughout.
+11. After each phase, confirm with the user before starting the next.
 
-The full test suite is `cargo test --quiet` (currently 229 passing,
-4 ignored audit tests). Run `cargo test --quiet -- --ignored` for the
-audit tests separately.
+The full test suite is `cargo test --quiet`. Run
+`cargo test --quiet -- --ignored` for the 4 audit tests separately.
+For each non-trivial phase, also run the verification commands listed
+in "Verification beyond `cargo test`" above (AoC programs, MD5
+benchmark, `peak_live` smoke check, SSA dump sanity).
