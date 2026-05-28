@@ -116,10 +116,16 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 self.const_tag(tag_index, disc_ty),
             );
         }
-        // Non-fieldless tag union: payload heap object holds the
-        // variant's fields. Variants with fewer fields than the
-        // union's max use a smaller allocation; void variants use a
-        // null payload pointer.
+        // Phase E: single-variant tag unions skip both the tag and
+        // the payload heap object — the variant is implicit and
+        // fields flow as parallel SSA Values. Closures with captures
+        // land here.
+        if let Some(ty) = ctx_ty {
+            if self.is_single_variant_tag_union(ty) {
+                return super::lowered_value::LoweredValue::Multi(args.to_vec());
+            }
+        }
+        // D2 multi-variant: tag in register, fields in payload heap.
         let tag = self.builder.const_u64(tag_index);
         let payload = if args.is_empty() {
             self.builder.const_ptr_null()

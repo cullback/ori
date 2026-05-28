@@ -114,10 +114,35 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             self.con_layout(name, Some(&inner_ty));
                         let fieldless = max_fields == 0;
                         let scr_lv = self.lower_expr_lv(inner);
-                        // For non-fieldless tag unions, lift `(tag,
-                        // payload)` out. Threading the payload (not
-                        // the tag-union shell) keeps the match-block
-                        // field loads at simple `fi*8` offsets.
+                        // Phase E: single-variant non-fieldless tag
+                        // unions have no tag — fields are the
+                        // scrutinee's slots directly. The is-pattern
+                        // always matches (only one variant exists);
+                        // we bind fields and fall through.
+                        if !fieldless && self.is_single_variant_tag_union(&inner_ty) {
+                            let slot_tys = self.expand_slots(&inner_ty);
+                            let field_vals: Vec<Value> = match scr_lv {
+                                super::lowered_value::LoweredValue::Multi(vs) => vs,
+                                super::lowered_value::LoweredValue::Single(v) if slot_tys.len() == 1 => vec![v],
+                                super::lowered_value::LoweredValue::Single(ptr) => {
+                                    let offsets = self.slot_offsets(&inner_ty);
+                                    slot_tys.into_iter().zip(offsets)
+                                        .map(|(ty, off)| self.builder.load(ptr, off, ty))
+                                        .collect()
+                                }
+                            };
+                            for (fi, field_pat) in fields.iter().enumerate() {
+                                self.bind_pattern_field(field_pat, field_vals[fi]);
+                            }
+                            let _ = (tag_index, field_types);
+                            // Skip to next chain element — no branch.
+                            return;
+                        }
+                        // For non-fieldless multi-variant tag unions,
+                        // lift `(tag, payload)` out. Threading the
+                        // payload (not the tag-union shell) keeps the
+                        // match-block field loads at simple `fi*8`
+                        // offsets.
                         let (tag, scr) = if fieldless {
                             let v = match scr_lv {
                                 super::lowered_value::LoweredValue::Single(v) => v,

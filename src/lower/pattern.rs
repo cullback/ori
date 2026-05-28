@@ -265,6 +265,51 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let (_, first_max, _) = self.con_layout(first_con_name, Some(&scrutinee_ty));
         let fieldless = first_max == 0;
 
+        // Phase E shortcut: a single-variant non-fieldless tag union
+        // has no tag at all — the scrutinee's `Multi` slots ARE the
+        // variant's fields. Skip the SwitchInt entirely; just bind
+        // pattern fields and execute the (single) arm body.
+        if !fieldless && self.is_single_variant_tag_union(&scrutinee_ty) {
+            let scr_lv = self.lower_expr_lv(scrutinee_expr);
+            let slot_tys = self.expand_slots(&scrutinee_ty);
+            let field_vals: Vec<Value> = match scr_lv {
+                super::lowered_value::LoweredValue::Multi(vs) => vs,
+                // A single-slot single-variant tag union is just the
+                // field's value — no heap object exists to load from.
+                super::lowered_value::LoweredValue::Single(v) if slot_tys.len() == 1 => vec![v],
+                super::lowered_value::LoweredValue::Single(ptr) => {
+                    let offsets = self.slot_offsets(&scrutinee_ty);
+                    slot_tys
+                        .into_iter()
+                        .zip(offsets)
+                        .map(|(ty, off)| self.builder.load(ptr, off, ty))
+                        .collect()
+                }
+            };
+            // Exactly one arm; pattern is the lone variant constructor.
+            assert_eq!(arms.len(), 1, "single-variant tag union must have exactly one arm");
+            let arm = &arms[0];
+            let ast::Pattern::Constructor { fields, .. } = &arm.pattern else {
+                panic!("match arms must use constructor patterns");
+            };
+            let (_, _, field_types) = self.con_layout(first_con_name, Some(&scrutinee_ty));
+            for (fi, field_pat) in fields.iter().enumerate() {
+                let _ = field_types
+                    .get(fi)
+                    .copied()
+                    .unwrap_or(ScalarType::RcPtr);
+                self.bind_pattern_field(field_pat, field_vals[fi]);
+            }
+            let result = self.lower_expr(&arm.body);
+            if arm.is_return {
+                self.builder.ret(result);
+                // Unreachable continuation: return a dummy of the
+                // expected merge type.
+                return self.dummy_of(result_ty);
+            }
+            return result;
+        }
+
         let scr_lv = self.lower_expr_lv(scrutinee_expr);
         // For fieldless tag unions the scrutinee IS the discriminant.
         // For non-fieldless tag unions we lift the (tag, payload) pair

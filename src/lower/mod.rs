@@ -295,18 +295,25 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             Type::App(name, _) if name == "List" => {
                 vec![ScalarType::U64, ScalarType::U64, ScalarType::RcPtr]
             }
-            // Non-fieldless tag unions decompose to (tag, payload):
-            // the discriminant lives in a register; the payload heap
-            // object holds variant-specific fields with no tag slot
-            // inside. Void variants use a null RcPtr payload.
-            // Fieldless tag unions stay single-slot (just the
-            // discriminant value) — handled by the fallthrough since
-            // `scalar_type` returns the right discriminant type for
-            // those.
-            Type::TagUnion { tags, .. }
-                if tags.iter().any(|(_, fields)| !fields.is_empty()) =>
-            {
-                vec![ScalarType::U64, ScalarType::RcPtr]
+            // Tag union strategy depends on shape:
+            // - Fieldless variants only: single discriminant scalar
+            //   (handled by the fallthrough — `scalar_type` returns
+            //   the right discriminant width).
+            // - Single non-fieldless variant: decompose directly to
+            //   the variant's fields. Phase E: closures with N
+            //   captures live in a single-variant tag union and
+            //   become `(cap1, cap2, ..., capN)` parallel Values
+            //   with no env-header heap object.
+            // - Multiple variants with at least one carrying fields:
+            //   D2 layout `(tag: U64, payload_ptr: RcPtr)`.
+            Type::TagUnion { tags, .. } => {
+                if tags.iter().all(|(_, fields)| fields.is_empty()) {
+                    vec![self.scalar_type(&unwrapped)]
+                } else if tags.len() == 1 {
+                    tags[0].1.iter().map(|t| self.scalar_type(t)).collect()
+                } else {
+                    vec![ScalarType::U64, ScalarType::RcPtr]
+                }
             }
             _ => vec![self.scalar_type(&unwrapped)],
         }
@@ -322,12 +329,34 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             Type::Tuple(tys) => (0..tys.len()).map(|i| i * 8).collect(),
             Type::Record { fields, .. } => (0..fields.len()).map(|i| i * 8).collect(),
             Type::App(name, _) if name == "List" => vec![0, 8, 16],
-            Type::TagUnion { tags, .. }
-                if tags.iter().any(|(_, fields)| !fields.is_empty()) =>
-            {
-                vec![0, 8]
+            Type::TagUnion { tags, .. } => {
+                if tags.iter().all(|(_, fields)| fields.is_empty()) {
+                    vec![0]
+                } else if tags.len() == 1 {
+                    // Phase E: single-variant materializes to its
+                    // fields back-to-back at 8-byte stride (no tag
+                    // slot since the variant is implicit).
+                    (0..tags[0].1.len()).map(|i| i * 8).collect()
+                } else {
+                    // D2: tag@0, payload_ptr@8.
+                    vec![0, 8]
+                }
             }
             _ => vec![0],
+        }
+    }
+
+    /// True if the type resolves to a tag union with exactly one
+    /// variant carrying fields. Phase E gives these the same
+    /// register-resident treatment as records/tuples — the variant
+    /// is implicit, fields are parallel Values.
+    pub(super) fn is_single_variant_tag_union(&self, ty: &Type) -> bool {
+        let unwrapped = self.resolve_transparent(ty);
+        match &unwrapped {
+            Type::TagUnion { tags, .. } => {
+                tags.len() == 1 && !tags[0].1.is_empty()
+            }
+            _ => false,
         }
     }
 

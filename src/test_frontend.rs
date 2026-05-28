@@ -131,6 +131,25 @@ fn run_i64(source: &str, input: i64) -> i64 {
 }
 
 #[test]
+fn e_single_variant_no_heap() {
+    // Phase E: single-variant non-fieldless tag unions skip both the
+    // tag and the payload heap object. `Wrapped(42).x` should produce
+    // the wrapped value directly with no heap allocation for the
+    // tag-union shell or payload.
+    let source = "\
+main : I64 -> I64
+main = |_| (
+    r = Wrapped(42)
+    if r : Wrapped(x) then x
+)";
+    let (result, heap) = run_with_heap(source, 0);
+    assert_eq!(result, Scalar::I64(42));
+    assert_eq!(heap.alloc_count, 0,
+        "expected zero allocs for single-variant tag union, got {}",
+        heap.alloc_count);
+}
+
+#[test]
 fn d1_inline_tuple_list_elements() {
     // Phase D1: List(Tuple(I64, I64)) stores each tuple as two
     // inline I64 slots (16-byte stride) in the data buffer rather

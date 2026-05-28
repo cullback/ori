@@ -390,14 +390,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
         let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
         if self.decls.constructors.contains_key(func) {
-            return super::lowered_value::LoweredValue::single(
-                self.lower_constructor_call(func, &arg_vals, Some(result_ty)),
-            );
+            return self.lower_constructor_call_lv(func, &arg_vals, Some(result_ty));
         }
         if func.starts_with(|c: char| c.is_ascii_uppercase()) {
-            return super::lowered_value::LoweredValue::single(
-                self.lower_constructor_call(func, &arg_vals, Some(result_ty)),
-            );
+            return self.lower_constructor_call_lv(func, &arg_vals, Some(result_ty));
         }
         panic!("undefined function or constructor: {func}")
     }
