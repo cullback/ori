@@ -150,6 +150,23 @@ main = |_| (
 }
 
 #[test]
+fn e_captured_closure_in_walk() {
+    // A closure-with-captures used in a walk. Under Phase E the
+    // closure's lambda set is single-variant (only this lambda type
+    // exists), so the closure value decomposes to Multi(captures...)
+    // at construction. Verify the walk still produces the right
+    // answer.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    n = arg + 10
+    [1, 2, 3].walk(0, |acc, x| acc + n + x)
+)";
+    // walk: 0 + 10 + 1 + 10 + 2 + 10 + 3 = 36
+    assert_eq!(run_i64(source, 0), 36);
+}
+
+#[test]
 fn d1_inline_tuple_list_elements() {
     // Phase D1: List(Tuple(I64, I64)) stores each tuple as two
     // inline I64 slots (16-byte stride) in the data buffer rather
