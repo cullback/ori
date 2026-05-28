@@ -293,37 +293,39 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         let resolved = direct.or_else(|| self.singletons.get(apply_name));
         if let Some(st) = resolved {
-            // Captures occupy one slot each in the closure record at
-            // offsets 8, 16, 24, ... — they are heap-materialized at
-            // capture time. Each capture's *source-level* Type tells
-            // us (a) the scalar type to load it as and (b) whether to
-            // splat it into multi-slots for the callee.
             let target_param_slots = self.callee_param_slots(&st.target_func, body_acc.len() + elem_vals.len() + st.num_captures);
             let target_param_types = self.callee_param_types(&st.target_func);
             let mut call_args = Vec::with_capacity(st.num_captures + body_acc.len() + elem_vals.len());
-            for i in 0..st.num_captures {
-                let slots: &[ScalarType] = target_param_slots
-                    .get(i)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[ScalarType::RcPtr]);
-                // Aggregate captures were materialized into one
-                // RcPtr slot at capture time; scalars use their
-                // direct scalar type.
-                let single_load_ty = if slots.len() == 1 { slots[0] } else { ScalarType::RcPtr };
-                let v = self.builder.load(body_step, (i + 1) * 8, single_load_ty);
-                if slots.len() > 1 {
-                    let cap_ty = target_param_types
+            // A closure with N source-level captures is a non-
+            // fieldless tag union with one variant whose payload
+            // heap object stores the N captures at offsets 0, 8,
+            // 16, ... The materialized closure record is the tag
+            // union shell: `tag@0`, `payload_ptr@8`. Fieldless
+            // closures (0 captures) are bare discriminant
+            // integers — no payload to load.
+            if st.num_captures > 0 {
+                let payload_ptr = self.builder.load(body_step, 8, ScalarType::RcPtr);
+                for i in 0..st.num_captures {
+                    let slots: &[ScalarType] = target_param_slots
                         .get(i)
-                        .cloned()
-                        .unwrap_or_else(|| Type::Con("__none".to_owned()));
-                    let expanded = self.to_slots(
-                        super::lowered_value::LoweredValue::single(v),
-                        &cap_ty,
-                        slots,
-                    );
-                    call_args.extend(expanded);
-                } else {
-                    call_args.push(v);
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[ScalarType::RcPtr]);
+                    let single_load_ty = if slots.len() == 1 { slots[0] } else { ScalarType::RcPtr };
+                    let v = self.builder.load(payload_ptr, i * 8, single_load_ty);
+                    if slots.len() > 1 {
+                        let cap_ty = target_param_types
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| Type::Con("__none".to_owned()));
+                        let expanded = self.to_slots(
+                            super::lowered_value::LoweredValue::single(v),
+                            &cap_ty,
+                            slots,
+                        );
+                        call_args.extend(expanded);
+                    } else {
+                        call_args.push(v);
+                    }
                 }
             }
             call_args.extend(body_acc.iter().copied());
@@ -348,17 +350,37 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
     }
 
-    /// Load the (multi-slot) acc payload out of a Continue/Break tag
-    /// union. The payload is stored as a single materialized RcPtr at
-    /// offset 8 (constructor allocated `2*8` bytes: tag + one
-    /// materialized acc ptr). Unmaterialize via `to_slots`.
-    fn load_walk_payload(&mut self, result_ptr: Value, acc_slots: &[ScalarType], acc_ty: &Type) -> Vec<Value> {
-        if acc_slots.len() == 1 {
-            return vec![self.builder.load(result_ptr, 8, acc_slots[0])];
+    /// Extract `(tag, payload_ptr)` from a walk-step apply's result.
+    /// With D2, apply returns 2 parallel slots directly; if the
+    /// upstream apply hasn't been expanded yet (legacy path) we
+    /// load the tag/payload pair from the materialized 16-byte shell.
+    fn split_walk_result(&mut self, result: &[Value]) -> (Value, Value) {
+        if result.len() == 2 {
+            return (result[0], result[1]);
         }
-        let payload_ptr = self.builder.load(result_ptr, 8, ScalarType::RcPtr);
+        debug_assert_eq!(
+            result.len(),
+            1,
+            "walk_until apply result has unexpected slot count {}",
+            result.len()
+        );
+        let r = result[0];
+        let tag = self.builder.load(r, 0, ScalarType::U64);
+        let payload_ptr = self.builder.load(r, 8, ScalarType::RcPtr);
+        (tag, payload_ptr)
+    }
+
+    /// Load the acc out of a Continue/Break tag-union's payload heap
+    /// object. The payload's first field is the source-level acc; if
+    /// the acc is multi-slot, that field stores the materialized acc
+    /// ptr which we then unmaterialize.
+    fn load_walk_acc_payload(&mut self, payload_ptr: Value, acc_slots: &[ScalarType], acc_ty: &Type) -> Vec<Value> {
+        if acc_slots.len() == 1 {
+            return vec![self.builder.load(payload_ptr, 0, acc_slots[0])];
+        }
+        let materialized_acc = self.builder.load(payload_ptr, 0, ScalarType::RcPtr);
         self.to_slots(
-            super::lowered_value::LoweredValue::single(payload_ptr),
+            super::lowered_value::LoweredValue::single(materialized_acc),
             acc_ty,
             acc_slots,
         )
@@ -380,17 +402,11 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         acc_slots: &[ScalarType],
         acc_ty: &Type,
     ) {
-        // The apply for walk_until returns Continue(Acc)|Break(Acc),
-        // which expand_slots leaves as a single RcPtr. So result has
-        // length 1.
-        debug_assert_eq!(
-            result.len(),
-            1,
-            "walk_until apply should return a single tag-union ptr"
-        );
-        let result_ptr = result[0];
-        let tag = self.builder.load(result_ptr, 0, ScalarType::U64);
-        let payload = self.load_walk_payload(result_ptr, acc_slots, acc_ty);
+        // D2: apply's tag-union return is `Multi(tag, payload_ptr)`
+        // — 2 slots. Older single-slot return falls back to loading
+        // tag/payload from the materialized 16-byte shell.
+        let (tag, payload_ptr) = self.split_walk_result(&result);
+        let payload = self.load_walk_acc_payload(payload_ptr, acc_slots, acc_ty);
         let _ = body_acc;
         let break_tag = self.decls.constructors["Break"].tag_index;
         let break_val = self.builder.const_u64(break_tag);
@@ -421,14 +437,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         acc_slots: &[ScalarType],
         acc_ty: &Type,
     ) {
-        debug_assert_eq!(
-            result.len(),
-            1,
-            "walk_until apply should return a single tag-union ptr"
-        );
-        let result_ptr = result[0];
-        let tag = self.builder.load(result_ptr, 0, ScalarType::U64);
-        let payload = self.load_walk_payload(result_ptr, acc_slots, acc_ty);
+        let (tag, payload_ptr) = self.split_walk_result(&result);
+        let payload = self.load_walk_acc_payload(payload_ptr, acc_slots, acc_ty);
         let _ = body_acc;
         let break_tag = self.decls.constructors["Break"].tag_index;
         let break_val = self.builder.const_u64(break_tag);

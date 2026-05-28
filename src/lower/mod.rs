@@ -295,6 +295,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             Type::App(name, _) if name == "List" => {
                 vec![ScalarType::U64, ScalarType::U64, ScalarType::RcPtr]
             }
+            // Non-fieldless tag unions decompose to (tag, payload):
+            // the discriminant lives in a register; the payload heap
+            // object holds variant-specific fields with no tag slot
+            // inside. Void variants use a null RcPtr payload.
+            // Fieldless tag unions stay single-slot (just the
+            // discriminant value) — handled by the fallthrough since
+            // `scalar_type` returns the right discriminant type for
+            // those.
+            Type::TagUnion { tags, .. }
+                if tags.iter().any(|(_, fields)| !fields.is_empty()) =>
+            {
+                vec![ScalarType::U64, ScalarType::RcPtr]
+            }
             _ => vec![self.scalar_type(&unwrapped)],
         }
     }
@@ -309,6 +322,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             Type::Tuple(tys) => (0..tys.len()).map(|i| i * 8).collect(),
             Type::Record { fields, .. } => (0..fields.len()).map(|i| i * 8).collect(),
             Type::App(name, _) if name == "List" => vec![0, 8, 16],
+            // Non-fieldless tag union: materializes to tag@0, payload@8.
+            Type::TagUnion { tags, .. }
+                if tags.iter().any(|(_, fields)| !fields.is_empty()) =>
+            {
+                vec![0, 8]
+            }
             _ => vec![0],
         }
     }

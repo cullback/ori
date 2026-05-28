@@ -86,27 +86,51 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         args: &[Value],
         ctx_ty: Option<&Type>,
     ) -> Value {
+        let lv = self.lower_constructor_call_lv(name, args, ctx_ty);
+        let ty = ctx_ty.cloned().unwrap_or_else(|| {
+            // Best-effort: caller didn't supply a context type. Use
+            // a placeholder; only the materialize fallback uses this.
+            crate::types::engine::Type::Con("__none".to_owned())
+        });
+        self.materialize_lv(lv, &ty)
+    }
+
+    /// LV-returning variant. Non-fieldless tag unions decompose to
+    /// `Multi(tag, payload_ptr)`: the tag lives in a register and the
+    /// payload heap object holds only the variant-specific fields
+    /// (no tag slot inside). Void variants in a non-fieldless union
+    /// use a null payload pointer. Fieldless unions stay as a bare
+    /// discriminant integer.
+    pub(super) fn lower_constructor_call_lv(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        ctx_ty: Option<&Type>,
+    ) -> super::lowered_value::LoweredValue {
         let (tag_index, max_fields, _field_types) = self.con_layout(name, ctx_ty);
-        // Fieldless tag union: represent as a bare discriminant integer.
         if max_fields == 0 {
             let disc_ty = ctx_ty
                 .map(|t| self.scalar_type(t))
                 .unwrap_or(ScalarType::U8);
-            return self.const_tag(tag_index, disc_ty);
+            return super::lowered_value::LoweredValue::single(
+                self.const_tag(tag_index, disc_ty),
+            );
         }
-        // Every tag-union constructor is heap-allocated (Phase A:
-        // `Agg(n)` is gone). The shape: tag at slot 0, payload from
-        // slot 1.
-        {
-            let alloc_size = (1 + max_fields) * 8;
-            let ptr = self.builder.alloc(alloc_size);
-            let tag_val = self.builder.const_u64(tag_index);
-            self.builder.store(ptr, 0, tag_val);
+        // Non-fieldless tag union: payload heap object holds the
+        // variant's fields. Variants with fewer fields than the
+        // union's max use a smaller allocation; void variants use a
+        // null payload pointer.
+        let tag = self.builder.const_u64(tag_index);
+        let payload = if args.is_empty() {
+            self.builder.const_ptr_null()
+        } else {
+            let payload_ptr = self.builder.alloc(args.len() * 8);
             for (i, &arg) in args.iter().enumerate() {
-                self.builder.store(ptr, (i + 1) * 8, arg);
+                self.builder.store(payload_ptr, i * 8, arg);
             }
-            ptr
-        }
+            payload_ptr
+        };
+        super::lowered_value::LoweredValue::Multi(vec![tag, payload])
     }
 }
 

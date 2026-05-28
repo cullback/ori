@@ -420,8 +420,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             "List.get" => {
                 let slots = self.list_slots(&args[0]);
                 let idx = self.lower_expr(&args[1]);
-                let v = self.emit_list_get_expanded(slots[0], slots[2], idx);
-                Some(super::lowered_value::LoweredValue::single(v))
+                Some(self.emit_list_get_expanded(slots[0], slots[2], idx))
             }
             "List.append" => {
                 let slots = self.list_slots(&args[0]);
@@ -466,8 +465,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             "List.get" => {
                 let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
                 let idx = self.lower_expr(&args[0]);
-                let v = self.emit_list_get_expanded(slots[0], slots[2], idx);
-                Some(super::lowered_value::LoweredValue::single(v))
+                Some(self.emit_list_get_expanded(slots[0], slots[2], idx))
             }
             "List.append" => {
                 let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
@@ -495,33 +493,34 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     /// `List.get` on expanded slots: bounds-check len, load data at
-    /// idx. Wrap in Ok/Err result.
-    fn emit_list_get_expanded(&mut self, len: Value, data: Value, idx: Value) -> Value {
+    /// idx. Returns `Multi(tag, payload)` per D2's tag-union shape —
+    /// `Ok(elem)` payload heap object holds the element at offset 0;
+    /// `Err(OutOfBounds)` payload holds the OOB discriminant at 0.
+    fn emit_list_get_expanded(&mut self, len: Value, data: Value, idx: Value) -> super::lowered_value::LoweredValue {
         let in_bounds = self.builder.binop(BinaryOp::Lt, idx, len, ScalarType::U8);
         let ok_block = self.builder.create_block();
         let err_block = self.builder.create_block();
         let merge = self.builder.create_block();
-        let merge_param = self.builder.add_block_param(merge, ScalarType::RcPtr);
+        let merge_tag = self.builder.add_block_param(merge, ScalarType::U64);
+        let merge_payload = self.builder.add_block_param(merge, ScalarType::RcPtr);
         self.builder.branch(in_bounds, ok_block, vec![], err_block, vec![]);
 
         self.builder.switch_to(ok_block);
         let elem = self.builder.load_dyn(data, idx, ScalarType::RcPtr);
-        let ok_result = self.builder.alloc(16);
         let ok_tag = self.builder.const_u64(0);
-        self.builder.store(ok_result, 0, ok_tag);
-        self.builder.store(ok_result, 8, elem);
-        self.builder.jump(merge, vec![ok_result]);
+        let ok_payload = self.builder.alloc(8);
+        self.builder.store(ok_payload, 0, elem);
+        self.builder.jump(merge, vec![ok_tag, ok_payload]);
 
         self.builder.switch_to(err_block);
-        let err_result = self.builder.alloc(16);
         let err_tag = self.builder.const_u64(1);
-        self.builder.store(err_result, 0, err_tag);
+        let err_payload = self.builder.alloc(8);
         let oob_tag = self.builder.const_u8(0);
-        self.builder.store(err_result, 8, oob_tag);
-        self.builder.jump(merge, vec![err_result]);
+        self.builder.store(err_payload, 0, oob_tag);
+        self.builder.jump(merge, vec![err_tag, err_payload]);
 
         self.builder.switch_to(merge);
-        merge_param
+        super::lowered_value::LoweredValue::Multi(vec![merge_tag, merge_payload])
     }
 
     /// `List.append` on expanded slots: FBIP on the data buffer

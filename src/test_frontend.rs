@@ -132,6 +132,7 @@ fn run_i64(source: &str, input: i64) -> i64 {
 
 
 
+
 #[allow(dead_code, reason = "used by structural-tag inference tests")]
 fn infer_func_type(source: &str, func: &str) -> String {
     let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
@@ -448,6 +449,25 @@ main = |arg| List.range(0, 5).len()";
     assert_eq!(heap.alloc_count, 1,
         "expected one heap alloc (data buffer) for decomposed list, got {}",
         heap.alloc_count);
+}
+
+#[test]
+fn d2_tag_union_payload_decomposed() {
+    // Phase D2: Non-fieldless tag unions decompose to (tag, payload).
+    // Constructors allocate only the payload (variant fields) — no tag
+    // slot inside. Pattern matching reads tag from the register-resident
+    // slot and fields from payload at offset 0, 8, ... Building
+    // `Ok(42)` from `Result(I64, Str)` and unwrapping should produce
+    // 42 with only the payload heap object (8 bytes) plus the
+    // materialized tag-union shell (16 bytes) — no inline-tag-and-field
+    // 16-byte alloc with field@8.
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    r = Ok(arg + 1)
+    r.unwrap()
+)";
+    assert_eq!(run_i64(source, 41), 42);
 }
 
 #[test]

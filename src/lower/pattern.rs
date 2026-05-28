@@ -255,7 +255,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         result_ty: ScalarType,
     ) -> Value {
         let scrutinee_ty = scrutinee_expr.ty.clone();
-        let scr_val = self.lower_expr(scrutinee_expr);
         // Determine fieldless from the first constructor's layout — more
         // reliable than `is_fieldless_type` since synthesized expressions
         // (apply functions) may have placeholder types.
@@ -265,15 +264,35 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         };
         let (_, first_max, _) = self.con_layout(first_con_name, Some(&scrutinee_ty));
         let fieldless = first_max == 0;
-        let tag = if fieldless {
-            scr_val // already the discriminant
+
+        let scr_lv = self.lower_expr_lv(scrutinee_expr);
+        // For fieldless tag unions the scrutinee IS the discriminant.
+        // For non-fieldless tag unions we lift the (tag, payload) pair
+        // out — using Multi slots directly when available, otherwise
+        // loading from the materialized 16-byte tag/payload shell.
+        // Threading the *payload* through arm blocks (instead of the
+        // whole tag union shell) is what lets field loads read at
+        // simple `fi*8` offsets.
+        let (tag, scr_val) = if fieldless {
+            let v = match scr_lv {
+                super::lowered_value::LoweredValue::Single(v) => v,
+                super::lowered_value::LoweredValue::Multi(vs) => vs.into_iter().next().unwrap(),
+            };
+            (v, v)
         } else {
-            self.builder.load(scr_val, 0, ScalarType::U64)
+            match scr_lv {
+                super::lowered_value::LoweredValue::Multi(vs) => (vs[0], vs[1]),
+                super::lowered_value::LoweredValue::Single(ptr) => {
+                    let t = self.builder.load(ptr, 0, ScalarType::U64);
+                    let p = self.builder.load(ptr, 8, ScalarType::RcPtr);
+                    (t, p)
+                }
+            }
         };
         let tag_block = self.builder.current_block.unwrap();
 
-        // Thread scr_val through block params only when it's NOT a
-        // function param (function params are always accessible).
+        // Thread `scr_val` (payload for non-fieldless, disc for
+        // fieldless) through arm blocks unless it's a function param.
         let scr_is_func_param = self.builder.func.params.contains(&scr_val);
         let scr_val_ty = scr_val.ty;
         let merge = self.builder.create_block();
@@ -324,9 +343,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let saved_vars = self.vars.clone();
 
             if !fieldless {
+                // `arm_scr` is the payload heap object: fields at
+                // offsets 0, 8, 16, ... (no tag slot, since the tag
+                // lives in a register).
                 for (fi, field_pat) in fields.iter().enumerate() {
                     let field_ty = field_types.get(fi).copied().unwrap_or(ScalarType::RcPtr);
-                    let field_val = self.builder.load(arm_scr, (fi + 1) * 8, field_ty);
+                    let field_val = self.builder.load(arm_scr, fi * 8, field_ty);
                     self.bind_pattern_field(field_pat, field_val);
                 }
             }

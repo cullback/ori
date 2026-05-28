@@ -238,7 +238,11 @@ fn main() {
         );
     }
 
-    // Handle Result output — result is a Ptr to a tagged union
+    // Handle Result output. With D2 the result is materialized as a
+    // 16-byte tag-union shell: `tag@0`, `payload_ptr@8`. The payload
+    // heap object holds the Continue/Break-style variant fields — for
+    // `Result(Str, Str)` that's the Str pointer at offset 0 of the
+    // payload.
     let ssa::eval::Scalar::Ptr(result_idx) = result else {
         eprintln!("unexpected non-Ptr result: {result:?}");
         process::exit(1);
@@ -247,10 +251,15 @@ fn main() {
         eprintln!("unexpected tag type");
         process::exit(1);
     };
-    let payload = heap.load(result_idx, 8, ssa::ScalarType::RcPtr);
+    let payload_ptr = heap.load(result_idx, 8, ssa::ScalarType::RcPtr);
+    let ssa::eval::Scalar::Ptr(payload_idx) = payload_ptr else {
+        eprintln!("unexpected non-Ptr payload: {payload_ptr:?}");
+        process::exit(1);
+    };
+    let str_ptr = heap.load(payload_idx, 0, ssa::ScalarType::RcPtr);
 
     // Tag 0 = first constructor (Ok), Tag 1 = second (Err)
-    let bytes = scalar_str_to_bytes(&heap, payload);
+    let bytes = scalar_str_to_bytes(&heap, str_ptr);
     if tag == 0 {
         std::io::stdout().write_all(&bytes).unwrap();
         if !bytes.ends_with(b"\n") {

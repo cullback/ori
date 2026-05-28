@@ -108,16 +108,31 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 pattern,
             } => {
                 let inner_ty = inner.ty.clone();
-                let scr = self.lower_expr(inner);
                 match pattern {
                     ast::Pattern::Constructor { name, fields } => {
                         let (tag_index, max_fields, field_types) =
                             self.con_layout(name, Some(&inner_ty));
                         let fieldless = max_fields == 0;
-                        let tag = if fieldless {
-                            scr // already the discriminant
+                        let scr_lv = self.lower_expr_lv(inner);
+                        // For non-fieldless tag unions, lift `(tag,
+                        // payload)` out. Threading the payload (not
+                        // the tag-union shell) keeps the match-block
+                        // field loads at simple `fi*8` offsets.
+                        let (tag, scr) = if fieldless {
+                            let v = match scr_lv {
+                                super::lowered_value::LoweredValue::Single(v) => v,
+                                super::lowered_value::LoweredValue::Multi(vs) => vs.into_iter().next().unwrap(),
+                            };
+                            (v, v)
                         } else {
-                            self.builder.load(scr, 0, ScalarType::U64)
+                            match scr_lv {
+                                super::lowered_value::LoweredValue::Multi(vs) => (vs[0], vs[1]),
+                                super::lowered_value::LoweredValue::Single(ptr) => {
+                                    let t = self.builder.load(ptr, 0, ScalarType::U64);
+                                    let p = self.builder.load(ptr, 8, ScalarType::RcPtr);
+                                    (t, p)
+                                }
+                            }
                         };
                         let disc_ty = if fieldless {
                             self.scalar_type(&inner_ty)
@@ -142,18 +157,21 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                             scr_param
                         };
                         self.builder.switch_to(match_block);
-                        // Bind pattern fields (empty for fieldless tags)
+                        // Bind pattern fields. `scr_in_match` is the
+                        // payload heap object — fields live at
+                        // `fi*8`, no tag offset.
                         for (fi, field_pat) in fields.iter().enumerate() {
                             let field_ty =
                                 field_types.get(fi).copied().unwrap_or(ScalarType::RcPtr);
                             let field_val =
-                                self.builder.load(scr_in_match, (fi + 1) * 8, field_ty);
+                                self.builder.load(scr_in_match, fi * 8, field_ty);
                             self.bind_pattern_field(field_pat, field_val);
                         }
                     }
                     ast::Pattern::Binding(sym) => {
                         // Always matches, bind value
-                        self.vars.insert(*sym, super::lowered_value::LoweredValue::single(scr));
+                        let lv = self.lower_expr_lv(inner);
+                        self.vars.insert(*sym, lv);
                     }
                     ast::Pattern::Wildcard => {
                         // Always matches, no binding
