@@ -131,6 +131,7 @@ fn run_i64(source: &str, input: i64) -> i64 {
 }
 
 
+
 #[allow(dead_code, reason = "used by structural-tag inference tests")]
 fn infer_func_type(source: &str, func: &str) -> String {
     let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
@@ -429,6 +430,23 @@ main = |arg| (
     // them directly. No heap roundtrip.
     assert_eq!(heap.alloc_count, 0,
         "expected zero allocs on decomposed tuple-returning call, got {}",
+        heap.alloc_count);
+}
+
+#[test]
+fn list_header_decomposed_avoids_materialize() {
+    // Phase C: List(T) decomposes to (len, cap, data) — only the data
+    // buffer hits the heap. List.range allocates one data buffer; len
+    // is consumed directly from the result slot, no header materialize.
+    let source = "\
+main : I64 -> U64
+main = |arg| List.range(0, 5).len()";
+    let (result, heap) = run_with_heap(source, 0);
+    assert_eq!(result, Scalar::U64(5));
+    // The data buffer is the only heap alloc; the (len, cap, data)
+    // header doesn't exist as a heap object anymore.
+    assert_eq!(heap.alloc_count, 1,
+        "expected one heap alloc (data buffer) for decomposed list, got {}",
         heap.alloc_count);
 }
 

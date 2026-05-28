@@ -5,7 +5,6 @@
 
 use crate::ast::{Expr, ExprKind};
 use crate::ssa::Value;
-use crate::ssa::builder::Builder;
 use crate::ssa::instruction::{BinaryOp, ScalarType};
 use crate::symbol::SymbolId;
 use crate::types::engine::Type;
@@ -137,6 +136,39 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.lower_call(&mangled, args, &outer.ty)
     }
 
+    /// LV-returning variant for QualifiedCall. The only path with
+    /// possible multi-shape output is the fallthrough to
+    /// `lower_call_lv`; everything else is single-Value and gets
+    /// wrapped.
+    pub(super) fn lower_qualified_call_lv(
+        &mut self,
+        _mangled: &str,
+        segments: &[&'src str],
+        args: &[Expr<'src>],
+        outer: &Expr<'src>,
+    ) -> super::lowered_value::LoweredValue {
+        let ExprKind::QualifiedCall { resolved, .. } = &outer.kind else {
+            unreachable!("lower_qualified_call_lv called on non-QualifiedCall");
+        };
+        // Numeric builtin and local-receiver method paths produce
+        // single values; reuse the legacy single-value dispatch.
+        if let Some(name) = resolved
+            && (name.starts_with("__builtin.") || self.is_local_receiver(segments.first().copied()))
+        {
+            return super::lowered_value::LoweredValue::single(
+                self.lower_qualified_call(segments, args, outer),
+            );
+        }
+        let mangled = resolved.clone().unwrap_or_else(|| segments.join("."));
+        self.lower_call_lv(&mangled, args, &outer.ty)
+    }
+
+    /// True if `name` resolves to a local binding in `self.vars`.
+    fn is_local_receiver(&self, name: Option<&'src str>) -> bool {
+        let Some(name) = name else { return false };
+        self.vars.iter().any(|(sym, _)| self.symbols.display(*sym) == name)
+    }
+
     pub(super) fn lower_method_call(
         &mut self,
         receiver: &Expr<'src>,
@@ -144,27 +176,31 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         args: &[Expr<'src>],
         outer: &Expr<'src>,
     ) -> Value {
+        let lv = self.lower_method_call_lv(receiver, method, args, outer);
+        self.materialize_lv(lv, &outer.ty)
+    }
+
+    /// LV-returning variant. Used by `lower_expr_lv` to keep list
+    /// builtins / user-call results flowing as `Multi` into immediate
+    /// consumers without a heap roundtrip.
+    pub(super) fn lower_method_call_lv(
+        &mut self,
+        receiver: &Expr<'src>,
+        method: &'src str,
+        args: &[Expr<'src>],
+        outer: &Expr<'src>,
+    ) -> super::lowered_value::LoweredValue {
         let ExprKind::MethodCall { resolved, .. } = &outer.kind else {
             unreachable!("lower_method_call called on non-MethodCall");
         };
         let mangled = if let Some(r) = resolved.clone() {
             r
         } else {
-            // No resolution from inference — resolve based on the
-            // concrete receiver type (happens for polymorphic methods
-            // after monomorphization).
             self.resolve_method_at_lower_time(method, &receiver.ty)
         };
-        // Peephole: `<list>.get(idx).unwrap()` lowers to a bounds-
-        // checked load with a __crash on the err arm — no Result alloc
-        // or destructuring. Without this fusion, SROA can't promote
-        // the alloc because the err-side static `Err(OutOfBounds)`
-        // doesn't unify with the ok-side fresh alloc at the merge.
         if let Some(v) = self.try_fuse_list_get_unwrap(method, receiver, args, outer) {
-            return v;
+            return super::lowered_value::LoweredValue::single(v);
         }
-        // Deforestation: check for List.range(a,b).walk(...) BEFORE
-        // lowering the receiver to avoid materializing the range list.
         if let Some(walk) = classify_walk(&mangled) {
             if let Some((start, end)) = self.as_range_call(receiver) {
                 assert!(args.len() == 2, "List.walk* method form takes 2 args");
@@ -174,60 +210,65 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let direct = self.resolve_closure_target(&args[1]);
                 let closure_val = self.lower_expr(&args[1]);
                 let apply_name = walk_apply_name(&mangled, &args[1].ty);
-                let result_lv = self.lower_range_walk(
+                return self.lower_range_walk(
                     start, end, init_vals, closure_val, &apply_name,
                     walk.until, acc_slots, &args[0].ty, direct,
                 );
-                return self.materialize_lv(result_lv, &args[0].ty);
+            }
+        }
+        if is_list_builtin(&mangled) {
+            let recv_lv = self.lower_expr_lv(receiver);
+            if let Some(lv) = self.try_emit_list_builtin_method_lv(&mangled, recv_lv, &receiver.ty, args) {
+                return lv;
             }
         }
         let recv_val = self.lower_expr(receiver);
+        // Below: handlers that all naturally return a single Value.
+        // Wrap with LoweredValue::single at each `return`.
         if mangled == "__record_equals" || mangled == "__tuple_equals" {
             let rhs = self.lower_expr(&args[0]);
             let resolved = self.resolve_transparent(&receiver.ty);
             let eq_name = self.ensure_eq_func(&resolved);
             let result = self.builder.call(&eq_name, vec![recv_val, rhs], ScalarType::U8);
-            return self.lower_bool_from_cmp(result);
+            return super::lowered_value::LoweredValue::single(self.lower_bool_from_cmp(result));
         }
         if mangled == "__record_to_str" {
-            return self.lower_record_to_str(recv_val, &receiver.ty);
+            return super::lowered_value::LoweredValue::single(self.lower_record_to_str(recv_val, &receiver.ty));
         }
         if mangled == "__record_hash" {
-            return self.lower_record_hash(recv_val, &receiver.ty);
+            return super::lowered_value::LoweredValue::single(self.lower_record_hash(recv_val, &receiver.ty));
         }
         if mangled == "__tuple_hash" {
-            return self.lower_tuple_hash(recv_val, &receiver.ty);
+            return super::lowered_value::LoweredValue::single(self.lower_tuple_hash(recv_val, &receiver.ty));
         }
         if mangled == "__tag_hash" {
-            return self.lower_tag_hash(recv_val, &receiver.ty);
+            return super::lowered_value::LoweredValue::single(self.lower_tag_hash(recv_val, &receiver.ty));
         }
         if let Some(op_name) = mangled.strip_prefix("__builtin.") {
             if op_name == "to_bits" {
                 let dest_ty = numeric::bits_dest_ty_for_ty(&receiver.ty);
-                return self.builder.bitcast(recv_val, dest_ty);
+                return super::lowered_value::LoweredValue::single(self.builder.bitcast(recv_val, dest_ty));
             }
             if op_name == "from_bits" {
-                return self.builder.bitcast(recv_val, ScalarType::F64);
+                return super::lowered_value::LoweredValue::single(self.builder.bitcast(recv_val, ScalarType::F64));
             }
             if op_name == "from_u8" {
                 let dest_ty = self.expr_scalar_type(outer);
-                return self.builder.cast(recv_val, dest_ty);
+                return super::lowered_value::LoweredValue::single(self.builder.cast(recv_val, dest_ty));
             }
             if op_name == "to_u8" {
-                return self.builder.cast(recv_val, ScalarType::U8);
+                return super::lowered_value::LoweredValue::single(self.builder.cast(recv_val, ScalarType::U8));
             }
             if op_name == "to_u64" {
-                return self.builder.cast(recv_val, ScalarType::U64);
+                return super::lowered_value::LoweredValue::single(self.builder.cast(recv_val, ScalarType::U64));
             }
             if op_name == "to_i64" {
-                return self.builder.cast(recv_val, ScalarType::I64);
+                return super::lowered_value::LoweredValue::single(self.builder.cast(recv_val, ScalarType::I64));
             }
             let rhs = self.lower_expr(&args[0]);
             let ty = self.expr_scalar_type(receiver);
-            return self.lower_builtin_op(op_name, recv_val, rhs, ty);
+            return super::lowered_value::LoweredValue::single(self.lower_builtin_op(op_name, recv_val, rhs, ty));
         }
-        // List walks: thread the multi-slot accumulator through the
-        // generated loop.
         if let Some(walk) = classify_walk(&mangled) {
             assert!(args.len() == 2, "List.walk* method form takes 2 args");
             let init_lv = self.lower_expr_lv(&args[0]);
@@ -237,7 +278,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let closure_val = self.lower_expr(&args[1]);
             let apply_name = walk_apply_name(&mangled, &args[1].ty);
             let elem_ty = list_element_type(&receiver.ty);
-            let result_lv = self.lower_list_walk(
+            return self.lower_list_walk(
                 recv_val,
                 init_vals,
                 closure_val,
@@ -248,10 +289,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 &elem_ty,
                 direct,
             );
-            return self.materialize_lv(result_lv, &args[0].ty);
         }
-        // Plain user-defined method call. Splat receiver + each arg
-        // into the callee's expanded sig.
+        // Plain user-defined method call.
         if self.decls.funcs.contains(&mangled) {
             let per_param_slots = self.callee_param_slots(&mangled, args.len() + 1);
             let recv_lv = super::lowered_value::LoweredValue::single(recv_val);
@@ -261,7 +300,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 arg_vals.extend(self.to_slots(lv, &a.ty, slots));
             }
             let ret_slots = self.callee_return_slots(&mangled);
-            let result_lv = if ret_slots.len() == 1 {
+            return if ret_slots.len() == 1 {
                 super::lowered_value::LoweredValue::single(
                     self.builder.call(&mangled, arg_vals, ret_slots[0]),
                 )
@@ -270,20 +309,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     self.builder.call_multi(&mangled, arg_vals, &ret_slots),
                 )
             };
-            return self.materialize_lv(result_lv, &outer.ty);
         }
-        // Intrinsic or list-builtin fallback. Args are passed
-        // unexpanded — these helpers don't take aggregate args today.
+        // Intrinsic fallback (numeric to_str etc.).
         let mut arg_vals = Vec::with_capacity(args.len() + 1);
         arg_vals.push(recv_val);
         for a in args {
             arg_vals.push(self.lower_expr(a));
         }
-        if let Some(v) = try_emit_list_builtin(&mut self.builder, &mangled, &arg_vals) {
-            return v;
-        }
         let ret_ty = self.func_ret_type(&mangled);
-        self.builder.call(&mangled, arg_vals, ret_ty)
+        super::lowered_value::LoweredValue::single(self.builder.call(&mangled, arg_vals, ret_ty))
     }
 
     /// Central dispatch for direct and static qualified calls: list
@@ -298,6 +332,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         args: &[Expr<'src>],
         result_ty: &Type,
     ) -> Value {
+        let lv = self.lower_call_lv(func, args, result_ty);
+        self.materialize_lv(lv, result_ty)
+    }
+
+    /// LV-returning variant of `lower_call`. Used by `lower_expr_lv`
+    /// so that list-builtin and user-call results can flow as `Multi`
+    /// into the next decomposed consumer without a heap roundtrip.
+    pub(super) fn lower_call_lv(
+        &mut self,
+        func: &str,
+        args: &[Expr<'src>],
+        result_ty: &Type,
+    ) -> super::lowered_value::LoweredValue {
         if let Some(walk) = classify_walk(func) {
             assert!(args.len() >= 3, "List.walk* takes 3 arguments");
             let init_lv = self.lower_expr_lv(&args[1]);
@@ -306,17 +353,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let direct = self.resolve_closure_target(&args[2]);
             let closure_val = self.lower_expr(&args[2]);
             let apply_name = walk_apply_name(func, &args[2].ty);
-            // Deforestation: List.walk(List.range(a, b), init, f) → counter loop.
             if let Some((start, end)) = self.as_range_call(&args[0]) {
-                let result_lv = self.lower_range_walk(
+                return self.lower_range_walk(
                     start, end, init_vals, closure_val, &apply_name,
                     walk.until, acc_slots, &args[1].ty, direct,
                 );
-                return self.materialize_lv(result_lv, &args[1].ty);
             }
             let list_val = self.lower_expr(&args[0]);
             let elem_ty = list_element_type(&args[0].ty);
-            let result_lv = self.lower_list_walk(
+            return self.lower_list_walk(
                 list_val,
                 init_vals,
                 closure_val,
@@ -327,36 +372,237 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 &elem_ty,
                 direct,
             );
-            return self.materialize_lv(result_lv, &args[1].ty);
         }
         if func == "crash" {
-            // Crash diverges, so its return is never observed at
-            // runtime. Typing it as the caller's expected result type
-            // keeps merge/return type agreement honest in the IR.
             let msg_val = self.lower_expr(&args[0]);
             let ret_ty = self.scalar_type(result_ty);
-            return self.builder.call("__crash", vec![msg_val], ret_ty);
+            return super::lowered_value::LoweredValue::single(
+                self.builder.call("__crash", vec![msg_val], ret_ty),
+            );
         }
-        // User-defined function: respect expanded sig (multi-slot
-        // params/returns). This path lowers args itself.
+        if is_list_builtin(func) {
+            if let Some(lv) = self.try_emit_list_builtin_lv(func, args) {
+                return lv;
+            }
+        }
         if self.decls.funcs.contains(func) {
-            let lv = self.lower_user_call(func, args, result_ty);
-            return self.materialize_lv(lv, result_ty);
+            return self.lower_user_call(func, args, result_ty);
         }
         let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
-        if let Some(v) = try_emit_list_builtin(&mut self.builder, func, &arg_vals) {
-            return v;
-        }
         if self.decls.constructors.contains_key(func) {
-            return self.lower_constructor_call(func, &arg_vals, Some(result_ty));
+            return super::lowered_value::LoweredValue::single(
+                self.lower_constructor_call(func, &arg_vals, Some(result_ty)),
+            );
         }
-        // Structural constructor (not in decl_info). Layout is
-        // derived from `result_ty` which inference closed to a
-        // concrete `Type::TagUnion`.
         if func.starts_with(|c: char| c.is_ascii_uppercase()) {
-            return self.lower_constructor_call(func, &arg_vals, Some(result_ty));
+            return super::lowered_value::LoweredValue::single(
+                self.lower_constructor_call(func, &arg_vals, Some(result_ty)),
+            );
         }
         panic!("undefined function or constructor: {func}")
+    }
+
+    /// Expansion-aware list builtin dispatch. Lists are consumed as
+    /// `(len, cap, data)` directly — no header materialization at
+    /// the call boundary. Returns `None` when `name` isn't a list
+    /// builtin; the caller falls through to user-call dispatch.
+    pub(super) fn try_emit_list_builtin_lv(
+        &mut self,
+        name: &str,
+        args: &[Expr<'src>],
+    ) -> Option<super::lowered_value::LoweredValue> {
+        let base = strip_mono_suffix(name);
+        match base {
+            "List.len" => {
+                let slots = self.list_slots(&args[0]);
+                Some(super::lowered_value::LoweredValue::single(slots[0]))
+            }
+            "List.get" => {
+                let slots = self.list_slots(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let v = self.emit_list_get_expanded(slots[0], slots[2], idx);
+                Some(super::lowered_value::LoweredValue::single(v))
+            }
+            "List.append" => {
+                let slots = self.list_slots(&args[0]);
+                let val = self.lower_expr(&args[1]);
+                let new_slots = self.emit_list_append_expanded(slots[0], slots[1], slots[2], val);
+                Some(super::lowered_value::LoweredValue::Multi(new_slots))
+            }
+            "List.set" => {
+                let slots = self.list_slots(&args[0]);
+                let idx = self.lower_expr(&args[1]);
+                let val = self.lower_expr(&args[2]);
+                let new_slots = self.emit_list_set_expanded(slots[0], slots[1], slots[2], idx, val);
+                Some(super::lowered_value::LoweredValue::Multi(new_slots))
+            }
+            "List.range" => {
+                let start = self.lower_expr(&args[0]);
+                let end = self.lower_expr(&args[1]);
+                let new_slots = self.emit_list_range_expanded(start, end);
+                Some(super::lowered_value::LoweredValue::Multi(new_slots))
+            }
+            _ => None,
+        }
+    }
+
+    /// Method-call variant: receiver and args are already lowered as
+    /// LoweredValues, possibly Multi for the list receiver.
+    pub(super) fn try_emit_list_builtin_method_lv(
+        &mut self,
+        name: &str,
+        receiver_lv: super::lowered_value::LoweredValue,
+        receiver_ty: &Type,
+        args: &[Expr<'src>],
+    ) -> Option<super::lowered_value::LoweredValue> {
+        let base = strip_mono_suffix(name);
+        let list_trio: [ScalarType; 3] =
+            [ScalarType::U64, ScalarType::U64, ScalarType::RcPtr];
+        match base {
+            "List.len" => {
+                let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
+                Some(super::lowered_value::LoweredValue::single(slots[0]))
+            }
+            "List.get" => {
+                let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
+                let idx = self.lower_expr(&args[0]);
+                let v = self.emit_list_get_expanded(slots[0], slots[2], idx);
+                Some(super::lowered_value::LoweredValue::single(v))
+            }
+            "List.append" => {
+                let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
+                let val = self.lower_expr(&args[0]);
+                let new_slots = self.emit_list_append_expanded(slots[0], slots[1], slots[2], val);
+                Some(super::lowered_value::LoweredValue::Multi(new_slots))
+            }
+            "List.set" => {
+                let slots = self.to_slots(receiver_lv, receiver_ty, &list_trio);
+                let idx = self.lower_expr(&args[0]);
+                let val = self.lower_expr(&args[1]);
+                let new_slots = self.emit_list_set_expanded(slots[0], slots[1], slots[2], idx, val);
+                Some(super::lowered_value::LoweredValue::Multi(new_slots))
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower a list expression, returning its (len, cap, data) slots.
+    fn list_slots(&mut self, expr: &Expr<'src>) -> Vec<Value> {
+        let lv = self.lower_expr_lv(expr);
+        let trio: [ScalarType; 3] =
+            [ScalarType::U64, ScalarType::U64, ScalarType::RcPtr];
+        self.to_slots(lv, &expr.ty, &trio)
+    }
+
+    /// `List.get` on expanded slots: bounds-check len, load data at
+    /// idx. Wrap in Ok/Err result.
+    fn emit_list_get_expanded(&mut self, len: Value, data: Value, idx: Value) -> Value {
+        let in_bounds = self.builder.binop(BinaryOp::Lt, idx, len, ScalarType::U8);
+        let ok_block = self.builder.create_block();
+        let err_block = self.builder.create_block();
+        let merge = self.builder.create_block();
+        let merge_param = self.builder.add_block_param(merge, ScalarType::RcPtr);
+        self.builder.branch(in_bounds, ok_block, vec![], err_block, vec![]);
+
+        self.builder.switch_to(ok_block);
+        let elem = self.builder.load_dyn(data, idx, ScalarType::RcPtr);
+        let ok_result = self.builder.alloc(16);
+        let ok_tag = self.builder.const_u64(0);
+        self.builder.store(ok_result, 0, ok_tag);
+        self.builder.store(ok_result, 8, elem);
+        self.builder.jump(merge, vec![ok_result]);
+
+        self.builder.switch_to(err_block);
+        let err_result = self.builder.alloc(16);
+        let err_tag = self.builder.const_u64(1);
+        self.builder.store(err_result, 0, err_tag);
+        let oob_tag = self.builder.const_u8(0);
+        self.builder.store(err_result, 8, oob_tag);
+        self.builder.jump(merge, vec![err_result]);
+
+        self.builder.switch_to(merge);
+        merge_param
+    }
+
+    /// `List.append` on expanded slots: FBIP on the data buffer
+    /// directly (no header to cow-prep). Returns the new
+    /// `(new_len, new_cap, new_data)` trio.
+    fn emit_list_append_expanded(
+        &mut self,
+        len: Value,
+        _cap: Value,
+        data: Value,
+        val: Value,
+    ) -> Vec<Value> {
+        let one = self.builder.const_u64(1);
+        let new_len = self.builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
+        let elem_size = self.builder.const_u64(8);
+        let new_byte_len = self.builder.binop(BinaryOp::Mul, new_len, elem_size, ScalarType::U64);
+        let new_data = self.builder.cow_resize_dyn(data, new_byte_len);
+        self.builder.store_dyn(new_data, len, val);
+        // cap = new_len in the simplified growth strategy (matches
+        // the legacy header layout's `store new_len -> hdr[8]`).
+        vec![new_len, new_len, new_data]
+    }
+
+    /// `List.set` on expanded slots: cow on the data buffer.
+    fn emit_list_set_expanded(
+        &mut self,
+        len: Value,
+        cap: Value,
+        data: Value,
+        idx: Value,
+        val: Value,
+    ) -> Vec<Value> {
+        let new_data = self.builder.cow_store_dyn(data, idx, val);
+        vec![len, cap, new_data]
+    }
+
+    /// `List.range(start, end)` on expanded slots: build a fresh
+    /// counter-driven list. Returns the new `(len, cap, data)` trio.
+    fn emit_list_range_expanded(&mut self, start: Value, end: Value) -> Vec<Value> {
+        let nonempty = self.builder.binop(BinaryOp::Gt, end, start, ScalarType::U8);
+        let then_block = self.builder.create_block();
+        let else_block = self.builder.create_block();
+        let count_merge = self.builder.create_block();
+        let count = self.builder.add_block_param(count_merge, ScalarType::U64);
+        self.builder.branch(nonempty, then_block, vec![], else_block, vec![]);
+
+        self.builder.switch_to(then_block);
+        let diff = self.builder.binop(BinaryOp::Sub, end, start, ScalarType::U64);
+        self.builder.jump(count_merge, vec![diff]);
+
+        self.builder.switch_to(else_block);
+        let zero = self.builder.const_u64(0);
+        self.builder.jump(count_merge, vec![zero]);
+
+        self.builder.switch_to(count_merge);
+        let eight = self.builder.const_u64(8);
+        let byte_len = self.builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
+        let data = self.builder.alloc_dyn(byte_len);
+
+        let header = self.builder.create_block();
+        let body = self.builder.create_block();
+        let exit = self.builder.create_block();
+        let header_i = self.builder.add_block_param(header, ScalarType::U64);
+        let body_i = self.builder.add_block_param(body, ScalarType::U64);
+
+        let zero2 = self.builder.const_u64(0);
+        self.builder.jump(header, vec![zero2]);
+
+        self.builder.switch_to(header);
+        let cond = self.builder.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
+        self.builder.branch(cond, body, vec![header_i], exit, vec![]);
+
+        self.builder.switch_to(body);
+        let val = self.builder.binop(BinaryOp::Add, start, body_i, ScalarType::U64);
+        self.builder.store_dyn(data, body_i, val);
+        let one = self.builder.const_u64(1);
+        let next_i = self.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+        self.builder.jump(header, vec![next_i]);
+
+        self.builder.switch_to(exit);
+        vec![count, count, data]
     }
 
     /// Lower a call to a known user-defined function, respecting its
@@ -457,126 +703,25 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
 // ---- List built-in lowering ----
 //
-// Method calls and qualified calls of `List.len`, `List.get`,
-// `List.set`, `List.append`, `List.range` are emitted as inline SSA
-// rather than function calls. Other List methods (`reverse`,
-// `sublist`, `repeat`, `walk`-derived helpers, etc.) are implemented
-// in the standard library and bottom out into this set.
-//
-// Mono leaves body-less methods unsuffixed, so the dispatch can
-// match the raw names directly. Returns `None` when the name isn't
-// a list built-in, so the caller falls through to the next branch.
+// `List.len`, `List.get`, `List.set`, `List.append`, `List.range` are
+// emitted as inline SSA directly on the expanded `(len, cap, data)`
+// slot trio. Method emitters live in the LowerCtx impl above; the
+// helpers here just classify names.
 
-pub(super) fn try_emit_list_builtin(
-    builder: &mut Builder,
-    name: &str,
-    args: &[Value],
-) -> Option<Value> {
-    Some(match name {
-        "List.len" => builder.load(args[0], 0, ScalarType::U64),
-        "List.get" => emit_list_get(builder, args),
-        "List.append" => emit_list_append(builder, args),
-        "List.range" => emit_list_range(builder, args),
-        "List.set" => emit_list_set(builder, args),
-        _ => return None,
-    })
+/// Strip the `__<mono-suffix>` from a callable name so list builtin
+/// dispatch can recognize specialized variants. `List.append__I64` →
+/// `List.append`.
+fn strip_mono_suffix(name: &str) -> &str {
+    name.split("__").next().unwrap_or(name)
 }
 
-/// Lower `list.append(val)` as FBIP: in-place when both list and
-/// data are uniquely owned; copy-on-write otherwise. Cow_move_out
-/// the data buffer from the header, cow-grow the data, store the
-/// new value at the old length, reinstall the data ptr, update
-/// the header's len/cap.
-fn emit_list_append(builder: &mut Builder, args: &[Value]) -> Value {
-    let list = args[0];
-    let val = args[1];
-
-    let (hdr, data) = builder.cow_move_out(list, 16);
-
-    let len = builder.load(hdr, 0, ScalarType::U64);
-    let one = builder.const_u64(1);
-    let new_len = builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
-
-    let elem_size = builder.const_u64(8);
-    let new_byte_len = builder.binop(BinaryOp::Mul, new_len, elem_size, ScalarType::U64);
-    let new_data = builder.cow_resize_dyn(data, new_byte_len);
-    builder.store_dyn(new_data, len, val);
-    builder.store(hdr, 0, new_len);
-    builder.store(hdr, 8, new_len);
-    builder.store(hdr, 16, new_data);
-    hdr
-}
-
-/// Lower `xs.set(idx, val)` as FBIP. A list is two heap objects
-/// (header + data buffer); FBIP needs both layers to be unique.
-/// `cow_move_out` extracts the data ptr from the (cow-prep'd)
-/// header. `cow_store_dyn` writes at `idx` with cow on the data
-/// buffer. Plain `store` reinstalls the buffer (header is provably
-/// unique after cow_move_out). Zero allocations on the unique
-/// path, full clone on the shared path.
-fn emit_list_set(builder: &mut Builder, args: &[Value]) -> Value {
-    let list = args[0];
-    let idx = args[1];
-    let new_val = args[2];
-
-    let (out_hdr, data) = builder.cow_move_out(list, 16);
-    let new_data = builder.cow_store_dyn(data, idx, new_val);
-    builder.store(out_hdr, 16, new_data);
-    out_hdr
-}
-
-/// Lower `List.range(start, end)`: builds a U64 list containing
-/// `[start, start+1, ..., end-1]`. Empty when `start >= end`.
-fn emit_list_range(builder: &mut Builder, args: &[Value]) -> Value {
-    let start = args[0];
-    let end = args[1];
-
-    let nonempty = builder.binop(BinaryOp::Gt, end, start, ScalarType::U8);
-    let then_block = builder.create_block();
-    let else_block = builder.create_block();
-    let count_merge = builder.create_block();
-    let count = builder.add_block_param(count_merge, ScalarType::U64);
-    builder.branch(nonempty, then_block, vec![], else_block, vec![]);
-
-    builder.switch_to(then_block);
-    let diff = builder.binop(BinaryOp::Sub, end, start, ScalarType::U64);
-    builder.jump(count_merge, vec![diff]);
-
-    builder.switch_to(else_block);
-    let zero = builder.const_u64(0);
-    builder.jump(count_merge, vec![zero]);
-
-    builder.switch_to(count_merge);
-    let eight = builder.const_u64(8);
-    let byte_len = builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
-    let data = builder.alloc_dyn(byte_len);
-
-    let header = builder.create_block();
-    let body = builder.create_block();
-    let exit = builder.create_block();
-    let header_i = builder.add_block_param(header, ScalarType::U64);
-    let body_i = builder.add_block_param(body, ScalarType::U64);
-
-    let zero2 = builder.const_u64(0);
-    builder.jump(header, vec![zero2]);
-
-    builder.switch_to(header);
-    let cond = builder.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
-    builder.branch(cond, body, vec![header_i], exit, vec![]);
-
-    builder.switch_to(body);
-    let val = builder.binop(BinaryOp::Add, start, body_i, ScalarType::U64);
-    builder.store_dyn(data, body_i, val);
-    let one = builder.const_u64(1);
-    let next_i = builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
-    builder.jump(header, vec![next_i]);
-
-    builder.switch_to(exit);
-    let list = builder.alloc(24);
-    builder.store(list, 0, count);
-    builder.store(list, 8, count);
-    builder.store(list, 16, data);
-    list
+/// True if `name` (with any mono suffix stripped) is one of the
+/// expansion-aware list builtins.
+fn is_list_builtin(name: &str) -> bool {
+    matches!(
+        strip_mono_suffix(name),
+        "List.len" | "List.get" | "List.append" | "List.range" | "List.set"
+    )
 }
 
 impl<'a, 'src> LowerCtx<'a, 'src> {
@@ -639,41 +784,4 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         self.builder.switch_to(merge);
         Some(merge_param)
     }
-}
-
-/// Emit a bounds-checked List.get that returns `Result(a, [OutOfBounds])`.
-/// Load len, compare, branch to `Ok(element)` or `Err(OutOfBounds)`.
-fn emit_list_get(builder: &mut Builder, args: &[Value]) -> Value {
-    let list = args[0];
-    let idx = args[1];
-
-    let len = builder.load(list, 0, ScalarType::U64);
-    let in_bounds = builder.binop(BinaryOp::Lt, idx, len, ScalarType::U8);
-
-    let ok_block = builder.create_block();
-    let err_block = builder.create_block();
-    let merge = builder.create_block();
-    let merge_param = builder.add_block_param(merge, ScalarType::RcPtr);
-
-    builder.branch(in_bounds, ok_block, vec![], err_block, vec![]);
-
-    builder.switch_to(ok_block);
-    let data = builder.load(list, 16, ScalarType::RcPtr);
-    let elem = builder.load_dyn(data, idx, ScalarType::RcPtr);
-    let ok_result = builder.alloc(16);
-    let ok_tag = builder.const_u64(0);
-    builder.store(ok_result, 0, ok_tag);
-    builder.store(ok_result, 8, elem);
-    builder.jump(merge, vec![ok_result]);
-
-    builder.switch_to(err_block);
-    let err_result = builder.alloc(16);
-    let err_tag = builder.const_u64(1);
-    builder.store(err_result, 0, err_tag);
-    let oob_tag = builder.const_u8(0);
-    builder.store(err_result, 8, oob_tag);
-    builder.jump(merge, vec![err_result]);
-
-    builder.switch_to(merge);
-    merge_param
 }

@@ -274,9 +274,10 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     }
 
     /// Expand a source-level type into its SSA-level slot types.
-    /// Tuples and records fan out shallowly; lists, strings, tag
-    /// unions, and scalars stay single-slot. Inner aggregate fields
-    /// stay heap-resident — only the outermost layer decomposes.
+    /// Tuples and records fan out shallowly; lists and strings
+    /// decompose into the `(len, cap, data)` trio. Tag unions and
+    /// scalars stay single-slot. Inner aggregate fields stay
+    /// heap-resident — only the outermost layer decomposes.
     pub(super) fn expand_slots(&self, ty: &Type) -> Vec<ScalarType> {
         let unwrapped = self.resolve_transparent(ty);
         match &unwrapped {
@@ -287,18 +288,27 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 sorted.sort_by_key(|(n, _)| *n);
                 sorted.into_iter().map(|(_, t)| self.scalar_type(t)).collect()
             }
+            // List(T) — and Str (transparently List(U8)) once unwrapped
+            // — decompose to (len, cap, data) at the SSA layer. The
+            // data buffer stays heap; the header fanout removes a
+            // load on every length/data access.
+            Type::App(name, _) if name == "List" => {
+                vec![ScalarType::U64, ScalarType::U64, ScalarType::RcPtr]
+            }
             _ => vec![self.scalar_type(&unwrapped)],
         }
     }
 
     /// Byte offsets of each slot in the materialized heap layout of
     /// an expandable type. Tuples and records use 8-byte stride;
-    /// other types collapse to a single offset 0.
+    /// `List` headers use the existing `(len@0, cap@8, data@16)`
+    /// layout — same stride, so no special case is needed yet.
     pub(super) fn slot_offsets(&self, ty: &Type) -> Vec<usize> {
         let unwrapped = self.resolve_transparent(ty);
         match &unwrapped {
             Type::Tuple(tys) => (0..tys.len()).map(|i| i * 8).collect(),
             Type::Record { fields, .. } => (0..fields.len()).map(|i| i * 8).collect(),
+            Type::App(name, _) if name == "List" => vec![0, 8, 16],
             _ => vec![0],
         }
     }
@@ -702,11 +712,33 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
 
             // Var lookup: return whatever shape the binding has.
+            // Zero-arg top-level functions are called here; route them
+            // through the lv-call path so multi-slot returns flow.
             ExprKind::Name(sym) => {
                 if let Some(lv) = self.vars.get(sym).cloned() {
                     return lv;
                 }
+                let name = self.symbols.display(*sym).to_owned();
+                if self.decls.funcs.contains(&name) {
+                    return self.lower_call_lv(&name, &[], &expr.ty);
+                }
                 LoweredValue::single(self.lower_expr_inner(expr))
+            }
+
+            // Call paths route through lv-variants so list builtins
+            // and multi-return user calls can flow as `Multi` into
+            // immediate destructure / field / builtin chains without
+            // a heap roundtrip.
+            ExprKind::Call { target, args, .. } => {
+                let name = self.symbols.display(*target).to_owned();
+                self.lower_call_lv(&name, args, &expr.ty)
+            }
+            ExprKind::QualifiedCall { segments, args, resolved } => {
+                let mangled = resolved.clone().unwrap_or_else(|| segments.join("."));
+                self.lower_qualified_call_lv(&mangled, segments, args, expr)
+            }
+            ExprKind::MethodCall { receiver, method, args, .. } => {
+                self.lower_method_call_lv(receiver, method, args, expr)
             }
 
             _ => LoweredValue::single(self.lower_expr_inner(expr)),

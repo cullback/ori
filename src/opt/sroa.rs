@@ -541,11 +541,15 @@ fn analyze_with_callee_sigs(
         }
         // When this function's return signature is fixed — either
         // because it's `__main` (the ABI to the Rust eval driver,
-        // which expects RcPtr) or because the verifier has denied
-        // its return promotion — escape any Return value's component
-        // so the body's rewrite can't produce an Agg-typed Return
-        // that mismatches the unchanged function signature.
-        let return_sig_locked = func.name == "__main" || self_denied_r;
+        // which expects RcPtr), because the verifier has denied its
+        // return promotion, or because the function returns multiple
+        // slots (SROA's single-Agg-promotion model doesn't apply) —
+        // escape any Return value's component so the body's rewrite
+        // can't produce an Agg-typed Return that mismatches the
+        // unchanged function signature.
+        let return_sig_locked = func.name == "__main"
+            || self_denied_r
+            || func.return_type.len() != 1;
         if return_sig_locked {
             if let Terminator::Return(vs) = &block.terminator {
                 for v in vs {
