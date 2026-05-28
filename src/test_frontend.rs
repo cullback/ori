@@ -287,8 +287,12 @@ main = |arg| (
 
 #[test]
 fn fbip_record_update_reuses_unique_base() {
-    // FBIP for record update: when `p` is uniquely owned, `{ p & x: 99 }`
-    // should reuse p's storage rather than allocating fresh.
+    // Phase B decomposes the record entirely: no heap object exists,
+    // so { p & x: 99 } is pure value substitution at the slot —
+    // strictly better than FBIP's in-place mutation. Originally this
+    // asserted reuse via alloc_count > fresh_alloc_count; with zero
+    // allocs that's moot. FBIP for records still applies when the
+    // record escapes onto the heap (e.g. stored in a list).
     let source = "\
 Point : { x : I64, y : I64 }
 main : I64 -> I64
@@ -298,25 +302,21 @@ main = |arg| (
     q.x + q.y
 )";
     let (result, heap) = run_with_heap(source, 5);
-    // result = 99 + 6 = 105
     assert_eq!(result, Scalar::I64(105));
-    // The record alloc should be reused: alloc_count > fresh_alloc_count.
-    assert!(heap.alloc_count > heap.fresh_alloc_count,
-        "FBIP record update regression: every alloc was fresh ({} == {})",
-        heap.alloc_count, heap.fresh_alloc_count);
-    // Every actual heap object freed by end. (alloc_count includes
-    // in-place reuses; fresh_alloc_count is real heap growth and
-    // should match free_count for no leak.)
-    assert_eq!(heap.count_live_objects(), 0,
-        "leak: {} objects still live at program end", heap.count_live_objects());
+    assert_eq!(heap.alloc_count, 0,
+        "expected zero allocs on decomposed record path, got {}",
+        heap.alloc_count);
+    assert_eq!(heap.count_live_objects(), 0);
 }
 
 #[test]
 fn fbip_record_update_clones_when_shared() {
-    // FBIP shared path: when p is used after the update, the update
-    // must clone (not in-place). We force sharing by using p again
-    // after building q. Must produce correct values and free
-    // everything cleanly.
+    // Phase B: decomposed records make "sharing" free — the update
+    // produces a fresh `q` slot-Vec by replacing one Value in p's
+    // slot-Vec, and p's binding still names the original slots. Both
+    // can be read independently with zero heap activity. The
+    // shared-base / cloned-result distinction only applies to heap-
+    // resident records.
     let source = "\
 Point : { x : I64, y : I64 }
 main : I64 -> I64
@@ -328,12 +328,10 @@ main = |arg| (
     let (result, heap) = run_with_heap(source, 5);
     // p.x + p.y + q.x + q.y = 5 + 6 + 99 + 6 = 116
     assert_eq!(result, Scalar::I64(116));
-    // Shared: two separate heap objects survive simultaneously.
-    assert!(heap.peak_live >= 2,
-        "expected at least 2 simultaneously-live records (shared base + clone); peak_live={}",
-        heap.peak_live);
-    assert_eq!(heap.count_live_objects(), 0,
-        "leak: {} objects still live at program end", heap.count_live_objects());
+    assert_eq!(heap.alloc_count, 0,
+        "expected zero allocs on decomposed record path, got {}",
+        heap.alloc_count);
+    assert_eq!(heap.count_live_objects(), 0);
 }
 
 #[test]
@@ -404,7 +402,13 @@ main = |arg| (
     (a, b) = pair
     a + b
 )";
-    assert_eq!(run_i64(source, 0), 3);
+    let (result, heap) = run_with_heap(source, 0);
+    assert_eq!(result, Scalar::I64(3));
+    // Phase B decomposes the tuple — no heap alloc anywhere on the
+    // construct→destructure→use path.
+    assert_eq!(heap.alloc_count, 0,
+        "expected zero allocs on decomposed tuple path, got {}",
+        heap.alloc_count);
 }
 
 #[test]

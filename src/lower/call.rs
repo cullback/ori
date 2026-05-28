@@ -46,11 +46,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             // Numeric builtin intrinsic. `segments[0]` is either a
             // local binding (receiver for `x.add(y)`) or a type name
             // (`I64` for eta-expanded `I64.add(a, b)`).
-            let local_val = self
+            let local_lv = self
                 .vars
                 .iter()
                 .find(|(sym, _)| self.symbols.display(**sym) == segments[0])
-                .map(|(_, v)| *v);
+                .map(|(_, v)| v.clone());
+            let local_val = local_lv.map(|lv| self.materialize(lv));
             if op_name == "to_bits" {
                 let arg = local_val.unwrap_or_else(|| self.lower_expr(&args[0]));
                 let dest_ty = numeric::bits_dest_ty(segments[0]);
@@ -93,18 +94,21 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             // Non-builtin method dispatch on a local receiver (the
             // qualified-call form of `receiver.method(args)`).
             let receiver_name = segments[0];
-            let receiver_val = self
+            let receiver_lv = self
                 .vars
                 .iter()
                 .find(|(sym, _)| self.symbols.display(**sym) == receiver_name)
-                .map(|(_, v)| *v)
-                .unwrap_or_else(|| {
+                .map(|(_, v)| v.clone());
+            let receiver_val = match receiver_lv {
+                Some(lv) => self.materialize(lv),
+                None => {
                     // Receiver is a declared nullary constructor
                     // being used as a method target (e.g. `True.not()`).
                     // Structural constructors don't flow through this
                     // path — they go through `ExprKind::Call` instead.
                     self.lower_constructor_call(receiver_name, &[], None)
-                });
+                }
+            };
             let mut arg_vals = vec![receiver_val];
             for a in args {
                 arg_vals.push(self.lower_expr(a));

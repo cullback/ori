@@ -153,7 +153,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     }
                     ast::Pattern::Binding(sym) => {
                         // Always matches, bind value
-                        self.vars.insert(*sym, scr);
+                        self.vars.insert(*sym, super::lowered_value::LoweredValue::single(scr));
                     }
                     ast::Pattern::Wildcard => {
                         // Always matches, no binding

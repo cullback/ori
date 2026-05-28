@@ -10,8 +10,11 @@
 //!
 //! Per `ExprKind`, dispatch to an emitter that writes instructions
 //! through `Builder`. Two side tables shape the output:
-//! - `self.vars: HashMap<SymbolId, Value>` — the live local map for
-//!   the current block. Updated as let-bindings introduce names.
+//! - `self.vars: HashMap<SymbolId, LoweredValue>` — the live local
+//!   map for the current block. Updated as let-bindings introduce
+//!   names. Bindings are `Single(v)` for scalars and (legacy)
+//!   heap-pointer aggregates; `Multi(vs)` for tuples/records that
+//!   decompose to N parallel slot Values.
 //! - `decl_info::DeclInfo` — constructor layouts, function arities
 //!   and return types, recursive-field flags.
 //!
@@ -56,6 +59,7 @@ pub mod constructor;
 pub mod elim_dead_allocs;
 pub mod eq;
 pub mod hash;
+pub mod lowered_value;
 pub mod numeric;
 pub mod rc_emit;
 pub mod ssa_form;
@@ -74,6 +78,8 @@ use crate::ssa::instruction::{BinaryOp, ScalarType, Value};
 use crate::symbol::{FieldInterner, SymbolId, SymbolTable};
 use crate::types::engine::{Type, TypeVar};
 use crate::types::infer::InferResult;
+
+use self::lowered_value::LoweredValue;
 
 /// Lower a monomorphized AST module to SSA IR.
 ///
@@ -177,10 +183,13 @@ use crate::passes::lambda_specialize::SingletonTarget;
 
 struct LowerCtx<'a, 'src> {
     builder: Builder,
-    /// Locals in scope: binding `SymbolId` → SSA value. Function
+    /// Locals in scope: binding `SymbolId` → lowered value. Function
     /// parameters, let-bound names, lambda params, and pattern
-    /// bindings all enter/exit this map as their scopes open and close.
-    vars: HashMap<SymbolId, Value>,
+    /// bindings all enter/exit this map as their scopes open and
+    /// close. A binding may be `Multi` if the source value is a
+    /// tuple or record and its construction site chose the
+    /// decomposed shape.
+    vars: HashMap<SymbolId, LoweredValue>,
     /// Generated equality functions, keyed by canonical name.
     /// Each entry is a real SSA function that compares two values
     /// of a concrete type field-by-field. Generated on first use
@@ -446,7 +455,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
         for (p, ty) in param_syms.iter().zip(&param_types) {
             let v = self.builder.add_func_param(*ty);
-            self.vars.insert(*p, v);
+            self.vars.insert(*p, LoweredValue::single(v));
         }
 
         // Set the return type BEFORE lowering the body so `ret` can
@@ -480,7 +489,143 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
 
     // ---- Expression lowering ----
 
+    /// Lower an expression and return its lowered form. Tuple and
+    /// record literals (and a few other constructs introduced in
+    /// later steps of phase B) return `Multi`; everything else
+    /// returns `Single`.
+    fn lower_expr_lv(&mut self, expr: &Expr<'src>) -> LoweredValue {
+        match &expr.kind {
+            // Tuple literal: decompose to N parallel Values. Each
+            // element lowers as a single Value — nested aggregates
+            // heap-materialize via the default `lower_expr` path,
+            // so an inner tuple becomes a single ptr in the outer's
+            // slot. Step 6 may revisit nested flattening.
+            ExprKind::Tuple(elems) => {
+                let vals: Vec<Value> = elems.iter().map(|e| self.lower_expr(e)).collect();
+                LoweredValue::Multi(vals)
+            }
+
+            // Record literal: same shape as Tuple, but slots are in
+            // alphabetical field-name order (matches the heap layout
+            // used by the materialized fallback and by field_index).
+            ExprKind::Record { fields } => {
+                let mut sorted: Vec<(&str, &Expr<'src>)> = fields
+                    .iter()
+                    .map(|(field_sym, e)| (self.fields.get(*field_sym), e))
+                    .collect();
+                sorted.sort_by_key(|(name, _)| *name);
+                let vals: Vec<Value> = sorted
+                    .into_iter()
+                    .map(|(_, e)| self.lower_expr(e))
+                    .collect();
+                LoweredValue::Multi(vals)
+            }
+
+            // RecordUpdate: if the base is a Multi (decomposed),
+            // the update is pure value substitution — replace each
+            // updated slot's Value, no CowStore. Base on a heap
+            // (Single) ptr stays with the existing CowStore chain.
+            ExprKind::RecordUpdate { base, updates } => {
+                let base_lv = self.lower_expr_lv(base);
+                let all_fields: Vec<String> = match &base.ty {
+                    Type::Record { fields, .. } => {
+                        let mut names: Vec<String> =
+                            fields.iter().map(|(n, _)| n.clone()).collect();
+                        names.sort_unstable();
+                        names
+                    }
+                    _ => panic!("RecordUpdate base is not a record type"),
+                };
+                if let LoweredValue::Multi(mut slots) = base_lv {
+                    for (sym, e) in updates {
+                        let name = self.fields.get(*sym).to_owned();
+                        let slot = all_fields
+                            .iter()
+                            .position(|n| n == &name)
+                            .expect("record update on unknown field");
+                        let v = self.lower_expr(e);
+                        slots[slot] = v;
+                    }
+                    return LoweredValue::Multi(slots);
+                }
+                // Heap base. Reproduce the legacy CowStore chain
+                // using the already-lowered base ptr.
+                let base_val = self.materialize(base_lv);
+                let new_vals: Vec<(usize, Value)> = updates
+                    .iter()
+                    .map(|(sym, e)| {
+                        let name = self.fields.get(*sym).to_owned();
+                        let slot = all_fields
+                            .iter()
+                            .position(|n| n == &name)
+                            .expect("record update on unknown field");
+                        (slot, self.lower_expr(e))
+                    })
+                    .collect();
+                let mut p = base_val;
+                for (slot, val) in new_vals {
+                    p = self.builder.cow_store(p, slot * 8, val);
+                }
+                LoweredValue::single(p)
+            }
+
+            // Field access on a Multi receiver is name resolution:
+            // pick the slot Value, no Load. Falls through to the
+            // single-result path when the receiver is heap-resident.
+            ExprKind::FieldAccess { record, field } => {
+                let rec_lv = self.lower_expr_lv(record);
+                if let LoweredValue::Multi(vs) = &rec_lv {
+                    let field_name = self.fields.get(*field);
+                    let slot = self.field_index(&record.ty, field_name);
+                    return LoweredValue::single(vs[slot]);
+                }
+                // Heap-resident receiver: materialize (no-op for
+                // Single) and emit the Load.
+                let ptr = self.materialize(rec_lv);
+                let field_name = self.fields.get(*field);
+                let slot = self.field_index(&record.ty, field_name);
+                let ty = self.expr_scalar_type(expr);
+                LoweredValue::single(self.builder.load(ptr, slot * 8, ty))
+            }
+
+            // Var lookup: return whatever shape the binding has.
+            ExprKind::Name(sym) => {
+                if let Some(lv) = self.vars.get(sym).cloned() {
+                    return lv;
+                }
+                LoweredValue::single(self.lower_expr_inner(expr))
+            }
+
+            _ => LoweredValue::single(self.lower_expr_inner(expr)),
+        }
+    }
+
+    /// Lower an expression and return a single SSA Value. If the
+    /// expression decomposes to `Multi`, materialize it to a heap
+    /// pointer at the construction site. Most call sites use this
+    /// wrapper today.
     fn lower_expr(&mut self, expr: &Expr<'src>) -> Value {
+        let lv = self.lower_expr_lv(expr);
+        self.materialize(lv)
+    }
+
+    /// Heap-materialize a `Multi` into a single RcPtr. Emits
+    /// `Alloc + Store_i` for each slot at offset `i*8`. `Single`
+    /// passes through.
+    fn materialize(&mut self, lv: LoweredValue) -> Value {
+        match lv {
+            LoweredValue::Single(v) => v,
+            LoweredValue::Multi(vs) => {
+                let ptr = self.builder.alloc(vs.len() * 8);
+                for (i, v) in vs.into_iter().enumerate() {
+                    self.builder.store(ptr, i * 8, v);
+                }
+                ptr
+            }
+        }
+    }
+
+    fn lower_expr_inner(&mut self, expr: &Expr<'src>) -> Value {
         match &expr.kind {
             ExprKind::IntLit(n) => {
                 numeric::lower_int_const(&mut self.builder, *n, &expr.ty)
@@ -504,8 +649,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
 
             ExprKind::Name(sym) => {
-                if let Some(&val) = self.vars.get(sym) {
-                    return val;
+                if let Some(lv) = self.vars.get(sym).cloned() {
+                    return self.materialize(lv);
                 }
                 let name = self.symbols.display(*sym);
                 if self.decls.constructors.contains_key(name) {
@@ -750,12 +895,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     if !used {
                         continue;
                     }
-                    let v = self.lower_expr(val);
-                    self.vars.insert(*name, v);
+                    let lv = self.lower_expr_lv(val);
+                    self.vars.insert(*name, lv);
                 }
                 Stmt::Destructure { pattern, val } => {
-                    let v = self.lower_expr(val);
-                    self.lower_destructure(pattern, v, &val.ty);
+                    let lv = self.lower_expr_lv(val);
+                    self.lower_destructure_lv(pattern, lv, &val.ty);
                 }
                 Stmt::Guard {
                     condition,
@@ -908,7 +1053,7 @@ fn lower_to_ssa<'src>(
         .zip(&main_param_tys)
         .map(|(p, &ty)| {
             let v = ctx.builder.add_func_param(ty);
-            ctx.vars.insert(*p, v);
+            ctx.vars.insert(*p, LoweredValue::single(v));
             v
         })
         .collect();

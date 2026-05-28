@@ -380,7 +380,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     pub(super) fn bind_pattern_field(&mut self, pat: &ast::Pattern<'src>, val: Value) {
         match pat {
             ast::Pattern::Binding(sym) => {
-                self.vars.insert(*sym, val);
+                self.vars.insert(*sym, super::lowered_value::LoweredValue::single(val));
             }
             ast::Pattern::Wildcard | ast::Pattern::IntLit(_) | ast::Pattern::StrLit(_) => {}
             _ => panic!("unsupported nested pattern in match arm field"),
@@ -392,6 +392,68 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     /// Detect `List.range(a, b)` as the list expression in a walk.
 
     // ---- Destructure lowering ----
+
+    /// Decomposed-aware destructure: when the source is `Multi`, bind
+    /// each pattern field directly to the slot Value without going
+    /// through Load. When the source is `Single` (heap ptr), fall back
+    /// to the existing Load-based path.
+    pub(super) fn lower_destructure_lv(
+        &mut self,
+        pattern: &ast::Pattern<'src>,
+        val: super::lowered_value::LoweredValue,
+        val_ty: &Type,
+    ) {
+        if let super::lowered_value::LoweredValue::Multi(vs) = val {
+            self.bind_decomposed(pattern, &vs, val_ty);
+            return;
+        }
+        let v = self.materialize(val);
+        self.lower_destructure(pattern, v, val_ty);
+    }
+
+    /// Bind a tuple/record pattern's elements directly to the
+    /// already-decomposed slot Values. Mirrors `lower_destructure`'s
+    /// shape but with no Load instructions.
+    pub(super) fn bind_decomposed(
+        &mut self,
+        pattern: &ast::Pattern<'src>,
+        slot_vals: &[Value],
+        val_ty: &Type,
+    ) {
+        match pattern {
+            ast::Pattern::Tuple(elems) => {
+                for (i, elem) in elems.iter().enumerate() {
+                    let v = slot_vals[i];
+                    self.lower_destructure_elem(elem, v);
+                }
+            }
+            ast::Pattern::Record { fields, .. } => {
+                let all_names: Vec<&str> = match val_ty {
+                    Type::Record { fields: type_fields, .. } => {
+                        let mut names: Vec<&str> =
+                            type_fields.iter().map(|(n, _)| n.as_str()).collect();
+                        names.sort_unstable();
+                        names
+                    }
+                    _ => {
+                        let mut names: Vec<&str> = fields
+                            .iter()
+                            .map(|(sym, _)| self.fields.get(*sym))
+                            .collect();
+                        names.sort_unstable();
+                        names
+                    }
+                };
+                for (field_sym, elem) in fields {
+                    let name = self.fields.get(*field_sym);
+                    let slot = all_names.iter().position(|n| *n == name).unwrap();
+                    let v = slot_vals[slot];
+                    self.lower_destructure_elem(elem, v);
+                }
+            }
+            _ => panic!("expected tuple or record pattern in decomposed destructure"),
+        }
+    }
 
     pub(super) fn lower_destructure(
         &mut self,
@@ -469,7 +531,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     pub(super) fn lower_destructure_elem(&mut self, elem: &ast::Pattern<'src>, val: Value) {
         match elem {
             ast::Pattern::Binding(sym) => {
-                self.vars.insert(*sym, val);
+                self.vars.insert(*sym, super::lowered_value::LoweredValue::single(val));
             }
             ast::Pattern::Tuple(_) | ast::Pattern::Record { .. } => {
                 // Nested destructure: use a dummy type (falls back to
