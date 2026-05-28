@@ -51,7 +51,15 @@ pub fn run(func: &mut Function) -> bool {
         }
         rewrite_terminator_operands(&mut block.terminator, &resolved);
         block.insts.retain(|inst| {
-            inst.dest().map_or(true, |d| !resolved.contains_key(&d))
+            let dests = inst.dests();
+            if dests.is_empty() {
+                return true;
+            }
+            // Keep the instruction unless every defined Value has been
+            // resolved to a replacement (nop_elim only ever resolves
+            // single-result BinOps today; the all() guard is harmless
+            // for multi-result inst, none of whose dests it resolves).
+            !dests.iter().all(|d| resolved.contains_key(d))
         });
     }
     true

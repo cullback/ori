@@ -106,7 +106,7 @@ fn elim_in_block(block: &mut crate::ssa::Block) {
                 mark(&mut escaped, idx);
                 mark(&mut escaped, val);
             }
-            Inst::CowMoveOut(_, ptr, _) => mark(&mut escaped, ptr),
+            Inst::CowMoveOut { src, .. } => mark(&mut escaped, src),
             Inst::CowResizeDyn(_, ptr, size) => {
                 mark(&mut escaped, ptr);
                 mark(&mut escaped, size);

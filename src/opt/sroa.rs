@@ -490,8 +490,8 @@ fn analyze_with_callee_sigs(
                     escape(idx, &mut uf, &mut escaped);
                     escape(val, &mut uf, &mut escaped);
                 }
-                Inst::CowMoveOut(_, ptr, _) => {
-                    escape(ptr, &mut uf, &mut escaped);
+                Inst::CowMoveOut { src, .. } => {
+                    escape(src, &mut uf, &mut escaped);
                 }
                 Inst::CowResizeDyn(_, ptr, size) => {
                     escape(ptr, &mut uf, &mut escaped);
@@ -656,8 +656,8 @@ fn call_sites_safe(
                             return false;
                         }
                     }
-                    Inst::CowMoveOut(_, ptr, _) => {
-                        if call_results.contains(ptr) {
+                    Inst::CowMoveOut { src, .. } => {
+                        if call_results.contains(src) {
                             return false;
                         }
                     }
@@ -975,7 +975,7 @@ fn rewrite(
             retype(p);
         }
         for inst in block.insts.iter_mut() {
-            if let Some(d) = inst.dest_mut() {
+            for d in inst.dests_mut() {
                 retype(d);
             }
             inst.map_operands_mut(&retype);

@@ -200,7 +200,13 @@ impl fmt::Display for FmtInst<'_> {
             Inst::Extract(d, agg, idx) => write!(f, "{d}: {} = extract {}, {idx}", d.ty, fmt_val(*agg, consts)),
             Inst::CowStore(d, ptr, off, val) => write!(f, "{d}: {} = cow_store {}[{off}], {}", d.ty, fmt_val(*ptr, consts), fmt_val(*val, consts)),
             Inst::CowStoreDyn(d, ptr, idx, val) => write!(f, "{d}: {} = cow_store_dyn {}[{}], {}", d.ty, fmt_val(*ptr, consts), fmt_val(*idx, consts), fmt_val(*val, consts)),
-            Inst::CowMoveOut(d, ptr, off) => write!(f, "{d}: {} = cow_move_out {}[{off}]", d.ty, fmt_val(*ptr, consts)),
+            Inst::CowMoveOut { results: [out, val], src, offset } => write!(
+                f,
+                "({out}: {}, {val}: {}) = cow_move_out {}[{offset}]",
+                out.ty,
+                val.ty,
+                fmt_val(*src, consts),
+            ),
             Inst::CowResizeDyn(d, ptr, n) => write!(f, "{d}: {} = cow_resize_dyn {}, {}", d.ty, fmt_val(*ptr, consts), fmt_val(*n, consts)),
             Inst::StaticRef(d, id) => write!(f, "{d}: {} = static_ref @{id}", d.ty),
             Inst::Cast(d, src) => {

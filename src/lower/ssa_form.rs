@@ -172,7 +172,7 @@ fn compute_local_defs(func: &Function) -> HashMap<BlockId, HashSet<Value>> {
             s.insert(p);
         }
         for inst in &block.insts {
-            if let Some(d) = inst.dest() {
+            for &d in inst.dests() {
                 s.insert(d);
             }
         }

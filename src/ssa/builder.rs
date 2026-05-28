@@ -229,14 +229,20 @@ impl Builder {
         v
     }
 
-    /// COW-aware "take child out of parent": returns an `Agg(2)`
-    /// = `(out_ptr, extracted_val)`. `out_ptr` is the (possibly
-    /// cloned) parent with slot `offset` set to null. `extracted_val`
-    /// is what was at the slot before. See `Inst::CowMoveOut`.
-    pub fn cow_move_out(&mut self, ptr: Value, offset: usize) -> Value {
-        let v = self.fresh_value(ScalarType::Agg(2));
-        self.push(Inst::CowMoveOut(v, ptr, offset));
-        v
+    /// COW-aware "take child out of parent". Returns
+    /// `(out_ptr, extracted_val)` as two parallel SSA Values:
+    /// `out_ptr` is the (possibly cloned) parent with slot `offset`
+    /// set to null; `extracted_val` is what was at the slot before.
+    /// See `Inst::CowMoveOut`.
+    pub fn cow_move_out(&mut self, ptr: Value, offset: usize) -> (Value, Value) {
+        let out_ptr = self.fresh_value(ScalarType::RcPtr);
+        let val = self.fresh_value(ScalarType::RcPtr);
+        self.push(Inst::CowMoveOut {
+            results: [out_ptr, val],
+            src: ptr,
+            offset,
+        });
+        (out_ptr, val)
     }
 
     /// COW-aware resize: get a buffer of `size_val` bytes, with the

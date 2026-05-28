@@ -222,25 +222,32 @@ pub enum Inst {
     /// Dynamic-index version of `CowStore`. The store goes to
     /// slot `idx_val` (8-byte stride, like `StoreDyn`).
     CowStoreDyn(Value, Value, Value, Value),
-    /// dest = `Agg(2)` packing `(out_ptr, extracted_val)`. Used to
-    /// set up nested FBIP: cow-prep the parent, then extract a
-    /// child for further FBIP modification.
+    /// `results = (out_ptr, extracted_val) = cow_move_out src[offset]`.
+    /// Two parallel results — out_ptr is the (possibly cloned) source
+    /// with the slot nulled; extracted_val is what was at the slot.
     ///
     /// Eval:
-    /// - If `ptr.rc == 1`: out_ptr = ptr; val = ptr[off]; ptr[off]
+    /// - If `src.rc == 1`: out_ptr = src; val = src[offset]; src[offset]
     ///   becomes null (slot's claim transfers to local).
-    /// - If `ptr.rc > 1`: clone ptr → out_ptr (rc_inc children;
-    ///   val.rc bumped by clone). Extract val from out_ptr[off];
-    ///   out_ptr[off] := null. rc_dec original ptr.
+    /// - If `src.rc > 1`: clone src → out_ptr (rc_inc children;
+    ///   val.rc bumped by clone). Extract val from out_ptr[offset];
+    ///   out_ptr[offset] := null. rc_dec original src.
     ///
     /// In both cases, the local now "owns" val (with a claim that
     /// was either the original slot's, or the clone's slot's).
     /// No net rc change on val from this op itself; the rc increment
     /// on val in the shared case comes from the implicit clone.
     ///
+    /// Fused single instruction: the slot-nulling and rc-prep must
+    /// happen atomically. Don't split it into prep + extract.
+    ///
     /// Replaces the `ReuseOrClone + MoveOut` pair used for the
     /// outer step of nested-FBIP patterns like list.set.
-    CowMoveOut(Value, Value, usize),
+    CowMoveOut {
+        results: [Value; 2],
+        src: Value,
+        offset: usize,
+    },
     /// dest = COW resize: get a (possibly cloned) buffer of size
     /// `new_size_val` bytes, with src's contents copied (or
     /// preserved in-place). For the FBIP grow patterns —
@@ -291,7 +298,6 @@ impl Inst {
             | Self::LoadDyn(v, _, _)
             | Self::CowStore(v, _, _, _)
             | Self::CowStoreDyn(v, _, _, _)
-            | Self::CowMoveOut(v, _, _)
             | Self::CowResizeDyn(v, _, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
@@ -299,6 +305,7 @@ impl Inst {
             | Self::Cast(v, _)
             | Self::BitCast(v, _) => std::slice::from_ref(v),
             Self::Call { results, .. } => results,
+            Self::CowMoveOut { results, .. } => results,
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => &[],
         }
     }
@@ -314,7 +321,6 @@ impl Inst {
             | Self::LoadDyn(v, _, _)
             | Self::CowStore(v, _, _, _)
             | Self::CowStoreDyn(v, _, _, _)
-            | Self::CowMoveOut(v, _, _)
             | Self::CowResizeDyn(v, _, _)
             | Self::Pack(v, _)
             | Self::Extract(v, _, _)
@@ -322,6 +328,7 @@ impl Inst {
             | Self::Cast(v, _)
             | Self::BitCast(v, _) => std::slice::from_mut(v),
             Self::Call { results, .. } => results,
+            Self::CowMoveOut { results, .. } => results,
             Self::Store(..) | Self::StoreDyn(..) | Self::RcInc(_) | Self::RcDec(_) => &mut [],
         }
     }
@@ -365,7 +372,7 @@ impl Inst {
             Self::Extract(_, agg, _) => vec![*agg],
             Self::CowStore(_, ptr, _, val) => vec![*ptr, *val],
             Self::CowStoreDyn(_, ptr, idx, val) => vec![*ptr, *idx, *val],
-            Self::CowMoveOut(_, ptr, _) => vec![*ptr],
+            Self::CowMoveOut { src, .. } => vec![*src],
             Self::CowResizeDyn(_, ptr, size) => vec![*ptr, *size],
             Self::StaticRef(..) => vec![],
             Self::Cast(_, src) | Self::BitCast(_, src) => vec![*src],
@@ -388,7 +395,7 @@ impl Inst {
             Self::Extract(_, agg, _) => f(agg),
             Self::CowStore(_, ptr, _, val) => { f(ptr); f(val); }
             Self::CowStoreDyn(_, ptr, idx, val) => { f(ptr); f(idx); f(val); }
-            Self::CowMoveOut(_, ptr, _) => f(ptr),
+            Self::CowMoveOut { src, .. } => f(src),
             Self::CowResizeDyn(_, ptr, size) => { f(ptr); f(size); }
             Self::Cast(_, src) | Self::BitCast(_, src) => f(src),
         }

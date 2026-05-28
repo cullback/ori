@@ -90,7 +90,7 @@ fn validate_function(
             }
         }
         for (idx, inst) in block.insts.iter().enumerate() {
-            if let Some(d) = inst.dest() {
+            for &d in inst.dests() {
                 if !defined.insert(d) {
                     r.errors.push(format!(
                         "{prefix}: b{}:{idx} {inst:?} redefines value {d}",
@@ -217,7 +217,7 @@ fn validate_function(
                     ));
                 }
             }
-            if let Some(d) = inst.dest() {
+            for &d in inst.dests() {
                 local.insert(d);
             }
         }

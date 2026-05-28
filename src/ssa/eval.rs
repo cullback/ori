@@ -1,5 +1,5 @@
 use crate::ssa::Module;
-use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator};
+use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
 
 /// A scalar runtime value that fits in a register.
 ///
@@ -471,6 +471,17 @@ fn eval_function_inner(
         }
 
         for inst in &block.insts {
+            // CowMoveOut writes two env slots; route it through a
+            // dedicated multi-result handler. Everything else has a
+            // single dest (or none) and goes through eval_inst.
+            if let Inst::CowMoveOut { results, src, offset } = inst {
+                let [out_ptr_dest, val_dest] = results;
+                let (out_scalar, val_scalar) =
+                    eval_cow_move_out(heap, &env, *src, *offset);
+                env[out_ptr_dest.id] = out_scalar;
+                env[val_dest.id] = val_scalar;
+                continue;
+            }
             let val = eval_inst(module, heap, scratch, &env, inst);
             if let Some(dest) = inst.dest() {
                 if let Some(v) = val {
@@ -743,23 +754,9 @@ fn eval_inst(module: &Module, heap: &mut Heap, scratch: &mut Scratch, env: &Env,
             Some(Scalar::Ptr(target_idx))
         }
 
-        Inst::CowMoveOut(_dest, ptr, off) => {
-            let Scalar::Ptr(idx) = env[ptr.id] else {
-                panic!("cow_move_out on non-ptr: {:?}", env[ptr.id]);
-            };
-            let new_idx = cow_prep(heap, idx);
-            // Borrowing load: the slot's claim transfers to the
-            // local — no rc traffic. (In the shared/clone path,
-            // val.rc was already bumped by the clone copying the
-            // child, so the local's claim is "the clone's slot's"
-            // claim. In the unique path, the local takes over
-            // the original slot's claim — net rc change zero.)
-            let val = heap.load(new_idx, *off, ScalarType::RcPtr);
-            // Raw null write — no auto-rc-balance.
-            heap.write_null_raw(new_idx, *off);
-            // Pack (out_ptr, val) into Agg(2) for multi-return.
-            let handle = heap.alloc_agg(vec![Scalar::Ptr(new_idx), val]);
-            Some(Scalar::Agg(handle))
+        Inst::CowMoveOut { .. } => {
+            // Handled in the multi-result branch in eval_function_inner.
+            unreachable!("CowMoveOut routed via dedicated handler");
         }
 
         Inst::Pack(_dest, fields) => {
@@ -882,6 +879,30 @@ fn scalar_to_u64(s: Scalar) -> u64 {
         Scalar::F64(_) => panic!("switch on float"),
         Scalar::Agg(_) => panic!("scalar_to_u64(Agg): aggregates have no scalar bit pattern"),
     }
+}
+
+/// CowMoveOut eval: cow-prep the source, then transfer the slot at
+/// `offset` into a returned scalar (slot left null). Returns
+/// `(out_ptr_scalar, extracted_val_scalar)`. The slot's rc claim
+/// transfers to the local — no extra rc traffic.
+fn eval_cow_move_out(
+    heap: &mut Heap,
+    env: &Env,
+    src: Value,
+    offset: usize,
+) -> (Scalar, Scalar) {
+    let Scalar::Ptr(idx) = env[src.id] else {
+        panic!("cow_move_out on non-ptr: {:?}", env[src.id]);
+    };
+    let new_idx = cow_prep(heap, idx);
+    // Borrowing load: the slot's claim transfers to the local — no
+    // rc traffic. (In the shared/clone path, val.rc was bumped by the
+    // clone copying the child, so the local's claim is "the clone's
+    // slot's" claim. In the unique path, the local takes over the
+    // original slot's claim — net rc change zero.)
+    let val = heap.load(new_idx, offset, ScalarType::RcPtr);
+    heap.write_null_raw(new_idx, offset);
+    (Scalar::Ptr(new_idx), val)
 }
 
 /// CowStore prep: given an idx whose contents we want to mutate,

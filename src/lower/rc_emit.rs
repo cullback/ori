@@ -152,7 +152,7 @@ fn emit_block(
         .map(|p| (*p, false))
         .collect();
     for inst in &block.insts {
-        if let Some(d) = inst.dest() {
+        for &d in inst.dests() {
             if needs_rc_emit(d.ty) {
                 defined.push((d, false));
             }
@@ -353,10 +353,10 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
                 }
             }
         }
-        Inst::CowMoveOut(_, ptr, _) => {
-            // CowMoveOut consumes ptr (cow_preps it).
-            if is_ptr(ptr) {
-                cons.push(*ptr);
+        Inst::CowMoveOut { src, .. } => {
+            // CowMoveOut consumes src (cow_preps it).
+            if is_ptr(src) {
+                cons.push(*src);
             }
         }
         Inst::CowResizeDyn(_, ptr, size) => {

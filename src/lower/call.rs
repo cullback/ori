@@ -410,9 +410,7 @@ fn emit_list_append(builder: &mut Builder, args: &[Value]) -> Value {
     let list = args[0];
     let val = args[1];
 
-    let hdr_and_data = builder.cow_move_out(list, 16);
-    let hdr = builder.extract(hdr_and_data, 0, ScalarType::RcPtr);
-    let data = builder.extract(hdr_and_data, 1, ScalarType::RcPtr);
+    let (hdr, data) = builder.cow_move_out(list, 16);
 
     let len = builder.load(hdr, 0, ScalarType::U64);
     let one = builder.const_u64(1);
@@ -440,9 +438,7 @@ fn emit_list_set(builder: &mut Builder, args: &[Value]) -> Value {
     let idx = args[1];
     let new_val = args[2];
 
-    let hdr_and_data = builder.cow_move_out(list, 16);
-    let out_hdr = builder.extract(hdr_and_data, 0, ScalarType::RcPtr);
-    let data = builder.extract(hdr_and_data, 1, ScalarType::RcPtr);
+    let (out_hdr, data) = builder.cow_move_out(list, 16);
     let new_data = builder.cow_store_dyn(data, idx, new_val);
     builder.store(out_hdr, 16, new_data);
     out_hdr

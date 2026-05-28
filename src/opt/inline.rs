@@ -194,7 +194,7 @@ fn perform_inline(
             max_val = max_val.max(p.id + 1);
         }
         for inst in &block.insts {
-            if let Some(d) = inst.dest() {
+            for &d in inst.dests() {
                 max_val = max_val.max(d.id + 1);
             }
         }
@@ -227,7 +227,7 @@ fn perform_inline(
             fresh(p, &mut val_map);
         }
         for inst in &block.insts {
-            if let Some(d) = inst.dest() {
+            for &d in inst.dests() {
                 fresh(d, &mut val_map);
             }
         }
@@ -377,8 +377,8 @@ fn remap_value(v: Value, map: &HashMap<Value, Value>) -> Value {
 
 fn remap_inst(inst: &Inst, map: &HashMap<Value, Value>) -> Inst {
     let mut remapped = inst.clone();
-    // Remap destination.
-    if let Some(d) = remapped.dest_mut() {
+    // Remap every defined Value.
+    for d in remapped.dests_mut() {
         if let Some(&new_d) = map.get(d) {
             *d = new_d;
         }

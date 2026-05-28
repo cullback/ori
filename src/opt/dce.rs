@@ -54,16 +54,15 @@ pub fn run(func: &mut Function) -> bool {
     for block in func.blocks.values_mut() {
         let before = block.insts.len();
         block.insts.retain(|inst| {
-            if let Some(dest) = inst.dest() {
-                if is_side_effect(inst) {
-                    return true;
-                }
-                if used.contains(&dest) {
-                    return true;
-                }
-                return false;
+            let dests = inst.dests();
+            if dests.is_empty() {
+                return true;
             }
-            true
+            if is_side_effect(inst) {
+                return true;
+            }
+            // Keep if any defined Value has a downstream use.
+            dests.iter().any(|d| used.contains(d))
         });
         if block.insts.len() != before {
             changed = true;
@@ -103,7 +102,7 @@ pub fn is_side_effect(inst: &Inst) -> bool {
             | Inst::RcDec(..)
             | Inst::CowStore(..)
             | Inst::CowStoreDyn(..)
-            | Inst::CowMoveOut(..)
+            | Inst::CowMoveOut { .. }
             | Inst::CowResizeDyn(..)
     )
 }

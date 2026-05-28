@@ -65,7 +65,7 @@ impl Function {
                 max_id = max_id.max(p.id + 1);
             }
             for inst in &block.insts {
-                if let Some(d) = inst.dest() {
+                for d in inst.dests() {
                     max_id = max_id.max(d.id + 1);
                 }
             }
