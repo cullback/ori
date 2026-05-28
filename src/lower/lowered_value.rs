@@ -34,19 +34,4 @@ impl LoweredValue {
     pub(super) fn single(v: Value) -> Self {
         Self::Single(v)
     }
-
-    /// Slice view of the contained Values. Single → one-element
-    /// slice; Multi → its slot Vec. Useful for iteration that
-    /// doesn't care which case it's in.
-    pub(super) fn slots(&self) -> &[Value] {
-        match self {
-            Self::Single(v) => std::slice::from_ref(v),
-            Self::Multi(vs) => vs.as_slice(),
-        }
-    }
-
-    /// True if this is a Multi.
-    pub(super) fn is_multi(&self) -> bool {
-        matches!(self, Self::Multi(_))
-    }
 }
