@@ -43,6 +43,7 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     crate::passes::lambda_lift::lift(&mut mono);
     let lambda_solution = crate::passes::lambda_solve::solve(&mono);
     crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
+    crate::passes::lambda_narrow::narrow(&mut mono);
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
@@ -229,9 +230,12 @@ main = |arg| (
 #[test]
 fn e_user_hof_two_callsites_same_type() {
     // Two call sites of `apply` with different closures of the same
-    // type. Pre-Stage-2 these merge into a 2-variant lambda set,
-    // forcing tag+payload heap and __apply_K dispatch. Post-Stage-2
-    // each call site has its own singleton set.
+    // type. Pre-Stage-2 these merged into a 2-variant lambda set,
+    // forcing the D2 (tag, payload_ptr) heap shape (2 allocs per
+    // closure: 4 total). Post-Stage-2 `lambda_narrow` clones `apply`
+    // per call site; each clone's HO param is a singleton TagUnion,
+    // Phase E decomposes the closure into register captures, and the
+    // body's `__apply_K` dispatch inlines as a direct call.
     let source = "\
 apply : (I64 -> I64), I64 -> I64
 apply = |f, n| f(n)
@@ -247,7 +251,31 @@ main = |arg| (
     let (result, heap) = run_with_heap(source, 5);
     // x1 = 1 + 15 = 16; x2 = 2 + 25 = 27; sum = 43
     assert_eq!(result, Scalar::I64(43));
-    println!("e_user_hof_two_callsites_same_type allocs: {}", heap.alloc_count);
+    assert_eq!(heap.alloc_count, 0,
+        "expected 0 allocs (per-call-site narrowing → Phase E for both \
+         closures), got {}",
+        heap.alloc_count);
+}
+
+#[test]
+fn e_user_hof_heterogeneous_callsite() {
+    // A single call site where the closure choice is a runtime
+    // condition (one of two lifted lambdas can flow in). Narrowing
+    // can't help here — the callee's HO param genuinely needs the
+    // multi-variant tag union. Verify the program still runs
+    // correctly (correctness check; alloc shape stays D2).
+    let source = "\
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    x = arg + 10
+    y = arg + 20
+    apply(if arg > 0 then (|n| n + x) else (|n| n + y), 7)
+)";
+    let result = run_i64(source, 5);
+    assert_eq!(result, 22);
 }
 
 #[test]
@@ -3544,6 +3572,7 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     crate::passes::lambda_lift::lift(&mut mono);
     let lambda_solution = crate::passes::lambda_solve::solve(&mono);
     crate::passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
+    crate::passes::lambda_narrow::narrow(&mut mono);
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     (mono.module, mono.symbols)
@@ -3650,10 +3679,14 @@ main = |arg| a(5)";
 }
 
 #[test]
-fn defunc_emits_apply_function() {
-    // The `__apply_K` function for a multi-entry lambda set
-    // should exist after defunc. Two lambdas flow into the same
-    // HO parameter, so the apply dispatch is needed.
+fn defunc_emits_apply_or_clone() {
+    // Two lambdas flow into the same HO parameter through two call
+    // sites. After `lambda_specialize` the merged set's `__apply_K`
+    // dispatcher is synthesized; after `lambda_narrow`, each call
+    // site retargets to a singleton clone of `apply` and `__apply_K`
+    // becomes unreachable. Both shapes — pre-narrow and post-narrow
+    // — are valid post-defunc outputs; assert that EITHER an
+    // `__apply_apply_*` dispatcher OR `apply__narrow*` clones exist.
     let source = "\
 apply : I64, (I64 -> I64) -> I64
 apply = |x, f| f(x)
@@ -3661,14 +3694,20 @@ apply = |x, f| f(x)
 main : I64, Bool -> I64
 main = |arg, b| if b then apply(5, |y| y * 2) else apply(5, |y| y + 1)";
     let (module, symbols) = compile_through_defunc(source);
-    let has_apply = module.decls.iter().any(|d| {
+    let mut has_apply_or_clone = false;
+    for d in &module.decls {
         if let crate::ast::Decl::FuncDef { name, .. } = d {
-            symbols.display(*name).starts_with("__apply_apply_")
-        } else {
-            false
+            let n = symbols.display(*name);
+            if n.starts_with("__apply_apply_") || n.starts_with("apply__narrow") {
+                has_apply_or_clone = true;
+                break;
+            }
         }
-    });
-    assert!(has_apply, "expected __apply_apply_* in module decls");
+    }
+    assert!(
+        has_apply_or_clone,
+        "expected __apply_apply_* or apply__narrow* in module decls"
+    );
 }
 
 // ============================================================

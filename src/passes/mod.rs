@@ -10,14 +10,16 @@
 //   8. lambda_lift       — lift lambdas to top-level functions
 //   9. lambda_solve      — 0-CFA: compute which closures flow where
 //  10. lambda_specialize — replace closures with constructors + dispatch
-//  11. decl_info         — build metadata tables for lowering
-//  12. reachable         — prune unreachable declarations
-//  13. ssa::lower        (not here — lives with the SSA IR)
+//  11. lambda_narrow     — per-call-site clones for user HOFs (Phase E)
+//  12. decl_info         — build metadata tables for lowering
+//  13. reachable         — prune unreachable declarations
+//  14. ssa::lower        (not here — lives with the SSA IR)
 
 pub mod decl_info;
 pub mod flatten_patterns;
 pub mod fold_lift;
 pub mod lambda_lift;
+pub mod lambda_narrow;
 pub mod lambda_solve;
 pub mod lambda_specialize;
 pub mod mono;

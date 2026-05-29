@@ -54,6 +54,7 @@ fn compile(
     passes::lambda_lift::lift(&mut mono);
     let lambda_solution = passes::lambda_solve::solve(&mono);
     passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
+    passes::lambda_narrow::narrow(&mut mono);
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = lower::lower(&mono, &resolved.fields)?;

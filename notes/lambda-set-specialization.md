@@ -1,6 +1,27 @@
 # Plan: per-call-site lambda set specialization
 
-Status: **Stage A shipped (walks).** Each `List.walk` / `List.walk_until` call site now has its own lambda set, keyed by the closure-arg's source span in addition to the step type. Phase E lowering's single-variant collapse fires for walk closures: the closure value decomposes into register captures, no tag/payload heap allocation, no `__apply_K` dispatcher. Verified by `e_captured_closure_in_walk` (2 allocs) and `e_two_walks_same_signature_singleton_each` (4 allocs across two walks).
+Status: **Shipped.** Stage A (walks) landed earlier; Stage 2 (user HOFs) landed as the `lambda_narrow` pass. `e_user_hof_two_callsites_same_type` is at 0 allocs (down from 4). All 238 tests + 4 audit tests pass.
+
+## Stage A — walks
+
+Each `List.walk` / `List.walk_until` call site has its own lambda set, keyed by the closure-arg's source span in addition to the step type. Phase E lowering's single-variant collapse fires for walk closures: the closure value decomposes into register captures, no tag/payload heap allocation, no `__apply_K` dispatcher. Verified by `e_captured_closure_in_walk` and `e_two_walks_same_signature_singleton_each`.
+
+## Stage 2 — user HOFs
+
+The `src/passes/lambda_narrow.rs` pass runs after `lambda_specialize`. For each `Call(user_hof, [Call(tag_sym, captures), ...])` where the tag's enclosing `TagDecl` is multi-variant, it:
+
+1. Generates a singleton `TagDecl` per narrowed HO position, with a fresh tag constructor symbol.
+2. Clones the callee `FuncDef` body with fresh `SymbolId`s for params and locals via an AST-substitution visitor.
+3. Rewrites the clone's body: `__apply_K(f, args)` where `f` is a narrowed param becomes `if f : new_tag(captures) then target_func(captures, args)` — a single-arm match that lower's `is_single_variant_tag_union` collapses to register decomposition.
+4. Registers a clone scheme in `func_schemes` with the HO param's type set to the singleton `Type::TagUnion` directly (skipping the `infer.transparent` indirection, since `infer.transparent` doesn't carry `TagUnion`-shaped entries).
+5. Rewrites each call site to target the clone, retargets the closure-constructor `Call`'s target to the new tag symbol, and pins the closure-expr's `ty` to the singleton `Type::TagUnion`.
+6. Adds the new `TagDecl`s + clones to `module.decls` and their `tag_targets` entries to `mono.tag_targets`. `decl_info::build` and `reachable::prune` pick them up automatically.
+
+Sites whose closure tag is in a single-variant `TagDecl` are skipped — narrowing there would be a no-op semantically and interacts badly with `const_eval`'s static-promotion path. The skip preserves the existing `e_user_hof_singleton_callsite` 0-alloc behavior (which comes from constant-fold + `static_promote`, not Phase E).
+
+Verified by pinned tests:
+- `e_user_hof_two_callsites_same_type` — two call sites of `apply` with different runtime-dependent closures, asserts 0 allocs.
+- `e_user_hof_heterogeneous_callsite` — single call site with `if cond then fn1 else fn2`, asserts correctness (alloc shape stays D2 since the merged tag union really is needed).
 
 Stage A landed as ~100 lines across `src/lower/walk.rs` (`walk_apply_name` takes a `Span`), `src/lower/call.rs` (callers pass the closure-arg span), `src/passes/lambda_solve.rs` (`walk_call_key` mangles the span), and `src/passes/reachable.rs` (mirrors the same name construction). The merge step in `lambda_solve` stayed — it still applies to non-walk HO positions.
 
