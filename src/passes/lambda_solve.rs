@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Decl, Expr, ExprKind, Stmt};
+use crate::ast::{Decl, Expr, ExprKind, Span, Stmt};
 use crate::passes::decl_info::{self, method_key};
 use crate::passes::mono::{append_type_mangling, Monomorphized};
 use crate::passes::reachable;
@@ -308,7 +308,11 @@ fn scan_expr(ctx: &mut Ctx<'_>, expr: &Expr<'_>) {
             // instead of sharing one apply with mixed returns.
             let mangled = resolved.clone().unwrap_or_else(|| segments.join("."));
             // Qualified form: `List.walk(xs, init, f)` — `f` at args[2].
-            let key = walk_call_key(&mangled, args.get(2).map(|a| &a.ty));
+            let key = walk_call_key(
+                &mangled,
+                args.get(2).map(|a| &a.ty),
+                args.get(2).map(|a| a.span),
+            );
             if is_list_walk(&mangled) || ctx.funcs.contains(&mangled) {
                 scan_call_args(ctx, &key, args, 0);
             } else {
@@ -323,10 +327,15 @@ fn scan_expr(ctx: &mut Ctx<'_>, expr: &Expr<'_>) {
                     // body, so mono can't specialize it — all walks
                     // share the unmangled callee name by default.
                     // Disambiguate by the step function's full type
-                    // (`(acc, elem) -> acc`) so walks at different
-                    // acc OR elem types land in separate lambda sets.
+                    // AND closure-arg span so each call site lands
+                    // in its own singleton lambda set, enabling the
+                    // Phase E direct-call shortcut at lower time.
                     // Method form: `xs.walk(init, f)` — `f` at args[1].
-                    let key = walk_call_key(target, args.get(1).map(|a| &a.ty));
+                    let key = walk_call_key(
+                        target,
+                        args.get(1).map(|a| &a.ty),
+                        args.get(1).map(|a| a.span),
+                    );
                     scan_call_args(ctx, &key, std::slice::from_ref(receiver.as_ref()), 0);
                     scan_call_args(ctx, &key, args, 1);
                 } else {
@@ -634,12 +643,15 @@ fn is_list_walk(name: &str) -> bool {
 }
 
 /// Build a lambda-set key for a walk call. Appends the step
-/// function's full type (`(acc, elem) -> acc`) to the callee name
-/// when the callee is a list walk, keeping different-typed walks in
-/// separate lambda sets. Keying on the step's whole `Arrow` discriminates
-/// both accumulator type AND element type — two walks with the same
-/// acc but different elem types would otherwise collide.
-fn walk_call_key(callee: &str, step_ty: Option<&Type>) -> String {
+/// function's full type and the closure-arg's source span to the
+/// callee name. The type mangling separates different-typed walks;
+/// the span mangling separates different call sites at the same
+/// type. Per-call-site keying is what makes each walk's lambda set
+/// singleton in the common case (one closure per call site), which
+/// fires Phase E's direct-call lowering and skips the apply
+/// dispatcher entirely.
+fn walk_call_key(callee: &str, step_ty: Option<&Type>, closure_span: Option<Span>) -> String {
+    use std::fmt::Write;
     if !is_list_walk(callee) {
         return callee.to_owned();
     }
@@ -649,5 +661,12 @@ fn walk_call_key(callee: &str, step_ty: Option<&Type>) -> String {
     let mut key = callee.to_owned();
     key.push_str("__");
     append_type_mangling(&mut key, ty);
+    if let Some(span) = closure_span {
+        write!(
+            &mut key,
+            "__cs{}_{}_{}",
+            span.file.0, span.start, span.end
+        ).unwrap();
+    }
     key
 }

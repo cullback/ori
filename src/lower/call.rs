@@ -209,7 +209,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let init_vals = self.to_slots(init_lv, &args[0].ty, &acc_slots);
                 let direct = self.resolve_closure_target(&args[1]);
                 let closure_val = self.lower_expr(&args[1]);
-                let apply_name = walk_apply_name(&mangled, &args[1].ty);
+                let apply_name = walk_apply_name(&mangled, &args[1].ty, args[1].span);
                 return self.lower_range_walk(
                     start, end, init_vals, closure_val, &apply_name,
                     walk.until, acc_slots, &args[0].ty, direct,
@@ -276,7 +276,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let init_vals = self.to_slots(init_lv, &args[0].ty, &acc_slots);
             let direct = self.resolve_closure_target(&args[1]);
             let closure_val = self.lower_expr(&args[1]);
-            let apply_name = walk_apply_name(&mangled, &args[1].ty);
+            let apply_name = walk_apply_name(&mangled, &args[1].ty, args[1].span);
             let elem_ty = list_element_type(&receiver.ty);
             return self.lower_list_walk(
                 recv_val,
@@ -352,7 +352,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let init_vals = self.to_slots(init_lv, &args[1].ty, &acc_slots);
             let direct = self.resolve_closure_target(&args[2]);
             let closure_val = self.lower_expr(&args[2]);
-            let apply_name = walk_apply_name(func, &args[2].ty);
+            let apply_name = walk_apply_name(func, &args[2].ty, args[2].span);
             if let Some((start, end)) = self.as_range_call(&args[0]) {
                 return self.lower_range_walk(
                     start, end, init_vals, closure_val, &apply_name,

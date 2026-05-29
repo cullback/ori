@@ -151,19 +151,103 @@ main = |_| (
 
 #[test]
 fn e_captured_closure_in_walk() {
-    // A closure-with-captures used in a walk. Under Phase E the
-    // closure's lambda set is single-variant (only this lambda type
-    // exists), so the closure value decomposes to Multi(captures...)
-    // at construction. Verify the walk still produces the right
-    // answer.
+    // A closure-with-captures used in a walk. Per-call-site lambda
+    // sets give this walk a singleton set, which Phase E lowering
+    // collapses to Multi(captures...) at construction — no tag and
+    // no payload heap object for the closure. Allocs are: list
+    // header (1) + data buffer (1) = 2. Without per-call-site
+    // keying the closure would also allocate a tag+payload heap
+    // object (2 more allocs).
     let source = "\
 main : I64 -> I64
 main = |arg| (
     n = arg + 10
     [1, 2, 3].walk(0, |acc, x| acc + n + x)
 )";
+    let (result, heap) = run_with_heap(source, 0);
     // walk: 0 + 10 + 1 + 10 + 2 + 10 + 3 = 36
-    assert_eq!(run_i64(source, 0), 36);
+    assert_eq!(result, Scalar::I64(36));
+    assert_eq!(heap.alloc_count, 2,
+        "expected 2 allocs (list header + data buffer; no closure heap), got {}",
+        heap.alloc_count);
+}
+
+#[test]
+fn e_two_walks_same_signature_singleton_each() {
+    // Two walks at the same `(I64, I64) -> I64` step type.
+    // Pre per-call-site keying both walks shared one lambda set
+    // (set contained two closures → multi-variant → went through
+    // `__apply_K` dispatcher and the closure value lived on the
+    // heap). With per-call-site keying each walk has its own
+    // singleton set, so each closure decomposes into register
+    // captures (Phase E).
+    let source = "\
+main : I64 -> I64
+main = |arg| (
+    a = arg + 10
+    b = arg + 20
+    s1 = [1, 2].walk(0, |acc, x| acc + a + x)
+    s2 = [3, 4].walk(s1, |acc, x| acc + b + x)
+    s2
+)";
+    let (result, heap) = run_with_heap(source, 0);
+    // walk1: 0 + 10 + 1 + 10 + 2 = 23
+    // walk2: 23 + 20 + 3 + 20 + 4 = 70
+    assert_eq!(result, Scalar::I64(70));
+    // Allocs: 2 list literals × (header + buffer) = 4. No closure heap.
+    assert_eq!(heap.alloc_count, 4,
+        "expected 4 allocs (2 list headers + 2 data buffers), got {}",
+        heap.alloc_count);
+}
+
+#[test]
+fn e_user_hof_singleton_callsite() {
+    // User HOF with one call site. The lambda set for `f` is a
+    // singleton (only one closure flows into it), so under Phase E
+    // the closure value should decompose to Multi(captures) at the
+    // call site and `f(n)` inside `apply` should be a direct call.
+    // Expected allocs: zero.
+    let source = "\
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    x = 10
+    apply(|y| y + x, arg)
+)";
+    let (result, heap) = run_with_heap(source, 5);
+    assert_eq!(result, Scalar::I64(15));
+    // The closure captures `x`. With Phase E, the closure value is
+    // Multi([x]) in registers — no heap object.
+    println!("e_user_hof_singleton_callsite allocs: {}", heap.alloc_count);
+    assert_eq!(heap.alloc_count, 0,
+        "expected 0 allocs (closure decomposed via Phase E), got {}",
+        heap.alloc_count);
+}
+
+#[test]
+fn e_user_hof_two_callsites_same_type() {
+    // Two call sites of `apply` with different closures of the same
+    // type. Pre-Stage-2 these merge into a 2-variant lambda set,
+    // forcing tag+payload heap and __apply_K dispatch. Post-Stage-2
+    // each call site has its own singleton set.
+    let source = "\
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    a = arg + 10
+    b = arg + 20
+    x1 = apply(|y| y + a, 1)
+    x2 = apply(|y| y + b, 2)
+    x1 + x2
+)";
+    let (result, heap) = run_with_heap(source, 5);
+    // x1 = 1 + 15 = 16; x2 = 2 + 25 = 27; sum = 43
+    assert_eq!(result, Scalar::I64(43));
+    println!("e_user_hof_two_callsites_same_type allocs: {}", heap.alloc_count);
 }
 
 #[test]

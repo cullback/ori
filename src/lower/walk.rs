@@ -3,7 +3,7 @@
 //! blocks) with the accumulator threaded through block params — no
 //! intermediate list allocation needed for `range`-driven walks.
 
-use crate::ast::{Expr, ExprKind};
+use crate::ast::{Expr, ExprKind, Span};
 use crate::passes::lambda_specialize::SingletonTarget;
 use crate::ssa::Value;
 use crate::ssa::instruction::{BinaryOp, ScalarType};
@@ -33,14 +33,22 @@ pub fn classify_walk(name: &str) -> Option<WalkKind> {
 
 /// Build the apply-function name for a walk call. Mirrors the
 /// `walk_call_key` logic in `lambda_solve`: appends the step
-/// function's full `Arrow` type so specialized walks get their own
-/// per-type apply dispatchers. `List.walk` is an intrinsic (no body
-/// to monomorphize), so without this all walks would share a single
-/// apply with type-incoherent arm returns.
-pub fn walk_apply_name(callee: &str, step_ty: &Type) -> String {
+/// function's full `Arrow` type AND the closure-arg's source span
+/// so each walk call site gets its own lambda set. `List.walk` is
+/// an intrinsic with no body to monomorphize; per-call-site keying
+/// is what lets the single closure flowing into each walk-site land
+/// in a singleton set, which Phase E lowering collapses into a
+/// direct call (no `__apply_K` dispatch, no payload heap object).
+pub fn walk_apply_name(callee: &str, step_ty: &Type, closure_span: Span) -> String {
+    use std::fmt::Write;
     let mut key = callee.to_owned();
     key.push_str("__");
     crate::passes::mono::append_type_mangling(&mut key, step_ty);
+    write!(
+        &mut key,
+        "__cs{}_{}_{}",
+        closure_span.file.0, closure_span.start, closure_span.end
+    ).unwrap();
     format!("__apply_{key}_2")
 }
 

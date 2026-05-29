@@ -171,11 +171,18 @@ fn is_list_walk(name: &str) -> bool {
 /// Build the same apply-function name that `lambda_solve` /
 /// `ssa::lower::walk_apply_name` produce so reachability marks the
 /// per-step-type apply variant as live. Keyed on the step function's
-/// full `Arrow` type to match `walk_call_key`.
-fn walk_apply_ref(callee: &str, step_ty: &crate::types::engine::Type) -> String {
+/// full `Arrow` type AND closure-arg span to match `walk_call_key`
+/// (per-call-site lambda sets).
+fn walk_apply_ref(callee: &str, step_ty: &crate::types::engine::Type, closure_span: crate::ast::Span) -> String {
+    use std::fmt::Write;
     let mut key = callee.to_owned();
     key.push_str("__");
     crate::passes::mono::append_type_mangling(&mut key, step_ty);
+    write!(
+        &mut key,
+        "__cs{}_{}_{}",
+        closure_span.file.0, closure_span.start, closure_span.end
+    ).unwrap();
     format!("__apply_{key}_2")
 }
 
@@ -208,12 +215,12 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) 
             // step function's type, which is args[2] in the
             // qualified form `List.walk(xs, init, f)`.
             if is_list_walk(&joined) && args.len() >= 3 {
-                refs.push(walk_apply_ref(&joined, &args[2].ty));
+                refs.push(walk_apply_ref(&joined, &args[2].ty, args[2].span));
             }
             refs.push(joined);
             if let Some(r) = resolved {
                 if is_list_walk(r) && args.len() >= 3 {
-                    refs.push(walk_apply_ref(r, &args[2].ty));
+                    refs.push(walk_apply_ref(r, &args[2].ty, args[2].span));
                 }
                 refs.push(r.clone());
             }
@@ -285,7 +292,7 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) 
             if let Some(r) = resolved {
                 // Method form: `xs.walk(init, f)` — `f` at args[1].
                 if is_list_walk(r) && args.len() >= 2 {
-                    refs.push(walk_apply_ref(r, &args[1].ty));
+                    refs.push(walk_apply_ref(r, &args[1].ty, args[1].span));
                 }
                 refs.push(r.clone());
             }
