@@ -28,7 +28,7 @@ use crate::ast::{
     self, Decl, Expr, ExprKind, MatchArm, Module, Pattern, Span, Stmt, TagDecl, TypeDeclKind,
     TypeExpr,
 };
-use crate::passes::lambda_solve::{LambdaEntry, LambdaSet, LambdaSolution};
+use crate::passes::lambda::solve::{LambdaEntry, LambdaSet, LambdaSolution};
 use crate::passes::mono::Monomorphized;
 use crate::source::SourceArena;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};

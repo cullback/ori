@@ -4,7 +4,7 @@
 //! intermediate list allocation needed for `range`-driven walks.
 
 use crate::ast::{Expr, ExprKind, Span};
-use crate::passes::lambda_specialize::SingletonTarget;
+use crate::passes::lambda::SingletonTarget;
 use crate::ssa::Value;
 use crate::ssa::instruction::{BinaryOp, ScalarType};
 use crate::types::engine::Type;

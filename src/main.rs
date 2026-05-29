@@ -51,10 +51,10 @@ fn compile(
     passes::topo::compute(&mut resolved)?;
     let infer_result = types::infer::check(&mut resolved)?;
     let mut mono = passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
-    passes::lambda_lift::lift(&mut mono);
-    let lambda_solution = passes::lambda_solve::solve(&mono);
-    passes::lambda_specialize::specialize(&mut mono, &lambda_solution);
-    passes::lambda_narrow::narrow(&mut mono);
+    passes::lambda::lift::lift(&mut mono);
+    let lambda_solution = passes::lambda::solve::solve(&mono);
+    passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
+    passes::lambda::narrow::narrow(&mut mono);
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (mut ssa_module, input_vals) = lower::lower(&mono, &resolved.fields)?;

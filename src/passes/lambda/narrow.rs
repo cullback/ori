@@ -35,7 +35,7 @@ use crate::ast::{
     self, Decl, Expr, ExprKind, ListPatternElem, MatchArm, Module, Pattern,
     RecordPatternRest, Span, Stmt, TagDecl, TypeDeclKind, TypeExpr,
 };
-use crate::passes::lambda_specialize::SingletonTarget;
+use crate::passes::lambda::specialize::SingletonTarget;
 use crate::passes::mono::Monomorphized;
 use crate::symbol::{FieldSym, SymbolId, SymbolKind, SymbolTable};
 use crate::types::engine::{Scheme, Type};

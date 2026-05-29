@@ -7,21 +7,17 @@
 //   5. topo              — topological sort, detect cycles (System T)
 //   6. types::infer      (not here — lives with the type engine)
 //   7. mono              — monomorphize polymorphic functions
-//   8. lambda_lift       — lift lambdas to top-level functions
-//   9. lambda_solve      — 0-CFA: compute which closures flow where
-//  10. lambda_specialize — replace closures with constructors + dispatch
-//  11. lambda_narrow     — per-call-site clones for user HOFs (Phase E)
-//  12. decl_info         — build metadata tables for lowering
-//  13. reachable         — prune unreachable declarations
-//  14. ssa::lower        (not here — lives with the SSA IR)
+//   8. lambda::*         — defunctionalize closures (4-pass sub-pipeline):
+//                          lift → solve → specialize → narrow
+//                          See `lambda/README.md` for the model and rationale.
+//   9. decl_info         — build metadata tables for lowering
+//  10. reachable         — prune unreachable declarations
+//  11. ssa::lower        (not here — lives with the SSA IR)
 
 pub mod decl_info;
 pub mod flatten_patterns;
 pub mod fold_lift;
-pub mod lambda_lift;
-pub mod lambda_narrow;
-pub mod lambda_solve;
-pub mod lambda_specialize;
+pub mod lambda;
 pub mod mono;
 pub mod reachable;
 pub mod resolve;

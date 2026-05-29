@@ -179,7 +179,7 @@ fn stmt_uses(s: &Stmt<'_>, target: SymbolId) -> bool {
 
 // ---- SSA lowering context ----
 
-use crate::passes::lambda_specialize::SingletonTarget;
+use crate::passes::lambda::SingletonTarget;
 
 struct LowerCtx<'a, 'src> {
     builder: Builder,
