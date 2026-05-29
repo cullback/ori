@@ -196,8 +196,6 @@ impl fmt::Display for FmtInst<'_> {
             }
             Inst::RcInc(ptr) => write!(f, "rc_inc {}", fmt_val(*ptr, consts)),
             Inst::RcDec(ptr) => write!(f, "rc_dec {}", fmt_val(*ptr, consts)),
-            Inst::Pack(d, fields) => write!(f, "{d}: {} = pack {}", d.ty, fmt_args(fields, consts)),
-            Inst::Extract(d, agg, idx) => write!(f, "{d}: {} = extract {}, {idx}", d.ty, fmt_val(*agg, consts)),
             Inst::CowStore(d, ptr, off, val) => write!(f, "{d}: {} = cow_store {}[{off}], {}", d.ty, fmt_val(*ptr, consts), fmt_val(*val, consts)),
             Inst::CowStoreDyn(d, ptr, idx, val) => write!(f, "{d}: {} = cow_store_dyn {}[{}], {}", d.ty, fmt_val(*ptr, consts), fmt_val(*idx, consts), fmt_val(*val, consts)),
             Inst::CowMoveOut { results: [out, val], src, offset } => write!(
@@ -289,7 +287,6 @@ impl fmt::Display for ScalarType {
             Self::F64 => write!(f, "f64"),
             Self::Ptr => write!(f, "ptr"),
             Self::RcPtr => write!(f, "rcptr"),
-            Self::Agg(n) => write!(f, "agg<{n}>"),
         }
     }
 }

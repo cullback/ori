@@ -19,15 +19,12 @@
 //! | `Call(_, _, args)`   | every Ptr arg                    | —                        |
 //! | `Store(p, _, v)`     | v (when Ptr)                     | p                        |
 //! | `StoreDyn(p, i, v)`  | v (when Ptr)                     | p, i                     |
-//! | `Pack(_, fields)`    | every Ptr field                  | —                        |
-//! | `Insert(_, a, _, v)` | a (if Ptr), v (if Ptr)           | —                        |
 //! | `Reset(_, p, _)`     | p                                | —                        |
 //! | `RcDec(p)`           | p                                | —                        |
 //! | `Drop(p, _)`         | p                                | —                        |
 //! | `Free(p)`            | p                                | —                        |
 //! | `Load(_, p, _)`      | —                                | p                        |
 //! | `LoadDyn(_, p, i)`   | —                                | p, i                     |
-//! | `Extract(_, a, _)`   | —                                | a                        |
 //! | `BinOp(_, _, l, r)`  | —                                | l, r                     |
 //! | `Cast`/`BitCast`     | —                                | src                      |
 //! | `RcInc(p)`           | —                                | p                        |
@@ -44,12 +41,9 @@ use crate::ssa::instruction::{BlockId, Inst, ScalarType, Value};
 use crate::ssa::{Function, Module};
 
 /// Values whose lifetime rc_emit must track: heap pointers (`Ptr`,
-/// `RcPtr`) and aggregates (`Agg(_)`). Aggs carry rc on behalf of
-/// their RcPtr fields — `Pack` auto-rc-incs them, `RcDec` on an Agg
-/// cascade-rc_decs them, so an Agg-typed local needs an end-of-life
-/// `rc_dec` just like a Ptr-typed one.
+/// `RcPtr`).
 fn needs_rc_emit(ty: ScalarType) -> bool {
-    matches!(ty, ScalarType::Ptr | ScalarType::RcPtr | ScalarType::Agg(_))
+    matches!(ty, ScalarType::Ptr | ScalarType::RcPtr)
 }
 
 /// Run naïve RC emission on every function in `module`.
@@ -371,26 +365,6 @@ fn classify(inst: &Inst) -> (Vec<Value>, Vec<Value>) {
         Inst::Cast(_, src) | Inst::BitCast(_, src) => {
             if is_ptr(src) {
                 borr.push(*src);
-            }
-        }
-        Inst::Pack(_, fields) => {
-            // Pack consumes its fields: each field's value moves
-            // into the aggregate. Mirrors how stores into a heap
-            // alloc auto-rc_inc — but since the agg is register-
-            // resident, no rc traffic; the rc accounting falls out
-            // of normal scope rules on the field values.
-            for f in fields {
-                if is_ptr(f) {
-                    borr.push(*f);
-                }
-            }
-        }
-        Inst::Extract(_, agg, _) => {
-            // Extract reads a field from an agg; the field's scalar
-            // is conceptually a fresh value. The agg itself is
-            // borrowed.
-            if is_ptr(agg) {
-                borr.push(*agg);
             }
         }
     }

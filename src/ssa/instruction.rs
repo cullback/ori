@@ -50,13 +50,6 @@ impl fmt::Display for BlockId {
 /// on the stack and skip rc bookkeeping entirely. Currently unused
 /// — `static_promote` produces statics typed as RcPtr (which is
 /// fine because rc on the sentinel-rc statics is a runtime no-op).
-///
-/// `Agg(n)` is an aggregate of `n` scalar values that lives in a
-/// register (i.e. in the SSA value's slot in `env`, not on the heap).
-/// Constructed by `Pack`, accessed by `Extract`. Lower never emits
-/// Agg-typed values directly — every aggregate construction lowers
-/// to `Alloc + Store`. The `opt::sroa` pass promotes heap allocs that
-/// don't escape into Agg values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     I8,
@@ -70,25 +63,16 @@ pub enum ScalarType {
     F64,
     Ptr,
     RcPtr,
-    /// Aggregate of `n` fields. Carries no per-field type info — the
-    /// runtime `Scalar::Agg(Vec<Scalar>)` carries that. Field count
-    /// is enough for validation (Pack's arity matches, Extract index
-    /// is in range).
-    Agg(usize),
 }
 
 impl ScalarType {
-    /// Byte width of this type when stored on the heap. Agg has no
-    /// heap representation — promoted aggs live in registers only.
-    /// Spilling an Agg back to the heap requires lowering it to
-    /// `Alloc + Store` first.
+    /// Byte width of this type when stored on the heap.
     pub fn byte_width(self) -> usize {
         match self {
             Self::I8 | Self::U8 => 1,
             Self::I16 | Self::U16 => 2,
             Self::I32 | Self::U32 => 4,
             Self::I64 | Self::U64 | Self::F64 | Self::Ptr | Self::RcPtr => 8,
-            Self::Agg(_) => panic!("Agg has no heap byte width — aggregate values live in registers only"),
         }
     }
 
@@ -262,15 +246,6 @@ pub enum Inst {
     ///
     /// Treated as CONSUME of `ptr` by rc_emit — same as CowStore.
     CowResizeDyn(Value, Value, Value),
-    /// dest = aggregate of N scalar values, in register. Used by
-    /// `opt::sroa` to promote a heap alloc whose result doesn't
-    /// escape. `dest.ty` is `Agg(N)`; `fields.len() == N`.
-    Pack(Value, Vec<Value>),
-    /// dest = field at `index` of an aggregate value. `src.ty` is
-    /// `Agg(N)`; `index < N`; `dest.ty` is whatever the field's
-    /// scalar type is (runtime carries the per-field type via the
-    /// `Scalar::Agg` Vec).
-    Extract(Value, Value, usize),
     /// dest = pointer to a pre-allocated static object by index.
     /// The object lives in `Module::statics` and is never freed.
     StaticRef(Value, usize),
@@ -299,8 +274,6 @@ impl Inst {
             | Self::CowStore(v, _, _, _)
             | Self::CowStoreDyn(v, _, _, _)
             | Self::CowResizeDyn(v, _, _)
-            | Self::Pack(v, _)
-            | Self::Extract(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
             | Self::BitCast(v, _) => std::slice::from_ref(v),
@@ -322,8 +295,6 @@ impl Inst {
             | Self::CowStore(v, _, _, _)
             | Self::CowStoreDyn(v, _, _, _)
             | Self::CowResizeDyn(v, _, _)
-            | Self::Pack(v, _)
-            | Self::Extract(v, _, _)
             | Self::StaticRef(v, _)
             | Self::Cast(v, _)
             | Self::BitCast(v, _) => std::slice::from_mut(v),
@@ -368,8 +339,6 @@ impl Inst {
             Self::LoadDyn(_, ptr, idx) => vec![*ptr, *idx],
             Self::StoreDyn(ptr, idx, val) => vec![*ptr, *idx, *val],
             Self::RcInc(v) | Self::RcDec(v) => vec![*v],
-            Self::Pack(_, fields) => fields.clone(),
-            Self::Extract(_, agg, _) => vec![*agg],
             Self::CowStore(_, ptr, _, val) => vec![*ptr, *val],
             Self::CowStoreDyn(_, ptr, idx, val) => vec![*ptr, *idx, *val],
             Self::CowMoveOut { src, .. } => vec![*src],
@@ -391,8 +360,6 @@ impl Inst {
             Self::LoadDyn(_, ptr, idx) => { f(ptr); f(idx); }
             Self::StoreDyn(ptr, idx, val) => { f(ptr); f(idx); f(val); }
             Self::RcInc(v) | Self::RcDec(v) => f(v),
-            Self::Pack(_, fields) => fields.iter_mut().for_each(&mut f),
-            Self::Extract(_, agg, _) => f(agg),
             Self::CowStore(_, ptr, _, val) => { f(ptr); f(val); }
             Self::CowStoreDyn(_, ptr, idx, val) => { f(ptr); f(idx); f(val); }
             Self::CowMoveOut { src, .. } => f(src),

@@ -512,11 +512,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             ScalarType::U64 => self.builder.const_u64(0),
             ScalarType::F64 => self.builder.const_f64(0.0),
             ScalarType::Ptr | ScalarType::RcPtr => self.builder.const_ptr_null(),
-            ScalarType::Agg(_) => panic!(
-                "dummy_of(Agg): lower never emits Agg-typed dummies — \
-                 Agg values appear only after opt::sroa, which runs \
-                 after lower"
-            ),
         }
     }
 

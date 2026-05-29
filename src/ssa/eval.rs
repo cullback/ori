@@ -2,12 +2,6 @@ use crate::ssa::Module;
 use crate::ssa::instruction::{BinaryOp, Inst, ScalarType, Terminator, Value};
 
 /// A scalar runtime value that fits in a register.
-///
-/// `Agg(handle)` is an aggregate value whose contents live in a side
-/// table (`Scratch::aggs`). Keeping `Scalar` `Copy` is important —
-/// env is indexed thousands of times per eval and we don't want to
-/// pay clone overhead on every access. Aggregate contents are
-/// referenced indirectly via `handle`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scalar {
     I8(i8),
@@ -20,17 +14,18 @@ pub enum Scalar {
     U64(u64),
     F64(f64),
     Ptr(usize), // index into heap
-    Agg(usize), // index into Scratch::aggs
 }
 
 /// Simulated heap for the interpreter.
 /// Each allocation is a byte buffer. Ptr-typed fields are tracked
 /// by byte offset so rc_dec can cascade-free children.
 /// Sentinel refcount for static/permanent objects (never freed).
-const RC_STATIC: usize = usize::MAX;
+/// Aligned with the target byte layout (header = `[pad:u32 | rc:u32]`,
+/// see `notes/ssa-decompose-plan.md` "Memory layout").
+const RC_STATIC: u32 = u32::MAX;
 
 struct HeapObject {
-    rc: usize,
+    rc: u32,
     data: Vec<u8>,
     /// Byte offsets of Ptr-typed values within `data`.
     ptr_offsets: Vec<usize>,
@@ -41,12 +36,6 @@ struct HeapObject {
 
 pub struct Heap {
     objects: Vec<HeapObject>,
-    /// Side table for aggregate-typed runtime values. `Scalar::Agg(h)`
-    /// indexes into here. No refcounting — aggregates are SSA-tracked,
-    /// not heap-managed. Currently never freed (handles accumulate
-    /// for the duration of an `eval`); lifecycle management can come
-    /// later if the cost matters.
-    aggs: Vec<Vec<Scalar>>,
     /// Free-list of indices with refcount 0, available for reuse.
     free_list: Vec<usize>,
     /// Cumulative allocation count (fresh + freelist reuse). Statics
@@ -100,9 +89,6 @@ fn scalar_type_of(val: Scalar) -> ScalarType {
         Scalar::U64(_) => ScalarType::U64,
         Scalar::F64(_) => ScalarType::F64,
         Scalar::Ptr(_) => ScalarType::RcPtr,
-        // We don't carry agg field count here; callers that need
-        // the precise type look at the SSA Value's declared type.
-        Scalar::Agg(_) => panic!("scalar_type_of(Agg): use the SSA value's declared type"),
     }
 }
 
@@ -119,7 +105,6 @@ fn write_scalar(buf: &mut [u8], offset: usize, val: Scalar) {
         Scalar::I64(n) => buf[offset..offset + 8].copy_from_slice(&n.to_le_bytes()),
         Scalar::F64(n) => buf[offset..offset + 8].copy_from_slice(&n.to_bits().to_le_bytes()),
         Scalar::Ptr(p) => buf[offset..offset + 8].copy_from_slice(&(p as u64).to_le_bytes()),
-        Scalar::Agg(_) => panic!("write_scalar: cannot store Agg to heap — spill to Pack/Extract first"),
     }
 }
 
@@ -136,7 +121,6 @@ fn read_scalar(buf: &[u8], offset: usize, ty: ScalarType) -> Scalar {
         ScalarType::I64 => Scalar::I64(i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())),
         ScalarType::F64 => Scalar::F64(f64::from_bits(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()))),
         ScalarType::Ptr | ScalarType::RcPtr => Scalar::Ptr(u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap()) as usize),
-        ScalarType::Agg(_) => panic!("read_scalar: Agg has no heap representation"),
     }
 }
 
@@ -145,20 +129,12 @@ impl Heap {
         // Index 0 is null
         Self {
             objects: vec![HeapObject { rc: 0, data: vec![], ptr_offsets: vec![], type_map: vec![] }],
-            aggs: Vec::new(),
             free_list: Vec::new(),
             alloc_count: 0,
             fresh_alloc_count: 0,
             free_count: 0,
             peak_live: 0,
         }
-    }
-
-    /// Allocate a new aggregate value. Returns its handle.
-    fn alloc_agg(&mut self, fields: Vec<Scalar>) -> usize {
-        let h = self.aggs.len();
-        self.aggs.push(fields);
-        h
     }
 
     /// Raw byte-write of null at byte offset. No rc traffic — used
@@ -683,40 +659,15 @@ fn eval_inst(_module: &Module, heap: &mut Heap, _scratch: &mut Scratch, env: &En
         }
 
         Inst::RcInc(ptr) => {
-            match env[ptr.id] {
-                Scalar::Ptr(idx) => heap.rc_inc(idx),
-                // RcInc on an Agg-typed value cascades through its
-                // RcPtr fields — the Agg "owns" claims on each Ptr
-                // field (placed there by Pack / cow_move_out / etc.),
-                // and sharing the Agg means sharing those claims.
-                Scalar::Agg(handle) => {
-                    let len = heap.aggs[handle].len();
-                    for i in 0..len {
-                        if let Scalar::Ptr(child) = heap.aggs[handle][i] {
-                            heap.rc_inc(child);
-                        }
-                    }
-                }
-                _ => {}
+            if let Scalar::Ptr(idx) = env[ptr.id] {
+                heap.rc_inc(idx);
             }
             None
         }
 
         Inst::RcDec(ptr) => {
-            match env[ptr.id] {
-                Scalar::Ptr(idx) => heap.rc_dec(idx),
-                // RcDec on an Agg-typed value cascade-rc_decs its
-                // RcPtr fields, mirroring the cascade-free that
-                // happens when a heap alloc with Ptr children dies.
-                Scalar::Agg(handle) => {
-                    let len = heap.aggs[handle].len();
-                    for i in 0..len {
-                        if let Scalar::Ptr(child) = heap.aggs[handle][i] {
-                            heap.rc_dec(child);
-                        }
-                    }
-                }
-                _ => {}
+            if let Scalar::Ptr(idx) = env[ptr.id] {
+                heap.rc_dec(idx);
             }
             None
         }
@@ -766,38 +717,6 @@ fn eval_inst(_module: &Module, heap: &mut Heap, _scratch: &mut Scratch, env: &En
         Inst::CowMoveOut { .. } => {
             // Handled in the multi-result branch in eval_function_inner.
             unreachable!("CowMoveOut routed via dedicated handler");
-        }
-
-        Inst::Pack(_dest, fields) => {
-            let vals: Vec<Scalar> = fields.iter().map(|f| env[f.id]).collect();
-            // Pack owns claims on its RcPtr fields, same as a heap
-            // alloc whose Stores would have auto-rc-inc'd. The
-            // matching releases happen at Extract (mints a fresh
-            // claim) and at RcDec on the Agg (cascade-frees the
-            // owned claims).
-            for (val, decl) in vals.iter().zip(fields.iter()) {
-                if decl.ty == ScalarType::RcPtr {
-                    if let Scalar::Ptr(child) = val {
-                        heap.rc_inc(*child);
-                    }
-                }
-            }
-            Some(Scalar::Agg(heap.alloc_agg(vals)))
-        }
-
-        Inst::Extract(dest, agg, idx) => {
-            let Scalar::Agg(handle) = env[agg.id] else {
-                panic!("extract from non-agg: {:?}", env[agg.id]);
-            };
-            let val = heap.aggs[handle][*idx];
-            // Mint a fresh claim for the consumer, mirroring Load's
-            // auto-rc-inc on RcPtr reads.
-            if dest.ty == ScalarType::RcPtr {
-                if let Scalar::Ptr(child) = val {
-                    heap.rc_inc(child);
-                }
-            }
-            Some(val)
         }
 
         Inst::Cast(dest, src) => {
@@ -870,7 +789,6 @@ fn bits_to_scalar(ty: ScalarType, bits: u64) -> Scalar {
         ScalarType::U64 => Scalar::U64(bits),
         ScalarType::F64 => Scalar::F64(f64::from_bits(bits)),
         ScalarType::Ptr | ScalarType::RcPtr => Scalar::Ptr(bits as usize),
-        ScalarType::Agg(_) => panic!("bits_to_scalar(Agg): aggregates can't be reconstructed from a single u64"),
     }
 }
 
@@ -886,7 +804,6 @@ fn scalar_to_u64(s: Scalar) -> u64 {
         Scalar::U64(n) => n,
         Scalar::Ptr(p) => p as u64,
         Scalar::F64(_) => panic!("switch on float"),
-        Scalar::Agg(_) => panic!("scalar_to_u64(Agg): aggregates have no scalar bit pattern"),
     }
 }
 

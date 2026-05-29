@@ -17,7 +17,6 @@ pub mod nop_elim;
 pub mod operands;
 pub mod rc_elide_static;
 pub mod rc_fuse;
-pub mod sroa;
 pub mod static_promote;
 
 use crate::ssa::Module;
@@ -54,8 +53,6 @@ pub fn run_full_pipeline(module: &mut Module) {
     crate::lower::ssa_form::run(module);
     optimize(module);
     const_eval::evaluate(module);
-    optimize(module);
-    sroa::run(module);
     optimize(module);
     rc_elide_static::run(module);
     rc_fuse::run(module);

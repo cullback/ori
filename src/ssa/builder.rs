@@ -326,25 +326,6 @@ impl Builder {
         self.push(Inst::RcDec(ptr));
     }
 
-    // ---- Aggregate values (register-resident) ----
-
-    /// Construct an aggregate from N field values. The dest gets
-    /// type `Agg(fields.len())`.
-    pub fn pack(&mut self, fields: Vec<Value>) -> Value {
-        let v = self.fresh_value(ScalarType::Agg(fields.len()));
-        self.push(Inst::Pack(v, fields));
-        v
-    }
-
-    /// Extract field at `index` from an aggregate. Caller specifies
-    /// the destination type since `ScalarType::Agg(n)` doesn't carry
-    /// per-field types.
-    pub fn extract(&mut self, agg: Value, index: usize, ty: ScalarType) -> Value {
-        let v = self.fresh_value(ty);
-        self.push(Inst::Extract(v, agg, index));
-        v
-    }
-
     pub fn cast(&mut self, src: Value, dest_ty: ScalarType) -> Value {
         let v = self.fresh_value(dest_ty);
         self.push(Inst::Cast(v, src));
