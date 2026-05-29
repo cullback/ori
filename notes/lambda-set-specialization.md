@@ -6,14 +6,42 @@ Stage A landed as ~100 lines across `src/lower/walk.rs` (`walk_apply_name` takes
 
 **Remaining: Stages 1-6 below** — per-call-site specialization for *user-defined* HOFs, i.e. real callee cloning. Stage A only covers intrinsics (walk has no AST body, so per-call-site keying suffices; the existing lower-time `singletons` map handles direct dispatch). User HOFs like `apply : (a -> b), a -> b` need their bodies cloned per call site so the inner HO call dispatches against a known (likely singleton) set.
 
-## Empirical findings (Stage A session)
+## Empirical findings
 
 Two pinned tests in `src/test_frontend.rs` exercise user HOFs and reveal the precise gap:
 
-- `e_user_hof_singleton_callsite` — user HOF `apply = |f, n| f(n)` called from one call site with a captured closure. **0 heap allocs today.** The existing singleton path in `lambda_specialize::rewrite_expr` already emits a direct call for `f(n)` inside the body when the merged set is singleton (which it is, because there's only one call site).
-- `e_user_hof_two_callsites_same_type` — same user HOF called from two call sites with two different captured closures. **2 heap allocs today.** The merge step in `lambda_solve` unifies the two closures into one multi-variant set, forcing D2 tag+payload heap for each closure value and dispatch through `__apply_K`.
+- `e_user_hof_singleton_callsite` — user HOF `apply = |f, n| f(n)` called from one call site with a captured closure. **0 heap allocs today.** Note: this is *not* because Phase E fires — the closure value still uses the D2 shape — but because the closure's captures are constant-foldable (`x = 10`), so `const_eval` + `static_promote` bake the closure as a static and `rc_elide_static` removes the rc traffic. With runtime-dependent captures the count would be > 0.
+- `e_user_hof_two_callsites_same_type` — same user HOF called from two call sites with two different captured closures of runtime-dependent values. **4 heap allocs today** (2 per closure: one for the captures payload + one for the `(tag, payload_ptr)` D2 shell). The merge step in `lambda_solve` unifies the two closures into one multi-variant tag union; the D2 shape is then required for both call sites because Phase E (single-variant decomposition) doesn't fire.
 
-So Stage 2's actual scope is narrower than it seemed before: the existing single-variant collapse already does the right thing per-call-site *when the merged set happens to be singleton*. The work is specifically to **stop merging across independent call sites** of the same callee, which requires cloning the callee per call site to give each clone its narrower HO param type.
+So Stage 2's actual goal: 4 allocs → 0 for this case, by making each call site's closure type single-variant so Phase E lowering's `is_single_variant_tag_union` collapse fires.
+
+## What partial implementations do NOT work
+
+Verified during the Stage 2 design pass:
+
+- **Per-call-site keying in `lambda_solve` without cloning** breaks 16 tests. The body of `apply` runs `enter_scope("apply", params)` which looks up `param_to_set[("apply", 0)]`; if external call sites populate per-call-site keys like `("apply__cs<span>", 0)` instead, the body-side lookup finds nothing and `f` isn't marked HO. Inside the body, `f(n)` then dispatches as a regular call to a closure value → runtime crash.
+- **Adding per-call-site sets *alongside* the merged set** (so the body still finds its set) doesn't help. The closure value at the call site would carry the singleton tag union type (for Phase E), but the callee's `f` param still expects the merged tag union type → type mismatch at the SSA level (Phase E shape `Multi(captures)` is multi-slot, merged shape `Multi(tag, payload_ptr)` is two-slot, but with different scalar types — they're not interchangeable).
+- **SSA-level inline + branch-fold + DCE** doesn't currently eliminate the closure heap. The `--dump-ssa` output for the 2-callsite case shows all 4 `alloc` instructions surviving optimization; branch-fold doesn't see through the store→switch→load chain.
+
+The cloning approach is the only one that gives each call site's `f` its own narrower type, which is what unblocks Phase E.
+
+## Required machinery for Stage 2
+
+To make `apply.cs1` and `apply.cs2` each fire Phase E:
+
+1. **AST clone with substitution.** Deep-clone the callee's `Decl::FuncDef` body. Allocate fresh `SymbolId`s for params and any local lets/destructures/pattern bindings; build a substitution map; walk every `ExprKind::Name`, `Pattern::Binding`, `Stmt::Let { name }`, etc. and remap. ~150 lines.
+2. **New singleton TagDecls per call site.** Each clone's HO param type is a new transparent newtype around a single-variant tag union. The variant carries the captures. ~50 lines.
+3. **New tag constructor symbols.** Each new TagDecl needs its own constructor `SymbolId` (Ori constructors are scoped by name, and `decl_info::build` reads each TagDecl's variants into the constructors map). Updating `tag_targets` so `lower::resolve_closure_target` finds the direct call target. ~50 lines.
+4. **Inline singleton dispatch in clone bodies.** Replace `__apply_K(f, args)` in the cloned body with the singleton's inline match: `if f : tag(captures) then lifted_func(captures, args)`. ~80 lines.
+5. **Scheme updates for clones.** `mono.infer.func_schemes` needs entries for each clone with the HO param's narrowed type. Without this, `lower::scalar_type` won't resolve the param to the singleton TagDecl. ~30 lines.
+6. **Call-site rewriting.** Walk all `Call(callee, args)` sites; for matching patterns, change `target` to the clone's symbol and update the closure-constructor args to use the new singleton tag. ~80 lines.
+7. **Reachable + decl_info.** Both passes already iterate over all decls and pick up new clones automatically (decl_info builds from the module; reachable does a DFS from `__main`), so no changes needed *for the clones themselves* — but the original (now-unreached) `apply` body and the wide `__apply_K` will be pruned by reachable. Verify with `audit_ssa_cleanliness*`.
+
+Total: ~440 lines for the pass + tests + integration. Genuinely a focused multi-day session, not "let me hack at it for a few more turns."
+
+## Why this session stops here
+
+Stage A landed cleanly (~100 lines, surgical). Stage 2 is structurally an order of magnitude larger. Attempting it mid-session — after F1-F4 + G1 + F2-full already shipped — risks the half-baked outcome the user explicitly rejected. The architecture is now documented in detail; the empirical numbers are pinned in tests; the next session can open `lambda_narrow.rs`, write the AST substitution helper first, and proceed from a clean slate.
 
 ## Why per-call-site keying alone (without cloning) doesn't help user HOFs
 
