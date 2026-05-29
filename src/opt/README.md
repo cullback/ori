@@ -37,7 +37,7 @@ ssa_form           # repair cross-block refs introduced by inline
 optimize           # cleanup post-inline
 const_eval         # compile-time-evaluate zero-arg pure functions
 optimize           # cleanup post-const_eval
-rc_elide_static    # strip rc traffic on StaticRef values
+retype_statics     # static-derived Values: RcPtr → Ptr
 rc_fuse            # cancel adjacent rc_inc/rc_dec pairs
 optimize           # final cleanup
 ```
@@ -54,7 +54,7 @@ major transform (each major transform unlocks new local opportunities).
 | `static_promote` | Move constant allocs out of the hot path. | Find `Alloc(N)` whose every store is a Const (or a pointer to another promoted alloc). Replace with `StaticRef`. |
 | `inline` | Eliminate small function-call overhead. | For each `Call` to a small callee (≤ `MAX_INLINE_INSTS` = 30), splice the body into the caller. Splices in an `RcInc` for each RcPtr arg at the splice point to compensate for the removed auto-rc-on-Call (eval normally rc_inc's every RcPtr arg at Call boundary; without that bump the callee body's rc accounting over-decs). Cross-block refs cleaned up by `ssa_form`. |
 | `const_eval` | Bake out zero-arg pure computations. | For each user function `f()` (no args, not `__`-prefixed), run eval. If result is a `Scalar`, replace `Call` with `Const`; if a heap value, materialize as `StaticRef`. |
-| `rc_elide_static` | Strip no-op rc on statics. | `StaticRef` values have sentinel rc; `RcInc`/`RcDec` on them are no-ops. Remove them. |
+| `retype_statics` | Express static-no-rc intent at the type level. | Fixpoint propagation: every `StaticRef` dest is `Ptr`; block params whose every incoming edge carries a static are `Ptr`; if a `Return` carries a static, the function's return type is `Ptr` (so callers' Call dests retype). `rc_emit` then skips `Ptr` automatically; no separate rc-stripping pass needed. |
 | `rc_fuse` | Cancel obvious rc traffic. | Adjacent `RcInc(v)` / `RcDec(v)` pairs (with nothing between that could touch v's rc) cancel out. |
 
 **Note on SROA.** A scalar-replacement-of-aggregates pass used to live

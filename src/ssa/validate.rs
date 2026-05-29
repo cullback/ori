@@ -18,7 +18,18 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use super::Module;
-use super::instruction::{Inst, Terminator, Value};
+use super::instruction::{Inst, ScalarType, Terminator, Value};
+
+/// Are two scalar types compatible for flow analysis? Identical types
+/// are always compatible. `Ptr` and `RcPtr` are also compatible — both
+/// are 8-byte heap pointers, and the rc semantics are runtime-decided
+/// (sentinel-rc on statics is a no-op). This lets `static_promote`
+/// retype statics to `Ptr` without inserting bitcasts at every
+/// boundary where a static flows into an RcPtr-expecting position.
+fn types_compatible(a: ScalarType, b: ScalarType) -> bool {
+    if a == b { return true; }
+    matches!((a, b), (ScalarType::Ptr, ScalarType::RcPtr) | (ScalarType::RcPtr, ScalarType::Ptr))
+}
 
 /// Structural errors make the module unsafe to eval. Warnings are
 /// soft inconsistencies (type lies) that don't affect correctness
@@ -157,7 +168,7 @@ fn validate_function(
                 // Warning-level: the runtime tolerates type lies
                 // today but they hide real bugs.
                 for (i, (arg, param)) in edge.args.iter().zip(&target_block.params).enumerate() {
-                    if arg.ty != param.ty {
+                    if !types_compatible(arg.ty, param.ty) {
                         let mut msg = String::new();
                         let _ = write!(
                             msg,
@@ -185,7 +196,7 @@ fn validate_function(
                 ));
             } else {
                 for (i, (v, ty)) in vs.iter().zip(&func.return_type).enumerate() {
-                    if v.ty != *ty {
+                    if !types_compatible(v.ty, *ty) {
                         r.warnings.push(format!(
                             "{prefix}: b{} Return value #{i} ({v}) has type {:?} but function returns {:?} at that position",
                             bid.0, v.ty, ty

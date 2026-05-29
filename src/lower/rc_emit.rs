@@ -40,10 +40,11 @@ use std::collections::{HashMap, HashSet};
 use crate::ssa::instruction::{BlockId, Inst, ScalarType, Value};
 use crate::ssa::{Function, Module};
 
-/// Values whose lifetime rc_emit must track: heap pointers (`Ptr`,
-/// `RcPtr`).
+/// Values whose lifetime rc_emit must track. `RcPtr` participates in
+/// reference counting and gets explicit `rc_inc`/`rc_dec`; `Ptr` is a
+/// raw pointer (statics, never freed) and emits no rc traffic.
 fn needs_rc_emit(ty: ScalarType) -> bool {
-    matches!(ty, ScalarType::Ptr | ScalarType::RcPtr)
+    matches!(ty, ScalarType::RcPtr)
 }
 
 /// Run naïve RC emission on every function in `module`.
