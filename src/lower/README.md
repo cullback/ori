@@ -52,19 +52,22 @@ test harness re-validates after every pass — a breakage shows up as
 3. **Leak-free RC traffic** (`rc_emit`). Every heap allocation has
    a matching `rc_dec` (or cascade from a parent's release) by
    program exit. Tests assert via `Heap::count_live_objects() == 0`.
-4. **Natural emission, including FBIP.** Lower picks the natural
-   emission for each AST node. For "build a modified version of an
-   existing structure" AST nodes (`RecordUpdate`, `list.set`, etc.),
-   the natural lowering is `ReuseOrClone(src, N)` — a primitive
-   whose runtime check (`if src.rc == 1` → mutate in place, else
-   clone) enforces FBIP semantics dynamically. **FBIP is
-   established here, by lower; it is NOT an opt pass.**
+4. **Natural emission, including FBIP and decomposition.** Lower picks
+   the natural emission for each AST node.
+   - For "build a modified version of an existing structure" AST nodes
+     (`RecordUpdate`, `list.set`, etc.), the natural lowering is
+     `cow_store_dyn` / `cow_move_out` / `cow_resize_dyn` — primitives
+     whose runtime check (`if src.rc == 1` → mutate in place, else
+     clone) enforces FBIP semantics dynamically.
+   - For fixed-shape aggregates (tuples, records, single-variant tag
+     unions, closure envs), the natural lowering emits **parallel SSA
+     Values** — no heap object. Multi-result `Inst::Call` and
+     `Terminator::Return(Vec<Value>)` carry these across function
+     boundaries. `LoweredValue::{Single, Multi}` is the bridge between
+     emission and consumption.
 
-   Other shape-level optimizations (scalarization of non-escaping
-   heap allocs, etc.) DO live in `opt/` and run later. The
-   distinction: FBIP is a semantic guarantee about how language
-   constructs are implemented; SROA is a performance optimization
-   that recognizes a static-analysis opportunity.
+   **Both FBIP and aggregate decomposition are established here, by
+   lower; they are NOT opt passes.**
 5. **No dead let-bindings.** Ori is total/pure, so an unused `let`
    binding has no observable effect. Lower elides them before
    emitting (see `lower_block` in `mod.rs`).
@@ -117,9 +120,11 @@ interpretation).
 - **Lower establishes correctness; opt establishes performance.**
   If a problem is "the program crashes," it's lower's job. If it's
   "the program is slow," opt's.
-- **Aggregates are heap-allocated at lower time.** SROA in `opt/`
-  promotes them to register `Agg` values when safe — lower doesn't
-  need to know.
+- **Aggregates decompose at lower time.** Tuples, records, and single-
+  variant tag unions emit parallel SSA Values directly. Heap stays for
+  variable-length buffers and multi-variant tag union payloads. There
+  is no aggregate type at the IR level — `ScalarType::Agg` doesn't
+  exist; neither do `Pack` or `Extract`.
 - **Auto-rc semantics live in `eval`, not in `lower`.** Lower emits
   RcPtr-typed loads/stores; the runtime handles the rc bookkeeping.
   This used to be `rc_emit`'s job; pushing it into eval simplified

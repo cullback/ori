@@ -37,8 +37,6 @@ ssa_form           # repair cross-block refs introduced by inline
 optimize           # cleanup post-inline
 const_eval         # compile-time-evaluate zero-arg pure functions
 optimize           # cleanup post-const_eval
-sroa               # promote non-escaping heap allocs to Agg values
-optimize           # cleanup post-sroa
 rc_elide_static    # strip rc traffic on StaticRef values
 rc_fuse            # cancel adjacent rc_inc/rc_dec pairs
 optimize           # final cleanup
@@ -56,9 +54,15 @@ major transform (each major transform unlocks new local opportunities).
 | `static_promote` | Move constant allocs out of the hot path. | Find `Alloc(N)` whose every store is a Const (or a pointer to another promoted alloc). Replace with `StaticRef`. |
 | `inline` | Eliminate small function-call overhead. | For each `Call` to a small callee (≤ `MAX_INLINE_INSTS` = 30), splice the body into the caller. Splices in an `RcInc` for each RcPtr arg at the splice point to compensate for the removed auto-rc-on-Call (eval normally rc_inc's every RcPtr arg at Call boundary; without that bump the callee body's rc accounting over-decs). Cross-block refs cleaned up by `ssa_form`. |
 | `const_eval` | Bake out zero-arg pure computations. | For each user function `f()` (no args, not `__`-prefixed), run eval. If result is a `Scalar`, replace `Call` with `Const`; if a heap value, materialize as `StaticRef`. |
-| `sroa` | Avoid heap allocs for ephemeral aggregates. | Detect `Alloc + N stores` whose result doesn't escape (no Call args, no Store-as-val, only Load/rc/Return uses). Replace with `Pack` (register-resident `Agg`); convert `Load` → `Extract`. Handles flow through block params and Returns (sig changes verified for safety). **Distinct from FBIP** — FBIP is established by lower's emission of `ReuseOrClone` for structure-update AST nodes; SROA is a separate static-analysis optimization for non-escaping allocs in general. |
 | `rc_elide_static` | Strip no-op rc on statics. | `StaticRef` values have sentinel rc; `RcInc`/`RcDec` on them are no-ops. Remove them. |
 | `rc_fuse` | Cancel obvious rc traffic. | Adjacent `RcInc(v)` / `RcDec(v)` pairs (with nothing between that could touch v's rc) cancel out. |
+
+**Note on SROA.** A scalar-replacement-of-aggregates pass used to live
+here, promoting non-escaping heap allocs to register `Agg` values.
+After the SSA decompose work (notes/ssa-decompose-plan.md), lower
+emits decomposed parallel SSA Values directly for fixed-shape
+aggregates — no heap alloc to promote in the first place. SROA was
+deleted as dead code.
 
 ### Local cleanup bundle (`optimize`)
 
@@ -86,20 +90,8 @@ Runs in order, each one-shot (no internal fixpoint loop):
 - **`jump_threading` has a bug** triggered post-inline by certain
   CFG shapes — `fold_tree_depth` test currently fails with
   "index out of bounds at jump_threading.rs:68." Not yet root-caused.
-- **`sroa`'s escape detection is conservative.** Any single unsafe
-  use of a flow value demotes ALL allocs in that function. A more
-  precise per-flow-group analysis would catch more.
-- **`Scalar::Agg` lifecycle leak.** `Scalar::Agg(handle)` indexes
-  into `eval::Heap::aggs` (a side table separate from the normal
-  rc-managed heap). Aggregates accumulate over an `eval` call and
-  never get freed. For benchmarks and one-shot compilation this is
-  fine; long-running programs would need lifecycle management.
-  This is a runtime cost, not an SROA-pass cost — SROA just emits
-  the `Pack`/`Extract` IR that eval interprets.
 - **`inline`'s threshold is 30 insts.** Larger functions don't get
-  inlined regardless of whether SROA would benefit from inlining
-  them. Could be made cost-based ("inline if the callee returns a
-  heap alloc that'd be SROA'd at the call site"), but not yet.
+  inlined regardless. Could be made cost-based but not yet.
 
 ## Design notes worth remembering
 
@@ -109,12 +101,8 @@ Runs in order, each one-shot (no internal fixpoint loop):
 - **The `optimize` bundle runs after every major pass.** This is
   intentional: const folding after inline exposes new const branches;
   DCE after const eval kills dead code; etc.
-- **Sig changes (e.g., SROA-promoting a function's return) require
+- **Sig changes (e.g., promoting a function's return type) require
   verification across ALL callers.** Roll back on first unsafe use.
   Aborting cleanly is always preferable to a half-applied transform.
-- **Cross-function fixpoint** lives in `sroa::run` — analyses
-  iterate until no function's outcome changes, then verify, then
-  rewrite. Pattern that other whole-module passes (e.g., a future
-  inliner-with-cost-model) can follow.
 - **Disabling passes is cheap.** If a pass misbehaves, gate it off
   in `run_full_pipeline` and keep going; the program still works.

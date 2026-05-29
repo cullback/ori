@@ -67,22 +67,25 @@ block" view never escapes inference.
 
 ## SSA representation
 
-- Two value kinds: **`RcPtr`** (heap object, rc-tracked) and **`Agg(N)`**
-  (register-resident tuple; `Pack` and static-index-only `Extract`).
-  Lists and Strs are always `RcPtr` — two-tier `[len, cap, data_ptr]`
-  header plus a dynamic data buffer. `Str = List(U8)`; there is no
-  separate string primitive.
-- **Aggs carry rc on behalf of their RcPtr fields**, in symmetry with
-  how heap allocs carry rc on behalf of their Ptr-typed slots:
-  - `Pack(d, fields)` `rc_inc`s every RcPtr field (mirrors `Store`'s
-    auto-rc-inc).
-  - `Extract(d, agg, idx)` `rc_inc`s the extracted value if `d.ty ==
-    RcPtr` (mirrors `Load`'s auto-rc-inc).
-  - `RcInc`/`RcDec` on an Agg-typed value cascade through every Ptr
-    field stored in the Agg (mirrors alloc-free's cascade).
-  `rc_emit` places end-of-life `rc_dec` on Agg-typed locals the same
-  way it does on RcPtr-typed locals — `cow_move_out`'s Agg result
-  is no longer leaked.
+- Two pointer kinds: **`RcPtr`** (heap object, rc-tracked) and **`Ptr`**
+  (raw pointer; statics use this via the sentinel-rc convention).
+  Scalar value kinds (`I8`–`U64`, `F64`) round it out — no aggregate
+  type at the IR level.
+- **Decomposed aggregates.** Tuples, records, single-variant tag unions,
+  and closure environments lower to **parallel SSA Values**, not heap
+  objects. A `(I64, Str)` is two Values; a record `{a: I64, b: I64}` is
+  two Values; a single-variant `Wrapped(I64, Str)` is three Values.
+  Multi-result `Inst::Call` and `Terminator::Return(Vec<Value>)` carry
+  these across function boundaries. Heap stays for: variable-length
+  buffers, multi-variant tag union payloads, and anything that escapes.
+- **Lists and Strs.** `(len: U64, cap: U64, data: RcPtr)` decomposes
+  into three parallel Values. The data buffer's elements are inlined
+  per their decomposed shape: a `List(Record{a:I64, b:I64})` buffer
+  has 16-byte slots; `List(Str)` has 24-byte slots. `Str = List(U8)`;
+  no separate string primitive.
+- **Multi-variant tag unions** lower to `(tag: U64, payload_ptr: RcPtr)`
+  — two parallel Values. The payload heap object holds variant-specific
+  fields with no tag slot inside. Void variants use a null payload.
 - `__main` is the ABI boundary to the Rust eval driver. Its return
   type must stay `RcPtr` (a `Result`); sig-changing optimizations must
   exclude it.
@@ -100,13 +103,12 @@ Concretely:
   If a behavior matters for correctness, the lowering must produce it
   directly — never rely on an opt pass to clean up.
 - `opt/` passes find emergent patterns *within* the natural lowering
-  (dead alloc elimination, scalar replacement, branch folding, rc
-  fusion, cross-function sig changes). Each pass should be independently
-  deletable.
+  (dead alloc elimination, branch folding, rc fusion, cross-function
+  sig changes). Each pass should be independently deletable.
 - Anything that "looks like" an optimization but is semantically
-  required (e.g. FBIP via `ReuseOrClone` / `cow_*`) belongs in `lower/`.
-  Anything that recognizes a static-analysis opportunity (e.g. SROA
-  promoting non-escaping allocs to `Pack`) belongs in `opt/`.
+  required (e.g. FBIP via `ReuseOrClone` / `cow_*`, decomposed
+  aggregate emission) belongs in `lower/`. Anything that recognizes
+  a static-analysis opportunity belongs in `opt/`.
 
 The motivation: keep the semantic surface in one place, so adding or
 deleting opt passes is a low-risk activity and reasoning about
