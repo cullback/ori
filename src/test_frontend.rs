@@ -152,13 +152,14 @@ main = |_| (
 
 #[test]
 fn e_captured_closure_in_walk() {
-    // A closure-with-captures used in a walk. Per-call-site lambda
-    // sets give this walk a singleton set, which Phase E lowering
-    // collapses to Multi(captures...) at construction — no tag and
-    // no payload heap object for the closure. Allocs are: list
-    // header (1) + data buffer (1) = 2. Without per-call-site
-    // keying the closure would also allocate a tag+payload heap
-    // object (2 more allocs).
+    // A closure-with-captures used in a walk. The list literal
+    // `[1, 2, 3]` is `static_promote`d so it contributes no
+    // runtime allocs. The closure captures `n` (one I64). With
+    // per-call-site lambda set keying, the walk's set is
+    // singleton, and Phase E lowering should collapse the
+    // closure value to `Multi(n)` — the capture lives in a
+    // register (threaded through the walk loop's block params),
+    // no payload heap, no tag shell. Expected allocs: zero.
     let source = "\
 main : I64 -> I64
 main = |arg| (
@@ -168,8 +169,9 @@ main = |arg| (
     let (result, heap) = run_with_heap(source, 0);
     // walk: 0 + 10 + 1 + 10 + 2 + 10 + 3 = 36
     assert_eq!(result, Scalar::I64(36));
-    assert_eq!(heap.alloc_count, 2,
-        "expected 2 allocs (list header + data buffer; no closure heap), got {}",
+    assert_eq!(heap.alloc_count, 0,
+        "expected 0 allocs (Phase E: closure decomposes to register \
+         captures; list is static), got {}",
         heap.alloc_count);
 }
 
@@ -195,9 +197,12 @@ main = |arg| (
     // walk1: 0 + 10 + 1 + 10 + 2 = 23
     // walk2: 23 + 20 + 3 + 20 + 4 = 70
     assert_eq!(result, Scalar::I64(70));
-    // Allocs: 2 list literals × (header + buffer) = 4. No closure heap.
-    assert_eq!(heap.alloc_count, 4,
-        "expected 4 allocs (2 list headers + 2 data buffers), got {}",
+    // Both lists `[1, 2]` and `[3, 4]` are compile-time constants and
+    // get `static_promote`d (no runtime allocs). Both closures
+    // decompose via Phase E (per-call-site singleton sets, captures
+    // threaded as block params). Net: zero runtime allocs.
+    assert_eq!(heap.alloc_count, 0,
+        "expected 0 allocs (lists are static, closures are Phase E), got {}",
         heap.alloc_count);
 }
 

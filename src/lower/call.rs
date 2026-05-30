@@ -4,6 +4,7 @@
 //! /`>`/`>=` on numeric types.
 
 use crate::ast::{Expr, ExprKind};
+use crate::passes::lambda::SingletonTarget;
 use crate::ssa::Value;
 use crate::ssa::instruction::{BinaryOp, ScalarType};
 use crate::symbol::SymbolId;
@@ -26,6 +27,56 @@ fn list_element_type(ty: &Type) -> Type {
 }
 
 impl<'a, 'src> LowerCtx<'a, 'src> {
+    /// Lower a closure expression destined for a walk's step
+    /// parameter, returning the captures-as-slots when possible.
+    ///
+    /// Returns `(step_vals, step_slot_tys)`:
+    ///
+    /// - **Direct dispatch + captures known**: the closure expr is a
+    ///   `Call(tag_sym, captures...)` and `tag_sym` is a known
+    ///   closure constructor. We lower each capture arg *directly*
+    ///   (via `lower_expr_lv` and `to_slots`) and never materialize
+    ///   the closure value — Phase E for closures. The captures'
+    ///   flattened slots are returned. Walk lowering threads them as
+    ///   parallel block params; `emit_walk_step_call` passes them
+    ///   straight to the lifted function.
+    /// - **Multi-variant fallback**: the closure expr lowers to a
+    ///   single heap pointer (the D2 shell). Returns `[closure_ptr]`
+    ///   with one slot type. Walk lowering threads one block param;
+    ///   `emit_walk_step_call` calls `__apply_K(closure_ptr, ...)`.
+    /// - **Direct dispatch + zero captures**: returns `(vec![], vec![])`.
+    ///   Walk lowering threads no extra block params.
+    fn lower_closure_step(
+        &mut self,
+        closure_expr: &Expr<'src>,
+        direct: Option<&'a SingletonTarget>,
+    ) -> (Vec<Value>, Vec<ScalarType>) {
+        if let Some(st) = direct {
+            if st.num_captures == 0 {
+                return (Vec::new(), Vec::new());
+            }
+            if let ExprKind::Call { args: ctor_args, .. } = &closure_expr.kind {
+                let mut vals = Vec::new();
+                let mut tys = Vec::new();
+                for arg in ctor_args {
+                    let lv = self.lower_expr_lv(arg);
+                    let slot_tys = self.expand_slots(&arg.ty);
+                    let slots = self.to_slots(lv, &arg.ty, &slot_tys);
+                    vals.extend(slots);
+                    tys.extend(slot_tys);
+                }
+                return (vals, tys);
+            }
+            // direct.is_some() but closure_expr isn't a tag-constructor
+            // Call (e.g. a Name reference to a closure-typed local).
+            // Fall through to the materialize path; walk's
+            // `emit_walk_step_call` will load captures the old way.
+        }
+        let v = self.lower_expr(closure_expr);
+        let ty = v.ty;
+        (vec![v], vec![ty])
+    }
+
     pub(super) fn lower_call_by_sym(
         &mut self,
         target: SymbolId,
@@ -208,11 +259,12 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 let acc_slots = self.expand_slots(&args[0].ty);
                 let init_vals = self.to_slots(init_lv, &args[0].ty, &acc_slots);
                 let direct = self.resolve_closure_target(&args[1]);
-                let closure_val = self.lower_expr(&args[1]);
+                let (step_vals, step_slot_tys) =
+                    self.lower_closure_step(&args[1], direct);
                 let apply_name = walk_apply_name(&mangled, &args[1].ty, args[1].span);
                 return self.lower_range_walk(
-                    start, end, init_vals, closure_val, &apply_name,
-                    walk.until, acc_slots, &args[0].ty, direct,
+                    start, end, init_vals, step_vals, step_slot_tys,
+                    &apply_name, walk.until, acc_slots, &args[0].ty, direct,
                 );
             }
         }
@@ -275,13 +327,15 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let acc_slots = self.expand_slots(&args[0].ty);
             let init_vals = self.to_slots(init_lv, &args[0].ty, &acc_slots);
             let direct = self.resolve_closure_target(&args[1]);
-            let closure_val = self.lower_expr(&args[1]);
+            let (step_vals, step_slot_tys) =
+                self.lower_closure_step(&args[1], direct);
             let apply_name = walk_apply_name(&mangled, &args[1].ty, args[1].span);
             let elem_ty = list_element_type(&receiver.ty);
             return self.lower_list_walk(
                 recv_val,
                 init_vals,
-                closure_val,
+                step_vals,
+                step_slot_tys,
                 &apply_name,
                 walk.until,
                 acc_slots,
@@ -351,12 +405,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             let acc_slots = self.expand_slots(&args[1].ty);
             let init_vals = self.to_slots(init_lv, &args[1].ty, &acc_slots);
             let direct = self.resolve_closure_target(&args[2]);
-            let closure_val = self.lower_expr(&args[2]);
+            let (step_vals, step_slot_tys) =
+                self.lower_closure_step(&args[2], direct);
             let apply_name = walk_apply_name(func, &args[2].ty, args[2].span);
             if let Some((start, end)) = self.as_range_call(&args[0]) {
                 return self.lower_range_walk(
-                    start, end, init_vals, closure_val, &apply_name,
-                    walk.until, acc_slots, &args[1].ty, direct,
+                    start, end, init_vals, step_vals, step_slot_tys,
+                    &apply_name, walk.until, acc_slots, &args[1].ty, direct,
                 );
             }
             let list_val = self.lower_expr(&args[0]);
@@ -364,7 +419,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             return self.lower_list_walk(
                 list_val,
                 init_vals,
-                closure_val,
+                step_vals,
+                step_slot_tys,
                 &apply_name,
                 walk.until,
                 acc_slots,
