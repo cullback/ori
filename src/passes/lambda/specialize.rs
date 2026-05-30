@@ -100,7 +100,7 @@ fn specialize_module<'src>(
                 Type::Arrow(_, r) => Some(r.as_ref().clone()),
                 _ => None,
             });
-        new_decls.push(build_apply_function(ls, &alloc, ls_idx, symbols, apply_ret_ty));
+        new_decls.push(build_apply_function(ls, &alloc, ls_idx, symbols, func_schemes, apply_ret_ty));
         for entry in &ls.entries {
             let target_func = entry.func_ref.clone().unwrap_or_else(|| {
                 symbols.display(entry.lifted_func).to_owned()
@@ -269,10 +269,17 @@ fn build_apply_function<'src>(
     alloc: &AllocatedSymbols,
     ls_idx: usize,
     symbols: &mut SymbolTable,
+    func_schemes: &HashMap<String, Scheme>,
     ret_ty: Option<Type>,
 ) -> Decl<'src> {
     let span = synth_span();
     let closure_param = symbols.fresh("__closure", span, SymbolKind::Local);
+    // `apply`'s arg-params take types from any entry's lifted scheme
+    // (lambda_set entries' apply portion is uniform within a set).
+    // Stamping these types here lets the body's Name(arg_param)
+    // references lower correctly when an apply arg is itself
+    // multi-slot.
+    let arg_types: Vec<Type> = apply_arg_types(ls, func_schemes, symbols);
     let arg_params: Vec<SymbolId> = (0..ls.arity)
         .map(|i| symbols.fresh(format!("__apply_arg_{i}"), span, SymbolKind::Local))
         .collect();
@@ -285,7 +292,7 @@ fn build_apply_function<'src>(
         .entries
         .iter()
         .enumerate()
-        .map(|(entry_idx, entry)| build_apply_arm(entry, &arg_params, alloc, ls_idx, entry_idx, symbols))
+        .map(|(entry_idx, entry)| build_apply_arm(entry, &arg_params, &arg_types, alloc, ls_idx, entry_idx, symbols, func_schemes))
         .collect();
 
     // Tag arm bodies and the If expression with the apply's declared
@@ -322,10 +329,12 @@ fn build_apply_function<'src>(
 fn build_apply_arm<'src>(
     entry: &LambdaEntry,
     arg_params: &[SymbolId],
+    arg_types: &[Type],
     alloc: &AllocatedSymbols,
     ls_idx: usize,
     entry_idx: usize,
     symbols: &mut SymbolTable,
+    func_schemes: &HashMap<String, Scheme>,
 ) -> MatchArm<'src> {
     let span = synth_span();
 
@@ -343,22 +352,43 @@ fn build_apply_arm<'src>(
         fields: capture_bindings.iter().map(|s| Pattern::Binding(*s)).collect(),
     };
 
-    // Body: call the lifted function with captures + args.
+    // Body: call the lifted function with captures + args. Each
+    // Name's `ty` is stamped from the lifted function's scheme so
+    // `lower::to_slots` can expand a multi-slot binding (e.g. a
+    // captured List or a multi-slot apply arg) at the lifted-call
+    // boundary. Without this the placeholder TypeVar(0) ty leaves
+    // `slot_offsets` falling back to a single slot, and the call
+    // is under-arity at the SSA boundary.
+    let cap_tys = lifted_func_capture_types(func_schemes, entry, symbols);
+    let typed_name = |sym: SymbolId, ty: Option<&Type>| -> Expr<'src> {
+        let mut e = Expr::new(ExprKind::Name(sym), span);
+        if let Some(t) = ty {
+            e.ty = t.clone();
+        }
+        e
+    };
     let body = if let Some(func_name) = &entry.func_ref {
         // Named function ref: Call(func, [args...])
         let target = symbols.fresh(func_name, span, SymbolKind::Func);
         let args: Vec<Expr<'src>> = arg_params
             .iter()
-            .map(|p| Expr::new(ExprKind::Name(*p), span))
+            .enumerate()
+            .map(|(i, p)| typed_name(*p, arg_types.get(i)))
             .collect();
         Expr::new(ExprKind::Call { target, args }, span)
     } else {
         // Lifted lambda: Call(lifted_func, [captures..., args...])
         let mut args: Vec<Expr<'src>> = capture_bindings
             .iter()
-            .map(|s| Expr::new(ExprKind::Name(*s), span))
+            .enumerate()
+            .map(|(i, s)| typed_name(*s, cap_tys.get(i)))
             .collect();
-        args.extend(arg_params.iter().map(|p| Expr::new(ExprKind::Name(*p), span)));
+        args.extend(
+            arg_params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| typed_name(*p, arg_types.get(i))),
+        );
         Expr::new(
             ExprKind::Call {
                 target: entry.lifted_func,
@@ -738,6 +768,35 @@ fn synth_span() -> Span {
 
 fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_owned().into_boxed_str())
+}
+
+/// Look up the apply function's arg types (the part of the lifted
+/// function's signature after the captures). All entries in a lambda
+/// set share the same apply arity and arg types; we read from the
+/// first available entry's lifted scheme.
+fn apply_arg_types(
+    ls: &LambdaSet,
+    func_schemes: &HashMap<String, Scheme>,
+    symbols: &SymbolTable,
+) -> Vec<Type> {
+    for entry in &ls.entries {
+        let name = entry
+            .func_ref
+            .clone()
+            .unwrap_or_else(|| symbols.display(entry.lifted_func).to_owned());
+        let Some(scheme) = func_schemes.get(&name) else {
+            continue;
+        };
+        let Type::Arrow(params, _) = &scheme.ty else {
+            continue;
+        };
+        let n = entry.captures.len();
+        if params.len() < n {
+            continue;
+        }
+        return params[n..].to_vec();
+    }
+    Vec::new()
 }
 
 /// Look up the source-level types of the lifted function's capture

@@ -313,6 +313,32 @@ main = |arg| (
 }
 
 #[test]
+fn e_user_hof_multislot_heterogeneous_dispatch() {
+    // Heterogeneous closure flow (runtime-conditional `if cond then
+    // fn_a else fn_b`) into a user HOF, where both branches capture
+    // multi-slot values. `lambda_narrow` can't narrow this (the
+    // closure is a variable, not a tag-constructor call at the call
+    // site), so dispatch goes through `lambda_specialize`'s
+    // synthesized `__apply_K` multi-variant dispatcher. Before the
+    // fix, the dispatcher's body had the same untyped-Name latent
+    // bug as the singleton path — it crashed at runtime.
+    let source = "\
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    xs = [arg + 1, arg + 2]
+    ys = [arg + 10, arg + 20]
+    f = if arg > 0 then (|n| n + xs.get(0).unwrap()) else (|n| n + ys.get(0).unwrap())
+    apply(f, 100)
+)";
+    // arg=5 → xs=[6,7], cond=true → 100 + 6 = 106
+    let result = run_i64(source, 5);
+    assert_eq!(result, 106);
+}
+
+#[test]
 fn e_user_hof_heterogeneous_callsite() {
     // A single call site where the closure choice is a runtime
     // condition (one of two lifted lambdas can flow in). Narrowing
