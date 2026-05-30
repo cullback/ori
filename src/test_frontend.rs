@@ -263,6 +263,56 @@ main = |arg| (
 }
 
 #[test]
+fn e_user_hof_multislot_single_callsite() {
+    // Single call site, multi-slot capture. Before the fix:
+    // lambda_specialize's singleton path created a capture-Name
+    // expression with placeholder type, so `lower::to_slots` couldn't
+    // expand the multi-slot capture at the lifted-func call boundary.
+    let source = "\
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    extras = [arg + 1, arg + 2, arg + 3]
+    apply(|y| y + extras.get(0).unwrap(), 10)
+)";
+    // arg=5 → extras=[6,7,8] → 10 + 6 = 16
+    let result = run_i64(source, 5);
+    assert_eq!(result, 16);
+}
+
+#[test]
+fn e_user_hof_multislot_capture() {
+    // User HOF whose closure captures a multi-slot value (a List,
+    // which decomposes to 3 SSA slots: len, cap, data). Two call
+    // sites so `lambda_narrow` clones the callee per site. Each
+    // clone's singleton TagDecl + body must receive and pass the
+    // capture as 3 flat slots to the lifted function — not as a
+    // single pointer-to-tuple. Without the flattening fix, the
+    // clone's pattern bind would extract one Value (a pointer)
+    // where the lifted function expects 3 slots, and the runtime
+    // would mis-interpret bytes (typically panicking with
+    // "unsupported binop Add on Ptr, I64" once the pointer gets
+    // arithmetically combined).
+    let source = "\
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    extras = [arg + 1, arg + 2, arg + 3]
+    x1 = apply(|y| y + extras.get(0).unwrap(), 10)
+    x2 = apply(|y| y + extras.get(1).unwrap(), 20)
+    x1 + x2
+)";
+    // arg = 5 → extras = [6, 7, 8]
+    // x1 = 10 + 6 = 16; x2 = 20 + 7 = 27; sum = 43
+    let result = run_i64(source, 5);
+    assert_eq!(result, 43);
+}
+
+#[test]
 fn e_user_hof_heterogeneous_callsite() {
     // A single call site where the closure choice is a runtime
     // condition (one of two lifted lambdas can flow in). Narrowing

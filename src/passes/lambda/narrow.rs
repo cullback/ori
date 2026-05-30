@@ -520,6 +520,7 @@ impl<'a> Synthesizer<'a> {
         let mut body_rewriter = CloneBodyRewriter {
             narrow_params: &narrow_param_info,
             symbols: self.symbols,
+            func_schemes: self.func_schemes,
         };
         let mut final_body = cloned_body;
         body_rewriter.walk_expr(&mut final_body);
@@ -610,6 +611,7 @@ fn singleton_tagunion_type(info: &NarrowedTag) -> Type {
 struct CloneBodyRewriter<'a> {
     narrow_params: &'a HashMap<SymbolId, NarrowedTag>,
     symbols: &'a mut SymbolTable,
+    func_schemes: &'a HashMap<String, Scheme>,
 }
 
 impl<'a, 'src> CloneBodyRewriter<'a> {
@@ -660,15 +662,34 @@ impl<'a, 'src> CloneBodyRewriter<'a> {
 
                         // Build the direct call: target_func(c0,
                         // c1, ..., other_args...).
+                        //
+                        // Each cap-Name's `ty` must be set to the
+                        // source-level capture type from the lifted
+                        // function's scheme. Without this, `lower`'s
+                        // `to_slots` at the call boundary can't expand
+                        // a multi-slot capture (e.g. a List) back into
+                        // its slot trio — it would pass a single Ptr
+                        // where the lifted function expects 3 slots,
+                        // and the runtime would mis-interpret bytes.
                         let target_func_sym = self.symbols.fresh(
                             &info.target_func,
                             expr.span,
                             SymbolKind::Func,
                         );
+                        let cap_tys = lifted_func_capture_types(
+                            self.func_schemes,
+                            &info.target_func,
+                            info.num_captures,
+                        );
                         let mut call_args: Vec<Expr<'src>> = cap_syms
                             .iter()
-                            .map(|s| {
-                                Expr::new(ExprKind::Name(*s), expr.span)
+                            .enumerate()
+                            .map(|(i, s)| {
+                                let mut e = Expr::new(ExprKind::Name(*s), expr.span);
+                                if let Some(ty) = cap_tys.get(i) {
+                                    e.ty = ty.clone();
+                                }
+                                e
                             })
                             .collect();
                         for a in other_args {
@@ -1197,6 +1218,29 @@ fn synth_span() -> Span {
 
 fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_owned().into_boxed_str())
+}
+
+/// Look up the source-level types of the first `n` parameters of a
+/// lifted function — these are its captures (placed first by
+/// `lambda_lift`). Returns an empty Vec on lookup failure so the
+/// caller can leave the placeholder type in place (harmless for
+/// scalar captures; only matters when a capture is multi-slot and
+/// `lower::to_slots` needs the type to expand the binding).
+fn lifted_func_capture_types(
+    func_schemes: &HashMap<String, Scheme>,
+    target_func: &str,
+    n: usize,
+) -> Vec<Type> {
+    let Some(scheme) = func_schemes.get(target_func) else {
+        return Vec::new();
+    };
+    let Type::Arrow(params, _) = &scheme.ty else {
+        return Vec::new();
+    };
+    if params.len() < n {
+        return Vec::new();
+    }
+    params[..n].to_vec()
 }
 
 /// Build a new Scheme by replacing param types at the indices in

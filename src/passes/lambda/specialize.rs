@@ -66,20 +66,22 @@ fn specialize_module<'src>(
     let alloc = allocate_symbols(solution, symbols);
 
     // Build ho_vars for each function: which params map to lambda sets.
-    let mut rewriter = Rewriter {
-        param_to_set: &solution.param_to_set,
-        sets: &solution.sets,
-        alloc: &alloc,
-        symbols,
-        ho_vars: solution.local_ho_vars.clone(),
+    let mut new_decls: Vec<Decl<'src>> = {
+        let mut rewriter = Rewriter {
+            param_to_set: &solution.param_to_set,
+            sets: &solution.sets,
+            alloc: &alloc,
+            symbols,
+            func_schemes: &*func_schemes,
+            ho_vars: solution.local_ho_vars.clone(),
+        };
+        // Rewrite module decls.
+        module
+            .decls
+            .into_iter()
+            .map(|d| rewriter.rewrite_decl(d))
+            .collect()
     };
-
-    // Rewrite module decls.
-    let mut new_decls: Vec<Decl<'src>> = module
-        .decls
-        .into_iter()
-        .map(|d| rewriter.rewrite_decl(d))
-        .collect();
 
     // Synthesize closure types and apply functions.
     // Singletons still get apply functions (to keep lifted funcs
@@ -381,6 +383,7 @@ struct Rewriter<'a> {
     sets: &'a [LambdaSet],
     alloc: &'a AllocatedSymbols,
     symbols: &'a SymbolTable,
+    func_schemes: &'a HashMap<String, Scheme>,
     ho_vars: HashMap<SymbolId, usize>,
 }
 
@@ -490,8 +493,33 @@ impl<'src> Rewriter<'_> {
                                 name: tag_name,
                                 fields: caps.iter().map(|s| Pattern::Binding(*s)).collect(),
                             };
+                            // The lifted function's first N params are
+                            // the source-level captures, typed per the
+                            // capture's actual type. Stamp each
+                            // capture-Name's `ty` with that type so
+                            // `lower::to_slots` can expand a multi-slot
+                            // capture (e.g. a List) from the pattern
+                            // binding (a single Ptr after materialize)
+                            // back into its slot trio at the lifted
+                            // call boundary. Without this the Name's
+                            // ty is the placeholder TypeVar(0),
+                            // `slot_offsets` falls back to a single
+                            // slot, and the call passes 1 arg where
+                            // the lifted func expects N.
+                            let cap_tys = lifted_func_capture_types(
+                                self.func_schemes,
+                                entry,
+                                self.symbols,
+                            );
                             let mut call_args: Vec<Expr<'src>> = caps.iter()
-                                .map(|s| Expr::new(ExprKind::Name(*s), span))
+                                .enumerate()
+                                .map(|(i, s)| {
+                                    let mut e = Expr::new(ExprKind::Name(*s), span);
+                                    if let Some(ty) = cap_tys.get(i) {
+                                        e.ty = ty.clone();
+                                    }
+                                    e
+                                })
                                 .collect();
                             call_args.append(args);
                             let call = Expr::new(ExprKind::Call {
@@ -710,4 +738,37 @@ fn synth_span() -> Span {
 
 fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_owned().into_boxed_str())
+}
+
+/// Look up the source-level types of the lifted function's capture
+/// parameters. The lifted function (built by `lambda_lift`) places
+/// captures as the first N parameters in declaration order, each
+/// typed with the original captured binding's type. `entry.captures`
+/// stores the source-level capture count.
+///
+/// Returns an empty Vec if the lifted function lacks a scheme entry
+/// or the scheme isn't an Arrow — both shouldn't happen for
+/// well-typed programs, and downstream callers fall back to leaving
+/// the capture-Name's placeholder type in place (which is harmless
+/// for scalar captures and only matters for multi-slot ones).
+fn lifted_func_capture_types(
+    func_schemes: &HashMap<String, Scheme>,
+    entry: &LambdaEntry,
+    symbols: &SymbolTable,
+) -> Vec<Type> {
+    let lifted_name = entry
+        .func_ref
+        .clone()
+        .unwrap_or_else(|| symbols.display(entry.lifted_func).to_owned());
+    let Some(scheme) = func_schemes.get(&lifted_name) else {
+        return Vec::new();
+    };
+    let Type::Arrow(params, _) = &scheme.ty else {
+        return Vec::new();
+    };
+    let n = entry.captures.len();
+    if params.len() < n {
+        return Vec::new();
+    }
+    params[..n].to_vec()
 }
