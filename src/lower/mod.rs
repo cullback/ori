@@ -230,18 +230,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             _phantom: std::marker::PhantomData,
         }
     }
-
-
-    /// If the closure expression is a known tag constructor, return
-    /// the direct call target.
-    fn resolve_closure_target(&self, closure_expr: &Expr<'_>) -> Option<&'a SingletonTarget> {
-        if let ExprKind::Call { target, .. } = &closure_expr.kind {
-            let name = self.symbols.display(*target);
-            self.tag_targets.get(name)
-        } else {
-            None
-        }
-    }
 }
 
 impl<'a, 'src> LowerCtx<'a, 'src> {
@@ -481,20 +469,6 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                 _ => vec![vec![ScalarType::RcPtr]; num_args],
             })
             .unwrap_or_else(|| vec![vec![ScalarType::RcPtr]; num_args])
-    }
-
-    /// Callee's source-level param Types in declaration order. Used
-    /// to drive `to_slots` for unmaterializing closure captures and
-    /// other heap-materialized args. Empty vec when no scheme.
-    pub(super) fn callee_param_types(&self, func: &str) -> Vec<Type> {
-        self.infer
-            .func_schemes
-            .get(func)
-            .map(|scheme| match &scheme.ty {
-                Type::Arrow(params, _) => params.clone(),
-                _ => Vec::new(),
-            })
-            .unwrap_or_default()
     }
 
     /// Emit a dummy value of the given scalar type for statically

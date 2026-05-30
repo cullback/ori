@@ -53,6 +53,24 @@ pub fn walk_apply_name(callee: &str, step_ty: &Type, closure_span: Span) -> Stri
 }
 
 impl<'a, 'src> LowerCtx<'a, 'src> {
+    /// If `closure_expr` is a known closure-tag constructor call
+    /// (i.e. a `Call(tag_sym, captures)` where the tag is in
+    /// `mono.tag_targets`), return the lifted function it dispatches
+    /// to. Used by walk lowering to take the direct-call path
+    /// (skipping `__apply_K`) and to drive Phase E flattening of
+    /// captures via `lower_closure_step`.
+    pub(super) fn resolve_closure_target(
+        &self,
+        closure_expr: &Expr<'_>,
+    ) -> Option<&'a SingletonTarget> {
+        if let ExprKind::Call { target, .. } = &closure_expr.kind {
+            let name = self.symbols.display(*target);
+            self.tag_targets.get(name)
+        } else {
+            None
+        }
+    }
+
     /// If `expr` is `List.range(start, end)`, return the lowered
     /// `start` / `end` values. Used by walk lowering to elide the
     /// intermediate list allocation when the source is a range.
@@ -165,11 +183,13 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             // result is a Continue/Break tag union (single RcPtr,
             // since tag unions don't decompose in this phase). The
             // payload IS the acc (multi-slot) stored after the tag.
+            // range-walk: header threads `end`; done threads nothing.
             self.emit_walk_until_branch(
                 result,
                 next_i,
                 &body_acc,
-                body_end,
+                &[body_end],
+                &[],
                 &body_step_vals,
                 done,
                 header,
@@ -283,12 +303,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let next_i = self.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
 
         if until {
-            self.emit_walk_until_branch_with_data(
+            // list-walk: header threads `(len, data)`; done threads
+            // `data` (for rc release on the buffer).
+            self.emit_walk_until_branch(
                 result,
                 next_i,
                 &body_acc,
-                body_len,
-                body_data,
+                &[body_len, body_data],
+                &[body_data],
                 &body_step_vals,
                 done,
                 header,
@@ -406,8 +428,19 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         )
     }
 
-    /// walk_until branch (range version). `result` is a single RcPtr
-    /// pointing at a Continue/Break tag union whose payload is the
+    /// walk_until branch — emits the conditional jump that decides
+    /// whether the loop continues (next iteration) or terminates
+    /// (jumps to `done`). Used by both range-walk and list-walk
+    /// loops, differing only in what's threaded:
+    ///
+    /// - `header_extra` — values threaded into the loop header for
+    ///   the next iteration. Range-walk passes `[end]`; list-walk
+    ///   passes `[len, data]`.
+    /// - `done_extra` — values threaded into `done` (for rc release
+    ///   on loop exit). Range-walk passes `[]`; list-walk passes
+    ///   `[data]`.
+    ///
+    /// `result` is a Continue/Break tag union whose payload is the
     /// (multi-slot) acc.
     #[allow(clippy::too_many_arguments)]
     fn emit_walk_until_branch(
@@ -415,7 +448,8 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         result: Vec<Value>,
         next_i: Value,
         body_acc: &[Value],
-        body_end: Value,
+        header_extra: &[Value],
+        done_extra: &[Value],
         body_step_vals: &[Value],
         done: crate::ssa::instruction::BlockId,
         header: crate::ssa::instruction::BlockId,
@@ -432,45 +466,14 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         let break_val = self.builder.const_u64(break_tag);
         let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
         let mut done_args = payload.clone();
+        done_args.extend(done_extra.iter().copied());
         done_args.extend(body_step_vals.iter().copied());
-        let mut header_args = Vec::with_capacity(2 + payload.len() + 1 + body_step_vals.len());
+        let mut header_args = Vec::with_capacity(
+            1 + payload.len() + header_extra.len() + body_step_vals.len(),
+        );
         header_args.push(next_i);
         header_args.extend(payload.iter().copied());
-        header_args.push(body_end);
-        header_args.extend(body_step_vals.iter().copied());
-        self.builder.branch(is_break, done, done_args, header, header_args);
-    }
-
-    /// walk_until branch (list version) — same as range except the
-    /// header threads `data` as well.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_walk_until_branch_with_data(
-        &mut self,
-        result: Vec<Value>,
-        next_i: Value,
-        body_acc: &[Value],
-        body_len: Value,
-        body_data: Value,
-        body_step_vals: &[Value],
-        done: crate::ssa::instruction::BlockId,
-        header: crate::ssa::instruction::BlockId,
-        acc_slots: &[ScalarType],
-        acc_ty: &Type,
-    ) {
-        let (tag, payload_ptr) = self.split_walk_result(&result);
-        let payload = self.load_walk_acc_payload(payload_ptr, acc_slots, acc_ty);
-        let _ = body_acc;
-        let break_tag = self.decls.constructors["Break"].tag_index;
-        let break_val = self.builder.const_u64(break_tag);
-        let is_break = self.builder.binop(BinaryOp::Eq, tag, break_val, ScalarType::U8);
-        let mut done_args = payload.clone();
-        done_args.push(body_data);
-        done_args.extend(body_step_vals.iter().copied());
-        let mut header_args = Vec::with_capacity(2 + payload.len() + 2 + body_step_vals.len());
-        header_args.push(next_i);
-        header_args.extend(payload.iter().copied());
-        header_args.push(body_len);
-        header_args.push(body_data);
+        header_args.extend(header_extra.iter().copied());
         header_args.extend(body_step_vals.iter().copied());
         self.builder.branch(is_break, done, done_args, header, header_args);
     }
