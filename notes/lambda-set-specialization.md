@@ -1,207 +1,215 @@
-# Plan: per-call-site lambda set specialization
+# Closures and lambda sets
 
-Status: **Shipped.** Stage A (walks) landed earlier; Stage 2 (user HOFs) landed as the `lambda_narrow` pass. `e_user_hof_two_callsites_same_type` is at 0 allocs (down from 4). All 238 tests + 4 audit tests pass.
+Ori compiles closures as **tagged unions over a finite, statically-known set of lifted functions**. There is no opaque function pointer, no vtable, and no heap allocation in the common case. This note is a tutorial and specification for how that works — the language-level concept, the semantics, and the runtime representation. For the implementation, see `src/passes/lambda/`.
 
-## Stage A — walks
+The companion note `notes/functions.md` covers function syntax. This note is about what happens *behind* a closure value.
 
-Each `List.walk` / `List.walk_until` call site has its own lambda set, keyed by the closure-arg's source span in addition to the step type. Phase E lowering's single-variant collapse fires for walk closures: the closure value decomposes into register captures, no tag/payload heap allocation, no `__apply_K` dispatcher. Verified by `e_captured_closure_in_walk` and `e_two_walks_same_signature_singleton_each`.
+## Lambda, closure, lambda set
 
-## Stage 2 — user HOFs
+Three words that get confused easily:
 
-The `src/passes/lambda_narrow.rs` pass runs after `lambda_specialize`. For each `Call(user_hof, [Call(tag_sym, captures), ...])` where the tag's enclosing `TagDecl` is multi-variant, it:
+- A **lambda** is the source-level expression `|args| body`. It's syntax. After lifting, no lambdas survive.
+- A **closure** is the runtime value that a lambda produces: a function paired with its captured environment. Two lambdas with the same body but different captures are two different closures.
+- A **lambda set** is the static enumeration of all closure values that can flow through a given function-typed position in the program. It's a property of *positions* (a parameter, a return, a let-bound variable), not values.
 
-1. Generates a singleton `TagDecl` per narrowed HO position, with a fresh tag constructor symbol.
-2. Clones the callee `FuncDef` body with fresh `SymbolId`s for params and locals via an AST-substitution visitor.
-3. Rewrites the clone's body: `__apply_K(f, args)` where `f` is a narrowed param becomes `if f : new_tag(captures) then target_func(captures, args)` — a single-arm match that lower's `is_single_variant_tag_union` collapses to register decomposition.
-4. Registers a clone scheme in `func_schemes` with the HO param's type set to the singleton `Type::TagUnion` directly (skipping the `infer.transparent` indirection, since `infer.transparent` doesn't carry `TagUnion`-shaped entries).
-5. Rewrites each call site to target the clone, retargets the closure-constructor `Call`'s target to the new tag symbol, and pins the closure-expr's `ty` to the singleton `Type::TagUnion`.
-6. Adds the new `TagDecl`s + clones to `module.decls` and their `tag_targets` entries to `mono.tag_targets`. `decl_info::build` and `reachable::prune` pick them up automatically.
+A function-typed parameter `f : a -> b` has, at every call site in the program, a lambda set that lists every closure value that can show up there. The compiler computes this set ahead of time. There is no runtime "function pointer that could be anything" — every possible target is named.
 
-Sites whose closure tag is in a single-variant `TagDecl` are skipped — narrowing there would be a no-op semantically and interacts badly with `const_eval`'s static-promotion path. The skip preserves the existing `e_user_hof_singleton_callsite` 0-alloc behavior (which comes from constant-fold + `static_promote`, not Phase E).
+## The setup: how a lambda becomes a value
 
-Verified by pinned tests:
-- `e_user_hof_two_callsites_same_type` — two call sites of `apply` with different runtime-dependent closures, asserts 0 allocs.
-- `e_user_hof_heterogeneous_callsite` — single call site with `if cond then fn1 else fn2`, asserts correctness (alloc shape stays D2 since the merged tag union really is needed).
+Start with a lambda:
 
-Stage A landed as ~100 lines across `src/lower/walk.rs` (`walk_apply_name` takes a `Span`), `src/lower/call.rs` (callers pass the closure-arg span), `src/passes/lambda_solve.rs` (`walk_call_key` mangles the span), and `src/passes/reachable.rs` (mirrors the same name construction). The merge step in `lambda_solve` stayed — it still applies to non-walk HO positions.
-
-**Remaining: Stages 1-6 below** — per-call-site specialization for *user-defined* HOFs, i.e. real callee cloning. Stage A only covers intrinsics (walk has no AST body, so per-call-site keying suffices; the existing lower-time `singletons` map handles direct dispatch). User HOFs like `apply : (a -> b), a -> b` need their bodies cloned per call site so the inner HO call dispatches against a known (likely singleton) set.
-
-## Empirical findings
-
-Two pinned tests in `src/test_frontend.rs` exercise user HOFs and reveal the precise gap:
-
-- `e_user_hof_singleton_callsite` — user HOF `apply = |f, n| f(n)` called from one call site with a captured closure. **0 heap allocs today.** Note: this is *not* because Phase E fires — the closure value still uses the D2 shape — but because the closure's captures are constant-foldable (`x = 10`), so `const_eval` + `static_promote` bake the closure as a static and `rc_elide_static` removes the rc traffic. With runtime-dependent captures the count would be > 0.
-- `e_user_hof_two_callsites_same_type` — same user HOF called from two call sites with two different captured closures of runtime-dependent values. **4 heap allocs today** (2 per closure: one for the captures payload + one for the `(tag, payload_ptr)` D2 shell). The merge step in `lambda_solve` unifies the two closures into one multi-variant tag union; the D2 shape is then required for both call sites because Phase E (single-variant decomposition) doesn't fire.
-
-So Stage 2's actual goal: 4 allocs → 0 for this case, by making each call site's closure type single-variant so Phase E lowering's `is_single_variant_tag_union` collapse fires.
-
-## What partial implementations do NOT work
-
-Verified during the Stage 2 design pass:
-
-- **Per-call-site keying in `lambda_solve` without cloning** breaks 16 tests. The body of `apply` runs `enter_scope("apply", params)` which looks up `param_to_set[("apply", 0)]`; if external call sites populate per-call-site keys like `("apply__cs<span>", 0)` instead, the body-side lookup finds nothing and `f` isn't marked HO. Inside the body, `f(n)` then dispatches as a regular call to a closure value → runtime crash.
-- **Adding per-call-site sets *alongside* the merged set** (so the body still finds its set) doesn't help. The closure value at the call site would carry the singleton tag union type (for Phase E), but the callee's `f` param still expects the merged tag union type → type mismatch at the SSA level (Phase E shape `Multi(captures)` is multi-slot, merged shape `Multi(tag, payload_ptr)` is two-slot, but with different scalar types — they're not interchangeable).
-- **SSA-level inline + branch-fold + DCE** doesn't currently eliminate the closure heap. The `--dump-ssa` output for the 2-callsite case shows all 4 `alloc` instructions surviving optimization; branch-fold doesn't see through the store→switch→load chain.
-
-The cloning approach is the only one that gives each call site's `f` its own narrower type, which is what unblocks Phase E.
-
-## Required machinery for Stage 2
-
-To make `apply.cs1` and `apply.cs2` each fire Phase E:
-
-1. **AST clone with substitution.** Deep-clone the callee's `Decl::FuncDef` body. Allocate fresh `SymbolId`s for params and any local lets/destructures/pattern bindings; build a substitution map; walk every `ExprKind::Name`, `Pattern::Binding`, `Stmt::Let { name }`, etc. and remap. ~150 lines.
-2. **New singleton TagDecls per call site.** Each clone's HO param type is a new transparent newtype around a single-variant tag union. The variant carries the captures. ~50 lines.
-3. **New tag constructor symbols.** Each new TagDecl needs its own constructor `SymbolId` (Ori constructors are scoped by name, and `decl_info::build` reads each TagDecl's variants into the constructors map). Updating `tag_targets` so `lower::resolve_closure_target` finds the direct call target. ~50 lines.
-4. **Inline singleton dispatch in clone bodies.** Replace `__apply_K(f, args)` in the cloned body with the singleton's inline match: `if f : tag(captures) then lifted_func(captures, args)`. ~80 lines.
-5. **Scheme updates for clones.** `mono.infer.func_schemes` needs entries for each clone with the HO param's narrowed type. Without this, `lower::scalar_type` won't resolve the param to the singleton TagDecl. ~30 lines.
-6. **Call-site rewriting.** Walk all `Call(callee, args)` sites; for matching patterns, change `target` to the clone's symbol and update the closure-constructor args to use the new singleton tag. ~80 lines.
-7. **Reachable + decl_info.** Both passes already iterate over all decls and pick up new clones automatically (decl_info builds from the module; reachable does a DFS from `__main`), so no changes needed *for the clones themselves* — but the original (now-unreached) `apply` body and the wide `__apply_K` will be pruned by reachable. Verify with `audit_ssa_cleanliness*`.
-
-Total: ~440 lines for the pass + tests + integration. Genuinely a focused multi-day session, not "let me hack at it for a few more turns."
-
-## Why this session stops here
-
-Stage A landed cleanly (~100 lines, surgical). Stage 2 is structurally an order of magnitude larger. Attempting it mid-session — after F1-F4 + G1 + F2-full already shipped — risks the half-baked outcome the user explicitly rejected. The architecture is now documented in detail; the empirical numbers are pinned in tests; the next session can open `lambda_narrow.rs`, write the AST substitution helper first, and proceed from a clean slate.
-
-## Why per-call-site keying alone (without cloning) doesn't help user HOFs
-
-Tempting shortcut: just key lambda sets by `(callee_name, call_site_span, arg_idx)`. Each call site gets its own set; sets are singleton; Phase E should fire.
-
-It doesn't work because the callee's HO param has *one* type — the union of all closures that can flow in. The closure value passed at each call site must conform to that union type. A Phase E single-variant value (the `Multi(captures)` shape, no tag) can't be passed to a position expecting a multi-variant tag union value (`Multi(tag, payload_ptr)`, D2 shape) — the shapes are incompatible.
-
-The escape is to make the callee's HO param have the narrower per-call-site type, which means *cloning the callee per call site*. The clone's HO param type is the singleton set; values at this clone's call site are Phase E shape; Phase E fires uniformly.
-
-Walks bypass this constraint because they have no callee body — there is no HO-param-typed variable to type-check. The lower stage emits the dispatch directly from the closure value at the call site.
-
-## Context for a fresh session
-
-Ori currently compiles closures via three passes (`notes/compiler-passes.md`):
-
-- `lambda_lift` — every `Lambda` becomes a top-level `__lifted_N(captures..., params...)`; the Lambda node is replaced with `Closure { func, captures }`.
-- `lambda_solve` — 0-CFA flow analysis. Tracks which lifted functions can flow into each HO parameter position. **Merges sets bidirectionally** when the same closure flows through multiple paths. Outputs `(func_name, param_index) → lambda_set_idx`.
-- `lambda_specialize` — for each merged set, synthesizes a `TagDecl` closure type and an `__apply_K` dispatcher. Rewrites every `Closure` to a tag constructor and every HO call to `__apply_K(f, args...)`.
-
-The merge step in `lambda_solve` is the problem. When polymorphic stdlib HOFs (`List.walk`, `List.map`, ...) accept closures from many call sites, all those closure sets unify into one. The resulting set is multi-variant, so `lambda_specialize` synthesizes a dispatcher and Phase E's single-variant collapse can't fire. The lowering correctly handles singletons; the upstream pass never produces any.
-
-## The decomposition principle
-
-**Specialize HOFs per call site, not per parameter position.** Each call site of a HOF gets its own clone of the callee, with the lambda set at *that call site* substituted into the callee's signature. After specialization the program is strictly first-order — there are no HOFs, and every closure value has a known, narrow set of possible targets.
-
-This mirrors the type-specialization (mono) pass: just as a polymorphic type variable gets resolved per call site by cloning the callee, a polymorphic *function set* variable gets resolved per call site by cloning the callee. Roc calls these orthogonal axes "type specialization" and "function specialization." Ori already has the first; this plan adds the second.
-
-## Why this is the right design
-
-Compared to today's merging + dispatcher:
-
-- **Smaller runtime representation.** A call site whose lambda set is singleton compiles to a direct call. No tag, no dispatcher, no payload heap object. Phase E lowering fires uniformly.
-- **Multi-element sets keep working.** A heterogeneous call site (e.g. `if cond then fn1 else fn2`) gets a real lambda set tag union. Dispatch is a tag compare + jump — no vtable, no heap. Same shape Roc compiles to.
-- **No new IR.** The same `TagDecl`/`Match` machinery used for ordinary tag unions handles dispatch. `lambda_specialize` becomes simpler: clone + substitute, no per-set dispatcher synthesis.
-
-Compared to Rust's approach (closures as anonymous types, generic HOFs, `dyn` for heterogeneity):
-
-- Rust handles homogeneous closures via mono — direct calls, no heap.
-- Heterogeneous closures cost a `Box<dyn Fn>`: heap allocation + vtable dispatch.
-- The Roc approach we're adopting handles both cases without heap or vtable. Strictly more powerful than Rust mono for our language.
-
-Reference: Roc RFC 0102 *Compiling lambda sets* (the RFC explicitly calls this orthogonality and pipeline-cleanliness the design's main argument).
-
-## Pipeline shape
-
-```
-parse → resolve → fold_lift → flatten_patterns → topo → infer
-     → mono → lambda_lift → lambda_solve → lambda_specialize
-     → reachable prune → lower (SSA) → opt → eval
+```ruby
+make_adder = |n| (|x| x + n)
 ```
 
-The pass *names* stay; their *semantics* change.
+The inner lambda `|x| x + n` captures `n` from the enclosing scope. The compiler **lifts** every lambda to a top-level function, threading captures in as leading parameters:
 
-### lambda_solve (new behavior)
+```ruby
+# After lifting (conceptually):
+__lifted_inner = |n_cap, x| x + n_cap
 
-Drop the merge step. Track per-call-site sets instead of per-position sets.
-
-Output today:
-```
-(func_name, param_index) → lambda_set_idx
+make_adder = |n| Closure { func: __lifted_inner, captures: (n,) }
 ```
 
-Output after this change:
+The result of evaluating the inner lambda is no longer an opaque function value — it's a *constructor call* producing a closure value. The function part (`func`) is a compile-time-known top-level function symbol. The captures are the run-of-the-mill values from the enclosing scope.
+
+This is the only thing a closure *is*: a function name paired with a tuple of captured values.
+
+## Lambda sets
+
+Consider:
+
+```ruby
+add_x : I64 -> I64
+greet : I64 -> I64
+add_x = |y| y + x_global
+greet = |y| y + s_global.len()
+
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
 ```
-call_site_id → lambda_set
+
+`apply`'s first parameter `f` has type `I64 -> I64`. From the type alone, `f` could be any function with that signature. But Ori is closed-world: every closure that can ever flow into `f` is constructed somewhere in the program, and the compiler enumerates them. That enumeration is the **lambda set** of `f`'s position.
+
+If the program calls `apply(add_x, 5)` once and never passes `greet` to apply, the lambda set of `apply`'s `f` is `{add_x}` — a singleton. If both calls exist, the set is `{add_x, greet}`.
+
+The lambda set is essentially a tag union type, automatically inferred:
+
+```
+f : I64 -[add_x | greet]-> I64
 ```
 
-Where `call_site_id` is a stable id for each HO call expression in the module. The `lambda_set` itself is a list of `(lifted_func, capture_types)` pairs — the same shape we have today, just not merged.
+(Ori doesn't write the lambda set in source syntax — the inference is implicit. The notation here is just to make the underlying structure visible.)
 
-The 0-CFA propagation is otherwise unchanged: trace `Closure` values through bindings, captures, returns, and into call positions. The only difference is that two different bindings flowing into the same parameter position from two different call sites stay separate.
+This is closely related to row-polymorphic tag unions for ordinary data: `[Ok(a), Err(e)]` is a tag union over two variants; the lambda set is a tag union whose variants are closures. The machinery is shared.
 
-Capture-chain propagation still applies (if `__lifted_N`'s capture is called, the enclosing function's corresponding parameter is HO at that callee's call sites).
+## Runtime representation
 
-### lambda_specialize (new behavior)
+A closure value at runtime is exactly its tag-union shape:
 
-For each HO call site `c` with lambda set `S_c`:
+- **Multi-variant lambda set**: `(tag, captures...)`. The tag identifies which closure the value is, the captures follow. Lowered as `(tag: U64, payload_ptr: RcPtr)` to a heap object containing the captures — the standard D2 shape for non-fieldless tag unions.
+- **Single-variant lambda set**: `(captures...)`. The tag is implicit (there's only one option), captures live in registers as parallel SSA values. No heap object. This is Phase E single-variant decomposition.
 
-1. Look up or create a specialized clone of the callee, keyed on `(callee_func, S_c)`.
-2. In the clone, substitute the HO parameter's type with the tag union `S_c` (or with the singleton variant if `|S_c| == 1`).
-3. Rewrite the call site to target the clone, and the closure-passing argument to construct the appropriate tag variant.
-4. If the clone itself contains HO calls whose lambda sets depend on the substituted parameter, recurse — those inner call sites now have known sets too.
+The single-variant case is the common case in practice. Most call sites pass one specific closure to one specific HOF — the lambda set is naturally singleton. The compiler exploits this aggressively.
 
-After specialization there are no `Closure` nodes and no HO parameters. Every call has a first-order target. The Phase E lowering single-variant shortcut fires whenever `|S_c| == 1` — which, with this pass, is the common case for `List.walk` and friends.
+When the lambda set is genuinely multi-variant (two or more closures flowing through the same position by run-time control flow), the tag exists and the dispatch is a tag compare. The dispatcher knows every possible target by name and emits a direct call per arm — no vtable, no indirect call.
 
-The keying step deduplicates: if two call sites pass the same lambda set to the same callee, they share one specialization.
+## Dispatch
 
-### Downstream passes
+Inside the HOF body, a call to the function-typed parameter is **tag dispatch over the lambda set**:
 
-Unchanged. `decl_info`, `reachable::prune`, SSA lower, opt, and eval all see a first-order module with normal tag unions. The Phase E machinery in `lower/` already handles the singleton-tag-union shortcut — no lowering changes needed.
+```ruby
+# Source:
+apply = |f, n| f(n)
 
-## Implementation order
+# Conceptual lowering (multi-variant case):
+apply = |f, n|
+    if f
+        : AddX(x) then __lifted_add_x(x, n)
+        : Greet(s) then __lifted_greet(s, n)
+```
 
-Each stage is independently testable.
+For a singleton lambda set, the dispatch is a one-arm match that the lowering collapses to a direct call:
 
-### Stage 1 — call-site ids
+```ruby
+# Singleton case:
+apply = |f, n|
+    if f : AddX(x) then __lifted_add_x(x, n)
 
-Add a `CallSiteId` numbering pass (or extend existing AST nodes with a stable id). Verify it survives through `lambda_lift` so `lambda_solve` can key on it.
+# Phase E lowers this to: __lifted_add_x(captures_from_f..., n)
+# — no tag check, no payload load, captures are already in registers.
+```
 
-### Stage 2 — non-merging solve
+The "tag dispatch" model means dispatch is **always discrimination over a known finite set**, never invocation through an unknown pointer. The runtime cost is at most one tag compare + a direct jump.
 
-Rewrite `lambda_solve` to track `call_site_id → lambda_set` without bidirectional merging. Capture-chain propagation stays. Verify on a small program with two `List.walk` call sites carrying different closures that the two sets stay separate.
+## Per-call-site specialization
 
-### Stage 3 — per-call-site specialization
+Two call sites of the same HOF can pass two different closures:
 
-Rewrite `lambda_specialize` to clone callees per call site. Drop the `__apply_K` dispatcher synthesis (the dispatch falls out of pattern matching on the cloned signature's tag union parameter). Verify that singleton sets produce direct calls and multi-variant sets produce normal `if … is …` dispatch.
+```ruby
+main = |arg|
+    a = arg + 10
+    b = arg + 20
+    x1 = apply(|y| y + a, 1)   # site 1: passes closure_a
+    x2 = apply(|y| y + b, 2)   # site 2: passes closure_b
+    x1 + x2
+```
 
-### Stage 4 — recursion
+A naive analysis would say `apply`'s `f` parameter has lambda set `{closure_a, closure_b}` — multi-variant. Each closure value at construction would then need the `(tag, payload)` shape, even though at each individual call site only one closure ever flows in.
 
-Handle HOFs that pass closures to other HOFs. The cloned callee may itself have HO call sites whose sets are now resolved; recurse the specialization. Verify with a `compose : (b -> c), (a -> b) -> (a -> c)` style example.
+Ori specializes more aggressively: it generates a **separate clone of `apply`** for each call site. The clone's `f` parameter has a singleton lambda set (just the one closure that flows in at that site). At each call site, the closure value is single-variant, Phase E fires, captures live in registers, and the dispatch inside the clone collapses to a direct call.
 
-### Stage 5 — verification
+This is the *function-set analog* of monomorphization. Just as Ori specializes generic functions per type — `apply : (a -> b), a -> b` is cloned per concrete `a, b` — it also specializes them per lambda set. Function specialization and type specialization are orthogonal axes of the same idea: replace polymorphism with cloning, get direct calls and tight layouts as the natural result.
 
-Pin tests asserting:
-- `walk_singleton_no_dispatcher` — a `List.walk` call with a single concrete closure produces no `__apply_K` and no payload heap alloc.
-- `walk_heterogeneous_tag_dispatch` — a position receiving two different closures gets a 2-variant tag union, dispatched without heap.
-- `compose_specialized_through_chain` — nested HO calls specialize transitively, no residual HO parameters.
+The genuinely multi-variant case — when *one* call site can produce *multiple* closures by runtime control flow — keeps the tag:
 
-### Stage 6 — cleanup
+```ruby
+apply(if cond then closure_a else closure_b, 5)
+```
 
-Delete the merged-set data structures and dispatcher-synthesis code in `lambda_specialize`. Remove the `_K` apply naming convention from `decl_info` and `reachable::prune`. Update `notes/compiler-passes.md` to reflect the new behavior.
+Here a single call site's closure value can be either closure depending on `cond`. The lambda set at this position is `{closure_a, closure_b}`; the value must carry the tag; the dispatcher must compare it. There's no narrowing to apply, and no way around the tag — but the dispatch is still a switch over two known arms with direct calls, not an indirect call.
 
-## Trade-offs
+## Compile-time collapse
 
-**Code-size growth.** Per-call-site cloning duplicates HOFs. For Ori — total, no general recursion, small programs — this is fine; the same trade-off Rust mono accepts. If it ever isn't, the escape valve is opt-in *erasure* (typed function pointer + opaque captures pointer) for specific positions, à la Rust `dyn`. Not in scope for this plan.
+The runtime representation is a worst-case description. In practice further compiler passes collapse it further when the surrounding code permits:
 
-**Specialization key equivalence.** Two call sites producing structurally equal lambda sets should share one specialization. Naive pointer equality on the set value won't work — we need structural equivalence, with care around recursive sets. Same problem the Roc RFC discusses for type-specialization keys; same solution (compare structurally, optionally intern). Probably defer until measured.
+- **Static promotion**: if a closure's captures are all compile-time constants, the entire closure value is baked into static memory. The dispatcher's tag load returns a static constant, branch folding prunes the unreachable arms, dead-code elimination removes the construction. The closure is gone before the program runs.
+- **Inlining + constant propagation**: if the HOF is small enough to inline, the closure construction and the dispatch end up in the same block. The tag store flows directly into the tag load; branch folding fires; the dispatch collapses to its one live arm.
+- **Phase E**: single-variant closures lower to register captures (no tag, no payload). This is automatic for every singleton lambda set, whether the singleton came from natural call-site usage or from per-call-site specialization.
 
-**Abilities / dispatch tables.** Out of scope. Ori doesn't have abilities; this plan is purely about closures.
+The layered story: **specialization** reduces the worst case at compile time (more sets become singleton); **lowering** turns singleton sets into register-only values; the **opt pipeline** does further constant-time collapse where the SSA permits.
 
-## Non-goals
+## What you pay, when
 
-- No new IR.
-- No changes to SSA lower.
-- No changes to RC/FBIP.
-- No erasure / `dyn` story.
-- No incremental compilation or per-module caching.
+| Closure construction | Cost |
+|---|---|
+| Singleton set + non-constant captures | Captures live in registers. No allocation. Dispatch is a direct call. |
+| Singleton set + constant captures | Closure folded into a static. Zero runtime work. |
+| Multi-variant set, statically determinable | Folded into the matching variant at compile time. Zero runtime work. |
+| Multi-variant set, runtime-conditional | Tag is stored at construction. Dispatch is one tag-compare + direct jump. Captures heap-allocated for variants that have them. |
 
-## Open questions
+The only irreducible cost is the genuinely heterogeneous, genuinely runtime-conditional case. And even there, the cost is one tag compare — the same cost as pattern-matching on `Ok(_) | Err(_)`. There is no vtable indirection in any case.
 
-- Do we need a `CallSiteId` newtype, or can existing expression-position info do the job? (Probably the latter — every `Call` AST node already has a unique position.)
-- Specialization clones may produce many functions with similar bodies. Is some merging worthwhile after the fact, or does dead-code elimination clean it up well enough? Probably the latter, but verify with a real program.
-- How do we cap recursive specialization for self-referential HO chains? Termination should follow from total recursion, but worth sanity-checking once the implementation exists.
+## Why this design
+
+Ori's central claim is that **memory is managed statically** — Perceus refcounting and FBIP in-place mutation aren't optimizations, they're the runtime model. For that claim to hold under higher-order functions, closures cannot be opaque. A closure that the compiler can't see through is a closure whose captures the RC pass can't track, whose lifetime FBIP can't reason about, and whose dispatch costs an indirect call.
+
+Lambda set inference is the mechanism that keeps closures transparent. Every closure is a constructor call producing a tagged union value, just like `Ok(x)` is a constructor call producing a `Result`. The same machinery — RC traffic on the payload, FBIP on update, single-variant decomposition for layout — handles closures uniformly. Higher-order code pays nothing extra at the language level.
+
+The model is borrowed from Roc, where the analogous machinery has shipped in production for years. The key insight (in both languages) is that closures are sum types: at any point in the program, a function-typed value is exactly one of a known finite set of options, and the compiler can specialize per option whenever it pays off.
+
+## Comparison
+
+| | Direct calls | Heterogeneous closures | Heap for closures | Indirect calls |
+|---|---|---|---|---|
+| Rust monomorphization | Yes, when types unify | No — needs `Box<dyn Fn>` | `dyn Fn` → heap | `dyn Fn` → vtable |
+| Type-erased function pointers (`fn(*captures)`) | Always | Yes | Yes (the captures) | Yes (the pointer) |
+| Ori lambda sets | Singleton sets | Yes, via tag union | Only when variant payload is nonempty | Never |
+
+Lambda set compilation strictly dominates monomorphization-with-dyn for heterogeneous closures — same direct-call quality, no heap, no vtable. The tag is the only added concept, and it's only paid when genuinely needed.
+
+## What is out of scope
+
+- **General recursion through closures.** Ori is total — structural recursion only via `fold` over inductive types. A closure can't refer to itself by name from inside its own body, so the lambda-lift step is straightforward and the lambda set is always finite.
+- **Closures crossing FFI.** All closure values are constructed inside the Ori program. Nothing flows back from a host that the compiler hasn't enumerated.
+- **Function pointers as first-class values across modules without a known set.** Lambda set inference is whole-program. Per-module incremental compilation, if added later, requires a story for cross-module function-set propagation (Roc has one; Ori currently does not need it).
+- **`dyn`-style erasure as an opt-in escape valve.** If code size from per-call-site cloning ever becomes a real problem, Ori could add an opt-in erasure mode for specific positions (typed function pointer + opaque captures pointer). Not currently planned — every benchmark so far fits inside the lambda-set model.
+
+## A worked example
+
+```ruby
+double = |x| x * 2
+
+apply : (I64 -> I64), I64 -> I64
+apply = |f, n| f(n)
+
+main : I64 -> I64
+main = |arg| (
+    x = arg + 1
+    apply(|y| y + x, 5) + apply(double, 7)
+)
+```
+
+What the compiler sees, after lambda lifting:
+
+- `double` is a named top-level function.
+- The inline `|y| y + x` becomes a lifted function `__lifted_0 = |x_cap, y| y + x_cap`, plus a closure value `Closure { func: __lifted_0, captures: (x,) }` at the call site.
+- Two call sites of `apply`: one passes the inline closure, one passes `double` directly (which the compiler treats as an empty-capture closure: `Closure { func: double, captures: () }`).
+
+Lambda sets at `apply`'s `f` parameter:
+- At site 1: `{__lifted_0(I64)}` — singleton, captures one I64.
+- At site 2: `{double()}` — singleton, no captures.
+
+Specialization clones `apply` per call site (their lambda sets differ). Each clone has a singleton `f`. Phase E lowers both closures to register-only values: site 1's is just the captured `x`, site 2's is empty. Each clone's body inlines to a direct call: `__lifted_0(x, 5)` and `double(7)` respectively.
+
+What actually runs:
+
+```ruby
+main = |arg|
+    x = arg + 1
+    (5 + x) + (7 * 2)    # closures fully eliminated
+```
+
+No tag was stored. No heap object was allocated for any closure. Two direct calls — one to `__lifted_0`, one to `double` — both of which the inliner is free to inline further. The end result is plain arithmetic.
+
+That collapse is what the lambda set machinery exists to deliver. Every higher-order Ori program is compiled toward this shape; the only deviations are the truly heterogeneous cases, where the cost is one tag compare.

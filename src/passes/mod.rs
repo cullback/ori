@@ -9,7 +9,8 @@
 //   7. mono              — monomorphize polymorphic functions
 //   8. lambda::*         — defunctionalize closures (4-pass sub-pipeline):
 //                          lift → solve → specialize → narrow
-//                          See `lambda/README.md` for the model and rationale.
+//                          See `notes/lambda-set-specialization.md` for the
+//                          language-level model and runtime semantics.
 //   9. decl_info         — build metadata tables for lowering
 //  10. reachable         — prune unreachable declarations
 //  11. ssa::lower        (not here — lives with the SSA IR)
