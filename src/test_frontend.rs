@@ -44,11 +44,26 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     let lambda_solution = crate::passes::lambda::solve::solve(&mono);
     crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
     crate::passes::lambda::narrow::narrow(&mut mono);
+    // Catch any synthesized Expr left with the inference placeholder
+    // type. Fails immediately rather than letting lower silently
+    // degrade (see e_user_hof_multislot_* tests for the bug class).
+    validate_ast_types(&mono, "after lambda passes");
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
     validate_after(&ssa_module, "lower");
     (ssa_module, input_vals)
+}
+
+fn validate_ast_types(mono: &crate::passes::mono::Monomorphized<'_>, after: &str) {
+    let errs = crate::passes::validate_ast_types::validate(&mono.module, &mono.symbols);
+    if !errs.is_empty() {
+        panic!(
+            "AST type validation failed {after}: placeholder Type::Var(0) on \
+             post-inference expressions (use Expr::typed not Expr::new):\n  {}",
+            errs.join("\n  ")
+        );
+    }
 }
 
 fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
@@ -3654,6 +3669,7 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     let lambda_solution = crate::passes::lambda::solve::solve(&mono);
     crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
     crate::passes::lambda::narrow::narrow(&mut mono);
+    validate_ast_types(&mono, "after lambda passes (defunc helper)");
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     (mono.module, mono.symbols)

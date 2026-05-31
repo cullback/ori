@@ -23,3 +23,4 @@ pub mod mono;
 pub mod reachable;
 pub mod resolve;
 pub mod topo;
+pub mod validate_ast_types;

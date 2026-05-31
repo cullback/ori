@@ -685,11 +685,17 @@ impl<'a, 'src> CloneBodyRewriter<'a> {
                             .iter()
                             .enumerate()
                             .map(|(i, s)| {
-                                let mut e = Expr::new(ExprKind::Name(*s), expr.span);
-                                if let Some(ty) = cap_tys.get(i) {
-                                    e.ty = ty.clone();
-                                }
-                                e
+                                // `Expr::typed` rather than
+                                // `Expr::new + .ty =` so the
+                                // required type shows up at the
+                                // construction site.
+                                let ty = cap_tys
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or(Type::Var(
+                                        crate::types::engine::TypeVar(0),
+                                    ));
+                                Expr::typed(ExprKind::Name(*s), expr.span, ty)
                             })
                             .collect();
                         for a in other_args {

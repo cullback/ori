@@ -361,11 +361,10 @@ fn build_apply_arm<'src>(
     // is under-arity at the SSA boundary.
     let cap_tys = lifted_func_capture_types(func_schemes, entry, symbols);
     let typed_name = |sym: SymbolId, ty: Option<&Type>| -> Expr<'src> {
-        let mut e = Expr::new(ExprKind::Name(sym), span);
-        if let Some(t) = ty {
-            e.ty = t.clone();
-        }
-        e
+        // `Expr::typed` rather than `Expr::new + .ty =` so the
+        // required type shows up at the construction site.
+        let ty = ty.cloned().unwrap_or(Type::Var(crate::types::engine::TypeVar(0)));
+        Expr::typed(ExprKind::Name(sym), span, ty)
     };
     let body = if let Some(func_name) = &entry.func_ref {
         // Named function ref: Call(func, [args...])
@@ -544,11 +543,18 @@ impl<'src> Rewriter<'_> {
                             let mut call_args: Vec<Expr<'src>> = caps.iter()
                                 .enumerate()
                                 .map(|(i, s)| {
-                                    let mut e = Expr::new(ExprKind::Name(*s), span);
-                                    if let Some(ty) = cap_tys.get(i) {
-                                        e.ty = ty.clone();
-                                    }
-                                    e
+                                    // `Expr::typed` rather than `Expr::new`
+                                    // to make the typed-Name requirement
+                                    // explicit at the construction site.
+                                    // `validate_ast_types` would flag a
+                                    // missing `cap_tys` entry (it'd see a
+                                    // placeholder Var on a synthesized
+                                    // Name in a Call arg).
+                                    let ty = cap_tys
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or(Type::Var(crate::types::engine::TypeVar(0)));
+                                    Expr::typed(ExprKind::Name(*s), span, ty)
                                 })
                                 .collect();
                             call_args.append(args);

@@ -156,6 +156,12 @@ pub struct Expr<'src> {
 }
 
 impl<'src> Expr<'src> {
+    /// Construct an Expr with the placeholder type. Correct for
+    /// **pre-inference** synthesizers (parser, `fold_lift`,
+    /// `flatten_patterns`) where inference will fill in the type
+    /// during its walk. Post-inference passes must use `Expr::typed`
+    /// or set the `ty` field explicitly — see `validate_ast_types`
+    /// for the check that catches violations.
     #[allow(dead_code, reason = "used by rewrite passes starting in Step 4")]
     pub fn new(kind: ExprKind<'src>, span: Span) -> Self {
         Self {
@@ -163,6 +169,25 @@ impl<'src> Expr<'src> {
             span,
             id: ExprId::fresh(),
             ty: placeholder_type(),
+        }
+    }
+
+    /// Construct an Expr with an explicit type. Required for any
+    /// synthesizer that runs **after inference** — `lambda_lift`,
+    /// `lambda_specialize`, `lambda_narrow`, etc. The type drives
+    /// `lower::scalar_type`, `expand_slots`, `slot_offsets`, and
+    /// `to_slots`; a placeholder type would degrade lower's
+    /// behavior silently (e.g. `to_slots` falls back to a single
+    /// slot, breaking multi-slot capture passing through call
+    /// boundaries). See the commit history around the
+    /// `e_user_hof_multislot_*` tests for the bug class this
+    /// helper exists to prevent.
+    pub fn typed(kind: ExprKind<'src>, span: Span, ty: Type) -> Self {
+        Self {
+            kind,
+            span,
+            id: ExprId::fresh(),
+            ty,
         }
     }
 }
