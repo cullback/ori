@@ -36,6 +36,8 @@ pub enum MInst {
     MovImm { rd: VReg, imm: u16 },
     /// `MOVN Xd, #imm16, LSL #0` — load NOT(imm); `MOVN ..., #0` = -1.
     MovInv { rd: VReg, imm: u16 },
+    /// `MOVK Xd, #imm16, LSL #(shift)` — keep other bits, patch a 16-bit chunk.
+    MovkImm { rd: VReg, imm: u16, shift: u8 },
     /// `MOV Xd, Xs` — register-to-register move. Used by the selector
     /// to shuffle SSA values into calling-convention slots.
     MovReg { rd: VReg, rs: VReg },
@@ -67,6 +69,14 @@ pub enum MInst {
     LsrReg { rd: VReg, rn: VReg, rm: VReg },
     /// `MUL Xd, Xn, Xm`.
     MulReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `UDIV Xd, Xn, Xm` — unsigned division.
+    UdivReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `ADD Xd, Xn, Xm, LSL #3` — indexed addressing for 8-byte slots.
+    AddRegLsl3 { rd: VReg, rn: VReg, rm: VReg },
+    /// `LDRB Wt, [Xn, #imm]` — zero-extending byte load.
+    LdrbImm { rt: VReg, rn: VReg, byte_offset: u16 },
+    /// `STRB Wt, [Xn, #imm]` — store low byte.
+    StrbImm { rt: VReg, rn: VReg, byte_offset: u16 },
     /// `RET` — return via X30/LR.
     Ret,
     /// `NOP` — filler for code-section alignment padding.
@@ -82,6 +92,8 @@ pub enum MInst {
     CmpReg { rn: VReg, rm: VReg },
     /// `CSET Xd, cond` — write 1/0 based on flags + condition.
     CSet { rd: VReg, cond: super::encode::Cond },
+    /// `CSEL Xd, Xn, Xm, cond` — `Xd = if cond { Xn } else { Xm }`.
+    CSel { rd: VReg, rn: VReg, rm: VReg, cond: super::encode::Cond },
     /// `B label` — unconditional branch.
     B { target: Label },
     /// `BL label` — branch + link (function call).
@@ -97,8 +109,13 @@ pub enum MInst {
 }
 
 /// A blob of bytes addressable by `Label::Data(idx)`.
+///
+/// `label` resolves to `start_of_bytes + label_offset`. For Phase 5f
+/// runtime-friendly statics this is 8 so the label points past the
+/// 8-byte size header; older code paths (Phase 0/3 hello-worlds) use 0.
 #[derive(Clone, Debug)]
 pub struct DataItem {
     pub label: Label,
     pub bytes: Vec<u8>,
+    pub label_offset: u32,
 }

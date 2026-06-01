@@ -169,6 +169,7 @@ pub fn lower_module(module: &Module) -> (Vec<MInst>, Vec<DataItem>) {
         .map(|(idx, obj)| DataItem {
             label: Label::Data(idx as u32),
             bytes: static_to_bytes(&obj.slots),
+            label_offset: 0,
         })
         .collect();
 

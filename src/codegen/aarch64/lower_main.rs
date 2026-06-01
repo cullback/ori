@@ -188,16 +188,93 @@ fn lower_inst(
             // No-op until a real refcount runtime exists.
         }
         Inst::Const(dest, bits) => {
-            assert!(*bits <= u64::from(u16::MAX), "Const {bits} exceeds 16-bit movz");
-            out.push(MInst::MovImm { rd: SCRATCH_C, imm: *bits as u16 });
+            // Load via MOVZ + (optional MOVKs) for values wider than 16 bits.
+            let low = (*bits & 0xFFFF) as u16;
+            out.push(MInst::MovImm { rd: SCRATCH_C, imm: low });
+            for shift in [16_u8, 32, 48] {
+                let chunk = ((*bits >> shift) & 0xFFFF) as u16;
+                if chunk != 0 {
+                    out.push(MInst::MovkImm { rd: SCRATCH_C, imm: chunk, shift });
+                }
+            }
             emit_store(*dest, SCRATCH_C, frame, out);
         }
         Inst::Alloc(dest, size) => {
-            // result = bump_ptr; bump_ptr += aligned_size
-            out.push(MInst::MovReg { rd: SCRATCH_C, rs: HEAP_BUMP_REG });
-            let aligned = ((*size + 7) & !7) as u32;
-            out.push(MInst::AddImm { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, imm: aligned });
+            // Size-tracked: alloc 8 bytes of header + size bytes of payload.
+            // Header at [user_ptr - 8] stores the payload size. This lets
+            // cow_resize_dyn copy the right number of bytes.
+            let aligned_payload = ((*size + 7) & !7) as u32;
+            // header_ptr = bump_ptr; user_ptr = header_ptr + 8; bump += 8 + size
+            out.push(MInst::MovReg { rd: SCRATCH_A, rs: HEAP_BUMP_REG });          // header_ptr
+            out.push(MInst::MovImm { rd: SCRATCH_B, imm: aligned_payload.try_into().unwrap_or(0xFFFF) });
+            // For sizes that fit in 16 bits we use MovImm; larger should not
+            // appear for static Alloc (Ori SSA produces small literal sizes).
+            assert!(aligned_payload <= u32::from(u16::MAX), "Alloc size too big: {aligned_payload}");
+            out.push(MInst::StrImm64 { rt: SCRATCH_B, rn: SCRATCH_A, byte_offset: 0 }); // store size header
+            out.push(MInst::AddImm { rd: SCRATCH_C, rn: SCRATCH_A, imm: 8 });       // user_ptr
+            out.push(MInst::AddImm { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, imm: aligned_payload + 8 });
             emit_store(*dest, SCRATCH_C, frame, out);
+        }
+        Inst::AllocDyn(dest, size_val) => {
+            // Same as Alloc but size is a runtime value. Caller is
+            // responsible for the size being 8-aligned.
+            emit_load(*size_val, SCRATCH_B, frame, out);                                 // size
+            out.push(MInst::MovReg { rd: SCRATCH_A, rs: HEAP_BUMP_REG });                // header_ptr
+            out.push(MInst::StrImm64 { rt: SCRATCH_B, rn: SCRATCH_A, byte_offset: 0 });  // store size
+            out.push(MInst::AddImm { rd: SCRATCH_C, rn: SCRATCH_A, imm: 8 });            // user_ptr
+            out.push(MInst::AddReg { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, rm: SCRATCH_B });
+            out.push(MInst::AddImm { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, imm: 8 });
+            emit_store(*dest, SCRATCH_C, frame, out);
+        }
+        Inst::CowResizeDyn(dest, ptr, new_size) => {
+            // Allocate a new buffer of `new_size` bytes, copy
+            // min(old_size, new_size) bytes from old → new, return
+            // new user ptr.
+            let old_ptr = VReg(12);
+            let new_size_r = VReg(13);
+            let old_size = VReg(14);
+            let new_header = VReg(15);
+            let new_user = VReg(16);
+            let copy_size = VReg(17);
+            let i = VReg(18);
+            let byte = VReg(19);
+            let addr_in = VReg(20);
+            let addr_out = VReg(21);
+
+            emit_load(*ptr, old_ptr, frame, out);
+            emit_load(*new_size, new_size_r, frame, out);
+
+            // old_size = [old_ptr - 8]; compute as (old_ptr - 8) + ldr [+0]
+            out.push(MInst::SubImm { rd: addr_in, rn: old_ptr, imm: 8 });
+            out.push(MInst::LdrImm64 { rt: old_size, rn: addr_in, byte_offset: 0 });
+
+            // Allocate new (size-tracked).
+            out.push(MInst::MovReg { rd: new_header, rs: HEAP_BUMP_REG });
+            out.push(MInst::StrImm64 { rt: new_size_r, rn: new_header, byte_offset: 0 });
+            out.push(MInst::AddImm { rd: new_user, rn: new_header, imm: 8 });
+            out.push(MInst::AddReg { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, rm: new_size_r });
+            out.push(MInst::AddImm { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, imm: 8 });
+
+            // copy_size = min(old_size, new_size_r)
+            out.push(MInst::CmpReg { rn: old_size, rm: new_size_r });
+            out.push(MInst::CSel { rd: copy_size, rn: old_size, rm: new_size_r, cond: Cond::Lt });
+
+            // Byte copy loop.
+            let loop_id = 0x6000_0000 | (dest.id as u32 & 0x7FFF);
+            let done_id = loop_id | 0x8000;
+            out.push(MInst::MovImm { rd: i, imm: 0 });
+            out.push(MInst::BlockStart { idx: loop_id });
+            out.push(MInst::CmpReg { rn: i, rm: copy_size });
+            out.push(MInst::BCond { cond: Cond::Ge, target: Label::Block(done_id) });
+            out.push(MInst::AddReg { rd: addr_in, rn: old_ptr, rm: i });
+            out.push(MInst::LdrbImm { rt: byte, rn: addr_in, byte_offset: 0 });
+            out.push(MInst::AddReg { rd: addr_out, rn: new_user, rm: i });
+            out.push(MInst::StrbImm { rt: byte, rn: addr_out, byte_offset: 0 });
+            out.push(MInst::AddImm { rd: i, rn: i, imm: 1 });
+            out.push(MInst::B { target: Label::Block(loop_id) });
+            out.push(MInst::BlockStart { idx: done_id });
+
+            emit_store(*dest, new_user, frame, out);
         }
         Inst::Store(ptr, offset, val) => {
             assert!(*offset <= 0x7FF8, "Store offset {offset} out of range");
@@ -212,6 +289,21 @@ fn lower_inst(
             emit_load(*ptr, SCRATCH_A, frame, out);
             out.push(MInst::LdrImm64 { rt: SCRATCH_C, rn: SCRATCH_A, byte_offset: *offset as u32 });
             emit_store(*dest, SCRATCH_C, frame, out);
+        }
+        Inst::LoadDyn(dest, ptr, idx_val) => {
+            // Stride 8 uniformly (eval semantics). addr = ptr + idx*8.
+            emit_load(*ptr, SCRATCH_A, frame, out);
+            emit_load(*idx_val, SCRATCH_B, frame, out);
+            out.push(MInst::AddRegLsl3 { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B });
+            out.push(MInst::LdrImm64 { rt: SCRATCH_C, rn: SCRATCH_C, byte_offset: 0 });
+            emit_store(*dest, SCRATCH_C, frame, out);
+        }
+        Inst::StoreDyn(ptr, idx_val, val) => {
+            emit_load(*ptr, SCRATCH_A, frame, out);
+            emit_load(*idx_val, SCRATCH_B, frame, out);
+            out.push(MInst::AddRegLsl3 { rd: SCRATCH_A, rn: SCRATCH_A, rm: SCRATCH_B });
+            emit_load(*val, SCRATCH_C, frame, out);
+            out.push(MInst::StrImm64 { rt: SCRATCH_C, rn: SCRATCH_A, byte_offset: 0 });
         }
         Inst::BinOp(dest, op, lhs, rhs) => {
             emit_load(*lhs, SCRATCH_A, frame, out);
@@ -235,14 +327,35 @@ fn lower_inst(
                 BinaryOp::Xor => out.push(MInst::EorReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
                 BinaryOp::Shl => out.push(MInst::LslReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
                 BinaryOp::Shr => out.push(MInst::LsrReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::Div => out.push(MInst::UdivReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::Rem => {
+                    // rem = a - (a/b)*b. Uses x12 as a scratch outside our
+                    // standard scratch trio to avoid clobbering.
+                    let q = VReg(12);
+                    out.push(MInst::UdivReg { rd: q, rn: SCRATCH_A, rm: SCRATCH_B });
+                    out.push(MInst::MulReg { rd: q, rn: q, rm: SCRATCH_B });
+                    out.push(MInst::SubReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: q });
+                }
                 other => panic!("Phase 5e: unsupported BinOp {other:?}"),
             }
             emit_store(*dest, SCRATCH_C, frame, out);
         }
         Inst::Call { results, target, args } => {
+            // Builtin: `__crash` is the runtime panic helper called from
+            // unwrap-on-None / unwrap-on-Err patterns. It never returns.
+            // Phase 5f minimum: drop the error message and just `exit(1)`.
+            // (Printing the message would mean inlining a third byte-pack
+            // loop; doable later.)
+            if target == "__crash" {
+                out.push(MInst::MovImm { rd: VReg(0), imm: 1 });
+                out.push(MInst::MovImm { rd: VReg(8), imm: 94 });
+                out.push(MInst::Svc { imm: 0 });
+                out.push(MInst::Brk { imm: 0 });
+                return;
+            }
+
             assert!(args.len() <= 8, "Phase 5e: >8 args needs stack-passed args");
             assert!(results.len() <= 8, "Phase 5e: >8 return values needs stack-passed returns");
-            // Load args directly into x0..xN (calling-convention regs).
             for (i, arg) in args.iter().enumerate() {
                 #[expect(clippy::cast_possible_truncation, reason = "≤ 8 args")]
                 let target_reg = VReg(i as u8);
@@ -252,12 +365,19 @@ fn lower_inst(
                 panic!("Phase 5e: Call to unknown function {target}")
             });
             out.push(MInst::Bl { target: Label::Func(idx) });
-            // Store return values from x0..xM into their slots.
             for (i, r) in results.iter().enumerate() {
                 #[expect(clippy::cast_possible_truncation, reason = "≤ 8 returns")]
                 let src_reg = VReg(i as u8);
                 emit_store(*r, src_reg, frame, out);
             }
+        }
+        Inst::Cast(dest, src) | Inst::BitCast(dest, src) => {
+            // Phase 5f: rely on 8-byte slots being zero-padded for
+            // smaller types — widening is just a slot copy. Narrowing
+            // is also a slot copy (high bits get carried but Ori
+            // semantics check the narrowed width at use sites).
+            emit_load(*src, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, out);
         }
         other => panic!("Phase 5e: unsupported SSA inst: {other:?}"),
     }
@@ -425,46 +545,125 @@ fn runtime_shim_with_label() -> Vec<MInst> {
 }
 
 /// Inline `_start` shim that runs AFTER __main's body has placed the
-/// Result pointer in x0. Hardcoded for `Result(Str, Str)`:
-///   x0 = result_ptr
-///   ldr x1, [x0, #0]    ; tag (0=Ok, 1=Err)
-///   ldr x0, [x0, #8]    ; payload_ptr (heap obj containing the Str ptr)
-///   ldr x0, [x0, #0]    ; str_ptr (the List(U8) header)
-///   ldr x2, [x0, #0]    ; len
-///   ldr x1, [x0, #16]   ; data ptr (raw bytes)
-///   mov x0, #1          ; fd = stdout
-///   mov x8, #64         ; write syscall
+/// Result pointer in x0. Decodes `Result(Str, Str)` and writes the
+/// payload Str's bytes to stdout (Ok) or stderr (Err).
+///
+/// Because the Str's data buffer is 8-byte-slotted (each byte in its
+/// own slot), we first byte-pack it into a contiguous buffer using
+/// the bump heap, then write that.
+///
+///   result_ptr in x0
+///   ldr x19, [x0, #0]   ; tag (saved for fd/exit_code decision)
+///   ldr x0,  [x0, #8]   ; payload_ptr
+///   ldr x0,  [x0, #0]   ; str_ptr
+///   ldr x2,  [x0, #0]   ; len
+///   ldr x3,  [x0, #16]  ; data_ptr (8-byte-spread)
+///
+///   mov x4, x28         ; out_buf = bump pointer (fresh region)
+///   add x28, x28, x2    ; advance bump past out_buf
+///
+///   mov x5, #0          ; i = 0
+/// pack_loop:
+///   cmp x5, x2
+///   b.ge pack_done
+///   add x6, x3, x5, lsl #3   ; addr = data_ptr + i*8
+///   ldrb w7, [x6]            ; byte = data_ptr[i*8]
+///   strb w7, [x4, x5]        ; out_buf[i] = byte (uses STRB Wt, [Xn, #imm]
+///                            ; but our encoder takes a reg-imm; here imm
+///                            ; is variable so we use add+strb#0)
+///   add x5, x5, #1
+///   b pack_loop
+/// pack_done:
+///
+///   ; write(fd, out_buf, len)
+///   cmp x19, #0
+///   b.eq ok_path
+///   mov x0, #2          ; stderr
+///   b after_fd
+/// ok_path:
+///   mov x0, #1          ; stdout
+/// after_fd:
+///   mov x1, x4
+///   mov x8, #64
 ///   svc #0
-///   mov x0, #0          ; exit 0 (always; Err handling deferred)
-///   mov x8, #94         ; exit_group
+///
+///   ; exit(tag)  (0 for Ok, 1 for Err)
+///   mov x0, x19
+///   mov x8, #94
 ///   svc #0
+///   brk #0
 fn runtime_shim() -> Vec<MInst> {
+    let result_ptr = VReg(0);
+    let tag = VReg(19);
+    let str_ptr = VReg(0);   // reused after walking
+    let len = VReg(2);
+    let data_ptr = VReg(3);
+    let out_buf = VReg(4);
+    let i = VReg(5);
+    let addr_in = VReg(6);
+    let byte = VReg(7);
+    let addr_out = VReg(20);
+
     vec![
-        // Save the str_ptr in x3 while we walk through; we need both
-        // len and data from it.
-        MInst::LdrImm64 { rt: VReg(1), rn: VReg(0), byte_offset: 0 },  // tag (ignored, kept for Phase 5)
-        MInst::LdrImm64 { rt: VReg(0), rn: VReg(0), byte_offset: 8 },  // x0 = payload_ptr
-        MInst::LdrImm64 { rt: VReg(0), rn: VReg(0), byte_offset: 0 },  // x0 = str_ptr
-        MInst::LdrImm64 { rt: VReg(2), rn: VReg(0), byte_offset: 0 },  // x2 = len
-        MInst::LdrImm64 { rt: VReg(1), rn: VReg(0), byte_offset: 16 }, // x1 = data ptr
-        MInst::MovImm { rd: VReg(0), imm: 1 },                          // fd = stdout
-        MInst::MovImm { rd: VReg(8), imm: 64 },                         // write syscall
+        // Decode Result → Str → (len, data_ptr).
+        MInst::LdrImm64 { rt: tag, rn: result_ptr, byte_offset: 0 },     // tag
+        MInst::LdrImm64 { rt: VReg(0), rn: result_ptr, byte_offset: 8 }, // payload_ptr
+        MInst::LdrImm64 { rt: VReg(0), rn: VReg(0), byte_offset: 0 },    // str_ptr
+        MInst::LdrImm64 { rt: len, rn: str_ptr, byte_offset: 0 },        // len
+        MInst::LdrImm64 { rt: data_ptr, rn: str_ptr, byte_offset: 16 },  // data ptr
+
+        // Allocate packed-output buffer from the bump heap.
+        MInst::MovReg { rd: out_buf, rs: HEAP_BUMP_REG },
+        // bump += len (round up so x28 stays aligned doesn't matter at exit).
+        MInst::AddReg { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, rm: len },
+
+        // Pack loop: for i in 0..len: out_buf[i] = data_ptr[i*8] (low byte).
+        MInst::MovImm { rd: i, imm: 0 },
+        MInst::BlockStart { idx: SHIM_PACK_LOOP },
+        MInst::CmpReg { rn: i, rm: len },
+        MInst::BCond { cond: Cond::Ge, target: Label::Block(SHIM_PACK_DONE) },
+        MInst::AddRegLsl3 { rd: addr_in, rn: data_ptr, rm: i },
+        MInst::LdrbImm { rt: byte, rn: addr_in, byte_offset: 0 },
+        MInst::AddReg { rd: addr_out, rn: out_buf, rm: i },
+        MInst::StrbImm { rt: byte, rn: addr_out, byte_offset: 0 },
+        MInst::AddImm { rd: i, rn: i, imm: 1 },
+        MInst::B { target: Label::Block(SHIM_PACK_LOOP) },
+        MInst::BlockStart { idx: SHIM_PACK_DONE },
+
+        // write(fd, out_buf, len). fd = 1 (Ok=stdout) or 2 (Err=stderr).
+        // Branchless: cset gives 0/1, then +1 → 1/2.
+        MInst::CmpImm { rn: tag, imm: 0 },
+        MInst::CSet { rd: VReg(0), cond: Cond::Ne },
+        MInst::AddImm { rd: VReg(0), rn: VReg(0), imm: 1 },
+        MInst::MovReg { rd: VReg(1), rs: out_buf },
+        MInst::MovImm { rd: VReg(8), imm: 64 }, // write syscall
         MInst::Svc { imm: 0 },
-        MInst::MovImm { rd: VReg(0), imm: 0 },                          // exit code
-        MInst::MovImm { rd: VReg(8), imm: 94 },                         // exit_group
+
+        // exit(tag): 0 for Ok, 1 for Err.
+        MInst::MovReg { rd: VReg(0), rs: tag },
+        MInst::MovImm { rd: VReg(8), imm: 94 }, // exit_group
         MInst::Svc { imm: 0 },
-        MInst::Brk { imm: 0 },                                          // unreachable
+        MInst::Brk { imm: 0 }, // unreachable
     ]
 }
 
-/// Heap arena size (mmap'd at startup). Layout within the arena:
-///   [0 .. STDIN_BUF_SIZE)               : stdin buffer
-///   [STDIN_BUF_SIZE .. +24)              : input Str header (len, cap, data)
-///   [STDIN_BUF_SIZE+24 .. ARENA_SIZE)    : bump-allocated heap
-///
-/// Both sizes must fit in a 16-bit movz immediate.
-const ARENA_SIZE: u16 = 0xF000; // 60 KiB
-const STDIN_BUF_SIZE: u16 = 0x1000; // 4 KiB
+/// Heap arena layout (mmap'd at startup):
+///   [0 .. STDIN_RAW_SIZE)               : raw stdin buffer
+///   [STDIN_RAW_SIZE .. SPREAD)          : 8-byte-spread input data (data_ptr)
+///   [SPREAD .. STRH)                     : input Str header (24 bytes)
+///   [STRH .. ARGS)                       : empty args List header (24 bytes)
+///   [ARGS .. ARENA_SIZE)                 : bump heap
+const STDIN_RAW_SIZE: u16 = 0x800;       // 2 KiB raw bytes from read
+const STDIN_SPREAD_SIZE: u16 = 0x4000;   // 16 KiB (2 KiB * 8)
+const ARENA_SIZE: u16 = 0xF000;          // 60 KiB total
+
+/// Block labels reserved for shim-internal loops. Range 0x4000_0000
+/// is free of real block labels (`(func<<16)|bid`) and synth thunks
+/// (`0x8000_0000+`).
+const SHIM_PACK_LOOP: u32 = 0x4000_0003;
+const SHIM_PACK_DONE: u32 = 0x4000_0004;
+const SHIM_SPREAD_LOOP: u32 = 0x4000_0005;
+const SHIM_SPREAD_DONE: u32 = 0x4000_0006;
 
 /// Generate the `_start` entry shim that runs before `__main`'s body:
 ///   1. mmap the arena.
@@ -472,57 +671,90 @@ const STDIN_BUF_SIZE: u16 = 0x1000; // 4 KiB
 ///   3. Build the input Str header inside the arena.
 ///   4. Place args (= 0, unused), input ptr, and bump pointer into
 ///      x0, x1, x28 respectively.
+/// Entry shim:
+///   1. mmap a 60 KiB arena.
+///   2. Read up to STDIN_RAW_SIZE bytes of stdin into the raw buffer.
+///   3. Spread each byte into an 8-byte slot in the spread buffer
+///      (so SSA's LoadDyn(idx) at `idx*8` returns the right byte).
+///   4. Build the input Str header pointing at the spread buffer.
+///   5. Build an empty args List header (3 zero u64 slots).
+///   6. Set x0 = args ptr, x1 = input Str ptr, x28 = bump heap base.
 fn entry_shim() -> Vec<MInst> {
-    // Pick callee-saved scratch regs the shim alone uses.
-    let arena = VReg(19); // base of the mmap region
-    let strh = VReg(20); // address of the input Str header
-    let bytes_read = VReg(21); // result of read(2)
+    let arena = VReg(19);
+    let strh = VReg(20);
+    let bytes_read = VReg(21);
+    let raw_buf = arena;                 // alias for clarity
+    let spread_buf = VReg(22);
+    let i = VReg(5);
+    let byte = VReg(6);
+    let addr_in = VReg(7);
+    let addr_out = VReg(23);
 
     vec![
         // mmap(addr=0, len=ARENA_SIZE, prot=R|W, flags=PRIVATE|ANON, fd=-1, off=0)
-        MInst::MovImm { rd: VReg(0), imm: 0 },        // addr
-        MInst::MovImm { rd: VReg(1), imm: ARENA_SIZE }, // len
-        MInst::MovImm { rd: VReg(2), imm: 3 },        // prot = PROT_READ | PROT_WRITE
-        MInst::MovImm { rd: VReg(3), imm: 0x22 },     // flags = MAP_PRIVATE | MAP_ANONYMOUS
-        MInst::MovInv { rd: VReg(4), imm: 0 },        // fd = -1
-        MInst::MovImm { rd: VReg(5), imm: 0 },        // offset
-        MInst::MovImm { rd: VReg(8), imm: 222 },      // mmap syscall
+        MInst::MovImm { rd: VReg(0), imm: 0 },
+        MInst::MovImm { rd: VReg(1), imm: ARENA_SIZE },
+        MInst::MovImm { rd: VReg(2), imm: 3 },         // prot = R|W
+        MInst::MovImm { rd: VReg(3), imm: 0x22 },      // PRIVATE | ANON
+        MInst::MovInv { rd: VReg(4), imm: 0 },         // fd = -1
+        MInst::MovImm { rd: VReg(5), imm: 0 },         // offset
+        MInst::MovImm { rd: VReg(8), imm: 222 },       // mmap
         MInst::Svc { imm: 0 },
-        // x0 now holds the arena base; save into `arena`.
         MInst::MovReg { rd: arena, rs: VReg(0) },
 
-        // read(fd=0, buf=arena, count=STDIN_BUF_SIZE)
-        MInst::MovImm { rd: VReg(0), imm: 0 },                  // stdin
-        MInst::MovReg { rd: VReg(1), rs: arena },               // buf
-        MInst::MovImm { rd: VReg(2), imm: STDIN_BUF_SIZE },     // count
-        MInst::MovImm { rd: VReg(8), imm: 63 },                 // read syscall
+        // read(fd=0, buf=raw_buf, count=STDIN_RAW_SIZE)
+        MInst::MovImm { rd: VReg(0), imm: 0 },
+        MInst::MovReg { rd: VReg(1), rs: raw_buf },
+        MInst::MovImm { rd: VReg(2), imm: STDIN_RAW_SIZE },
+        MInst::MovImm { rd: VReg(8), imm: 63 },        // read
         MInst::Svc { imm: 0 },
-        // x0 = bytes read; stash into `bytes_read`.
         MInst::MovReg { rd: bytes_read, rs: VReg(0) },
 
-        // strh = arena + STDIN_BUF_SIZE
-        MInst::AddImm { rd: strh, rn: arena, imm: u32::from(STDIN_BUF_SIZE) },
+        // spread_buf = arena + STDIN_RAW_SIZE + 8 (8-byte size header
+        // precedes the user pointer, so cow_resize_dyn can find the size).
+        MInst::AddImm { rd: spread_buf, rn: arena, imm: u32::from(STDIN_RAW_SIZE) + 8 },
 
-        // Store the Str header fields: [len, cap, data_ptr].
-        MInst::StrImm64 { rt: bytes_read, rn: strh, byte_offset: 0 },  // len
-        MInst::MovImm { rd: VReg(2), imm: STDIN_BUF_SIZE },             // tmp = cap value
-        MInst::StrImm64 { rt: VReg(2), rn: strh, byte_offset: 8 },     // cap
-        MInst::StrImm64 { rt: arena, rn: strh, byte_offset: 16 },      // data
+        // Spread loop: for i in 0..bytes_read:
+        //   byte    = raw_buf[i]              (1-byte stride)
+        //   spread_buf[i*8] = byte            (8-byte slot, low byte)
+        MInst::MovImm { rd: i, imm: 0 },
+        MInst::BlockStart { idx: SHIM_SPREAD_LOOP },
+        MInst::CmpReg { rn: i, rm: bytes_read },
+        MInst::BCond { cond: Cond::Ge, target: Label::Block(SHIM_SPREAD_DONE) },
+        MInst::AddReg { rd: addr_in, rn: raw_buf, rm: i },
+        MInst::LdrbImm { rt: byte, rn: addr_in, byte_offset: 0 },
+        MInst::AddRegLsl3 { rd: addr_out, rn: spread_buf, rm: i },
+        MInst::StrImm64 { rt: byte, rn: addr_out, byte_offset: 0 },
+        MInst::AddImm { rd: i, rn: i, imm: 1 },
+        MInst::B { target: Label::Block(SHIM_SPREAD_LOOP) },
+        MInst::BlockStart { idx: SHIM_SPREAD_DONE },
 
-        // Empty args List header at strh + 24 — 3 zero u64 slots
-        // (len=0, cap=0, data=null). We write via XZR (= VReg(31)).
-        MInst::AddImm { rd: VReg(2), rn: strh, imm: 24 },         // tmp = args ptr
+        // Write the spread_buf's size header: [spread_buf - 8] = bytes_read * 8.
+        // VReg(2) = bytes_read * 8 via add_reg_lsl3 with xzr base.
+        MInst::AddRegLsl3 { rd: VReg(2), rn: VReg(31), rm: bytes_read },
+        MInst::SubImm { rd: VReg(3), rn: spread_buf, imm: 8 },  // header addr
+        MInst::StrImm64 { rt: VReg(2), rn: VReg(3), byte_offset: 0 },
+
+        // strh = spread_buf + STDIN_SPREAD_SIZE
+        MInst::AddImm { rd: strh, rn: spread_buf, imm: u32::from(STDIN_SPREAD_SIZE) },
+        // Str header: (len, cap, data_ptr)
+        MInst::StrImm64 { rt: bytes_read, rn: strh, byte_offset: 0 },
+        MInst::MovImm { rd: VReg(2), imm: STDIN_RAW_SIZE },
+        MInst::StrImm64 { rt: VReg(2), rn: strh, byte_offset: 8 },
+        MInst::StrImm64 { rt: spread_buf, rn: strh, byte_offset: 16 },
+
+        // Empty args List header at strh + 24.
+        MInst::AddImm { rd: VReg(2), rn: strh, imm: 24 },
         MInst::StrImm64 { rt: VReg(31), rn: VReg(2), byte_offset: 0 },
         MInst::StrImm64 { rt: VReg(31), rn: VReg(2), byte_offset: 8 },
         MInst::StrImm64 { rt: VReg(31), rn: VReg(2), byte_offset: 16 },
 
-        // Bump pointer (X28) = strh + 24 + 24. Heap starts after the
-        // args header.
+        // Bump pointer past args header.
         MInst::AddImm { rd: HEAP_BUMP_REG, rn: strh, imm: 48 },
 
-        // Set up __main's params: x0 = args ptr, x1 = input ptr.
-        MInst::MovReg { rd: VReg(0), rs: VReg(2) },
-        MInst::MovReg { rd: VReg(1), rs: strh },
+        // Set up __main params.
+        MInst::MovReg { rd: VReg(0), rs: VReg(2) },  // args
+        MInst::MovReg { rd: VReg(1), rs: strh },     // input
     ]
 }
 
@@ -709,7 +941,9 @@ pub fn lower_const_return(info: &ConstReturn, module: &Module) -> (Vec<MInst>, V
         MInst::Svc { imm: 0 },
     ];
 
-    let data = vec![DataItem { label, bytes: data_bytes }];
+    // Const-return path emits raw bytes (no size header) since it
+    // calls write() directly with len.
+    let data = vec![DataItem { label, bytes: data_bytes, label_offset: 0 }];
     (mir, data)
 }
 
@@ -718,16 +952,23 @@ pub fn lower_const_return(info: &ConstReturn, module: &Module) -> (Vec<MInst>, V
 const LOAD_VADDR: u64 = 0x0040_0000;
 const PAYLOAD_FILE_OFFSET: u64 = 64 + 56; // ELF header + program header
 
-fn slot_byte_size(slot: &StaticSlot) -> usize {
-    match slot {
-        StaticSlot::U8(_) => 1,
-        StaticSlot::U32(_) => 4,
-        StaticSlot::U64(_) | StaticSlot::I64(_) | StaticSlot::StaticPtr(_) => 8,
-    }
+/// Per eval's `init_statics`: every slot occupies 8 bytes regardless
+/// of payload type. U8 slots have the byte in the low position and 7
+/// zero pad bytes; U32 has 4 payload + 4 pad. This uniform layout is
+/// what `LoadDyn` / `StoreDyn` assume (slot index → offset = idx*8).
+const SLOT_BYTES: usize = 8;
+
+/// Each allocation (static and dynamic) is prefixed by an 8-byte
+/// size header (the byte size of the user data). `cow_resize_dyn`
+/// reads this header to know how many bytes to copy.
+const SIZE_HEADER_BYTES: usize = 8;
+
+fn static_payload_bytes(slots: &[StaticSlot]) -> usize {
+    slots.len() * SLOT_BYTES
 }
 
-fn static_byte_size(slots: &[StaticSlot]) -> usize {
-    slots.iter().map(slot_byte_size).sum()
+fn static_total_bytes(slots: &[StaticSlot]) -> usize {
+    SIZE_HEADER_BYTES + static_payload_bytes(slots)
 }
 
 /// Round `n` up to the next multiple of 8.
@@ -735,39 +976,44 @@ fn round_up_8(n: u64) -> u64 {
     (n + 7) & !7
 }
 
-/// Compute the file offset of each static, relative to the start of
-/// the data section. Each static is padded to 8-byte alignment so its
-/// `U64` and `StaticPtr` slots load correctly via `ldr` (which traps
-/// on misaligned addresses by default on aarch64-linux).
+/// Compute the file offset of each static's HEADER, relative to the
+/// start of the data section. Each static is `8 + N*8` bytes
+/// (size header + N 8-byte slots), already 8-byte aligned.
 fn static_offsets(module: &Module) -> Vec<u64> {
     let mut offsets = Vec::with_capacity(module.statics.len());
     let mut cumulative = 0_u64;
     for obj in &module.statics {
         offsets.push(cumulative);
-        cumulative += static_byte_size(&obj.slots) as u64;
-        cumulative = round_up_8(cumulative);
+        cumulative += static_total_bytes(&obj.slots) as u64;
     }
     offsets
 }
 
-/// Absolute virtual address of static at `idx`, given the code size
-/// (so we can place data after the code in the segment).
+/// Absolute virtual address of the static's USER pointer (skipping the
+/// 8-byte size header). `static_ref` and `StaticPtr` slots both
+/// resolve to this address.
 fn static_vaddr(idx: usize, code_size: u64, offsets: &[u64]) -> u64 {
-    LOAD_VADDR + PAYLOAD_FILE_OFFSET + code_size + offsets[idx]
+    LOAD_VADDR + PAYLOAD_FILE_OFFSET + code_size + offsets[idx] + SIZE_HEADER_BYTES as u64
 }
 
-/// Serialize one static object's slots to bytes (no inter-object padding).
+/// Serialize one static object: 8-byte size header (payload bytes),
+/// then each slot in an 8-byte cell.
 fn serialize_one_static(slots: &[StaticSlot], code_size: u64, offsets: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(static_byte_size(slots));
-    for slot in slots {
+    let payload_bytes = static_payload_bytes(slots);
+    let mut out = vec![0_u8; SIZE_HEADER_BYTES + payload_bytes];
+    // Header at offset 0: u64 with payload size.
+    out[0..8].copy_from_slice(&(payload_bytes as u64).to_le_bytes());
+    // Slots follow.
+    for (i, slot) in slots.iter().enumerate() {
+        let s = SIZE_HEADER_BYTES + i * SLOT_BYTES;
         match slot {
-            StaticSlot::U8(b) => out.push(*b),
-            StaticSlot::U32(w) => out.extend_from_slice(&w.to_le_bytes()),
-            StaticSlot::U64(w) => out.extend_from_slice(&w.to_le_bytes()),
-            StaticSlot::I64(w) => out.extend_from_slice(&w.to_le_bytes()),
+            StaticSlot::U8(b) => out[s] = *b,
+            StaticSlot::U32(w) => out[s..s + 4].copy_from_slice(&w.to_le_bytes()),
+            StaticSlot::U64(w) => out[s..s + 8].copy_from_slice(&w.to_le_bytes()),
+            StaticSlot::I64(w) => out[s..s + 8].copy_from_slice(&w.to_le_bytes()),
             StaticSlot::StaticPtr(target_idx) => {
                 let va = static_vaddr(*target_idx, code_size, offsets);
-                out.extend_from_slice(&va.to_le_bytes());
+                out[s..s + 8].copy_from_slice(&va.to_le_bytes());
             }
         }
     }
@@ -784,21 +1030,14 @@ pub fn data_items(module: &Module, code_size: u64) -> Vec<super::mir::DataItem> 
     let offsets = static_offsets(module);
     let mut items = Vec::with_capacity(module.statics.len());
     for (idx, obj) in module.statics.iter().enumerate() {
-        let mut bytes = serialize_one_static(&obj.slots, code_size, &offsets);
-        // Determine pad to next 8-byte boundary based on the offset
-        // table delta.
-        let this_start = offsets[idx];
-        let next_start = offsets
-            .get(idx + 1)
-            .copied()
-            .unwrap_or_else(|| round_up_8(this_start + static_byte_size(&obj.slots) as u64));
-        let want_len = (next_start - this_start) as usize;
-        while bytes.len() < want_len {
-            bytes.push(0);
-        }
+        let bytes = serialize_one_static(&obj.slots, code_size, &offsets);
         items.push(super::mir::DataItem {
             label: Label::Data(idx as u32),
             bytes,
+            // Skip the 8-byte size header so `Label::Data(idx)` points
+            // at the user pointer. `cow_resize_dyn` reads the size by
+            // computing user_ptr - 8.
+            label_offset: SIZE_HEADER_BYTES as u32,
         });
     }
     items

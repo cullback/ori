@@ -76,6 +76,19 @@ pub fn movn_imm16(rd: Reg, imm: u16) -> u32 {
     0x9280_0000 | (u32::from(imm) << 5) | u32::from(rd.0)
 }
 
+/// Encode `MOVK Xd, #imm16, LSL #(shift)` — patch the 16 bits at
+/// `shift` position without touching other bits. Used after a MOVZ
+/// to assemble 32- / 48- / 64-bit constants.
+///
+/// `shift` must be one of `0, 16, 32, 48`. The `hw` field is `shift/16`.
+#[must_use]
+pub fn movk_imm16(rd: Reg, imm: u16, shift: u8) -> u32 {
+    debug_assert!(rd.0 < 32, "Rd out of range");
+    debug_assert!(matches!(shift, 0 | 16 | 32 | 48), "MOVK shift {shift} not in {{0,16,32,48}}");
+    let hw = u32::from(shift) / 16;
+    0xF280_0000 | (hw << 21) | (u32::from(imm) << 5) | u32::from(rd.0)
+}
+
 /// Encode `ADR Xd, label` — load `PC + offset` into a 64-bit register.
 ///
 /// `offset` is in bytes from the address of this instruction; the
@@ -247,6 +260,39 @@ pub fn mul_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9B00_7C00 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
 }
 
+/// Encode `UDIV Xd, Xn, Xm` — unsigned 64-bit divide.
+#[must_use]
+pub fn udiv_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0x9AC0_0800 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Encode `ADD Xd, Xn, Xm, LSL #3` — register-register add with the
+/// second operand shifted left by 3. Used for indexed addressing
+/// when each element occupies an 8-byte slot (`addr = base + idx*8`).
+#[must_use]
+pub fn add_reg_lsl3(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    // 0x8B00_0000 base, shift_type=LSL (00), imm6=3 (bits 15:10)
+    0x8B00_0C00 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Encode `LDRB Wt, [Xn, #imm]` — load byte, zero-extend to 32-bit.
+#[must_use]
+pub fn ldrb_imm(rt: Reg, rn: Reg, byte_offset: u16) -> u32 {
+    debug_assert!(rt.0 < 32 && rn.0 < 32, "register out of range");
+    debug_assert!(byte_offset < 4096, "LDRB imm offset {byte_offset} out of 12-bit range");
+    0x3940_0000 | (u32::from(byte_offset) << 10_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rt.0)
+}
+
+/// Encode `STRB Wt, [Xn, #imm]` — store low byte of Wt.
+#[must_use]
+pub fn strb_imm(rt: Reg, rn: Reg, byte_offset: u16) -> u32 {
+    debug_assert!(rt.0 < 32 && rn.0 < 32, "register out of range");
+    debug_assert!(byte_offset < 4096, "STRB imm offset {byte_offset} out of 12-bit range");
+    0x3900_0000 | (u32::from(byte_offset) << 10_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rt.0)
+}
+
 /// Encode `RET` (defaults to returning via X30/LR).
 #[must_use]
 pub fn ret() -> u32 {
@@ -311,6 +357,13 @@ pub fn cset(rd: Reg, cond: Cond) -> u32 {
     assert!(rd.0 < 32, "Rd out of range");
     // Cond field in CSINC carries the INVERSE of cset's condition.
     0x9A9F_07E0 | (cond.inv() << 12_u32) | u32::from(rd.0)
+}
+
+/// Encode `CSEL Xd, Xn, Xm, cond` — `Xd = if cond { Xn } else { Xm }`.
+#[must_use]
+pub fn csel(rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
+    assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0x9A80_0000 | (u32::from(rm.0) << 16) | ((cond as u32) << 12) | (u32::from(rn.0) << 5) | u32::from(rd.0)
 }
 
 /// Encode `B.cond label` — conditional branch, ±1 MiB range.

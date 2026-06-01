@@ -51,7 +51,7 @@ fn build_label_map(insts: &[MInst], data: &[DataItem]) -> LabelMap {
     let code_size = byte;
     let mut cursor = code_size;
     for item in data {
-        map.insert(item.label, cursor);
+        map.insert(item.label, cursor + u64::from(item.label_offset));
         cursor += item.bytes.len() as u64;
     }
     map
@@ -76,6 +76,7 @@ fn encode_inst(inst: &MInst, inst_offset: u64, labels: &LabelMap) -> u32 {
     match inst {
         MInst::MovImm { rd, imm } => encode::movz_imm16(v(*rd), *imm),
         MInst::MovInv { rd, imm } => encode::movn_imm16(v(*rd), *imm),
+        MInst::MovkImm { rd, imm, shift } => encode::movk_imm16(v(*rd), *imm, *shift),
         MInst::MovReg { rd, rs } => encode::mov_reg(v(*rd), v(*rs)),
         MInst::AdrLabel { rd, label } => {
             let off = pc_relative(inst_offset, *label, labels);
@@ -93,6 +94,10 @@ fn encode_inst(inst: &MInst, inst_offset: u64, labels: &LabelMap) -> u32 {
         MInst::LslReg { rd, rn, rm } => encode::lsl_reg(v(*rd), v(*rn), v(*rm)),
         MInst::LsrReg { rd, rn, rm } => encode::lsr_reg(v(*rd), v(*rn), v(*rm)),
         MInst::MulReg { rd, rn, rm } => encode::mul_reg(v(*rd), v(*rn), v(*rm)),
+        MInst::UdivReg { rd, rn, rm } => encode::udiv_reg(v(*rd), v(*rn), v(*rm)),
+        MInst::AddRegLsl3 { rd, rn, rm } => encode::add_reg_lsl3(v(*rd), v(*rn), v(*rm)),
+        MInst::LdrbImm { rt, rn, byte_offset } => encode::ldrb_imm(v(*rt), v(*rn), *byte_offset),
+        MInst::StrbImm { rt, rn, byte_offset } => encode::strb_imm(v(*rt), v(*rn), *byte_offset),
         MInst::Ret => encode::ret(),
         MInst::Nop => encode::nop(),
         MInst::Svc { imm } => encode::svc(*imm),
@@ -100,6 +105,7 @@ fn encode_inst(inst: &MInst, inst_offset: u64, labels: &LabelMap) -> u32 {
         MInst::CmpImm { rn, imm } => encode::cmp_imm(v(*rn), *imm),
         MInst::CmpReg { rn, rm } => encode::cmp_reg(v(*rn), v(*rm)),
         MInst::CSet { rd, cond } => encode::cset(v(*rd), *cond),
+        MInst::CSel { rd, rn, rm, cond } => encode::csel(v(*rd), v(*rn), v(*rm), *cond),
         MInst::B { target } => encode::b(pc_relative(inst_offset, *target, labels)),
         MInst::Bl { target } => encode::bl(pc_relative(inst_offset, *target, labels)),
         MInst::BCond { cond, target } => {
@@ -155,7 +161,7 @@ mod tests {
     }
 
     fn hello_world_data() -> Vec<DataItem> {
-        vec![DataItem { label: MSG, bytes: b"hello\n".to_vec() }]
+        vec![DataItem { label: MSG, bytes: b"hello\n".to_vec(), label_offset: 0 }]
     }
 
     #[test]
