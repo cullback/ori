@@ -1,5 +1,6 @@
 mod ast;
 mod ast_display;
+mod codegen;
 mod error;
 mod lower;
 mod numeric;
@@ -134,11 +135,29 @@ fn scalar_str_to_bytes(heap: &ssa::eval::Heap, str_ptr: ssa::eval::Scalar) -> Ve
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Phase 0 codegen escape hatch: bypass the whole frontend and
+    // write the hand-crafted hello-world ELF directly. Removes any
+    // dependence on a working Ori source file.
+    if let Some(out_path) = args.iter().position(|a| a == "--emit-hello").and_then(|i| args.get(i + 1)) {
+        codegen::hello::emit(std::path::Path::new(out_path)).unwrap_or_else(|e| {
+            eprintln!("emit-hello: {e}");
+            process::exit(1);
+        });
+        return;
+    }
+
     let dump_ssa = args.iter().any(|a| a == "--dump-ssa");
+    let emit_native = args
+        .iter()
+        .position(|a| a == "--emit-native")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let positional: Vec<&String> = args
         .iter()
         .skip(1)
         .filter(|a| !a.starts_with("--"))
+        .filter(|a| Some(*a) != emit_native.as_ref())
         .collect();
     // `ori test <file.ori>` runs all `expect` decls; otherwise the
     // first positional is the source path and the rest are program args.
@@ -148,6 +167,8 @@ fn main() {
     };
     if file_args.is_empty() {
         eprintln!("usage: ori [--dump-ssa] [test] <file.ori> [args...]");
+        eprintln!("       ori --emit-hello <output_path>");
+        eprintln!("       ori --emit-native <output_path> <file.ori>");
         process::exit(1);
     }
     let source_path = file_args[0];
@@ -201,6 +222,25 @@ fn main() {
     if dump_ssa {
         eprint!("{ssa_module}");
         process::exit(0);
+    }
+
+    if let Some(out_path) = emit_native.as_ref() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let bytes = codegen::build::build_ori_program_linux_aarch64(&ssa_module);
+        let path = std::path::Path::new(out_path);
+        std::fs::write(path, &bytes).unwrap_or_else(|e| {
+            eprintln!("emit-native: {e}");
+            process::exit(1);
+        });
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| {
+                eprintln!("emit-native chmod: {e}");
+                process::exit(1);
+            });
+        // Flush in case stdout is line-buffered for the calling shell.
+        let _ = std::io::stderr().flush();
+        return;
     }
 
     // Build SSA inputs
