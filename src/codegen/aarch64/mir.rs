@@ -41,6 +41,10 @@ pub enum MInst {
     /// `MOV Xd, Xs` — register-to-register move. Used by the selector
     /// to shuffle SSA values into calling-convention slots.
     MovReg { rd: VReg, rs: VReg },
+    /// `MOV Wd, Ws` — 32-bit move; zero-extends low 32 bits into Xd
+    /// (clearing the high 32). Used to narrow U32-typed values before
+    /// storing them so their slot doesn't leak carry from prior ops.
+    MovWReg { rd: VReg, rs: VReg },
     /// `ADR Xd, label` — load PC-relative address of the label.
     AdrLabel { rd: VReg, label: Label },
     /// `LDR Xt, [Xn, #imm]` — load 64 bits from `Xn + imm`. `imm`

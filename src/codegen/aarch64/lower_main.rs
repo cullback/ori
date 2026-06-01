@@ -137,14 +137,26 @@ fn build_frame_for(func: &Function) -> Frame {
     Frame { slots, size, lr_offset, non_leaf }
 }
 
-/// Function-name → label-index lookup. Built once for the whole module.
+/// Function-name → label-index lookup. Built once for the whole
+/// module. Names are sorted so indices are stable across runs
+/// (otherwise `HashMap` iteration order randomness leaks into our
+/// codegen and the binary's behavior changes per invocation).
 fn function_index_map(module: &Module) -> HashMap<String, u32> {
+    let mut names: Vec<&String> = module.functions.keys().collect();
+    names.sort();
     let mut map = HashMap::new();
-    for (idx, name) in module.functions.keys().enumerate() {
+    for (idx, name) in names.into_iter().enumerate() {
         #[expect(clippy::cast_possible_truncation, reason = "<= u32::MAX functions")]
         map.insert(name.clone(), idx as u32);
     }
     map
+}
+
+/// Iterate functions in a deterministic order (sorted by name).
+fn functions_sorted(module: &Module) -> Vec<(&String, &Function)> {
+    let mut pairs: Vec<_> = module.functions.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs
 }
 
 fn slot_of(v: Value, frame: &Frame) -> u32 {
@@ -163,7 +175,33 @@ fn emit_load(v: Value, reg: VReg, frame: &Frame, out: &mut Vec<MInst>) {
 }
 
 /// Emit `str Xreg, [sp, #slot]` for the value `v`.
+///
+/// If `v.ty` is narrower than 64 bits, the source register's high
+/// bits are first cleared so the slot's full 8 bytes reflect a
+/// canonical N-bit value. This keeps subsequent loads + comparisons
+/// honest when arithmetic on a narrow type would otherwise leak carry
+/// into the upper bits.
 fn emit_store(v: Value, reg: VReg, frame: &Frame, out: &mut Vec<MInst>) {
+    use crate::ssa::ScalarType;
+    match v.ty {
+        ScalarType::U32 | ScalarType::I32 => {
+            // `mov Wreg, Wreg` zero-extends low 32 bits to 64.
+            out.push(MInst::MovWReg { rd: reg, rs: reg });
+        }
+        ScalarType::U8 | ScalarType::I8 | ScalarType::U16 | ScalarType::I16 => {
+            // Mask to byte/halfword width. Use SCRATCH_C-adjacent reg
+            // for the mask constant; this must not collide with `reg`.
+            let mask = if matches!(v.ty, ScalarType::U16 | ScalarType::I16) {
+                0xFFFF_u16
+            } else {
+                0xFF_u16
+            };
+            let tmp = if reg == VReg(12) { VReg(13) } else { VReg(12) };
+            out.push(MInst::MovImm { rd: tmp, imm: mask });
+            out.push(MInst::AndReg { rd: reg, rn: reg, rm: tmp });
+        }
+        _ => {} // U64, RcPtr, Ptr, F64: pass through unchanged.
+    }
     out.push(MInst::StrImm64 {
         rt: reg,
         rn: SP_REG,
@@ -655,7 +693,8 @@ fn runtime_shim() -> Vec<MInst> {
 ///   [ARGS .. ARENA_SIZE)                 : bump heap
 const STDIN_RAW_SIZE: u16 = 0x800;       // 2 KiB raw bytes from read
 const STDIN_SPREAD_SIZE: u16 = 0x4000;   // 16 KiB (2 KiB * 8)
-const ARENA_SIZE: u16 = 0xF000;          // 60 KiB total
+const ARENA_SIZE: u16 = 0xF000;          // 60 KiB — keep ≤ 16-bit movz range
+                                          // (~40 KiB of bump heap after fixed setup)
 
 /// Block labels reserved for shim-internal loops. Range 0x4000_0000
 /// is free of real block labels (`(func<<16)|bid`) and synth thunks
@@ -807,7 +846,7 @@ pub fn lower_to_mir(module: &Module) -> Vec<MInst> {
 
     out.extend(runtime_shim_with_label());
 
-    for (name, func) in &module.functions {
+    for (name, func) in functions_sorted(module) {
         if name == &module.entry {
             continue;
         }

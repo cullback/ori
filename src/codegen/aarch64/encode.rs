@@ -138,6 +138,16 @@ pub fn mov_reg(rd: Reg, rs: Reg) -> u32 {
     0xAA00_03E0 | (u32::from(rs.0) << 16) | u32::from(rd.0)
 }
 
+/// Encode `MOV Wd, Ws` (32-bit) — zero-extends the low 32 bits of
+/// `Xs` into `Xd`, clearing the upper 32 bits. We use this as a
+/// one-instruction "narrow to U32" after any arithmetic that may
+/// have leaked carry beyond bit 31. Encoded as `ORR Wd, WZR, Ws`.
+#[must_use]
+pub fn mov_w_reg(rd: Reg, rs: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rs.0 < 32, "register out of range");
+    0x2A00_03E0 | (u32::from(rs.0) << 16) | u32::from(rd.0)
+}
+
 /// Encode `BRK #imm16` — software breakpoint, terminates the process
 /// with SIGTRAP. Used as a "trap-on-unreachable" landing pad after
 /// syscalls that shouldn't return (e.g. exit).

@@ -49,10 +49,15 @@ pub fn build_ori_program_linux_aarch64(module: &Module) -> Vec<u8> {
 }
 
 /// Byte count of the encoded code section — counts only instructions
-/// that emit bytes (skips `BlockStart` pseudo-ops).
+/// that emit bytes. Must match emit::emit's exclusion list (all
+/// pseudo-ops), otherwise static VAs computed for the data section
+/// diverge from where the data actually lands.
 fn mir_code_size(mir: &[super::aarch64::mir::MInst]) -> u64 {
     use super::aarch64::mir::MInst;
-    let n = mir.iter().filter(|i| !matches!(i, MInst::BlockStart { .. })).count();
+    let n = mir
+        .iter()
+        .filter(|i| !matches!(i, MInst::BlockStart { .. } | MInst::FuncStart { .. }))
+        .count();
     (n as u64) * 4
 }
 
@@ -182,6 +187,14 @@ mod tests {
     }
 
     fn compile_and_run_with_stdin(src: &str, stdin_data: &[u8]) -> (Vec<u8>, std::process::Output) {
+        compile_and_run_in_dir(src, stdin_data, None)
+    }
+
+    fn compile_and_run_in_dir(
+        src: &str,
+        stdin_data: &[u8],
+        source_dir: Option<&std::path::Path>,
+    ) -> (Vec<u8>, std::process::Output) {
         use crate::source::SourceArena;
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
@@ -189,7 +202,7 @@ mod tests {
 
         let mut arena = SourceArena::new();
         let main_file = arena.add("/tmp/ori_phase5_test.ori".to_string(), src.to_string());
-        let resolved = crate::resolve(&mut arena, main_file, None, false)
+        let resolved = crate::resolve(&mut arena, main_file, source_dir, false)
             .unwrap_or_else(|e| panic!("resolve failed: {}", e.format(&arena)));
         let (ssa_module, _input_vals) = crate::compile(resolved)
             .unwrap_or_else(|e| panic!("compile failed: {}", e.format(&arena)));
@@ -273,6 +286,51 @@ mod tests {
         let (_bytes, out) = compile_and_run_with_stdin(src, b"");
         assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
         assert_eq!(out.stdout, b"small");
+    }
+
+    /// Phase 5f: end-to-end md5 — the full pipeline exercising every
+    /// piece this session built. md5("a") has byte 0 = 0x0c ≠ 0, so
+    /// the program returns Ok("nonzero").
+    ///
+    /// This is the high-confidence test that LoadDyn + StoreDyn +
+    /// cow_resize_dyn + 8-byte-slot semantics + 32-bit constants +
+    /// Cast + Rem + size-tracked allocator + inter-function calls all
+    /// compose correctly, _and_ that static VAs computed for static
+    /// data agree with where the data actually lands (this was a
+    /// real bug: `mir_code_size` had to filter FuncStart pseudos
+    /// just like emit::emit does, otherwise static-to-static
+    /// pointers were off by 4*num_functions bytes).
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn md5_hash_runs_end_to_end() {
+        let src = "import md5\n\
+                   main : List(Str), Str -> Result(Str, Str)\n\
+                   main = |a, i| (\n\
+                       hsh = md5_hash(\"a\".to_utf8())\n\
+                       if hsh.get(0).unwrap() == 0 then Ok(\"zero\") else Ok(\"nonzero\")\n\
+                   )\n";
+        let dir = std::path::Path::new("programs/aoc");
+        let (_bytes, out) = compile_and_run_in_dir(src, b"", Some(dir));
+        assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"nonzero", "md5(\"a\")[0] = 0x0c ≠ 0");
+    }
+
+    /// Phase 5f: md5_hash output round-trips as bytes. md5("a") =
+    /// 0cc175b9c0f1b6a831c399e269772661.
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn md5_hash_produces_correct_bytes() {
+        let src = "import md5\n\
+                   main : List(Str), Str -> Result(Str, Str)\n\
+                   main = |a, i| Ok(md5_hash(\"a\".to_utf8()))\n";
+        let dir = std::path::Path::new("programs/aoc");
+        let (_bytes, out) = compile_and_run_in_dir(src, b"", Some(dir));
+        assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+        let expected: [u8; 16] = [
+            0x0c, 0xc1, 0x75, 0xb9, 0xc0, 0xf1, 0xb6, 0xa8,
+            0x31, 0xc3, 0x99, 0xe2, 0x69, 0x77, 0x26, 0x61,
+        ];
+        assert_eq!(out.stdout, expected, "md5(\"a\") byte mismatch");
     }
 
     /// Phase 5a: empty stdin should produce empty stdout, exit 0.

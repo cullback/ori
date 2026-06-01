@@ -78,6 +78,7 @@ fn encode_inst(inst: &MInst, inst_offset: u64, labels: &LabelMap) -> u32 {
         MInst::MovInv { rd, imm } => encode::movn_imm16(v(*rd), *imm),
         MInst::MovkImm { rd, imm, shift } => encode::movk_imm16(v(*rd), *imm, *shift),
         MInst::MovReg { rd, rs } => encode::mov_reg(v(*rd), v(*rs)),
+        MInst::MovWReg { rd, rs } => encode::mov_w_reg(v(*rd), v(*rs)),
         MInst::AdrLabel { rd, label } => {
             let off = pc_relative(inst_offset, *label, labels);
             encode::adr(v(*rd), off)
