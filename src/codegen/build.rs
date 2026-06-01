@@ -264,6 +264,17 @@ mod tests {
         assert_eq!(out.stdout, b"three deep\n");
     }
 
+    /// Phase 5d: BinOp arithmetic + comparisons. With args empty,
+    /// args.len() + 1 = 1, and 1 > 5 is false → "small".
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn arithmetic_comparison_picks_correct_branch() {
+        let src = "main : List(Str), Str -> Result(Str, Str)\nmain = |a,i| (\n    n = a.len() + 1\n    if n > 5 then Ok(\"big\") else Ok(\"small\")\n)\n";
+        let (_bytes, out) = compile_and_run_with_stdin(src, b"");
+        assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"small");
+    }
+
     /// Phase 5a: empty stdin should produce empty stdout, exit 0.
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]

@@ -165,14 +165,32 @@ fn lower_inst(
             });
         }
         Inst::BinOp(dest, op, lhs, rhs) => {
-            // Phase 5b: only equality (used by Switch on a bool) is wired
-            // up via cmp + cset. Other ops land in Phase 5d.
+            let d = vreg_of(*dest, vmap);
+            let a = vreg_of(*lhs, vmap);
+            let b = vreg_of(*rhs, vmap);
+            // Comparisons set flags via CMP then materialize a 0/1
+            // result via CSET. Arithmetic / bitwise / shift ops are
+            // direct reg-reg encodings.
+            let cmp_then = |cond: Cond, out: &mut Vec<MInst>| {
+                out.push(MInst::CmpReg { rn: a, rm: b });
+                out.push(MInst::CSet { rd: d, cond });
+            };
             match op {
-                BinaryOp::Eq => {
-                    out.push(MInst::CmpReg { rn: vreg_of(*lhs, vmap), rm: vreg_of(*rhs, vmap) });
-                    out.push(MInst::CSet { rd: vreg_of(*dest, vmap), cond: Cond::Eq });
-                }
-                other => panic!("Phase 5b: unsupported BinOp {other:?}"),
+                BinaryOp::Eq => cmp_then(Cond::Eq, out),
+                BinaryOp::Neq => cmp_then(Cond::Ne, out),
+                BinaryOp::Lt => cmp_then(Cond::Lt, out),
+                BinaryOp::Le => cmp_then(Cond::Le, out),
+                BinaryOp::Gt => cmp_then(Cond::Gt, out),
+                BinaryOp::Ge => cmp_then(Cond::Ge, out),
+                BinaryOp::Add => out.push(MInst::AddReg { rd: d, rn: a, rm: b }),
+                BinaryOp::Sub => out.push(MInst::SubReg { rd: d, rn: a, rm: b }),
+                BinaryOp::Mul => out.push(MInst::MulReg { rd: d, rn: a, rm: b }),
+                BinaryOp::And => out.push(MInst::AndReg { rd: d, rn: a, rm: b }),
+                BinaryOp::Or => out.push(MInst::OrrReg { rd: d, rn: a, rm: b }),
+                BinaryOp::Xor => out.push(MInst::EorReg { rd: d, rn: a, rm: b }),
+                BinaryOp::Shl => out.push(MInst::LslReg { rd: d, rn: a, rm: b }),
+                BinaryOp::Shr => out.push(MInst::LsrReg { rd: d, rn: a, rm: b }),
+                other => panic!("Phase 5d: unsupported BinOp {other:?}"),
             }
         }
         Inst::Call { results, target, args } => {

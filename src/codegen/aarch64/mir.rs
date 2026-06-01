@@ -53,6 +53,20 @@ pub enum MInst {
     SubImm { rd: VReg, rn: VReg, imm: u32 },
     /// `ADD Xd, Xn, Xm` — register-register add.
     AddReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `SUB Xd, Xn, Xm`.
+    SubReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `AND Xd, Xn, Xm`.
+    AndReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `ORR Xd, Xn, Xm`.
+    OrrReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `EOR Xd, Xn, Xm` — bitwise XOR.
+    EorReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `LSL Xd, Xn, Xm` — variable shift left.
+    LslReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `LSR Xd, Xn, Xm` — variable shift right.
+    LsrReg { rd: VReg, rn: VReg, rm: VReg },
+    /// `MUL Xd, Xn, Xm`.
+    MulReg { rd: VReg, rn: VReg, rm: VReg },
     /// `RET` — return via X30/LR.
     Ret,
     /// `NOP` — filler for code-section alignment padding.

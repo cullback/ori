@@ -198,6 +198,55 @@ pub fn add_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x8B00_0000 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
 }
 
+/// Encode `SUB Xd, Xn, Xm`.
+#[must_use]
+pub fn sub_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0xCB00_0000 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Encode `AND Xd, Xn, Xm`.
+#[must_use]
+pub fn and_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0x8A00_0000 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Encode `ORR Xd, Xn, Xm`.
+#[must_use]
+pub fn orr_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0xAA00_0000 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Encode `EOR Xd, Xn, Xm` — bitwise XOR.
+#[must_use]
+pub fn eor_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0xCA00_0000 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Encode `LSL Xd, Xn, Xm` — logical shift left by register (alias of LSLV).
+#[must_use]
+pub fn lsl_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0x9AC0_2000 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Encode `LSR Xd, Xn, Xm` — logical shift right by register (alias of LSRV).
+#[must_use]
+pub fn lsr_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0x9AC0_2400 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Encode `MUL Xd, Xn, Xm` — alias of `MADD Xd, Xn, Xm, XZR`.
+#[must_use]
+pub fn mul_reg(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    debug_assert!(rd.0 < 32 && rn.0 < 32 && rm.0 < 32, "register out of range");
+    0x9B00_7C00 | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
 /// Encode `RET` (defaults to returning via X30/LR).
 #[must_use]
 pub fn ret() -> u32 {
