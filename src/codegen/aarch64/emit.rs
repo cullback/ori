@@ -31,7 +31,7 @@ type LabelMap = HashMap<Label, u64>;
 
 /// True for pseudo-ops that emit no bytes.
 fn is_pseudo(inst: &MInst) -> bool {
-    matches!(inst, MInst::BlockStart { .. })
+    matches!(inst, MInst::BlockStart { .. } | MInst::FuncStart { .. })
 }
 
 fn build_label_map(insts: &[MInst], data: &[DataItem]) -> LabelMap {
@@ -41,6 +41,9 @@ fn build_label_map(insts: &[MInst], data: &[DataItem]) -> LabelMap {
         match inst {
             MInst::BlockStart { idx } => {
                 map.insert(Label::Block(*idx), byte);
+            }
+            MInst::FuncStart { idx } => {
+                map.insert(Label::Func(*idx), byte);
             }
             _ => byte += 4,
         }
@@ -91,10 +94,13 @@ fn encode_inst(inst: &MInst, inst_offset: u64, labels: &LabelMap) -> u32 {
         MInst::CmpReg { rn, rm } => encode::cmp_reg(v(*rn), v(*rm)),
         MInst::CSet { rd, cond } => encode::cset(v(*rd), *cond),
         MInst::B { target } => encode::b(pc_relative(inst_offset, *target, labels)),
+        MInst::Bl { target } => encode::bl(pc_relative(inst_offset, *target, labels)),
         MInst::BCond { cond, target } => {
             encode::b_cond(*cond, pc_relative(inst_offset, *target, labels))
         }
-        MInst::BlockStart { .. } => unreachable!("pseudo-op should not reach encoder"),
+        MInst::BlockStart { .. } | MInst::FuncStart { .. } => {
+            unreachable!("pseudo-op should not reach encoder")
+        }
     }
 }
 

@@ -24,6 +24,10 @@ pub enum Label {
     /// Block identifier — resolved by the layout pass to the byte
     /// offset of the matching `BlockStart` pseudo-instruction.
     Block(u32),
+    /// Function identifier (index into the module's function table) —
+    /// resolved by the layout pass to the byte offset of the function's
+    /// `FuncStart` pseudo-instruction.
+    Func(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -66,11 +70,16 @@ pub enum MInst {
     CSet { rd: VReg, cond: super::encode::Cond },
     /// `B label` — unconditional branch.
     B { target: Label },
+    /// `BL label` — branch + link (function call).
+    Bl { target: Label },
     /// `B.cond label` — conditional branch.
     BCond { cond: super::encode::Cond, target: Label },
     /// Pseudo-op: marks where a basic block starts. Emits no bytes;
     /// the layout pass records the byte offset for `Label::Block(idx)`.
     BlockStart { idx: u32 },
+    /// Pseudo-op: marks where a function's code starts. Emits no bytes;
+    /// records the offset for `Label::Func(idx)`.
+    FuncStart { idx: u32 },
 }
 
 /// A blob of bytes addressable by `Label::Data(idx)`.

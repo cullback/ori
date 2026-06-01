@@ -61,21 +61,15 @@ use super::mir::{DataItem, Label, MInst, VReg};
 const FIRST_FREE_VREG: u8 = 9;
 const HEAP_BUMP_REG: VReg = VReg(28);
 
-/// Map each SSA Value to a virtual register. Function params get
-/// pinned to x0, x1, ... per the calling convention; the rest are
-/// dense from FIRST_FREE_VREG.
-fn assign_vregs(module: &Module) -> HashMap<usize, VReg> {
-    let func = module
-        .functions
-        .get(&module.entry)
-        .unwrap_or_else(|| panic!("entry function {} not found", module.entry));
-
+/// Map each SSA Value (within a single function) to a virtual register.
+/// Function params get pinned to x0, x1, ... per the calling convention;
+/// the rest are dense from FIRST_FREE_VREG.
+fn assign_vregs_for(func: &Function) -> HashMap<usize, VReg> {
     let mut map = HashMap::new();
     let mut next = FIRST_FREE_VREG;
 
-    // Pin function params to their incoming registers (x0, x1, ...).
     for (i, p) in func.params.iter().enumerate() {
-        assert!(i < 8, "Phase 5a: ≤8 function params (would need stack-passed args)");
+        assert!(i < 8, "Phase 5c: ≤8 function params (would need stack-passed args)");
         #[expect(clippy::cast_possible_truncation, reason = "i < 8")]
         let phys = VReg(i as u8);
         map.insert(p.id, phys);
@@ -83,7 +77,7 @@ fn assign_vregs(module: &Module) -> HashMap<usize, VReg> {
 
     let assign = |id: usize, map: &mut HashMap<usize, VReg>, next: &mut u8| {
         map.entry(id).or_insert_with(|| {
-            assert!(*next < HEAP_BUMP_REG.0, "Phase 5a: too many live SSA values; needs stack regalloc");
+            assert!(*next < HEAP_BUMP_REG.0, "Phase 5c: too many live SSA values; needs stack regalloc");
             let v = VReg(*next);
             *next += 1;
             v
@@ -103,6 +97,16 @@ fn assign_vregs(module: &Module) -> HashMap<usize, VReg> {
     map
 }
 
+/// Function-name → label-index lookup. Built once for the whole module.
+fn function_index_map(module: &Module) -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    for (idx, name) in module.functions.keys().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "<= u32::MAX functions")]
+        map.insert(name.clone(), idx as u32);
+    }
+    map
+}
+
 fn vreg_of(v: Value, vmap: &HashMap<usize, VReg>) -> VReg {
     *vmap
         .get(&v.id)
@@ -110,7 +114,12 @@ fn vreg_of(v: Value, vmap: &HashMap<usize, VReg>) -> VReg {
 }
 
 /// Lower one SSA instruction. Pushes zero or more MIR ops.
-fn lower_inst(inst: &Inst, vmap: &HashMap<usize, VReg>, out: &mut Vec<MInst>) {
+fn lower_inst(
+    inst: &Inst,
+    vmap: &HashMap<usize, VReg>,
+    func_idx: &HashMap<String, u32>,
+    out: &mut Vec<MInst>,
+) {
     match inst {
         Inst::StaticRef(dest, idx) => {
             out.push(MInst::AdrLabel {
@@ -166,7 +175,33 @@ fn lower_inst(inst: &Inst, vmap: &HashMap<usize, VReg>, out: &mut Vec<MInst>) {
                 other => panic!("Phase 5b: unsupported BinOp {other:?}"),
             }
         }
-        other => panic!("Phase 5b: unsupported SSA inst: {other:?}"),
+        Inst::Call { results, target, args } => {
+            // Move each arg into x0..xN (calling-convention regs).
+            assert!(args.len() <= 8, "Phase 5c: >8 args needs stack-passed args");
+            for (i, arg) in args.iter().enumerate() {
+                let arg_v = vreg_of(*arg, vmap);
+                #[expect(clippy::cast_possible_truncation, reason = "args.len() ≤ 8")]
+                let target_v = VReg(i as u8);
+                if arg_v != target_v {
+                    out.push(MInst::MovReg { rd: target_v, rs: arg_v });
+                }
+            }
+            let idx = *func_idx.get(target).unwrap_or_else(|| {
+                panic!("Phase 5c: Call to unknown function {target}")
+            });
+            out.push(MInst::Bl { target: Label::Func(idx) });
+            // Capture multi-value returns from x0..xM.
+            assert!(results.len() <= 8, "Phase 5c: >8 return values needs stack-passed returns");
+            for (i, r) in results.iter().enumerate() {
+                let result_v = vreg_of(*r, vmap);
+                #[expect(clippy::cast_possible_truncation, reason = "results.len() ≤ 8")]
+                let src_v = VReg(i as u8);
+                if result_v != src_v {
+                    out.push(MInst::MovReg { rd: result_v, rs: src_v });
+                }
+            }
+        }
+        other => panic!("Phase 5c: unsupported SSA inst: {other:?}"),
     }
 }
 
@@ -199,101 +234,101 @@ fn emit_edge_moves(
     }
 }
 
-fn block_label(bid: BlockId) -> Label {
-    Label::Block(bid.0 as u32)
+/// Pack a per-function block id into a globally-unique label.
+/// Layout: bits 30:16 = func_idx, bits 15:0 = local block id.
+/// Synthetic thunk ids set bits 31 or 30, keeping them disjoint.
+#[expect(clippy::cast_possible_truncation, reason = "block ids fit in 16 bits, func ids in 15")]
+fn block_label(func_idx: u32, bid: BlockId) -> Label {
+    Label::Block(((func_idx & 0x7FFF) << 16) | (bid.0 as u32 & 0xFFFF))
 }
 
-/// Lower a terminator. Adds moves for outgoing edge block-params and
-/// then a B / B.cond / chain-of-comparisons depending on the kind.
+/// Lower a terminator. For non-entry functions, Return moves values to
+/// x0..xN and does `ret`. For the entry (`__main`), it jumps to the
+/// shared `EXIT_BLOCK_LABEL` where the runtime shim takes over.
 fn lower_terminator(
     term: &Terminator,
     func: &Function,
+    func_idx: u32,
+    is_entry: bool,
     vmap: &HashMap<usize, VReg>,
     out: &mut Vec<MInst>,
 ) {
     match term {
         Terminator::Return(vs) => {
-            assert_eq!(vs.len(), 1, "Phase 5b: only single-value Return supported");
-            let src = vreg_of(vs[0], vmap);
-            if src != VReg(0) {
-                out.push(MInst::MovReg { rd: VReg(0), rs: src });
+            assert!(vs.len() <= 8, "Phase 5c: >8 return values needs stack-passed returns");
+            for (i, v) in vs.iter().enumerate() {
+                let src = vreg_of(*v, vmap);
+                #[expect(clippy::cast_possible_truncation, reason = "≤ 8 returns")]
+                let dst = VReg(i as u8);
+                if src != dst {
+                    out.push(MInst::MovReg { rd: dst, rs: src });
+                }
             }
-            out.push(MInst::B { target: Label::Block(EXIT_BLOCK_LABEL) });
+            if is_entry {
+                out.push(MInst::B { target: Label::Block(EXIT_BLOCK_LABEL) });
+            } else {
+                out.push(MInst::Ret);
+            }
         }
         Terminator::Jump(edge) => {
             emit_edge_moves(edge, edge.target, func, vmap, out);
-            out.push(MInst::B { target: block_label(edge.target) });
+            out.push(MInst::B { target: block_label(func_idx, edge.target) });
         }
         Terminator::Branch { cond, then_edge, else_edge } => {
-            // cmp cond, #0; b.ne <then>; (fallthrough to else)
             let cond_v = vreg_of(*cond, vmap);
             out.push(MInst::CmpImm { rn: cond_v, imm: 0 });
-            // Plan: emit a fresh synthetic block id for the then-thunk
-            // (param moves + b target). For now keep it linear:
-            // b.ne to the THEN moves, fall through to ELSE moves.
-            // We can't easily emit anonymous synthetic blocks without
-            // an id scheme. The simplest correct shape is:
-            //
-            //   cmp cond, #0
-            //   b.ne taken_thunk
-            //   <else moves>
-            //   b else_target
-            //   taken_thunk: <then moves> ; b then_target
-            //
-            // We synthesize a unique block id by combining the source
-            // block id (encoded as the high bits) with the sense bit.
-            let thunk_id = synth_branch_thunk_id(then_edge.target, /*then_sense*/ true);
+            // b.ne to the then-thunk, fall through to else moves.
+            let thunk_id = synth_branch_thunk_id(func_idx, then_edge.target);
             out.push(MInst::BCond { cond: Cond::Ne, target: Label::Block(thunk_id) });
             emit_edge_moves(else_edge, else_edge.target, func, vmap, out);
-            out.push(MInst::B { target: block_label(else_edge.target) });
+            out.push(MInst::B { target: block_label(func_idx, else_edge.target) });
             out.push(MInst::BlockStart { idx: thunk_id });
             emit_edge_moves(then_edge, then_edge.target, func, vmap, out);
-            out.push(MInst::B { target: block_label(then_edge.target) });
+            out.push(MInst::B { target: block_label(func_idx, then_edge.target) });
         }
         Terminator::SwitchInt { scrutinee, arms, default } => {
             let s_v = vreg_of(*scrutinee, vmap);
             for (i, (val, edge)) in arms.iter().enumerate() {
                 let val_u32 = u32::try_from(*val).expect("Phase 5b: switch arm value > u32");
                 out.push(MInst::CmpImm { rn: s_v, imm: val_u32 });
-                let thunk_id = synth_switch_thunk_id(edge.target, i as u32);
+                #[expect(clippy::cast_possible_truncation, reason = "≤ 8 arms in practice")]
+                let thunk_id = synth_switch_thunk_id(func_idx, edge.target, i as u32);
                 out.push(MInst::BCond { cond: Cond::Eq, target: Label::Block(thunk_id) });
             }
             match default {
                 Some(edge) => {
                     emit_edge_moves(edge, edge.target, func, vmap, out);
-                    out.push(MInst::B { target: block_label(edge.target) });
+                    out.push(MInst::B { target: block_label(func_idx, edge.target) });
                 }
                 None => {
-                    // No default in our test programs — but the SSA
-                    // always provides exhaustive coverage. Insert a
-                    // crash-fast trap as defensive measure.
                     out.push(MInst::Brk { imm: 0 });
                 }
             }
-            // Emit each arm's thunk
             for (i, (_, edge)) in arms.iter().enumerate() {
-                let thunk_id = synth_switch_thunk_id(edge.target, i as u32);
+                #[expect(clippy::cast_possible_truncation, reason = "≤ 8 arms in practice")]
+                let thunk_id = synth_switch_thunk_id(func_idx, edge.target, i as u32);
                 out.push(MInst::BlockStart { idx: thunk_id });
                 emit_edge_moves(edge, edge.target, func, vmap, out);
-                out.push(MInst::B { target: block_label(edge.target) });
+                out.push(MInst::B { target: block_label(func_idx, edge.target) });
             }
         }
     }
 }
 
-/// Synthesize a unique block-label id for a Branch's "then-thunk".
-/// Reserves the high bit so it can't collide with real block ids
-/// (which are small `usize`s).
-fn synth_branch_thunk_id(target: BlockId, then_sense: bool) -> u32 {
-    let base = (target.0 as u32) & 0x0000_FFFF;
-    let sense = u32::from(then_sense);
-    0x8000_0000 | (sense << 16) | base
+/// Synthesize a unique block-label id for a Branch's then-thunk.
+/// Sets bit 31 to keep it disjoint from real block labels.
+fn synth_branch_thunk_id(func_idx: u32, target: BlockId) -> u32 {
+    #[expect(clippy::cast_possible_truncation, reason = "block / func ids fit in 15 bits each")]
+    let base = ((func_idx & 0x7FFF) << 16) | (target.0 as u32 & 0xFFFF);
+    0x8000_0000 | base
 }
 
 /// Synthesize a unique block-label id for a Switch arm's thunk.
-fn synth_switch_thunk_id(target: BlockId, arm_idx: u32) -> u32 {
-    let base = (target.0 as u32) & 0x0000_FFFF;
-    0xC000_0000 | (arm_idx << 16) | base
+/// Bits 31:30 = 11; encodes arm index in the low bits below func_idx.
+fn synth_switch_thunk_id(func_idx: u32, target: BlockId, arm_idx: u32) -> u32 {
+    #[expect(clippy::cast_possible_truncation, reason = "block / func ids fit in 15 bits each")]
+    let local = ((func_idx & 0x7F) << 16) | ((arm_idx & 0xFF) << 8) | (target.0 as u32 & 0xFF);
+    0xC000_0000 | local
 }
 
 /// Wrap the runtime shim with a `BlockStart { EXIT_BLOCK_LABEL }` so
@@ -406,31 +441,64 @@ fn entry_shim() -> Vec<MInst> {
     ]
 }
 
-/// Lower module → MIR. Returns the MIR stream; the caller pairs it
-/// with `serialize_statics` for the data section.
+/// Emit one function's MIR. For the entry (`is_entry == true`), no
+/// FuncStart label and Return jumps to EXIT. For others, a FuncStart
+/// pseudo-op gives the function its label and Return does `ret`.
+fn lower_function(
+    func: &Function,
+    func_idx_map: &HashMap<String, u32>,
+    is_entry: bool,
+    out: &mut Vec<MInst>,
+) {
+    let vmap = assign_vregs_for(func);
+    let func_idx = *func_idx_map.get(&func.name).expect("function not in idx map");
+
+    if !is_entry {
+        out.push(MInst::FuncStart { idx: func_idx });
+    }
+
+    for (bid, block) in &func.blocks {
+        let combined = match block_label(func_idx, *bid) {
+            Label::Block(c) => c,
+            _ => unreachable!(),
+        };
+        out.push(MInst::BlockStart { idx: combined });
+        for inst in &block.insts {
+            lower_inst(inst, &vmap, func_idx_map, out);
+        }
+        lower_terminator(&block.terminator, func, func_idx, is_entry, &vmap, out);
+    }
+}
+
+/// Lower module → MIR. Emits in order:
+///   1. entry shim (mmap, stdin read, params setup)
+///   2. entry function (__main) body
+///   3. runtime shim at EXIT label
+///   4. each non-entry function (so __main can `bl` them)
+///   5. 8-byte alignment pad before data
 #[must_use]
 pub fn lower_to_mir(module: &Module) -> Vec<MInst> {
-    let vmap = assign_vregs(module);
-    let func = module.functions.get(&module.entry).unwrap();
+    let func_idx_map = function_index_map(module);
 
     let mut out = entry_shim();
-    // Emit each block with a BlockStart label so terminators can target it.
-    for (bid, block) in &func.blocks {
-        out.push(MInst::BlockStart { idx: bid.0 as u32 });
-        for inst in &block.insts {
-            lower_inst(inst, &vmap, &mut out);
-        }
-        lower_terminator(&block.terminator, func, &vmap, &mut out);
-    }
+
+    let entry = module.functions.get(&module.entry).expect("entry function not found");
+    lower_function(entry, &func_idx_map, /*is_entry*/ true, &mut out);
 
     out.extend(runtime_shim_with_label());
 
+    for (name, func) in &module.functions {
+        if name == &module.entry {
+            continue;
+        }
+        lower_function(func, &func_idx_map, /*is_entry*/ false, &mut out);
+    }
+
     // Pad the code stream to an 8-byte boundary so the data section
-    // that immediately follows (with U64 / pointer slots) is naturally
-    // aligned for `ldr Xt, [Xn]` which traps on misaligned addresses.
+    // that follows (with U64 / pointer slots) is naturally aligned.
     let code_bytes: usize = out
         .iter()
-        .filter(|i| !matches!(i, MInst::BlockStart { .. }))
+        .filter(|i| !matches!(i, MInst::BlockStart { .. } | MInst::FuncStart { .. }))
         .count()
         * 4;
     if !code_bytes.is_multiple_of(8) {

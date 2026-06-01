@@ -294,6 +294,21 @@ pub fn b(byte_offset: i32) -> u32 {
     0x1400_0000 | imm26_masked
 }
 
+/// Encode `BL label` — branch with link (call). Same range / encoding
+/// shape as B but sets `X30 = pc + 4` so the callee can `RET`.
+#[must_use]
+pub fn bl(byte_offset: i32) -> u32 {
+    assert!(byte_offset % 4 == 0, "BL offset must be 4-aligned");
+    let imm26 = byte_offset / 4;
+    assert!(
+        (-(1_i32 << 25_i32)..(1_i32 << 25_i32)).contains(&imm26),
+        "BL offset {byte_offset} out of ±128MiB range"
+    );
+    #[expect(clippy::cast_sign_loss, reason = "wrapping into 26-bit field is intentional")]
+    let imm26_masked = (imm26 as u32) & 0x03FF_FFFF;
+    0x9400_0000 | imm26_masked
+}
+
 #[cfg(test)]
 mod tests {
     use super::regs::*;
@@ -497,6 +512,12 @@ mod tests {
         assert_eq!(b(4), 0x1400_0001);
         // b -4 -> 0x17FFFFFF.
         assert_eq!(b(-4), 0x17FF_FFFF);
+    }
+
+    #[test]
+    fn bl_encoding() {
+        // Cross-verified: bl +4 -> 0x94000001 (same offset semantics as B).
+        assert_eq!(bl(4), 0x9400_0001);
     }
 
     // Watermark integration: emitting the hello-world code via these

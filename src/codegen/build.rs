@@ -240,6 +240,30 @@ mod tests {
         assert_eq!(out.stdout, b"no args");
     }
 
+    /// Phase 5c: inter-function calls. Calls a helper that's the
+    /// identity function; expected to round-trip stdin like echo.
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn identity_helper_passes_input_through() {
+        let src = "helper : Str -> Str\nhelper = |s| s\n\nmain : List(Str), Str -> Result(Str, Str)\nmain = |a,i| Ok(helper(i))\n";
+        let (_bytes, out) = compile_and_run_with_stdin(src, b"hello via helper\n");
+        assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"hello via helper\n");
+    }
+
+    /// Phase 5c: nested calls. Three identity calls — exercises the
+    /// caller-saved register handling (or its absence; we only use
+    /// caller-saved regs for vregs but never reuse them across calls
+    /// in this trivial pattern).
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn nested_identity_calls_work() {
+        let src = "id : Str -> Str\nid = |s| s\n\nmain : List(Str), Str -> Result(Str, Str)\nmain = |a,i| Ok(id(id(id(i))))\n";
+        let (_bytes, out) = compile_and_run_with_stdin(src, b"three deep\n");
+        assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"three deep\n");
+    }
+
     /// Phase 5a: empty stdin should produce empty stdout, exit 0.
     #[test]
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
