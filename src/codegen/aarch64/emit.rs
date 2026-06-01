@@ -29,9 +29,23 @@ use super::mir::{DataItem, Label, MInst, VReg};
 /// emitted code+data blob (code first, data after).
 type LabelMap = HashMap<Label, u64>;
 
+/// True for pseudo-ops that emit no bytes.
+fn is_pseudo(inst: &MInst) -> bool {
+    matches!(inst, MInst::BlockStart { .. })
+}
+
 fn build_label_map(insts: &[MInst], data: &[DataItem]) -> LabelMap {
-    let code_size = (insts.len() * 4) as u64;
     let mut map = LabelMap::new();
+    let mut byte = 0_u64;
+    for inst in insts {
+        match inst {
+            MInst::BlockStart { idx } => {
+                map.insert(Label::Block(*idx), byte);
+            }
+            _ => byte += 4,
+        }
+    }
+    let code_size = byte;
     let mut cursor = code_size;
     for item in data {
         map.insert(item.label, cursor);
@@ -53,6 +67,7 @@ fn pc_relative(inst_offset: u64, label: Label, labels: &LabelMap) -> i32 {
 }
 
 /// Encode a single MIR instruction into its 32-bit machine word.
+/// Caller must NOT pass pseudo-ops (they emit nothing).
 fn encode_inst(inst: &MInst, inst_offset: u64, labels: &LabelMap) -> u32 {
     let v = vreg_to_phys;
     match inst {
@@ -69,30 +84,38 @@ fn encode_inst(inst: &MInst, inst_offset: u64, labels: &LabelMap) -> u32 {
         MInst::SubImm { rd, rn, imm } => encode::sub_imm(v(*rd), v(*rn), *imm),
         MInst::AddReg { rd, rn, rm } => encode::add_reg(v(*rd), v(*rn), v(*rm)),
         MInst::Ret => encode::ret(),
+        MInst::Nop => encode::nop(),
         MInst::Svc { imm } => encode::svc(*imm),
         MInst::Brk { imm } => encode::brk(*imm),
+        MInst::CmpImm { rn, imm } => encode::cmp_imm(v(*rn), *imm),
+        MInst::CmpReg { rn, rm } => encode::cmp_reg(v(*rn), v(*rm)),
+        MInst::CSet { rd, cond } => encode::cset(v(*rd), *cond),
+        MInst::B { target } => encode::b(pc_relative(inst_offset, *target, labels)),
+        MInst::BCond { cond, target } => {
+            encode::b_cond(*cond, pc_relative(inst_offset, *target, labels))
+        }
+        MInst::BlockStart { .. } => unreachable!("pseudo-op should not reach encoder"),
     }
 }
 
 /// Emit code + data to a contiguous byte vector. Code starts at offset
-/// 0; data follows immediately. Returns `(combined_bytes, code_size)`
-/// so the container can place data and code separately if it wants.
+/// 0; data follows immediately. Returns `(combined_bytes, code_size)`.
 #[must_use]
 pub fn emit(insts: &[MInst], data: &[DataItem]) -> (Vec<u8>, u64) {
     let labels = build_label_map(insts, data);
-    let code_size = (insts.len() as u64) * 4;
-    let data_size: u64 = data.iter().map(|d| d.bytes.len() as u64).sum();
-    let mut out = Vec::with_capacity((code_size + data_size) as usize);
-
-    for (i, inst) in insts.iter().enumerate() {
-        let off = (i as u64) * 4;
-        let word = encode_inst(inst, off, &labels);
+    let mut out = Vec::new();
+    for inst in insts {
+        if is_pseudo(inst) {
+            continue;
+        }
+        let pc = out.len() as u64;
+        let word = encode_inst(inst, pc, &labels);
         out.extend_from_slice(&word.to_le_bytes());
     }
+    let code_size = out.len() as u64;
     for item in data {
         out.extend_from_slice(&item.bytes);
     }
-
     (out, code_size)
 }
 

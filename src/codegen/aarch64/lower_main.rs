@@ -39,8 +39,10 @@
 
 use std::collections::HashMap;
 
-use crate::ssa::{Function, Inst, Module, StaticSlot, Terminator, Value};
+use crate::ssa::instruction::BlockEdge;
+use crate::ssa::{BinaryOp, BlockId, Function, Inst, Module, StaticSlot, Terminator, Value};
 
+use super::encode::Cond;
 use super::mir::{DataItem, Label, MInst, VReg};
 
 /// Register policy for Phase 5a:
@@ -153,24 +155,153 @@ fn lower_inst(inst: &Inst, vmap: &HashMap<usize, VReg>, out: &mut Vec<MInst>) {
                 byte_offset: *offset as u32,
             });
         }
-        other => panic!("Phase 5a: unsupported SSA inst: {other:?}"),
+        Inst::BinOp(dest, op, lhs, rhs) => {
+            // Phase 5b: only equality (used by Switch on a bool) is wired
+            // up via cmp + cset. Other ops land in Phase 5d.
+            match op {
+                BinaryOp::Eq => {
+                    out.push(MInst::CmpReg { rn: vreg_of(*lhs, vmap), rm: vreg_of(*rhs, vmap) });
+                    out.push(MInst::CSet { rd: vreg_of(*dest, vmap), cond: Cond::Eq });
+                }
+                other => panic!("Phase 5b: unsupported BinOp {other:?}"),
+            }
+        }
+        other => panic!("Phase 5b: unsupported SSA inst: {other:?}"),
     }
 }
 
-/// Lower the terminator. Today only `Return(Vec<Value>)` is handled —
-/// it places the (single) returned value into x0 so the runtime shim
-/// can read it. No `ret` — we fall through into the shim.
-fn lower_terminator(term: &Terminator, vmap: &HashMap<usize, VReg>, out: &mut Vec<MInst>) {
+/// Sentinel block index used for the runtime-shim "exit" landing pad.
+/// Every `Return` lowers to a jump to this label, where the post-main
+/// shim begins. Real block ids start at 0; we pick a high one out of
+/// the way.
+const EXIT_BLOCK_LABEL: u32 = 0xFFFF_FFFE;
+
+/// Emit moves to set up a destination block's params from an edge's args.
+/// Naive: emit one MovReg per pair, in order. This is correct when no
+/// destination vreg appears as a source in another pair (otherwise we'd
+/// need a swap chain). For our hello-world-class programs this trivially
+/// holds since block params get distinct vregs.
+fn emit_edge_moves(
+    edge: &BlockEdge,
+    dest_block: BlockId,
+    func: &Function,
+    vmap: &HashMap<usize, VReg>,
+    out: &mut Vec<MInst>,
+) {
+    let dest = func.blocks.get(&dest_block).expect("edge to nonexistent block");
+    assert_eq!(edge.args.len(), dest.params.len(), "edge arity mismatch");
+    for (arg, param) in edge.args.iter().zip(&dest.params) {
+        let src = vreg_of(*arg, vmap);
+        let dst = vreg_of(*param, vmap);
+        if src != dst {
+            out.push(MInst::MovReg { rd: dst, rs: src });
+        }
+    }
+}
+
+fn block_label(bid: BlockId) -> Label {
+    Label::Block(bid.0 as u32)
+}
+
+/// Lower a terminator. Adds moves for outgoing edge block-params and
+/// then a B / B.cond / chain-of-comparisons depending on the kind.
+fn lower_terminator(
+    term: &Terminator,
+    func: &Function,
+    vmap: &HashMap<usize, VReg>,
+    out: &mut Vec<MInst>,
+) {
     match term {
         Terminator::Return(vs) => {
-            assert_eq!(vs.len(), 1, "Phase 4-lite: only single-value Return supported");
+            assert_eq!(vs.len(), 1, "Phase 5b: only single-value Return supported");
             let src = vreg_of(vs[0], vmap);
             if src != VReg(0) {
                 out.push(MInst::MovReg { rd: VReg(0), rs: src });
             }
+            out.push(MInst::B { target: Label::Block(EXIT_BLOCK_LABEL) });
         }
-        other => panic!("Phase 4-lite: unsupported terminator: {other:?}"),
+        Terminator::Jump(edge) => {
+            emit_edge_moves(edge, edge.target, func, vmap, out);
+            out.push(MInst::B { target: block_label(edge.target) });
+        }
+        Terminator::Branch { cond, then_edge, else_edge } => {
+            // cmp cond, #0; b.ne <then>; (fallthrough to else)
+            let cond_v = vreg_of(*cond, vmap);
+            out.push(MInst::CmpImm { rn: cond_v, imm: 0 });
+            // Plan: emit a fresh synthetic block id for the then-thunk
+            // (param moves + b target). For now keep it linear:
+            // b.ne to the THEN moves, fall through to ELSE moves.
+            // We can't easily emit anonymous synthetic blocks without
+            // an id scheme. The simplest correct shape is:
+            //
+            //   cmp cond, #0
+            //   b.ne taken_thunk
+            //   <else moves>
+            //   b else_target
+            //   taken_thunk: <then moves> ; b then_target
+            //
+            // We synthesize a unique block id by combining the source
+            // block id (encoded as the high bits) with the sense bit.
+            let thunk_id = synth_branch_thunk_id(then_edge.target, /*then_sense*/ true);
+            out.push(MInst::BCond { cond: Cond::Ne, target: Label::Block(thunk_id) });
+            emit_edge_moves(else_edge, else_edge.target, func, vmap, out);
+            out.push(MInst::B { target: block_label(else_edge.target) });
+            out.push(MInst::BlockStart { idx: thunk_id });
+            emit_edge_moves(then_edge, then_edge.target, func, vmap, out);
+            out.push(MInst::B { target: block_label(then_edge.target) });
+        }
+        Terminator::SwitchInt { scrutinee, arms, default } => {
+            let s_v = vreg_of(*scrutinee, vmap);
+            for (i, (val, edge)) in arms.iter().enumerate() {
+                let val_u32 = u32::try_from(*val).expect("Phase 5b: switch arm value > u32");
+                out.push(MInst::CmpImm { rn: s_v, imm: val_u32 });
+                let thunk_id = synth_switch_thunk_id(edge.target, i as u32);
+                out.push(MInst::BCond { cond: Cond::Eq, target: Label::Block(thunk_id) });
+            }
+            match default {
+                Some(edge) => {
+                    emit_edge_moves(edge, edge.target, func, vmap, out);
+                    out.push(MInst::B { target: block_label(edge.target) });
+                }
+                None => {
+                    // No default in our test programs — but the SSA
+                    // always provides exhaustive coverage. Insert a
+                    // crash-fast trap as defensive measure.
+                    out.push(MInst::Brk { imm: 0 });
+                }
+            }
+            // Emit each arm's thunk
+            for (i, (_, edge)) in arms.iter().enumerate() {
+                let thunk_id = synth_switch_thunk_id(edge.target, i as u32);
+                out.push(MInst::BlockStart { idx: thunk_id });
+                emit_edge_moves(edge, edge.target, func, vmap, out);
+                out.push(MInst::B { target: block_label(edge.target) });
+            }
+        }
     }
+}
+
+/// Synthesize a unique block-label id for a Branch's "then-thunk".
+/// Reserves the high bit so it can't collide with real block ids
+/// (which are small `usize`s).
+fn synth_branch_thunk_id(target: BlockId, then_sense: bool) -> u32 {
+    let base = (target.0 as u32) & 0x0000_FFFF;
+    let sense = u32::from(then_sense);
+    0x8000_0000 | (sense << 16) | base
+}
+
+/// Synthesize a unique block-label id for a Switch arm's thunk.
+fn synth_switch_thunk_id(target: BlockId, arm_idx: u32) -> u32 {
+    let base = (target.0 as u32) & 0x0000_FFFF;
+    0xC000_0000 | (arm_idx << 16) | base
+}
+
+/// Wrap the runtime shim with a `BlockStart { EXIT_BLOCK_LABEL }` so
+/// every `Return` lowering can `B` here.
+fn runtime_shim_with_label() -> Vec<MInst> {
+    let mut v = vec![MInst::BlockStart { idx: EXIT_BLOCK_LABEL }];
+    v.extend(runtime_shim());
+    v
 }
 
 /// Inline `_start` shim that runs AFTER __main's body has placed the
@@ -258,12 +389,19 @@ fn entry_shim() -> Vec<MInst> {
         MInst::StrImm64 { rt: VReg(2), rn: strh, byte_offset: 8 },     // cap
         MInst::StrImm64 { rt: arena, rn: strh, byte_offset: 16 },      // data
 
-        // Bump pointer (X28) = strh + 24. The remainder of the arena
-        // is the heap for SSA-level Allocs.
-        MInst::AddImm { rd: HEAP_BUMP_REG, rn: strh, imm: 24 },
+        // Empty args List header at strh + 24 — 3 zero u64 slots
+        // (len=0, cap=0, data=null). We write via XZR (= VReg(31)).
+        MInst::AddImm { rd: VReg(2), rn: strh, imm: 24 },         // tmp = args ptr
+        MInst::StrImm64 { rt: VReg(31), rn: VReg(2), byte_offset: 0 },
+        MInst::StrImm64 { rt: VReg(31), rn: VReg(2), byte_offset: 8 },
+        MInst::StrImm64 { rt: VReg(31), rn: VReg(2), byte_offset: 16 },
 
-        // Set up __main's params: x0 = args (unused, pass 0), x1 = input ptr.
-        MInst::MovImm { rd: VReg(0), imm: 0 },
+        // Bump pointer (X28) = strh + 24 + 24. Heap starts after the
+        // args header.
+        MInst::AddImm { rd: HEAP_BUMP_REG, rn: strh, imm: 48 },
+
+        // Set up __main's params: x0 = args ptr, x1 = input ptr.
+        MInst::MovReg { rd: VReg(0), rs: VReg(2) },
         MInst::MovReg { rd: VReg(1), rs: strh },
     ]
 }
@@ -276,14 +414,29 @@ pub fn lower_to_mir(module: &Module) -> Vec<MInst> {
     let func = module.functions.get(&module.entry).unwrap();
 
     let mut out = entry_shim();
-    for block in func.blocks.values() {
+    // Emit each block with a BlockStart label so terminators can target it.
+    for (bid, block) in &func.blocks {
+        out.push(MInst::BlockStart { idx: bid.0 as u32 });
         for inst in &block.insts {
             lower_inst(inst, &vmap, &mut out);
         }
-        lower_terminator(&block.terminator, &vmap, &mut out);
+        lower_terminator(&block.terminator, func, &vmap, &mut out);
     }
 
-    out.extend(runtime_shim());
+    out.extend(runtime_shim_with_label());
+
+    // Pad the code stream to an 8-byte boundary so the data section
+    // that immediately follows (with U64 / pointer slots) is naturally
+    // aligned for `ldr Xt, [Xn]` which traps on misaligned addresses.
+    let code_bytes: usize = out
+        .iter()
+        .filter(|i| !matches!(i, MInst::BlockStart { .. }))
+        .count()
+        * 4;
+    if !code_bytes.is_multiple_of(8) {
+        out.push(MInst::Nop);
+    }
+
     out
 }
 
@@ -421,14 +574,22 @@ fn static_byte_size(slots: &[StaticSlot]) -> usize {
     slots.iter().map(slot_byte_size).sum()
 }
 
+/// Round `n` up to the next multiple of 8.
+fn round_up_8(n: u64) -> u64 {
+    (n + 7) & !7
+}
+
 /// Compute the file offset of each static, relative to the start of
-/// the data section (i.e. immediately after the code).
+/// the data section. Each static is padded to 8-byte alignment so its
+/// `U64` and `StaticPtr` slots load correctly via `ldr` (which traps
+/// on misaligned addresses by default on aarch64-linux).
 fn static_offsets(module: &Module) -> Vec<u64> {
     let mut offsets = Vec::with_capacity(module.statics.len());
     let mut cumulative = 0_u64;
     for obj in &module.statics {
         offsets.push(cumulative);
         cumulative += static_byte_size(&obj.slots) as u64;
+        cumulative = round_up_8(cumulative);
     }
     offsets
 }
@@ -439,23 +600,18 @@ fn static_vaddr(idx: usize, code_size: u64, offsets: &[u64]) -> u64 {
     LOAD_VADDR + PAYLOAD_FILE_OFFSET + code_size + offsets[idx]
 }
 
-/// Serialize all statics to a single packed byte vector. `StaticPtr`
-/// slots get resolved to absolute VAs using the layout passed in.
-#[must_use]
-pub fn serialize_statics(module: &Module, code_size: u64) -> Vec<u8> {
-    let offsets = static_offsets(module);
-    let mut out = Vec::new();
-    for obj in &module.statics {
-        for slot in &obj.slots {
-            match slot {
-                StaticSlot::U8(b) => out.push(*b),
-                StaticSlot::U32(w) => out.extend_from_slice(&w.to_le_bytes()),
-                StaticSlot::U64(w) => out.extend_from_slice(&w.to_le_bytes()),
-                StaticSlot::I64(w) => out.extend_from_slice(&w.to_le_bytes()),
-                StaticSlot::StaticPtr(target_idx) => {
-                    let va = static_vaddr(*target_idx, code_size, &offsets);
-                    out.extend_from_slice(&va.to_le_bytes());
-                }
+/// Serialize one static object's slots to bytes (no inter-object padding).
+fn serialize_one_static(slots: &[StaticSlot], code_size: u64, offsets: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(static_byte_size(slots));
+    for slot in slots {
+        match slot {
+            StaticSlot::U8(b) => out.push(*b),
+            StaticSlot::U32(w) => out.extend_from_slice(&w.to_le_bytes()),
+            StaticSlot::U64(w) => out.extend_from_slice(&w.to_le_bytes()),
+            StaticSlot::I64(w) => out.extend_from_slice(&w.to_le_bytes()),
+            StaticSlot::StaticPtr(target_idx) => {
+                let va = static_vaddr(*target_idx, code_size, offsets);
+                out.extend_from_slice(&va.to_le_bytes());
             }
         }
     }
@@ -463,19 +619,30 @@ pub fn serialize_statics(module: &Module, code_size: u64) -> Vec<u8> {
 }
 
 /// Build the `DataItem` list for the emit pass. Each static becomes
-/// one labelled blob at the correct offset; serialization happens
-/// here so absolute pointers resolve.
+/// one labelled blob; trailing zero-pad bytes are appended to the
+/// preceding item to bring the *next* item to 8-byte alignment.
+/// (Putting the pad on the previous item keeps each `Label::Data(idx)`
+/// pointing at the static's true start.)
 #[must_use]
 pub fn data_items(module: &Module, code_size: u64) -> Vec<super::mir::DataItem> {
     let offsets = static_offsets(module);
-    let serialized = serialize_statics(module, code_size);
     let mut items = Vec::with_capacity(module.statics.len());
     for (idx, obj) in module.statics.iter().enumerate() {
-        let start = offsets[idx] as usize;
-        let end = start + static_byte_size(&obj.slots);
+        let mut bytes = serialize_one_static(&obj.slots, code_size, &offsets);
+        // Determine pad to next 8-byte boundary based on the offset
+        // table delta.
+        let this_start = offsets[idx];
+        let next_start = offsets
+            .get(idx + 1)
+            .copied()
+            .unwrap_or_else(|| round_up_8(this_start + static_byte_size(&obj.slots) as u64));
+        let want_len = (next_start - this_start) as usize;
+        while bytes.len() < want_len {
+            bytes.push(0);
+        }
         items.push(super::mir::DataItem {
             label: Label::Data(idx as u32),
-            bytes: serialized[start..end].to_vec(),
+            bytes,
         });
     }
     items

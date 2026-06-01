@@ -38,7 +38,7 @@ pub fn build_ori_program_linux_aarch64(module: &Module) -> Vec<u8> {
         lower_main::lower_const_return(&info, module)
     } else {
         let mir = lower_main::lower_to_mir(module);
-        let code_size = (mir.len() as u64) * 4;
+        let code_size = mir_code_size(&mir);
         let data = lower_main::data_items(module, code_size);
         (mir, data)
     };
@@ -46,6 +46,14 @@ pub fn build_ori_program_linux_aarch64(module: &Module) -> Vec<u8> {
     let code = &combined[..code_size as usize];
     let data_bytes = &combined[code_size as usize..];
     elf::build(0, code, data_bytes)
+}
+
+/// Byte count of the encoded code section — counts only instructions
+/// that emit bytes (skips `BlockStart` pseudo-ops).
+fn mir_code_size(mir: &[super::aarch64::mir::MInst]) -> u64 {
+    use super::aarch64::mir::MInst;
+    let n = mir.iter().filter(|i| !matches!(i, MInst::BlockStart { .. })).count();
+    (n as u64) * 4
 }
 
 #[cfg(test)]
@@ -218,6 +226,18 @@ mod tests {
         let (_bytes, out) = compile_and_run_with_stdin(src, b"hello from stdin\n");
         assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
         assert_eq!(out.stdout, b"hello from stdin\n");
+    }
+
+    /// Phase 5b: branches + multi-block functions. The args list is
+    /// empty in our entry shim, so this program takes the `args : []`
+    /// arm and prints "no args".
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn branching_program_takes_correct_arm() {
+        let src = "main : List(Str), Str -> Result(Str, Str)\nmain = |a,i| if a : [] then Ok(\"no args\") else Ok(\"got args\")\n";
+        let (_bytes, out) = compile_and_run_with_stdin(src, b"");
+        assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"no args");
     }
 
     /// Phase 5a: empty stdin should produce empty stdout, exit 0.

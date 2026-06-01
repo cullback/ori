@@ -204,6 +204,96 @@ pub fn ret() -> u32 {
     0xD65F_03C0
 }
 
+/// Encode `NOP` — used as 4-byte filler when the code section needs
+/// to be padded to an 8-byte boundary so the data section that follows
+/// stays naturally aligned for 64-bit loads.
+#[must_use]
+pub fn nop() -> u32 {
+    0xD503_201F
+}
+
+/// AArch64 condition codes (4-bit field used by B.cond, CSEL, CSET, ...).
+#[derive(Copy, Clone, Debug)]
+pub enum Cond {
+    Eq = 0,
+    Ne = 1,
+    Hs = 2, // unsigned >=
+    Lo = 3, // unsigned <
+    Mi = 4,
+    Pl = 5,
+    Vs = 6,
+    Vc = 7,
+    Hi = 8, // unsigned >
+    Ls = 9, // unsigned <=
+    Ge = 10,
+    Lt = 11,
+    Gt = 12,
+    Le = 13,
+    Al = 14,
+}
+
+impl Cond {
+    #[must_use]
+    pub fn inv(self) -> u32 {
+        (self as u32) ^ 1
+    }
+}
+
+/// Encode `CMP Xn, #imm` (alias for `SUBS XZR, Xn, #imm`). Uses the
+/// same imm12 + LSL #12 dispatch policy as `add_imm`/`sub_imm`.
+#[must_use]
+pub fn cmp_imm(rn: Reg, imm: u32) -> u32 {
+    assert!(rn.0 < 32, "Rn out of range");
+    let (imm12, sh) = encode_imm12_with_optional_lsl12(imm, "CMP");
+    0xF100_001F | (sh << 22_u32) | (imm12 << 10_u32) | (u32::from(rn.0) << 5_u32)
+}
+
+/// Encode `CMP Xn, Xm` (alias for `SUBS XZR, Xn, Xm`).
+#[must_use]
+pub fn cmp_reg(rn: Reg, rm: Reg) -> u32 {
+    assert!(rn.0 < 32 && rm.0 < 32, "register out of range");
+    0xEB00_001F | (u32::from(rm.0) << 16_u32) | (u32::from(rn.0) << 5_u32)
+}
+
+/// Encode `CSET Xd, cond` (alias for `CSINC Xd, XZR, XZR, !cond`).
+/// Sets `Xd` to 1 if `cond` is met, 0 otherwise.
+#[must_use]
+pub fn cset(rd: Reg, cond: Cond) -> u32 {
+    assert!(rd.0 < 32, "Rd out of range");
+    // Cond field in CSINC carries the INVERSE of cset's condition.
+    0x9A9F_07E0 | (cond.inv() << 12_u32) | u32::from(rd.0)
+}
+
+/// Encode `B.cond label` — conditional branch, ±1 MiB range.
+/// `byte_offset` is from the address of THIS instruction; must be
+/// a multiple of 4 and within the signed 21-bit (in bytes) range.
+#[must_use]
+pub fn b_cond(cond: Cond, byte_offset: i32) -> u32 {
+    assert!(byte_offset % 4 == 0, "B.cond offset must be 4-aligned");
+    let imm19 = byte_offset / 4;
+    assert!(
+        (-(1_i32 << 18_i32)..(1_i32 << 18_i32)).contains(&imm19),
+        "B.cond offset {byte_offset} out of ±1MiB range"
+    );
+    #[expect(clippy::cast_sign_loss, reason = "wrapping into 19-bit field is intentional")]
+    let imm19_masked = (imm19 as u32) & 0x0007_FFFF;
+    0x5400_0000 | (imm19_masked << 5_u32) | (cond as u32)
+}
+
+/// Encode `B label` — unconditional branch, ±128 MiB range.
+#[must_use]
+pub fn b(byte_offset: i32) -> u32 {
+    assert!(byte_offset % 4 == 0, "B offset must be 4-aligned");
+    let imm26 = byte_offset / 4;
+    assert!(
+        (-(1_i32 << 25_i32)..(1_i32 << 25_i32)).contains(&imm26),
+        "B offset {byte_offset} out of ±128MiB range"
+    );
+    #[expect(clippy::cast_sign_loss, reason = "wrapping into 26-bit field is intentional")]
+    let imm26_masked = (imm26 as u32) & 0x03FF_FFFF;
+    0x1400_0000 | imm26_masked
+}
+
 #[cfg(test)]
 mod tests {
     use super::regs::*;
@@ -371,6 +461,42 @@ mod tests {
         // Cross-verified: movn x4, #0 -> 0x92800004 (loads -1).
         assert_eq!(movn_imm16(Reg(4), 0), 0x9280_0004);
         assert_eq!(movn_imm16(X0, 0), 0x9280_0000);
+    }
+
+    #[test]
+    fn cmp_encodings() {
+        // Cross-verified:
+        //   cmp x9, #0     -> 0xF100013F
+        //   cmp x9, #1     -> 0xF100053F
+        //   cmp x9, x10    -> 0xEB0A013F
+        assert_eq!(cmp_imm(Reg(9), 0), 0xF100_013F);
+        assert_eq!(cmp_imm(Reg(9), 1), 0xF100_053F);
+        assert_eq!(cmp_reg(Reg(9), Reg(10)), 0xEB0A_013F);
+    }
+
+    #[test]
+    fn cset_encodings() {
+        // Cross-verified:
+        //   cset x10, eq -> 0x9A9F17EA
+        //   cset x10, ne -> 0x9A9F07EA
+        assert_eq!(cset(Reg(10), Cond::Eq), 0x9A9F_17EA);
+        assert_eq!(cset(Reg(10), Cond::Ne), 0x9A9F_07EA);
+    }
+
+    #[test]
+    fn b_cond_encoding() {
+        // Cross-verified: b.eq +8 -> 0x54000040 (imm19 = 2).
+        assert_eq!(b_cond(Cond::Eq, 8), 0x5400_0040);
+        // b.eq -4 -> imm19 = -1 = 0x7FFFF, encoded as ...
+        assert_eq!(b_cond(Cond::Eq, -4), 0x54FF_FFE0);
+    }
+
+    #[test]
+    fn b_encoding() {
+        // Cross-verified: b +4 -> 0x14000001.
+        assert_eq!(b(4), 0x1400_0001);
+        // b -4 -> 0x17FFFFFF.
+        assert_eq!(b(-4), 0x17FF_FFFF);
     }
 
     // Watermark integration: emitting the hello-world code via these

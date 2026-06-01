@@ -21,6 +21,9 @@ pub struct VReg(pub u8);
 pub enum Label {
     /// Index into the function's data table.
     Data(u32),
+    /// Block identifier — resolved by the layout pass to the byte
+    /// offset of the matching `BlockStart` pseudo-instruction.
+    Block(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -48,11 +51,26 @@ pub enum MInst {
     AddReg { rd: VReg, rn: VReg, rm: VReg },
     /// `RET` — return via X30/LR.
     Ret,
+    /// `NOP` — filler for code-section alignment padding.
+    Nop,
     /// `SVC #imm` — supervisor call.
     Svc { imm: u16 },
     /// `BRK #imm` — trap. Placed after non-returning syscalls as a
     /// crash-fast landing pad in case control somehow flows past.
     Brk { imm: u16 },
+    /// `CMP Xn, #imm` — sets flags.
+    CmpImm { rn: VReg, imm: u32 },
+    /// `CMP Xn, Xm` — sets flags.
+    CmpReg { rn: VReg, rm: VReg },
+    /// `CSET Xd, cond` — write 1/0 based on flags + condition.
+    CSet { rd: VReg, cond: super::encode::Cond },
+    /// `B label` — unconditional branch.
+    B { target: Label },
+    /// `B.cond label` — conditional branch.
+    BCond { cond: super::encode::Cond, target: Label },
+    /// Pseudo-op: marks where a basic block starts. Emits no bytes;
+    /// the layout pass records the byte offset for `Label::Block(idx)`.
+    BlockStart { idx: u32 },
 }
 
 /// A blob of bytes addressable by `Label::Data(idx)`.
