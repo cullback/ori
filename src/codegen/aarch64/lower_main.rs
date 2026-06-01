@@ -43,13 +43,25 @@ use crate::ssa::{Function, Inst, Module, StaticSlot, Terminator, Value};
 
 use super::mir::{DataItem, Label, MInst, VReg};
 
-/// Reserve x0..x8 for syscall ABI; SSA values get dense vregs starting
-/// at 9. With this floor, programs with ≤ ~21 SSA values fit without
-/// stack spilling (we leave x29/x30/sp alone).
+/// Register policy for Phase 5a:
+///   x0          — first param (args), syscall arg 0, return reg
+///   x1          — second param (input), syscall arg 1
+///   x2..x7      — syscall args (transient)
+///   x8          — syscall number
+///   x9..x14     — SSA value vregs (dense from FIRST_FREE_VREG)
+///   x19..x21    — scratch held by the entry shim
+///   x28         — reserved: bump pointer for the heap arena
+///   x29, x30    — frame pointer / link register, untouched
+///   sp          — stack pointer, untouched
+///
+/// With this layout, functions with ≤ ~6 simultaneous live SSA values
+/// fit; anything bigger needs real regalloc.
 const FIRST_FREE_VREG: u8 = 9;
+const HEAP_BUMP_REG: VReg = VReg(28);
 
-/// Map each SSA Value to a virtual register densely. Returns the map
-/// plus the highest vreg used (for sanity).
+/// Map each SSA Value to a virtual register. Function params get
+/// pinned to x0, x1, ... per the calling convention; the rest are
+/// dense from FIRST_FREE_VREG.
 fn assign_vregs(module: &Module) -> HashMap<usize, VReg> {
     let func = module
         .functions
@@ -59,18 +71,23 @@ fn assign_vregs(module: &Module) -> HashMap<usize, VReg> {
     let mut map = HashMap::new();
     let mut next = FIRST_FREE_VREG;
 
+    // Pin function params to their incoming registers (x0, x1, ...).
+    for (i, p) in func.params.iter().enumerate() {
+        assert!(i < 8, "Phase 5a: ≤8 function params (would need stack-passed args)");
+        #[expect(clippy::cast_possible_truncation, reason = "i < 8")]
+        let phys = VReg(i as u8);
+        map.insert(p.id, phys);
+    }
+
     let assign = |id: usize, map: &mut HashMap<usize, VReg>, next: &mut u8| {
         map.entry(id).or_insert_with(|| {
-            assert!(*next < 29, "Phase 4-lite: function has too many live values for dense vreg map; needs stack regalloc");
+            assert!(*next < HEAP_BUMP_REG.0, "Phase 5a: too many live SSA values; needs stack regalloc");
             let v = VReg(*next);
             *next += 1;
             v
         });
     };
 
-    for p in &func.params {
-        assign(p.id, &mut map, &mut next);
-    }
     for block in func.blocks.values() {
         for p in &block.params {
             assign(p.id, &mut map, &mut next);
@@ -100,18 +117,43 @@ fn lower_inst(inst: &Inst, vmap: &HashMap<usize, VReg>, out: &mut Vec<MInst>) {
             });
         }
         Inst::RcInc(_) | Inst::RcDec(_) => {
-            // No-op for now. Statics carry sentinel rc, so RC ops on
-            // them are legitimately no-ops; once we have a real heap
-            // these need to become inline rc adjustments or calls.
+            // No-op until Phase 5e introduces a real refcount runtime.
+            // The bump allocator never frees, so leaks are correct-but-leaky.
         }
         Inst::Const(dest, bits) => {
-            assert!(*bits <= u64::from(u16::MAX), "Const {bits} exceeds Phase 4-lite movz range");
+            // 16-bit immediate fast path; widening with MOVK comes later.
+            assert!(*bits <= u64::from(u16::MAX), "Phase 5a: Const {bits} exceeds 16-bit movz");
             out.push(MInst::MovImm {
                 rd: vreg_of(*dest, vmap),
                 imm: *bits as u16,
             });
         }
-        other => panic!("Phase 4-lite: unsupported SSA inst: {other:?}"),
+        Inst::Alloc(dest, size) => {
+            // result = bump_ptr; bump_ptr += size_8aligned
+            let dest_v = vreg_of(*dest, vmap);
+            out.push(MInst::MovReg { rd: dest_v, rs: HEAP_BUMP_REG });
+            let aligned = ((*size + 7) & !7) as u32;
+            out.push(MInst::AddImm { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, imm: aligned });
+        }
+        Inst::Store(ptr, offset, val) => {
+            assert!(*offset <= 0x7FF8, "Phase 5a: Store offset {offset} out of range");
+            assert!(offset.is_multiple_of(8), "Phase 5a: Store offset must be 8-aligned");
+            out.push(MInst::StrImm64 {
+                rt: vreg_of(*val, vmap),
+                rn: vreg_of(*ptr, vmap),
+                byte_offset: *offset as u32,
+            });
+        }
+        Inst::Load(dest, ptr, offset) => {
+            assert!(*offset <= 0x7FF8, "Phase 5a: Load offset {offset} out of range");
+            assert!(offset.is_multiple_of(8), "Phase 5a: Load offset must be 8-aligned");
+            out.push(MInst::LdrImm64 {
+                rt: vreg_of(*dest, vmap),
+                rn: vreg_of(*ptr, vmap),
+                byte_offset: *offset as u32,
+            });
+        }
+        other => panic!("Phase 5a: unsupported SSA inst: {other:?}"),
     }
 }
 
@@ -164,6 +206,68 @@ fn runtime_shim() -> Vec<MInst> {
     ]
 }
 
+/// Heap arena size (mmap'd at startup). Layout within the arena:
+///   [0 .. STDIN_BUF_SIZE)               : stdin buffer
+///   [STDIN_BUF_SIZE .. +24)              : input Str header (len, cap, data)
+///   [STDIN_BUF_SIZE+24 .. ARENA_SIZE)    : bump-allocated heap
+///
+/// Both sizes must fit in a 16-bit movz immediate.
+const ARENA_SIZE: u16 = 0xF000; // 60 KiB
+const STDIN_BUF_SIZE: u16 = 0x1000; // 4 KiB
+
+/// Generate the `_start` entry shim that runs before `__main`'s body:
+///   1. mmap the arena.
+///   2. read(0, arena, STDIN_BUF_SIZE).
+///   3. Build the input Str header inside the arena.
+///   4. Place args (= 0, unused), input ptr, and bump pointer into
+///      x0, x1, x28 respectively.
+fn entry_shim() -> Vec<MInst> {
+    // Pick callee-saved scratch regs the shim alone uses.
+    let arena = VReg(19); // base of the mmap region
+    let strh = VReg(20); // address of the input Str header
+    let bytes_read = VReg(21); // result of read(2)
+
+    vec![
+        // mmap(addr=0, len=ARENA_SIZE, prot=R|W, flags=PRIVATE|ANON, fd=-1, off=0)
+        MInst::MovImm { rd: VReg(0), imm: 0 },        // addr
+        MInst::MovImm { rd: VReg(1), imm: ARENA_SIZE }, // len
+        MInst::MovImm { rd: VReg(2), imm: 3 },        // prot = PROT_READ | PROT_WRITE
+        MInst::MovImm { rd: VReg(3), imm: 0x22 },     // flags = MAP_PRIVATE | MAP_ANONYMOUS
+        MInst::MovInv { rd: VReg(4), imm: 0 },        // fd = -1
+        MInst::MovImm { rd: VReg(5), imm: 0 },        // offset
+        MInst::MovImm { rd: VReg(8), imm: 222 },      // mmap syscall
+        MInst::Svc { imm: 0 },
+        // x0 now holds the arena base; save into `arena`.
+        MInst::MovReg { rd: arena, rs: VReg(0) },
+
+        // read(fd=0, buf=arena, count=STDIN_BUF_SIZE)
+        MInst::MovImm { rd: VReg(0), imm: 0 },                  // stdin
+        MInst::MovReg { rd: VReg(1), rs: arena },               // buf
+        MInst::MovImm { rd: VReg(2), imm: STDIN_BUF_SIZE },     // count
+        MInst::MovImm { rd: VReg(8), imm: 63 },                 // read syscall
+        MInst::Svc { imm: 0 },
+        // x0 = bytes read; stash into `bytes_read`.
+        MInst::MovReg { rd: bytes_read, rs: VReg(0) },
+
+        // strh = arena + STDIN_BUF_SIZE
+        MInst::AddImm { rd: strh, rn: arena, imm: u32::from(STDIN_BUF_SIZE) },
+
+        // Store the Str header fields: [len, cap, data_ptr].
+        MInst::StrImm64 { rt: bytes_read, rn: strh, byte_offset: 0 },  // len
+        MInst::MovImm { rd: VReg(2), imm: STDIN_BUF_SIZE },             // tmp = cap value
+        MInst::StrImm64 { rt: VReg(2), rn: strh, byte_offset: 8 },     // cap
+        MInst::StrImm64 { rt: arena, rn: strh, byte_offset: 16 },      // data
+
+        // Bump pointer (X28) = strh + 24. The remainder of the arena
+        // is the heap for SSA-level Allocs.
+        MInst::AddImm { rd: HEAP_BUMP_REG, rn: strh, imm: 24 },
+
+        // Set up __main's params: x0 = args (unused, pass 0), x1 = input ptr.
+        MInst::MovImm { rd: VReg(0), imm: 0 },
+        MInst::MovReg { rd: VReg(1), rs: strh },
+    ]
+}
+
 /// Lower module → MIR. Returns the MIR stream; the caller pairs it
 /// with `serialize_statics` for the data section.
 #[must_use]
@@ -171,7 +275,7 @@ pub fn lower_to_mir(module: &Module) -> Vec<MInst> {
     let vmap = assign_vregs(module);
     let func = module.functions.get(&module.entry).unwrap();
 
-    let mut out = Vec::new();
+    let mut out = entry_shim();
     for block in func.blocks.values() {
         for inst in &block.insts {
             lower_inst(inst, &vmap, &mut out);

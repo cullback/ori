@@ -67,6 +67,15 @@ pub fn movz_imm16(rd: Reg, imm: u16) -> u32 {
     0xD280_0000 | (u32::from(imm) << 5) | u32::from(rd.0)
 }
 
+/// Encode `MOVN Xd, #imm16, LSL #0` — load the bitwise NOT of a 16-bit
+/// immediate into a 64-bit register. `MOVN Xd, #0` is the canonical
+/// way to load `-1` (= `0xFFFF_FFFF_FFFF_FFFF`).
+#[must_use]
+pub fn movn_imm16(rd: Reg, imm: u16) -> u32 {
+    debug_assert!(rd.0 < 32, "Rd out of range");
+    0x9280_0000 | (u32::from(imm) << 5) | u32::from(rd.0)
+}
+
 /// Encode `ADR Xd, label` — load `PC + offset` into a 64-bit register.
 ///
 /// `offset` is in bytes from the address of this instruction; the
@@ -149,20 +158,37 @@ pub fn str_imm64(rt: Reg, rn: Reg, byte_offset: u32) -> u32 {
     0xF900_0000 | (imm12 << 10_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rt.0)
 }
 
-/// Encode `ADD Xd, Xn, #imm` — unshifted 12-bit immediate add.
+/// Encode `ADD Xd, Xn, #imm` — 12-bit immediate add, auto-dispatching
+/// between the unshifted and `LSL #12` (4096-multiple) encodings.
+///
+/// Range: `0..4096` unshifted, or `(N * 4096)` for `N < 4096`. Other
+/// values panic — the caller must materialize them in a register and
+/// use `add_reg` instead.
 #[must_use]
-pub fn add_imm(rd: Reg, rn: Reg, imm: u16) -> u32 {
-    debug_assert!(rd.0 < 32 && rn.0 < 32, "register out of range");
-    debug_assert!(imm < 4096, "ADD imm {imm} out of 12-bit range");
-    0x9100_0000 | (u32::from(imm) << 10_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+pub fn add_imm(rd: Reg, rn: Reg, imm: u32) -> u32 {
+    assert!(rd.0 < 32 && rn.0 < 32, "register out of range");
+    let (imm12, sh) = encode_imm12_with_optional_lsl12(imm, "ADD");
+    0x9100_0000 | (sh << 22_u32) | (imm12 << 10_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
 }
 
-/// Encode `SUB Xd, Xn, #imm` — unshifted 12-bit immediate subtract.
+/// Encode `SUB Xd, Xn, #imm` — same dispatch policy as `add_imm`.
 #[must_use]
-pub fn sub_imm(rd: Reg, rn: Reg, imm: u16) -> u32 {
-    debug_assert!(rd.0 < 32 && rn.0 < 32, "register out of range");
-    debug_assert!(imm < 4096, "SUB imm {imm} out of 12-bit range");
-    0xD100_0000 | (u32::from(imm) << 10_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+pub fn sub_imm(rd: Reg, rn: Reg, imm: u32) -> u32 {
+    assert!(rd.0 < 32 && rn.0 < 32, "register out of range");
+    let (imm12, sh) = encode_imm12_with_optional_lsl12(imm, "SUB");
+    0xD100_0000 | (sh << 22_u32) | (imm12 << 10_u32) | (u32::from(rn.0) << 5_u32) | u32::from(rd.0)
+}
+
+/// Shared imm12 / `LSL #12` dispatch for `add_imm`/`sub_imm`.
+/// Returns `(imm12_field, sh_field)`.
+fn encode_imm12_with_optional_lsl12(imm: u32, op: &str) -> (u32, u32) {
+    if imm < 4096 {
+        (imm, 0)
+    } else if imm < (4096 << 12) && imm.is_multiple_of(4096) {
+        (imm >> 12_u32, 1)
+    } else {
+        panic!("{op} imm {imm} not encodable as imm12 (with optional LSL #12); materialize in a reg instead")
+    }
 }
 
 /// Encode `ADD Xd, Xn, Xm` — register-register add (no shift).
@@ -306,6 +332,23 @@ mod tests {
     }
 
     #[test]
+    fn add_imm_lsl12_encoding() {
+        // imm = 4096 fits as `add Xd, Xn, #1, LSL #12`. The encoder
+        // must take the shifted path, not silently overflow into the
+        // sh bit. Cross-verified with `as`:
+        //   add x20, x19, #4096 -> 0x91400674
+        //   add x0,  x1,  #8192 -> 0x91400820
+        assert_eq!(add_imm(Reg(20), Reg(19), 4096), 0x9140_0674);
+        assert_eq!(add_imm(X0, X1, 8192), 0x9140_0820);
+    }
+
+    #[test]
+    #[should_panic(expected = "not encodable")]
+    fn add_imm_panics_on_non_encodable() {
+        let _ = add_imm(X0, X1, 4097);
+    }
+
+    #[test]
     fn sub_imm_encoding() {
         // Cross-verified: sub sp, sp, #32 -> 0xD10083FF.
         assert_eq!(sub_imm(SP, SP, 32), 0xD100_83FF);
@@ -321,6 +364,13 @@ mod tests {
     fn ret_encoding() {
         // Cross-verified: ret -> 0xD65F03C0 (Xn defaults to X30 / LR).
         assert_eq!(ret(), 0xD65F_03C0);
+    }
+
+    #[test]
+    fn movn_encoding() {
+        // Cross-verified: movn x4, #0 -> 0x92800004 (loads -1).
+        assert_eq!(movn_imm16(Reg(4), 0), 0x9280_0004);
+        assert_eq!(movn_imm16(X0, 0), 0x9280_0000);
     }
 
     // Watermark integration: emitting the hello-world code via these

@@ -173,6 +173,63 @@ mod tests {
         assert_eq!(bytes.len(), 157, "expected 120+32+5 = 157 bytes for Err(\"oops\\n\")");
     }
 
+    fn compile_and_run_with_stdin(src: &str, stdin_data: &[u8]) -> (Vec<u8>, std::process::Output) {
+        use crate::source::SourceArena;
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Stdio;
+
+        let mut arena = SourceArena::new();
+        let main_file = arena.add("/tmp/ori_phase5_test.ori".to_string(), src.to_string());
+        let resolved = crate::resolve(&mut arena, main_file, None, false)
+            .unwrap_or_else(|e| panic!("resolve failed: {}", e.format(&arena)));
+        let (ssa_module, _input_vals) = crate::compile(resolved)
+            .unwrap_or_else(|e| panic!("compile failed: {}", e.format(&arena)));
+
+        let bytes = build_ori_program_linux_aarch64(&ssa_module);
+
+        let dir = std::env::temp_dir().join(format!("ori-phase5-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prog");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&bytes).unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child = std::process::Command::new(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(stdin_data).unwrap();
+        let out = child.wait_with_output().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        (bytes, out)
+    }
+
+    /// Phase 5a: echo program. `main = |a,i| Ok(input)` reads stdin,
+    /// allocates Result+Ok shell at runtime via the bump allocator,
+    /// returns. The runtime shim writes the Str's bytes back out.
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn echo_program_round_trips_stdin() {
+        let src = "main : List(Str), Str -> Result(Str, Str)\nmain = |a,i| Ok(i)\n";
+        let (_bytes, out) = compile_and_run_with_stdin(src, b"hello from stdin\n");
+        assert!(out.status.success(), "exit {:?}; stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout, b"hello from stdin\n");
+    }
+
+    /// Phase 5a: empty stdin should produce empty stdout, exit 0.
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn echo_program_handles_empty_stdin() {
+        let src = "main : List(Str), Str -> Result(Str, Str)\nmain = |a,i| Ok(i)\n";
+        let (_bytes, out) = compile_and_run_with_stdin(src, b"");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"");
+    }
+
     /// Phase 4 end-to-end: real Ori source through the existing
     /// frontend, lowered to native via `build_ori_program_linux_aarch64`,
     /// executed. The high-confidence test for the whole pipeline.

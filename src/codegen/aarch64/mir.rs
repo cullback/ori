@@ -27,6 +27,8 @@ pub enum Label {
 pub enum MInst {
     /// `MOVZ Xd, #imm16, LSL #0` — load a 16-bit unsigned immediate.
     MovImm { rd: VReg, imm: u16 },
+    /// `MOVN Xd, #imm16, LSL #0` — load NOT(imm); `MOVN ..., #0` = -1.
+    MovInv { rd: VReg, imm: u16 },
     /// `MOV Xd, Xs` — register-to-register move. Used by the selector
     /// to shuffle SSA values into calling-convention slots.
     MovReg { rd: VReg, rs: VReg },
@@ -37,10 +39,11 @@ pub enum MInst {
     LdrImm64 { rt: VReg, rn: VReg, byte_offset: u32 },
     /// `STR Xt, [Xn, #imm]` — store 64 bits.
     StrImm64 { rt: VReg, rn: VReg, byte_offset: u32 },
-    /// `ADD Xd, Xn, #imm` — unshifted 12-bit immediate add.
-    AddImm { rd: VReg, rn: VReg, imm: u16 },
-    /// `SUB Xd, Xn, #imm` — unshifted 12-bit immediate subtract.
-    SubImm { rd: VReg, rn: VReg, imm: u16 },
+    /// `ADD Xd, Xn, #imm` — 12-bit imm (auto-shifts to LSL #12 for
+    /// 4096-multiples up to ~16 MiB).
+    AddImm { rd: VReg, rn: VReg, imm: u32 },
+    /// `SUB Xd, Xn, #imm` — same dispatch policy as `AddImm`.
+    SubImm { rd: VReg, rn: VReg, imm: u32 },
     /// `ADD Xd, Xn, Xm` — register-register add.
     AddReg { rd: VReg, rn: VReg, rm: VReg },
     /// `RET` — return via X30/LR.
