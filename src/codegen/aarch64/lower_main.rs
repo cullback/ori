@@ -45,56 +45,96 @@ use crate::ssa::{BinaryOp, BlockId, Function, Inst, Module, StaticSlot, Terminat
 use super::encode::Cond;
 use super::mir::{DataItem, Label, MInst, VReg};
 
-/// Register policy for Phase 5a:
-///   x0          — first param (args), syscall arg 0, return reg
-///   x1          — second param (input), syscall arg 1
-///   x2..x7      — syscall args (transient)
-///   x8          — syscall number
-///   x9..x14     — SSA value vregs (dense from FIRST_FREE_VREG)
-///   x19..x21    — scratch held by the entry shim
-///   x28         — reserved: bump pointer for the heap arena
-///   x29, x30    — frame pointer / link register, untouched
-///   sp          — stack pointer, untouched
+/// Register policy for Phase 5e (stack-everything):
+///   x0..x7     — function-call ABI (args + first ≤2 return values)
+///   x8         — syscall number
+///   x9         — scratch operand A (first load target)
+///   x10        — scratch operand B (second load target)
+///   x11        — scratch result (where the op writes before store)
+///   x19..x21   — entry-shim scratch (mmap base, str header, bytes_read)
+///   x28        — heap bump pointer (callee-saved by ABI; we own it)
+///   x30        — link register; saved to frame for non-entry calls
+///   sp         — stack pointer; frame allocated in function prologue
 ///
-/// With this layout, functions with ≤ ~6 simultaneous live SSA values
-/// fit; anything bigger needs real regalloc.
-const FIRST_FREE_VREG: u8 = 9;
+/// Every SSA Value gets a stack slot at `[sp, #(slot_offset)]`. Each
+/// Inst loads its operands into x9/x10, computes into x11, stores the
+/// result. Frame size is rounded up so `sub sp, sp, #FRAME` and
+/// `add sp, sp, #FRAME` both encode in one instruction (either 12-bit
+/// imm or LSL #12 form via our `add_imm`/`sub_imm` dispatch).
 const HEAP_BUMP_REG: VReg = VReg(28);
+const SP_REG: VReg = VReg(31);
+const LR_REG: VReg = VReg(30);
+const SCRATCH_A: VReg = VReg(9);
+const SCRATCH_B: VReg = VReg(10);
+const SCRATCH_C: VReg = VReg(11);
 
-/// Map each SSA Value (within a single function) to a virtual register.
-/// Function params get pinned to x0, x1, ... per the calling convention;
-/// the rest are dense from FIRST_FREE_VREG.
-fn assign_vregs_for(func: &Function) -> HashMap<usize, VReg> {
-    let mut map = HashMap::new();
-    let mut next = FIRST_FREE_VREG;
+/// Per-function slot map: SSA value id → byte offset within the stack
+/// frame. Slot 0 is at [sp+0], slot 1 at [sp+8], etc.
+type SlotMap = HashMap<usize, u32>;
 
-    for (i, p) in func.params.iter().enumerate() {
-        assert!(i < 8, "Phase 5c: ≤8 function params (would need stack-passed args)");
-        #[expect(clippy::cast_possible_truncation, reason = "i < 8")]
-        let phys = VReg(i as u8);
-        map.insert(p.id, phys);
+/// Frame layout for one function.
+#[derive(Debug, Clone)]
+struct Frame {
+    /// SSA value id → byte offset within the frame.
+    slots: SlotMap,
+    /// Total bytes allocated by `sub sp` in the prologue. Always a
+    /// multiple of 16 for SP alignment, and chosen so it fits in one
+    /// `sub_imm` encoding.
+    size: u32,
+    /// Byte offset of the LR save slot (relative to sp). Only valid
+    /// when the function is non-leaf (calls another function).
+    lr_offset: u32,
+    /// True iff the function contains any `Inst::Call` — needs to
+    /// save/restore LR around its body.
+    non_leaf: bool,
+}
+
+/// Round `n` up so it's a valid `add_imm` / `sub_imm` immediate AND a
+/// multiple of 16 (SP alignment).
+fn round_frame_size(raw: u32) -> u32 {
+    let aligned = (raw + 15) & !15;
+    if aligned < 4096 {
+        aligned
+    } else {
+        // Round up to next multiple of 4096 so the LSL #12 form encodes it.
+        (aligned + 4095) & !4095
     }
+}
 
-    let assign = |id: usize, map: &mut HashMap<usize, VReg>, next: &mut u8| {
-        map.entry(id).or_insert_with(|| {
-            assert!(*next < HEAP_BUMP_REG.0, "Phase 5c: too many live SSA values; needs stack regalloc");
-            let v = VReg(*next);
-            *next += 1;
-            v
+fn function_is_non_leaf(func: &Function) -> bool {
+    func.blocks
+        .values()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Call { .. })))
+}
+
+fn build_frame_for(func: &Function) -> Frame {
+    let mut slots: SlotMap = HashMap::new();
+    let mut next_offset: u32 = 0;
+    let mut alloc = |id: usize, slots: &mut SlotMap, off: &mut u32| {
+        slots.entry(id).or_insert_with(|| {
+            let s = *off;
+            *off += 8;
+            s
         });
     };
-
+    for p in &func.params {
+        alloc(p.id, &mut slots, &mut next_offset);
+    }
     for block in func.blocks.values() {
         for p in &block.params {
-            assign(p.id, &mut map, &mut next);
+            alloc(p.id, &mut slots, &mut next_offset);
         }
         for inst in &block.insts {
             for d in inst.dests() {
-                assign(d.id, &mut map, &mut next);
+                alloc(d.id, &mut slots, &mut next_offset);
             }
         }
     }
-    map
+    let non_leaf = function_is_non_leaf(func);
+    let raw = next_offset + if non_leaf { 8 } else { 0 };
+    let size = round_frame_size(raw);
+    let lr_offset = size - 8;
+    Frame { slots, size, lr_offset, non_leaf }
 }
 
 /// Function-name → label-index lookup. Built once for the whole module.
@@ -107,73 +147,78 @@ fn function_index_map(module: &Module) -> HashMap<String, u32> {
     map
 }
 
-fn vreg_of(v: Value, vmap: &HashMap<usize, VReg>) -> VReg {
-    *vmap
-        .get(&v.id)
-        .unwrap_or_else(|| panic!("SSA value v{} has no vreg assignment", v.id))
+fn slot_of(v: Value, frame: &Frame) -> u32 {
+    *frame.slots.get(&v.id).unwrap_or_else(|| {
+        panic!("SSA value v{} has no stack slot in this function", v.id)
+    })
 }
 
-/// Lower one SSA instruction. Pushes zero or more MIR ops.
+/// Emit `ldr Xreg, [sp, #slot]` for the value `v`.
+fn emit_load(v: Value, reg: VReg, frame: &Frame, out: &mut Vec<MInst>) {
+    out.push(MInst::LdrImm64 {
+        rt: reg,
+        rn: SP_REG,
+        byte_offset: slot_of(v, frame),
+    });
+}
+
+/// Emit `str Xreg, [sp, #slot]` for the value `v`.
+fn emit_store(v: Value, reg: VReg, frame: &Frame, out: &mut Vec<MInst>) {
+    out.push(MInst::StrImm64 {
+        rt: reg,
+        rn: SP_REG,
+        byte_offset: slot_of(v, frame),
+    });
+}
+
+/// Lower one SSA instruction with stack-everything regalloc. Each
+/// SSA Value reads through `[sp, #slot]` and writes the same way.
 fn lower_inst(
     inst: &Inst,
-    vmap: &HashMap<usize, VReg>,
+    frame: &Frame,
     func_idx: &HashMap<String, u32>,
     out: &mut Vec<MInst>,
 ) {
     match inst {
         Inst::StaticRef(dest, idx) => {
-            out.push(MInst::AdrLabel {
-                rd: vreg_of(*dest, vmap),
-                label: Label::Data(*idx as u32),
-            });
+            out.push(MInst::AdrLabel { rd: SCRATCH_C, label: Label::Data(*idx as u32) });
+            emit_store(*dest, SCRATCH_C, frame, out);
         }
         Inst::RcInc(_) | Inst::RcDec(_) => {
-            // No-op until Phase 5e introduces a real refcount runtime.
-            // The bump allocator never frees, so leaks are correct-but-leaky.
+            // No-op until a real refcount runtime exists.
         }
         Inst::Const(dest, bits) => {
-            // 16-bit immediate fast path; widening with MOVK comes later.
-            assert!(*bits <= u64::from(u16::MAX), "Phase 5a: Const {bits} exceeds 16-bit movz");
-            out.push(MInst::MovImm {
-                rd: vreg_of(*dest, vmap),
-                imm: *bits as u16,
-            });
+            assert!(*bits <= u64::from(u16::MAX), "Const {bits} exceeds 16-bit movz");
+            out.push(MInst::MovImm { rd: SCRATCH_C, imm: *bits as u16 });
+            emit_store(*dest, SCRATCH_C, frame, out);
         }
         Inst::Alloc(dest, size) => {
-            // result = bump_ptr; bump_ptr += size_8aligned
-            let dest_v = vreg_of(*dest, vmap);
-            out.push(MInst::MovReg { rd: dest_v, rs: HEAP_BUMP_REG });
+            // result = bump_ptr; bump_ptr += aligned_size
+            out.push(MInst::MovReg { rd: SCRATCH_C, rs: HEAP_BUMP_REG });
             let aligned = ((*size + 7) & !7) as u32;
             out.push(MInst::AddImm { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, imm: aligned });
+            emit_store(*dest, SCRATCH_C, frame, out);
         }
         Inst::Store(ptr, offset, val) => {
-            assert!(*offset <= 0x7FF8, "Phase 5a: Store offset {offset} out of range");
-            assert!(offset.is_multiple_of(8), "Phase 5a: Store offset must be 8-aligned");
-            out.push(MInst::StrImm64 {
-                rt: vreg_of(*val, vmap),
-                rn: vreg_of(*ptr, vmap),
-                byte_offset: *offset as u32,
-            });
+            assert!(*offset <= 0x7FF8, "Store offset {offset} out of range");
+            assert!(offset.is_multiple_of(8), "Store offset must be 8-aligned");
+            emit_load(*ptr, SCRATCH_A, frame, out);
+            emit_load(*val, SCRATCH_B, frame, out);
+            out.push(MInst::StrImm64 { rt: SCRATCH_B, rn: SCRATCH_A, byte_offset: *offset as u32 });
         }
         Inst::Load(dest, ptr, offset) => {
-            assert!(*offset <= 0x7FF8, "Phase 5a: Load offset {offset} out of range");
-            assert!(offset.is_multiple_of(8), "Phase 5a: Load offset must be 8-aligned");
-            out.push(MInst::LdrImm64 {
-                rt: vreg_of(*dest, vmap),
-                rn: vreg_of(*ptr, vmap),
-                byte_offset: *offset as u32,
-            });
+            assert!(*offset <= 0x7FF8, "Load offset {offset} out of range");
+            assert!(offset.is_multiple_of(8), "Load offset must be 8-aligned");
+            emit_load(*ptr, SCRATCH_A, frame, out);
+            out.push(MInst::LdrImm64 { rt: SCRATCH_C, rn: SCRATCH_A, byte_offset: *offset as u32 });
+            emit_store(*dest, SCRATCH_C, frame, out);
         }
         Inst::BinOp(dest, op, lhs, rhs) => {
-            let d = vreg_of(*dest, vmap);
-            let a = vreg_of(*lhs, vmap);
-            let b = vreg_of(*rhs, vmap);
-            // Comparisons set flags via CMP then materialize a 0/1
-            // result via CSET. Arithmetic / bitwise / shift ops are
-            // direct reg-reg encodings.
+            emit_load(*lhs, SCRATCH_A, frame, out);
+            emit_load(*rhs, SCRATCH_B, frame, out);
             let cmp_then = |cond: Cond, out: &mut Vec<MInst>| {
-                out.push(MInst::CmpReg { rn: a, rm: b });
-                out.push(MInst::CSet { rd: d, cond });
+                out.push(MInst::CmpReg { rn: SCRATCH_A, rm: SCRATCH_B });
+                out.push(MInst::CSet { rd: SCRATCH_C, cond });
             };
             match op {
                 BinaryOp::Eq => cmp_then(Cond::Eq, out),
@@ -182,44 +227,39 @@ fn lower_inst(
                 BinaryOp::Le => cmp_then(Cond::Le, out),
                 BinaryOp::Gt => cmp_then(Cond::Gt, out),
                 BinaryOp::Ge => cmp_then(Cond::Ge, out),
-                BinaryOp::Add => out.push(MInst::AddReg { rd: d, rn: a, rm: b }),
-                BinaryOp::Sub => out.push(MInst::SubReg { rd: d, rn: a, rm: b }),
-                BinaryOp::Mul => out.push(MInst::MulReg { rd: d, rn: a, rm: b }),
-                BinaryOp::And => out.push(MInst::AndReg { rd: d, rn: a, rm: b }),
-                BinaryOp::Or => out.push(MInst::OrrReg { rd: d, rn: a, rm: b }),
-                BinaryOp::Xor => out.push(MInst::EorReg { rd: d, rn: a, rm: b }),
-                BinaryOp::Shl => out.push(MInst::LslReg { rd: d, rn: a, rm: b }),
-                BinaryOp::Shr => out.push(MInst::LsrReg { rd: d, rn: a, rm: b }),
-                other => panic!("Phase 5d: unsupported BinOp {other:?}"),
+                BinaryOp::Add => out.push(MInst::AddReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::Sub => out.push(MInst::SubReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::Mul => out.push(MInst::MulReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::And => out.push(MInst::AndReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::Or => out.push(MInst::OrrReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::Xor => out.push(MInst::EorReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::Shl => out.push(MInst::LslReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                BinaryOp::Shr => out.push(MInst::LsrReg { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B }),
+                other => panic!("Phase 5e: unsupported BinOp {other:?}"),
             }
+            emit_store(*dest, SCRATCH_C, frame, out);
         }
         Inst::Call { results, target, args } => {
-            // Move each arg into x0..xN (calling-convention regs).
-            assert!(args.len() <= 8, "Phase 5c: >8 args needs stack-passed args");
+            assert!(args.len() <= 8, "Phase 5e: >8 args needs stack-passed args");
+            assert!(results.len() <= 8, "Phase 5e: >8 return values needs stack-passed returns");
+            // Load args directly into x0..xN (calling-convention regs).
             for (i, arg) in args.iter().enumerate() {
-                let arg_v = vreg_of(*arg, vmap);
-                #[expect(clippy::cast_possible_truncation, reason = "args.len() ≤ 8")]
-                let target_v = VReg(i as u8);
-                if arg_v != target_v {
-                    out.push(MInst::MovReg { rd: target_v, rs: arg_v });
-                }
+                #[expect(clippy::cast_possible_truncation, reason = "≤ 8 args")]
+                let target_reg = VReg(i as u8);
+                emit_load(*arg, target_reg, frame, out);
             }
             let idx = *func_idx.get(target).unwrap_or_else(|| {
-                panic!("Phase 5c: Call to unknown function {target}")
+                panic!("Phase 5e: Call to unknown function {target}")
             });
             out.push(MInst::Bl { target: Label::Func(idx) });
-            // Capture multi-value returns from x0..xM.
-            assert!(results.len() <= 8, "Phase 5c: >8 return values needs stack-passed returns");
+            // Store return values from x0..xM into their slots.
             for (i, r) in results.iter().enumerate() {
-                let result_v = vreg_of(*r, vmap);
-                #[expect(clippy::cast_possible_truncation, reason = "results.len() ≤ 8")]
-                let src_v = VReg(i as u8);
-                if result_v != src_v {
-                    out.push(MInst::MovReg { rd: result_v, rs: src_v });
-                }
+                #[expect(clippy::cast_possible_truncation, reason = "≤ 8 returns")]
+                let src_reg = VReg(i as u8);
+                emit_store(*r, src_reg, frame, out);
             }
         }
-        other => panic!("Phase 5c: unsupported SSA inst: {other:?}"),
+        other => panic!("Phase 5e: unsupported SSA inst: {other:?}"),
     }
 }
 
@@ -229,26 +269,28 @@ fn lower_inst(
 /// the way.
 const EXIT_BLOCK_LABEL: u32 = 0xFFFF_FFFE;
 
-/// Emit moves to set up a destination block's params from an edge's args.
-/// Naive: emit one MovReg per pair, in order. This is correct when no
-/// destination vreg appears as a source in another pair (otherwise we'd
-/// need a swap chain). For our hello-world-class programs this trivially
-/// holds since block params get distinct vregs.
+/// Emit slot-to-slot copies for an edge's block-param plumbing.
+/// For each (edge arg, dest param) pair, load from arg's slot into a
+/// scratch register and store into the dest param's slot.
+///
+/// Order doesn't matter because we always go through a scratch — no
+/// two pairs interfere (no shared destination since SSA gives every
+/// param a unique slot).
 fn emit_edge_moves(
     edge: &BlockEdge,
     dest_block: BlockId,
     func: &Function,
-    vmap: &HashMap<usize, VReg>,
+    frame: &Frame,
     out: &mut Vec<MInst>,
 ) {
     let dest = func.blocks.get(&dest_block).expect("edge to nonexistent block");
     assert_eq!(edge.args.len(), dest.params.len(), "edge arity mismatch");
     for (arg, param) in edge.args.iter().zip(&dest.params) {
-        let src = vreg_of(*arg, vmap);
-        let dst = vreg_of(*param, vmap);
-        if src != dst {
-            out.push(MInst::MovReg { rd: dst, rs: src });
+        if slot_of(*arg, frame) == slot_of(*param, frame) {
+            continue;
         }
+        emit_load(*arg, SCRATCH_A, frame, out);
+        emit_store(*param, SCRATCH_A, frame, out);
     }
 }
 
@@ -268,68 +310,93 @@ fn lower_terminator(
     func: &Function,
     func_idx: u32,
     is_entry: bool,
-    vmap: &HashMap<usize, VReg>,
+    frame: &Frame,
     out: &mut Vec<MInst>,
 ) {
     match term {
         Terminator::Return(vs) => {
-            assert!(vs.len() <= 8, "Phase 5c: >8 return values needs stack-passed returns");
+            assert!(vs.len() <= 8, "Phase 5e: >8 return values needs stack-passed returns");
+            // Load return values from slots into x0..xN.
             for (i, v) in vs.iter().enumerate() {
-                let src = vreg_of(*v, vmap);
                 #[expect(clippy::cast_possible_truncation, reason = "≤ 8 returns")]
                 let dst = VReg(i as u8);
-                if src != dst {
-                    out.push(MInst::MovReg { rd: dst, rs: src });
-                }
+                emit_load(*v, dst, frame, out);
             }
             if is_entry {
+                // No epilogue — entry never returns; runtime shim exits.
                 out.push(MInst::B { target: Label::Block(EXIT_BLOCK_LABEL) });
             } else {
+                emit_epilogue(frame, out);
                 out.push(MInst::Ret);
             }
         }
         Terminator::Jump(edge) => {
-            emit_edge_moves(edge, edge.target, func, vmap, out);
+            emit_edge_moves(edge, edge.target, func, frame, out);
             out.push(MInst::B { target: block_label(func_idx, edge.target) });
         }
         Terminator::Branch { cond, then_edge, else_edge } => {
-            let cond_v = vreg_of(*cond, vmap);
-            out.push(MInst::CmpImm { rn: cond_v, imm: 0 });
-            // b.ne to the then-thunk, fall through to else moves.
+            emit_load(*cond, SCRATCH_A, frame, out);
+            out.push(MInst::CmpImm { rn: SCRATCH_A, imm: 0 });
             let thunk_id = synth_branch_thunk_id(func_idx, then_edge.target);
             out.push(MInst::BCond { cond: Cond::Ne, target: Label::Block(thunk_id) });
-            emit_edge_moves(else_edge, else_edge.target, func, vmap, out);
+            emit_edge_moves(else_edge, else_edge.target, func, frame, out);
             out.push(MInst::B { target: block_label(func_idx, else_edge.target) });
             out.push(MInst::BlockStart { idx: thunk_id });
-            emit_edge_moves(then_edge, then_edge.target, func, vmap, out);
+            emit_edge_moves(then_edge, then_edge.target, func, frame, out);
             out.push(MInst::B { target: block_label(func_idx, then_edge.target) });
         }
         Terminator::SwitchInt { scrutinee, arms, default } => {
-            let s_v = vreg_of(*scrutinee, vmap);
+            emit_load(*scrutinee, SCRATCH_A, frame, out);
             for (i, (val, edge)) in arms.iter().enumerate() {
-                let val_u32 = u32::try_from(*val).expect("Phase 5b: switch arm value > u32");
-                out.push(MInst::CmpImm { rn: s_v, imm: val_u32 });
+                let val_u32 = u32::try_from(*val).expect("Phase 5e: switch arm value > u32");
+                out.push(MInst::CmpImm { rn: SCRATCH_A, imm: val_u32 });
                 #[expect(clippy::cast_possible_truncation, reason = "≤ 8 arms in practice")]
                 let thunk_id = synth_switch_thunk_id(func_idx, edge.target, i as u32);
                 out.push(MInst::BCond { cond: Cond::Eq, target: Label::Block(thunk_id) });
             }
             match default {
                 Some(edge) => {
-                    emit_edge_moves(edge, edge.target, func, vmap, out);
+                    emit_edge_moves(edge, edge.target, func, frame, out);
                     out.push(MInst::B { target: block_label(func_idx, edge.target) });
                 }
-                None => {
-                    out.push(MInst::Brk { imm: 0 });
-                }
+                None => out.push(MInst::Brk { imm: 0 }),
             }
             for (i, (_, edge)) in arms.iter().enumerate() {
                 #[expect(clippy::cast_possible_truncation, reason = "≤ 8 arms in practice")]
                 let thunk_id = synth_switch_thunk_id(func_idx, edge.target, i as u32);
                 out.push(MInst::BlockStart { idx: thunk_id });
-                emit_edge_moves(edge, edge.target, func, vmap, out);
+                emit_edge_moves(edge, edge.target, func, frame, out);
                 out.push(MInst::B { target: block_label(func_idx, edge.target) });
             }
         }
+    }
+}
+
+/// Emit `sub sp, sp, #FRAME`; if non-leaf, save x30 at `lr_offset`.
+/// Then spill each function parameter from x0..xN into its slot.
+fn emit_prologue(func: &Function, frame: &Frame, out: &mut Vec<MInst>) {
+    if frame.size > 0 {
+        out.push(MInst::SubImm { rd: SP_REG, rn: SP_REG, imm: frame.size });
+    }
+    if frame.non_leaf {
+        out.push(MInst::StrImm64 { rt: LR_REG, rn: SP_REG, byte_offset: frame.lr_offset });
+    }
+    // Spill the function's incoming params from x0..xN to their slots.
+    for (i, p) in func.params.iter().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "≤ 8 params")]
+        let src = VReg(i as u8);
+        emit_store(*p, src, frame, out);
+    }
+}
+
+/// Emit `ldr x30, [sp, #lr_offset]` (if non-leaf) and `add sp, sp, #FRAME`.
+/// The caller is responsible for the trailing `ret`.
+fn emit_epilogue(frame: &Frame, out: &mut Vec<MInst>) {
+    if frame.non_leaf {
+        out.push(MInst::LdrImm64 { rt: LR_REG, rn: SP_REG, byte_offset: frame.lr_offset });
+    }
+    if frame.size > 0 {
+        out.push(MInst::AddImm { rd: SP_REG, rn: SP_REG, imm: frame.size });
     }
 }
 
@@ -459,21 +526,24 @@ fn entry_shim() -> Vec<MInst> {
     ]
 }
 
-/// Emit one function's MIR. For the entry (`is_entry == true`), no
-/// FuncStart label and Return jumps to EXIT. For others, a FuncStart
-/// pseudo-op gives the function its label and Return does `ret`.
+/// Emit one function with stack-everything regalloc. Prologue
+/// allocates the frame and spills params; body uses [sp, #slot]
+/// for every Value access; epilogue at each Return restores LR
+/// and deallocates the frame (or, for the entry, jumps to EXIT).
 fn lower_function(
     func: &Function,
     func_idx_map: &HashMap<String, u32>,
     is_entry: bool,
     out: &mut Vec<MInst>,
 ) {
-    let vmap = assign_vregs_for(func);
+    let frame = build_frame_for(func);
     let func_idx = *func_idx_map.get(&func.name).expect("function not in idx map");
 
     if !is_entry {
         out.push(MInst::FuncStart { idx: func_idx });
     }
+
+    emit_prologue(func, &frame, out);
 
     for (bid, block) in &func.blocks {
         let combined = match block_label(func_idx, *bid) {
@@ -482,9 +552,9 @@ fn lower_function(
         };
         out.push(MInst::BlockStart { idx: combined });
         for inst in &block.insts {
-            lower_inst(inst, &vmap, func_idx_map, out);
+            lower_inst(inst, &frame, func_idx_map, out);
         }
-        lower_terminator(&block.terminator, func, func_idx, is_entry, &vmap, out);
+        lower_terminator(&block.terminator, func, func_idx, is_entry, &frame, out);
     }
 }
 
