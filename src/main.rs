@@ -72,10 +72,23 @@ fn compile(
     let core_attempt = passes::core::pipeline::lower_module(
         &mut mono, &resolved.fields, &decls,
     );
+    if let Err(e) = &core_attempt {
+        if std::env::var("ORI_TRACE_CORE").is_ok() {
+            eprintln!("[core] fallback: {e}");
+        }
+    }
     let core_module = core_attempt.ok().filter(|m| {
         let r = ssa::validate::validate(m);
-        r.is_clean() && r.warnings.is_empty()
+        let ok = r.is_clean() && r.warnings.is_empty();
+        if !ok && std::env::var("ORI_TRACE_CORE").is_ok() {
+            eprintln!("[core] fallback: validation errors={:?} warnings={:?}",
+                r.errors, r.warnings);
+        }
+        ok
     });
+    if core_module.is_some() && std::env::var("ORI_TRACE_CORE").is_ok() {
+        eprintln!("[core] used Core pipeline");
+    }
 
     let (mut ssa_module, input_vals) = if let Some(m) = core_module {
         let main_params = m.functions.get("__main")

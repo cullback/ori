@@ -101,7 +101,10 @@ pub fn lower_module(
         // identities only (x + 0, x * 1); fusion rules land here.
         let core_body: Vec<_> = core_body.into_iter().map(super::rules::simplify).collect();
 
-        // Core → SSA (immutable borrow on mono.symbols).
+        // Core → SSA via lower_slots so payload Con / multi-result
+        // App / multi-slot Match return their full slot list.
+        // Concatenating each core_body slot's lowered values gives
+        // the function's return slot list.
         let result_vals: Vec<Value> = {
             let mut ctx = to_ssa::Ctx {
                 builder: &mut builder,
@@ -110,11 +113,14 @@ pub fn lower_module(
                 locals: to_ssa_locals,
                 fieldless: decls.fieldless_tags.clone(),
             };
-            core_body
-                .iter()
-                .map(|e| to_ssa::lower(&mut ctx, e))
-                .collect::<Result<_, _>>()
-                .map_err(|e| format!("function `{name_str}`: Core→SSA: {e}"))?
+            let mut all = Vec::new();
+            for e in &core_body {
+                all.extend(
+                    to_ssa::lower_slots(&mut ctx, e)
+                        .map_err(|e| format!("function `{name_str}`: Core→SSA: {e}"))?,
+                );
+            }
+            all
         };
 
         // Emit return + finish.
