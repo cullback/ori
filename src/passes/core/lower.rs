@@ -138,26 +138,18 @@ pub fn lower_expr_with(ctx: &LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Expr, St
             })
         }
 
-        ExprKind::Tuple(elems) => {
-            // Tuples lower to records with positional field names —
-            // "0", "1", "2", ... — same convention the existing
-            // lowering uses for naming tuple slots.
-            let fields: Vec<(super::expr::FieldId, Expr)> = elems
-                .iter()
-                .enumerate()
-                .map(|(i, e)| Ok((i.to_string(), lower_expr_with(ctx, e)?)))
-                .collect::<Result<_, String>>()?;
-            Ok(Expr::Record { fields, ty: ast.ty.clone() })
-        }
-
-        ExprKind::Record { fields } => {
-            let field_exprs: Vec<(super::expr::FieldId, Expr)> = fields
-                .iter()
-                .map(|(fsym, e)| {
-                    Ok((ctx.fields.get(*fsym).to_string(), lower_expr_with(ctx, e)?))
-                })
-                .collect::<Result<_, String>>()?;
-            Ok(Expr::Record { fields: field_exprs, ty: ast.ty.clone() })
+        ExprKind::Tuple(_) | ExprKind::Record { .. } => {
+            // Aggregates are SROA'd at AST→Core into slot lists, not
+            // represented as Core IR nodes. The slot-decomposition
+            // path goes through `lower_expr_slots` (not yet wired in
+            // through `lower_expr`). For now, programs that hit a
+            // Tuple/Record at expression position via this entry are
+            // unsupported.
+            Err(format!(
+                "core::lower_expr: {} requires slot-decomposition path \
+                 (lower_expr_slots) — not yet wired",
+                ast_kind_name(&ast.kind)
+            ))
         }
 
         ExprKind::If { expr, arms, else_body } => {

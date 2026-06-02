@@ -6,25 +6,26 @@
 //!
 //! ## Primitives
 //!
-//! Post-lambda-lift, post-mono, typed, direct-style. Eight
+//! Post-lambda-lift, post-mono, typed, direct-style. Seven
 //! **structural** primitives — each carries an algebraic rewrite
-//! home, the test for whether the IR earns its shape:
+//! home:
 //!
-//! - `Var` — variable reference
+//! - `Var` — variable reference (single slot)
 //! - `Lit` — scalar literal
 //! - `App` — first-order call to a known top-level function
 //! - `Let` — `let x = e1 in e2`
 //! - `Match` — non-recursive case analysis on tag unions
 //! - `Cata` — structural recursion (the **only** iteration primitive)
 //! - `Con` — tag-union constructor
-//! - `Record` — non-tagged aggregate
 //!
 //! Plus one **scalar** primitive, `BinOp`, for arithmetic / comparison
-//! / bitwise / boolean operators. Scalar ops sit outside the
-//! algebraic rewrite system (fusion never touches them); they could
-//! be modeled as `App` to intrinsic symbols, but that adds plumbing
-//! for no payoff. Treating them as a dedicated node keeps `App` to
-//! mean "call a user or library function," which is more honest.
+//! / bitwise / boolean operators.
+//!
+//! **No `Record`, `Tuple`, or `FieldAccess` in the IR.** Aggregates
+//! are SROA'd at AST→Core: an N-field record/tuple becomes N parallel
+//! Core expressions in a slot list. Field access becomes slot picking.
+//! See `notes/core-ir.md` for the rationale (algebraic-purity, no-
+//! aggregate-identity language property).
 //!
 //! ## Status
 //!

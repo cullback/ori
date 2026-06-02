@@ -27,10 +27,6 @@ use crate::ast::BinOp as AstBinOp;
 use crate::symbol::SymbolId;
 use crate::types::engine::Type;
 
-/// Field identifier within a record. Reuses the AST representation;
-/// fields are interned strings during inference.
-pub type FieldId = String;
-
 /// Constructor tag — the source name of the variant (`"Cons"`,
 /// `"Nil"`, `"Ok"`, `"Err"`, `"True"`, ...). Tag unions are
 /// structural in Ori (the tag name identifies the variant within
@@ -148,17 +144,14 @@ pub enum Expr {
     /// `Con(tag, args, type)` — tag-union constructor. Explicit, not
     /// folded into `App` — keeps `Match(Con(t, args), arms)` as a
     /// syntactic rewrite (`case-of-known-constructor`).
+    ///
+    /// **Records and tuples don't have a Core node.** They're SROA'd
+    /// at AST→Core into slot lists (see `lower::lower_expr_slots`).
+    /// `Con` stays because it carries a tag — the dispatch needs to
+    /// be visible to `Match`.
     Con {
         tag: TagId,
         args: Vec<Expr>,
-        ty: Type,
-    },
-
-    /// `Record(fields, type)` — non-tagged aggregate. Distinct from
-    /// `Con` because there's no alternative branch — records aren't
-    /// pattern-matched against multiple constructors.
-    Record {
-        fields: Vec<(FieldId, Expr)>,
         ty: Type,
     },
 
@@ -188,7 +181,6 @@ impl Expr {
             | Self::Match { ty, .. }
             | Self::Cata { ty, .. }
             | Self::Con { ty, .. }
-            | Self::Record { ty, .. }
             | Self::BinOp { ty, .. } => ty,
         }
     }

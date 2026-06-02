@@ -313,7 +313,6 @@ fn variant_name(expr: &Expr) -> &'static str {
         Expr::Match { .. } => "Match",
         Expr::Cata { .. } => "Cata",
         Expr::Con { .. } => "Con",
-        Expr::Record { .. } => "Record",
         Expr::BinOp { .. } => "BinOp",
     }
 }

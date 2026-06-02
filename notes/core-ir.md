@@ -129,32 +129,99 @@ is a Core-level transformation). We can revisit that.
 
 ## The IR
 
-Eight **structural** primitives + one **scalar** primitive, post-
+Seven **structural** primitives + one **scalar** primitive, post-
 lambda-lift, post-mono, typed, direct-style.
 
 ```rust
 enum Core {
     // Structural — participate in algebraic rewrites
-    Var(VarId),                            // typed variable reference
+    Var(VarId),                            // typed variable reference (single slot)
     Lit(Literal),                          // typed scalar literal
     App(FuncId, Vec<Core>),                // first-order call to known top-level
-    Let(VarId, Box<Core>, Box<Core>),      // let x = e1 in e2
+    Let(VarId, Box<Core>, Box<Core>),      // let x = e1 in e2 (single-slot binding)
     Match(Box<Core>, Vec<MatchArm>),       // non-recursive case on tag union
     Cata(Box<Core>, Box<Core>, Box<Core>), // structural recursion (the ONLY iteration)
     Con(TagId, Vec<Core>),                 // tag-union constructor
-    Record(Vec<(FieldId, Core)>),          // non-tagged aggregate
 
     // Scalar — pass-through to SSA, never touched by fusion
     BinOp(BinOp, Box<Core>, Box<Core>),    // arithmetic / comparison / boolean
 }
 ```
 
-Note on the split: scalar `BinOp` could be expressed as `App(intrinsic_sym, [lhs, rhs])`,
-matching GHC's approach where primops are functions with special `Id`s.
-We chose the dedicated node instead — `App` then unambiguously means
-"call a user or library function," and we avoid needing an intrinsic-symbol
-registry for what's ultimately pass-through to SSA. The algebraic
-rewrite system doesn't see `BinOp` at all.
+**No `Record`, no `Tuple`, no `FieldAccess`.** Aggregates exist at the
+AST (source structure) and at SSA (decomposed parallel Values + memory
+layout) — but not at Core. The IR is purely algebraic.
+
+### How aggregates flow without IR nodes
+
+Each Core `Expr` is conceptually **single-slot**. Multi-slot
+aggregates exist as **parallel lists of Core expressions** at the
+AST→Core boundary, not as IR nodes:
+
+- `lower_expr_slots(ctx, ast) -> Vec<Expr>` — one Core Expr per slot
+  of the AST expression's type. Slot count is `expand_slots(ast.ty)`,
+  deterministic from type.
+- Scalars: 1-element Vec. Records/tuples: N-element Vec.
+- `ExprKind::Tuple` / `ExprKind::Record`: concatenate child slot lists.
+- `ExprKind::FieldAccess { record, field }`: take `record`'s slot list,
+  pick the slice at the field's offset/count (computed from `record.ty`
+  and `field`).
+- `Pattern::Record` / `Pattern::Tuple`: destructure into N bindings,
+  one per slot.
+
+### Aggregate-producing control flow
+
+When an `If` or `Match` returns a multi-slot type, **the construct is
+duplicated per slot**. `if c then {a:1, b:2} else {a:3, b:4}` lowers
+to two parallel `Match` expressions:
+
+- slot 0 (`a`): `Match(c, True → 1, False → 3)`
+- slot 1 (`b`): `Match(c, True → 2, False → 4)`
+
+The condition `c` is duplicated. **Pure + total → semantically free**
+(no observable difference). The performance cost (re-evaluating `c`)
+is recovered by future CSE/GVN at the Core opt layer.
+
+### Slot symbols and debug names
+
+When AST→Core decomposes an aggregate binding (`let r = {x:1, y:2}`),
+it mints fresh **slot symbols** (`r_x`, `r_y`) via the symbol table
+and tracks them in a per-binding slot map:
+
+```rust
+locals: HashMap<SymbolId, Vec<SymbolId>>   // AST sym → slot syms
+```
+
+A parallel `slot_paths: HashMap<SymbolId, String>` records each slot
+symbol's source-derived dotted path (`r.x`, `r.b.c`, `t.0`). The
+SSA display reads this table — debug output shows `v17<r.b.c>`
+instead of `v17`. Same table powers error messages.
+
+### Why this shape
+
+Records and tuples don't participate in algebraic rewriting — fusion
+laws operate on `Cata`, `Map`, `Build`, `Match`, `Con`. Keeping
+`Record`/`Tuple` as Core nodes would make every rewrite walk past
+inert plumbing. By SROA-ing them away at AST→Core, the Core IR
+matches its purpose exactly: every primitive has an algebraic
+rewrite home, nothing inert.
+
+The cost lives in AST→Core (slot tracking, decomposition, duplication
+for control-flow). It's substantial but localized — one pass with one
+author writing it once. Downstream Core code stays minimal.
+
+This is sound specifically because Ori has **no aggregate identity** —
+no pointer-takes, no record-by-reference equality, no FFI opacity,
+no varargs. See `notes/language-properties.md`. In any language with
+those features, this SROA would be unsound.
+
+Note on the scalar/structural split: `BinOp` could be expressed as
+`App(intrinsic_sym, [lhs, rhs])`, matching GHC's approach where primops
+are functions with special `Id`s. We chose the dedicated node instead —
+`App` then unambiguously means "call a user or library function," and
+we avoid needing an intrinsic-symbol registry for what's ultimately
+pass-through to SSA. The algebraic rewrite system doesn't see `BinOp`
+at all.
 
 Plus the supporting types: `VarId`, `FuncId`, `TagId`, `FieldId`,
 `Literal`, `MatchArm { pattern, body }`, `Pattern { constructor, binders }`.
