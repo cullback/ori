@@ -105,6 +105,31 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 
         Expr::Match { scrutinee, arms, ty } => lower_match(ctx, scrutinee, arms, ty),
 
+        Expr::Con { tag, args, ty } => {
+            // Fieldless constructor — emit the discriminant scalar
+            // directly. Payload-carrying constructors need the
+            // aggregate-decomposition refactor (lower returning
+            // Vec<Value> for the (tag, payload) shape) and land
+            // when that's in place.
+            if !args.is_empty() {
+                return Err(format!(
+                    "core::to_ssa: Con `{tag}` carries {} args (payload constructors not yet supported)",
+                    args.len()
+                ));
+            }
+            let tag_idx = if let Some(meta) = ctx.decls.constructors.get(tag) {
+                meta.tag_index
+            } else {
+                // Structural fieldless union — sort tags alphabetically,
+                // take the position. Need the scrutinee-type context
+                // which we don't have here, so fall back via the
+                // result type which IS the union type.
+                structural_con_layout(ty, tag, &ctx.fieldless).0
+            };
+            let disc = resolve_scalar_type(ty, &ctx.fieldless);
+            Ok(emit_tag_const(ctx.builder, tag_idx, disc))
+        }
+
         _ => Err(format!(
             "core::to_ssa: variant not yet supported: {}",
             variant_name(expr)
@@ -264,6 +289,18 @@ fn map_binop(op: AstBinOp) -> BinaryOp {
             // If a Core::BinOp carries And/Or we have an upstream bug.
             panic!("core::to_ssa: And/Or should not appear as BinOp at Core level")
         }
+    }
+}
+
+/// Emit a constant of `disc` type holding `tag_idx`. The width of the
+/// discriminant determines which `const_*` Builder method to use.
+fn emit_tag_const(b: &mut Builder, tag_idx: u64, disc: ScalarType) -> Value {
+    match disc {
+        ScalarType::U8 => b.const_u8(tag_idx as u8),
+        ScalarType::U16 => b.const_u16(tag_idx as u16),
+        ScalarType::U32 => b.const_u32(tag_idx as u32),
+        ScalarType::U64 => b.const_u64(tag_idx),
+        other => panic!("core::to_ssa: unexpected discriminant type {other:?}"),
     }
 }
 
