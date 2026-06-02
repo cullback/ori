@@ -4518,6 +4518,54 @@ main = |n| if n == 0 : True then 1 : False then 0
 }
 
 #[test]
+fn core_pipeline_lowers_multi_function_module() {
+    // End-to-end whole-module compilation through Core. Tests that
+    // - multi-function programs work
+    // - inter-function calls (helper from main) survive the pipeline
+    // - the resulting SSA module evaluates to the right result
+    let source = "\
+helper : I64 -> I64
+helper = |x| x * 2
+
+main : I64 -> I64
+main = |n| helper(n) + 1
+";
+    let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
+    let infer_result = through_infer(&mut resolved);
+    let mut mono = crate::passes::mono::specialize(
+        resolved.module,
+        infer_result,
+        resolved.symbols,
+    );
+    crate::passes::lambda::lift::lift(&mut mono);
+    let lambda_solution = crate::passes::lambda::solve::solve(&mono);
+    crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
+    crate::passes::lambda::narrow::narrow(&mut mono);
+    let decls = crate::passes::decl_info::build(&mono);
+
+    let module = crate::passes::core::pipeline::lower_module(
+        &mut mono,
+        &resolved.fields,
+        &decls,
+    ).expect("whole-module Core lowering should succeed");
+    crate::ssa::validate::check(&module, "core pipeline e2e");
+
+    // Confirm both functions made it.
+    assert!(module.functions.contains_key("__main"),
+        "expected __main in module, got functions: {:?}",
+        module.functions.keys().collect::<Vec<_>>());
+    assert!(module.functions.contains_key("helper"),
+        "expected helper in module");
+
+    // Eval with n=5: helper(5) = 10; 10 + 1 = 11.
+    let mut heap = crate::ssa::eval::new_heap();
+    crate::ssa::eval::load_statics(&module, &mut heap);
+    let result = crate::ssa::eval::eval(&module, &mut heap, &[Scalar::I64(5)]);
+    assert_eq!(result, Scalar::I64(11),
+        "helper(5) + 1 should evaluate to 11");
+}
+
+#[test]
 fn loop_analysis_recognizes_walk() {
     // A range-driven walk that lower emits as a header/body/exit
     // loop with an IV (the counter) and an accumulator. The
