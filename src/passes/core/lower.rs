@@ -271,6 +271,14 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             let name = resolved
                 .as_ref()
                 .ok_or_else(|| "core::lower_expr: QualifiedCall unresolved".to_string())?;
+            // `__builtin.*` calls are intrinsics handled by existing-
+            // lower (Cast / BitCast / numeric ops). We don't emit
+            // specialized SSA for them yet — bail to trigger fallback.
+            if name.starts_with("__builtin.") {
+                return Err(format!(
+                    "core::lower_expr: QualifiedCall to intrinsic `{name}` not yet handled"
+                ));
+            }
             let arg_exprs = lower_call_args(ctx, args)?;
             if ctx.constructors.contains(name) {
                 Ok(vec![Expr::Con {
@@ -291,6 +299,11 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             let name = resolved
                 .as_ref()
                 .ok_or_else(|| "core::lower_expr: MethodCall unresolved".to_string())?;
+            if name.starts_with("__builtin.") {
+                return Err(format!(
+                    "core::lower_expr: MethodCall to intrinsic `{name}` not yet handled"
+                ));
+            }
             let mut arg_exprs: Vec<Expr> = Vec::new();
             arg_exprs.extend(lower_expr_slots(ctx, receiver)?);
             for a in args {

@@ -117,11 +117,12 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             .copied()
             .ok_or_else(|| format!("core::to_ssa: unbound Var #{}", sym.0)),
 
-        Expr::Lit { value: Literal::Int(n), ty: _ty } => {
-            // Type-aware: we'd ideally pick the const variant based on
-            // the literal's resolved type. The minimal slice uses I64;
-            // type-directed const selection lands when we grow.
-            Ok(ctx.builder.const_i64(*n))
+        Expr::Lit { value: Literal::Int(n), ty } => {
+            // Type-directed const emission. Programs with U64, U8, I32,
+            // etc. integer literals need the right const_* method or
+            // SSA validation rejects the type mismatch.
+            let scalar = resolve_scalar_type(ty, &ctx.fieldless);
+            Ok(emit_int_const(ctx.builder, *n, scalar))
         }
 
         Expr::Lit { value: Literal::Float(f), .. } => Ok(ctx.builder.const_f64(*f)),
@@ -457,6 +458,25 @@ fn emit_tag_const(b: &mut Builder, tag_idx: u64, disc: ScalarType) -> Value {
         ScalarType::U32 => b.const_u32(tag_idx as u32),
         ScalarType::U64 => b.const_u64(tag_idx),
         other => panic!("core::to_ssa: unexpected discriminant type {other:?}"),
+    }
+}
+
+/// Emit an integer literal at the appropriate scalar width. Pure
+/// type-directed dispatch over Builder's typed const_* methods.
+fn emit_int_const(b: &mut Builder, n: i64, ty: ScalarType) -> Value {
+    match ty {
+        ScalarType::I8  => b.const_i8(n as i8),
+        ScalarType::U8  => b.const_u8(n as u8),
+        ScalarType::I16 => b.const_i16(n as i16),
+        ScalarType::U16 => b.const_u16(n as u16),
+        ScalarType::I32 => b.const_i32(n as i32),
+        ScalarType::U32 => b.const_u32(n as u32),
+        ScalarType::I64 => b.const_i64(n),
+        ScalarType::U64 => b.const_u64(n as u64),
+        // Floats / Ptr / RcPtr — invalid for an integer literal; the
+        // type system should reject before this point. Treat as an
+        // inference bug.
+        other => panic!("core::to_ssa: integer literal can't have type {other:?}"),
     }
 }
 
