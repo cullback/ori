@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use crate::ast::BinOp as AstBinOp;
 use crate::lower::constructor::structural_con_layout;
-use crate::passes::decl_info::resolve_scalar_type;
+use crate::passes::decl_info::{DeclInfo, resolve_scalar_type};
 use crate::ssa::instruction::{BinaryOp, ScalarType};
 use crate::ssa::{Builder, Value};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -42,6 +42,7 @@ use super::expr::{Expr, Literal, MatchArm, Pattern};
 pub struct Ctx<'b> {
     pub builder: &'b mut Builder,
     pub symbols: &'b SymbolTable,
+    pub decls: &'b DeclInfo,
     pub locals: HashMap<SymbolId, Value>,
     pub fieldless: HashMap<String, ScalarType>,
 }
@@ -168,8 +169,17 @@ fn lower_match(
                          (non-fieldless union not yet supported)"
                     ));
                 }
-                let (tag_idx, _, _) =
-                    structural_con_layout(&scrutinee_ty, tag, &ctx.fieldless);
+                // Declared constructors (Bool's True/False, Maybe's
+                // Some/None, etc.) live in decl_info.constructors —
+                // their tag_index is fixed by the type's declaration
+                // order. Structural unions (anonymous `[Foo, Bar]`)
+                // aren't in the map and use alphabetical sort via
+                // structural_con_layout.
+                let tag_idx = if let Some(meta) = ctx.decls.constructors.get(tag) {
+                    meta.tag_index
+                } else {
+                    structural_con_layout(&scrutinee_ty, tag, &ctx.fieldless).0
+                };
                 constructor_arms.push((tag_idx, arm));
             }
             Pattern::Wildcard => {
@@ -317,9 +327,11 @@ mod tests {
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
         let symbols = SymbolTable::new();
+        let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
             symbols: &symbols,
+            decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
         };
@@ -348,9 +360,11 @@ mod tests {
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
         let symbols = SymbolTable::new();
+        let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
             symbols: &symbols,
+            decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
         };
@@ -392,9 +406,11 @@ mod tests {
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
+        let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
             symbols: &symbols,
+            decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
         };
@@ -444,9 +460,11 @@ mod tests {
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
+        let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
             symbols: &symbols,
+            decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
         };
@@ -510,9 +528,11 @@ mod tests {
         fieldless.insert("Bool".to_string(), ScalarType::U8);
         let mut locals = HashMap::new();
         locals.insert(sentinel, one_u8);
+        let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
             symbols: &symbols,
+            decls: &decls,
             locals,
             fieldless,
         };
@@ -547,9 +567,11 @@ mod tests {
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
         let symbols = SymbolTable::new();
+        let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
             symbols: &symbols,
+            decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
         };

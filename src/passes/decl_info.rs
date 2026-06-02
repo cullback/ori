@@ -156,6 +156,7 @@ pub struct ConstructorMeta {
 
 /// Registration data about all declared functions, constructors, and
 /// builtins. Populated by [`build`] and consumed by `ssa::lower`.
+#[derive(Default)]
 pub struct DeclInfo {
     /// Every known callable, keyed by its mangled display name
     /// (e.g. `main`, `List.sum__I64`, `__apply_List.walk_2`).

@@ -4409,14 +4409,17 @@ main = |n| n + 1
     b.switch_to(crate::ssa::BlockId(0));
     let mut locals = std::collections::HashMap::new();
     locals.insert(n_sym, n_val);
+    let decls = crate::passes::decl_info::DeclInfo::default();
     let mut ctx = crate::passes::core::to_ssa::Ctx {
         builder: &mut b,
         symbols: &mono.symbols,
+        decls: &decls,
         locals,
         fieldless: std::collections::HashMap::new(),
     };
     let result = crate::passes::core::to_ssa::lower(&mut ctx, &core_body)
         .expect("Core→SSA should succeed");
+    drop(ctx);
     b.ret(result);
     b.finish_function("__main", crate::ssa::ScalarType::I64);
     let module = b.build("__main");
@@ -4427,6 +4430,75 @@ main = |n| n + 1
     crate::ssa::eval::load_statics(&module, &mut heap);
     let result = crate::ssa::eval::eval(&module, &mut heap, &[Scalar::I64(5)]);
     assert_eq!(result, Scalar::I64(6), "5 + 1 should evaluate to 6");
+}
+
+#[test]
+fn core_lowering_roundtrips_if_with_bool() {
+    // Round-trip a program with an If through Core. The AST has
+    //   if (n == 0) : True then 1 : False then 0
+    // which lowers to Core::Match with two Constructor arms over a
+    // fieldless [True, False] union. Core→SSA emits a SwitchInt.
+    let source = "\
+main : I64 -> I64
+main = |n| if n == 0 : True then 1 : False then 0
+";
+    let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
+    let infer_result = through_infer(&mut resolved);
+    let mut mono = crate::passes::mono::specialize(
+        resolved.module,
+        infer_result,
+        resolved.symbols,
+    );
+    crate::passes::lambda::lift::lift(&mut mono);
+    let lambda_solution = crate::passes::lambda::solve::solve(&mono);
+    crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
+    crate::passes::lambda::narrow::narrow(&mut mono);
+    let decls = crate::passes::decl_info::build(&mono);
+
+    let ctx = crate::passes::core::lower::LowerCtx { fields: &resolved.fields };
+    let main_decl = mono.module.decls.iter().find(|d| matches!(d,
+        crate::ast::Decl::FuncDef { name, .. }
+            if mono.symbols.display(*name) == "main"
+    )).expect("expected `main` decl");
+    let crate::ast::Decl::FuncDef { params, body, .. } = main_decl else {
+        unreachable!();
+    };
+    let n_sym = params[0];
+
+    let core_body = crate::passes::core::lower::lower_expr_with(&ctx, body)
+        .expect("Core lowering should succeed");
+
+    let mut b = crate::ssa::Builder::new();
+    let n_val = b.add_func_param(crate::ssa::ScalarType::I64);
+    let _entry = b.create_block();
+    b.switch_to(crate::ssa::BlockId(0));
+    let mut locals = std::collections::HashMap::new();
+    locals.insert(n_sym, n_val);
+    let mut core_ctx = crate::passes::core::to_ssa::Ctx {
+        builder: &mut b,
+        symbols: &mono.symbols,
+        decls: &decls,
+        locals,
+        fieldless: decls.fieldless_tags.clone(),
+    };
+    let result = crate::passes::core::to_ssa::lower(&mut core_ctx, &core_body)
+        .expect("Core→SSA should succeed");
+    drop(core_ctx);
+    b.ret(result);
+    b.finish_function("__main", crate::ssa::ScalarType::I64);
+    let module = b.build("__main");
+    crate::ssa::validate::check(&module, "core if e2e");
+
+    // Eval with n=0 (expect True → 1) and n=5 (expect False → 0).
+    let mut heap = crate::ssa::eval::new_heap();
+    crate::ssa::eval::load_statics(&module, &mut heap);
+    let r0 = crate::ssa::eval::eval(&module, &mut heap, &[Scalar::I64(0)]);
+    assert_eq!(r0, Scalar::I64(1), "n=0 should select True arm");
+
+    let mut heap = crate::ssa::eval::new_heap();
+    crate::ssa::eval::load_statics(&module, &mut heap);
+    let r5 = crate::ssa::eval::eval(&module, &mut heap, &[Scalar::I64(5)]);
+    assert_eq!(r5, Scalar::I64(0), "n=5 should select False arm");
 }
 
 #[test]
