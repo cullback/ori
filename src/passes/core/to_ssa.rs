@@ -388,7 +388,22 @@ fn lower_match(
             }
         }
 
-        let body_val = lower(ctx, &arm.body)?;
+        // Lower the body via lower_slots so payload Con works. If
+        // the arm produces multiple slots but the Match result is
+        // single-slot (which happens when the Match's result type is
+        // a tag-union `:=` whose expand_slots returns 1), materialize
+        // the slots into a single heap shell — same convention as
+        // pipeline.rs uses for the function return boundary.
+        let arm_slots = lower_slots(ctx, &arm.body)?;
+        let body_val = if arm_slots.len() == 1 {
+            arm_slots[0]
+        } else {
+            let shell = ctx.builder.alloc(arm_slots.len() * 8);
+            for (i, v) in arm_slots.iter().enumerate() {
+                ctx.builder.store(shell, i * 8, *v);
+            }
+            shell
+        };
         ctx.builder.jump(merge, vec![body_val]);
 
         // Restore shadowed bindings.
@@ -409,7 +424,16 @@ fn lower_match(
     let default_block = if let Some(arm) = default_arm {
         let b = ctx.builder.create_block();
         ctx.builder.switch_to(b);
-        let body_val = lower(ctx, &arm.body)?;
+        let arm_slots = lower_slots(ctx, &arm.body)?;
+        let body_val = if arm_slots.len() == 1 {
+            arm_slots[0]
+        } else {
+            let shell = ctx.builder.alloc(arm_slots.len() * 8);
+            for (i, v) in arm_slots.iter().enumerate() {
+                ctx.builder.store(shell, i * 8, *v);
+            }
+            shell
+        };
         ctx.builder.jump(merge, vec![body_val]);
         Some(b)
     } else {
