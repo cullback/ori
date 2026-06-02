@@ -25,8 +25,8 @@ optimization but as the runtime model.
   - `Foo :: T` — **opaque** newtype: callers see `Foo` as its own
     type; `T` is hidden outside the methods block.
 - **`.( methods )` block on a type decl.** `Foo := T.(...)` or
-  `Foo :: T.(...)` attaches methods. Inside the block, *parameters and
-  return values typed `Foo` auto-unwrap to `T`* — "opaque outside,
+  `Foo :: T.(...)` attaches methods. Inside the block, _parameters and
+  return values typed `Foo` auto-unwrap to `T`_ — "opaque outside,
   transparent inside." This is the only way to define methods on a
   newtype.
 - **Pattern matching** is `if expr : pat then body : pat then body
@@ -34,7 +34,7 @@ optimization but as the runtime model.
 - **Guards** are introduced with `and` after a pattern:
   `: [x] and x > 0 then body`.
 - **Return arms.** An arm can end in `return` instead of `then`. The
-  body's value then returns from the *enclosing function*, not the
+  body's value then returns from the _enclosing function_, not the
   match expression. (`?` desugars to a match where the `Err` arm is
   `return`.)
 - **`?` operator** on a `Result` desugars to
@@ -95,14 +95,14 @@ block" view never escapes inference.
 Each layer has one job. Code that doesn't fit a layer's job goes in
 the wrong layer.
 
-| Layer | Job |
-|---|---|
-| `src/syntax/` | text → AST (grammar lives here) |
-| `src/passes/` | AST → AST transforms (`resolve`, `mono`, `lambda::lift`, `flatten_patterns`, etc.) |
-| `src/types/` | type inference + unification |
-| `src/lower/` | AST → SSA. **Establishes language semantics 1:1.** |
-| `src/opt/` | SSA → SSA equivalence-preserving rewrites. |
-| `src/codegen/` | SSA → bytes (instructions + ELF/Mach-O container). |
+| Layer          | Job                                                                                |
+| -------------- | ---------------------------------------------------------------------------------- |
+| `src/syntax/`  | text → AST (grammar lives here)                                                    |
+| `src/passes/`  | AST → AST transforms (`resolve`, `mono`, `lambda::lift`, `flatten_patterns`, etc.) |
+| `src/types/`   | type inference + unification                                                       |
+| `src/lower/`   | AST → SSA. **Establishes language semantics 1:1.**                                 |
+| `src/opt/`     | SSA → SSA equivalence-preserving rewrites.                                         |
+| `src/codegen/` | SSA → bytes (instructions + ELF/Mach-O container).                                 |
 
 **`lower/` establishes the language's behavior. `opt/` only makes it
 faster.** Deleting every pass under `opt/` leaves a correct, slower
@@ -111,7 +111,7 @@ program — this is a hard invariant, not a goal. Semantic guarantees
 enforced by `lower/`'s emission choices; never rely on an opt pass
 to clean up.
 
-`opt/` passes find emergent patterns *within* the natural lowering
+`opt/` passes find emergent patterns _within_ the natural lowering
 (dead alloc elimination, branch folding, rc fusion, sig changes).
 Each pass is independently deletable. Anything that "looks like" an
 optimization but is semantically required (e.g. FBIP via `cow_*`,
@@ -121,25 +121,36 @@ See `src/lower/README.md` and `src/opt/README.md` for module details.
 
 ## Where optimizations go
 
-**Rule of thumb:** if an optimization is meaningful in `eval` mode
-(no codegen, just the interpreter), it belongs in `src/opt/`. If it
-requires reasoning about specific machine instructions, registers,
-or addressing modes, it belongs in `src/codegen/`. Default to `opt/`
-when ambiguous — more reusable.
+**Rule of thumb:** **all SSA-to-SSA equivalence-preserving rewrites
+belong in `src/opt/`.** They benefit every downstream consumer — eval
+today, aarch64-linux codegen, a future macOS or x86_64 codegen, a
+future bytecode interpreter — without duplication.
 
-Concrete:
+`src/codegen/` only hosts work that **exists because of target-specific
+representation choices**:
 
-- Const folding (`BinOp(Const,Const) → Const`) → `opt/` (helps eval).
-- Dead branch elimination (Branch with Const cond → Jump) → `opt/`.
-- Narrow-store elimination (skip `mov W,W` when register's high bits
-  are provably zero) → `codegen/`.
-- Static-ref tracking for rc-skip → `codegen/` (codegen owns the
-  rc-emit decision; SSA still carries the rc op).
-- Address-mode selection, register allocation → `codegen/`.
+- **Instruction selection.** The peephole-style choice of *which*
+  machine instruction implements an SSA op (e.g. `add reg,reg,#imm`
+  vs `add reg,reg,reg`; `ldr` immediate-offset vs register-offset).
+- **Register allocation** — only meaningful when "registers" exist.
+- **ABI lowering** — calling-convention reg placement, frame layout,
+  LR save/restore, callee-saved spills.
+- **Branch displacement / layout** — turning block labels into
+  PC-relative byte offsets.
+- **Properties that exist only in the machine model.** E.g.
+  `KnownZeroHigh(N)` reasoning about 64-bit-register bit patterns
+  for narrow SSA types. At the SSA level a `U32` is 32 bits, full
+  stop; "the upper 32 bits of a 64-bit register" is a codegen artifact.
 
-**Anti-pattern:** a codegen-level fact lattice that duplicates
-SSA-level const-prop. If you find yourself doing const-prop at
-codegen, strengthen the SSA pass instead.
+**Anti-pattern:** any optimization that reasons about SSA shape but
+appears under `src/codegen/`. If you find yourself adding const-prop,
+dead-branch elim, common-subexpression elim, or any other SSA-to-SSA
+rewrite at codegen, **strengthen the SSA pass instead** — every
+backend gets the benefit. Codegen-level lattices that pre-derive SSA
+facts (e.g. `Const(_)`, `StaticRef(_)`) duplicate work that belongs
+upstream; the only codegen-level facts that are legitimate are the
+ones the SSA can't represent (`KnownZeroHigh`, allocation-site
+identity for free-helper dispatch, etc.).
 
 ## Invariants and validation
 
@@ -197,7 +208,7 @@ Use this when reviewing a pass or module, or cleaning one up:
       delete the pass and the suite still passes, the test coverage
       is wrong, not the pass.
 - [ ] **Regression test for every fixed bug.**
-- [ ] **Comments explain *why*, not *what*.** Well-named identifiers
+- [ ] **Comments explain _why_, not _what_.** Well-named identifiers
       carry "what." Hidden constraints, subtle invariants, and
       workarounds need comments. Don't reference current task,
       caller, or fix history — that rots.
