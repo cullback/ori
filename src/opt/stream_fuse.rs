@@ -11,15 +11,14 @@
 //! (`AllocDyn`, `CowStoreDyn`, `LoadDyn`, `RcDec`) and loop structure
 //! from `ssa::loops`. It does not know about `List`.
 //!
-//! ## Scope (v0)
+//! ## Scope of this commit
 //!
-//! The recognizer (`find_candidates`) handles the general use-pattern
-//! described below. The rewriter (`fuse`) is currently restricted to
-//! the **writer-stores-IV** case — the writer's `CowStoreDyn` writes
-//! the IV itself, so substitution doesn't need to clone any
-//! value-computation insts. Cases where the writer stores some
-//! `f(iv)` require cloning the producer's compute graph into the
-//! reader's body; that lands in v1.
+//! Detection only — `find_candidates` walks each function, classifies
+//! each `AllocDyn`'s uses, and returns a `Candidate` for every buffer
+//! whose use pattern matches the fusable shape. The rewrite step
+//! lands in a follow-on commit; keeping the recognizer separate lets
+//! us verify the pattern-matcher against real lower output before
+//! we commit to mutation.
 //!
 //! ## What counts as fusable
 //!
@@ -56,20 +55,15 @@
 //!    one** `LoadDyn` chain-use at the IV. (Generalizable later;
 //!    this first scope keeps the recognizer obvious.)
 //!
-//! ## Entry points
+//! ## Inputs / outputs
 //!
-//! - `find_candidates(&Function) -> Vec<Candidate>` — pure detection.
-//! - `fuse(&mut Function, &Candidate) -> Result<()>` — rewrite a
-//!   single candidate. Returns `Err` if the candidate is outside the
-//!   v0 rewrite scope (e.g. writer-stores-non-IV).
-//! - `run(&mut Module) -> usize` — find + fuse, returns count of
-//!   fusions applied. Not wired into `run_full_pipeline` yet —
-//!   opt-in until we confirm coverage on real programs.
+//! Input: `&Function` (no mutation in this commit).
+//! Output: `Vec<Candidate>` — one per fusable buffer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use crate::ssa::{Function, Module};
-use crate::ssa::instruction::{BlockEdge, BlockId, Inst, Terminator, Value};
+use crate::ssa::Function;
+use crate::ssa::instruction::{BlockId, Inst, Value};
 use crate::ssa::loops::{analyze, Loop, LoopInfo};
 
 /// One recognized fusion opportunity in a function.
@@ -338,226 +332,14 @@ fn const_value(func: &Function, v: Value) -> Option<u64> {
     None
 }
 
-fn compute_predecessors(func: &Function) -> HashMap<BlockId, Vec<BlockId>> {
-    let mut map: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+fn compute_predecessors(func: &Function) -> std::collections::HashMap<BlockId, Vec<BlockId>> {
+    let mut map: std::collections::HashMap<BlockId, Vec<BlockId>> = std::collections::HashMap::new();
     for (&bid, block) in &func.blocks {
         for edge in block.terminator.successors() {
             map.entry(edge.target).or_default().push(bid);
         }
     }
     map
-}
-
-// ---- Rewrite ----
-
-/// Module-level entry: find every candidate in every function and
-/// fuse it. Returns the number of fusions applied. Re-runs detection
-/// after each fusion (because the IR shape changes).
-pub fn run(module: &mut Module) -> usize {
-    let mut total = 0;
-    for func in module.functions.values_mut() {
-        loop {
-            let cands = find_candidates(func);
-            let Some(cand) = cands.into_iter().next() else { break };
-            if fuse(func, &cand).is_err() { break; }
-            total += 1;
-        }
-    }
-    total
-}
-
-/// Apply a fusion. Mutates `func` to remove the alloc / writer loop /
-/// rc_dec, replace the reader's `LoadDyn` with the writer's stored
-/// value (renamed from writer-IV to reader-IV), and rewire CFG.
-///
-/// Returns `Err` if the candidate's writer doesn't fit the v0 scope
-/// (writer must store its own IV directly — no value-computation).
-pub fn fuse(func: &mut Function, cand: &Candidate) -> Result<(), &'static str> {
-    let info = analyze(func);
-    let lp_w = &info.loops[cand.writer_loop];
-    let lp_r = &info.loops[cand.reader_loop];
-
-    let writer_iv_body = body_iv(func, lp_w).ok_or("writer body IV not found")?;
-    let reader_iv_body = body_iv(func, lp_r).ok_or("reader body IV not found")?;
-
-    // v0 scope: writer stores its IV directly. The substitute for
-    // the reader's loaded value is the reader's body IV.
-    if cand.writer_stored_value != writer_iv_body {
-        return Err("v0: writer must store its IV directly");
-    }
-    let substitute = reader_iv_body;
-
-    // 1. Substitute uses of the loaded value before deleting the load_dyn.
-    rename_value_uses(func, cand.reader_loaded_value, substitute);
-
-    // 2. Delete chain-touching instructions (load_dyn, cow_store_dyn,
-    //    rc_dec on the buffer) and the alloc_dyn itself. Use retain
-    //    so we don't have to chase index invalidation.
-    let chain = &cand.buffer_chain;
-    let load_dest = cand.reader_loaded_value;
-    let alloc_buf = cand.buf_initial;
-    for block in func.blocks.values_mut() {
-        block.insts.retain(|inst| match inst {
-            Inst::AllocDyn(d, _) => *d != alloc_buf,
-            Inst::CowStoreDyn(_, ptr, _, _) => !chain.contains(ptr),
-            Inst::LoadDyn(d, _, _) => *d != load_dest,
-            Inst::RcDec(v) => !chain.contains(v),
-            _ => true,
-        });
-    }
-
-    // 3. Strip chain Values from block params and from every edge's
-    //    args. Compute slots first, then update params + args in a
-    //    second pass — keeping the two phases separate keeps the
-    //    index arithmetic local.
-    let chain_slots: HashMap<BlockId, Vec<usize>> = func
-        .blocks
-        .iter()
-        .map(|(&bid, block)| {
-            let slots: Vec<usize> = block
-                .params
-                .iter()
-                .enumerate()
-                .filter_map(|(i, p)| if chain.contains(p) { Some(i) } else { None })
-                .collect();
-            (bid, slots)
-        })
-        .collect();
-
-    for block in func.blocks.values_mut() {
-        update_terminator_args(&mut block.terminator, &chain_slots);
-    }
-    for (bid, block) in func.blocks.iter_mut() {
-        if let Some(slots) = chain_slots.get(bid) {
-            // Remove in descending order so earlier indices stay valid.
-            for &slot in slots.iter().rev() {
-                block.params.remove(slot);
-            }
-        }
-    }
-
-    // 4. Rewire: in `alloc_block`, the original terminator jumped to
-    //    the writer-header. Redirect it directly to the writer's exit
-    //    block. After step 3 the writer-exit's params are empty (we
-    //    stripped the buffer; v0 requires no other writer accumulators),
-    //    so the new jump carries no args. The writer header/body
-    //    become unreachable and are dropped in step 5.
-    let writer_exit = lp_w.exit;
-    let writer_exit_params_remaining = func.blocks[&writer_exit].params.len();
-    if writer_exit_params_remaining != 0 {
-        return Err("v0: writer-exit has non-chain params (writer carries other accumulators)");
-    }
-    func.blocks.get_mut(&cand.alloc_block).unwrap().terminator =
-        Terminator::Jump(BlockEdge { target: writer_exit, args: vec![] });
-
-    // 5. Drop unreachable blocks (the writer's header + body, and
-    //    anything else only reachable through them).
-    remove_unreachable(func);
-
-    Ok(())
-}
-
-/// Body-block IV-slot Value for a loop. The body block is
-/// `back_edge_pred` and the IV in the header is `lp.iv`; this returns
-/// the param at the same slot in the body.
-fn body_iv(func: &Function, lp: &Loop) -> Option<Value> {
-    let header = &func.blocks[&lp.header];
-    let iv_slot = header.params.iter().position(|&p| p == lp.iv)?;
-    func.blocks[&lp.back_edge_pred].params.get(iv_slot).copied()
-}
-
-/// Rename every operand-use of `from` to `to`, across all insts and
-/// every terminator's edge args in the function. Does not touch
-/// instruction destinations or block params.
-fn rename_value_uses(func: &mut Function, from: Value, to: Value) {
-    for block in func.blocks.values_mut() {
-        for inst in block.insts.iter_mut() {
-            inst.map_operands_mut(|v| if *v == from { *v = to; });
-        }
-        rewrite_terminator_args(&mut block.terminator, |v| {
-            if *v == from { *v = to; }
-        });
-    }
-}
-
-fn rewrite_terminator_args(term: &mut Terminator, mut f: impl FnMut(&mut Value)) {
-    match term {
-        Terminator::Return(vs) => vs.iter_mut().for_each(&mut f),
-        Terminator::Jump(edge) => edge.args.iter_mut().for_each(&mut f),
-        Terminator::Branch { cond, then_edge, else_edge } => {
-            f(cond);
-            then_edge.args.iter_mut().for_each(&mut f);
-            else_edge.args.iter_mut().for_each(&mut f);
-        }
-        Terminator::SwitchInt { scrutinee, arms, default } => {
-            f(scrutinee);
-            for (_, edge) in arms.iter_mut() {
-                edge.args.iter_mut().for_each(&mut f);
-            }
-            if let Some(edge) = default {
-                edge.args.iter_mut().for_each(&mut f);
-            }
-        }
-    }
-}
-
-/// For each edge in `term`, drop the args at the slots listed in
-/// `chain_slots[edge.target]`. Sliced in descending order so the
-/// remaining indices stay valid.
-fn update_terminator_args(
-    term: &mut Terminator,
-    chain_slots: &HashMap<BlockId, Vec<usize>>,
-) {
-    fn strip(args: &mut Vec<Value>, slots: &[usize]) {
-        for &slot in slots.iter().rev() {
-            if slot < args.len() {
-                args.remove(slot);
-            }
-        }
-    }
-    match term {
-        Terminator::Return(_) => {}
-        Terminator::Jump(edge) => {
-            if let Some(s) = chain_slots.get(&edge.target) {
-                strip(&mut edge.args, s);
-            }
-        }
-        Terminator::Branch { then_edge, else_edge, .. } => {
-            if let Some(s) = chain_slots.get(&then_edge.target) {
-                strip(&mut then_edge.args, s);
-            }
-            if let Some(s) = chain_slots.get(&else_edge.target) {
-                strip(&mut else_edge.args, s);
-            }
-        }
-        Terminator::SwitchInt { arms, default, .. } => {
-            for (_, edge) in arms.iter_mut() {
-                if let Some(s) = chain_slots.get(&edge.target) {
-                    strip(&mut edge.args, s);
-                }
-            }
-            if let Some(edge) = default {
-                if let Some(s) = chain_slots.get(&edge.target) {
-                    strip(&mut edge.args, s);
-                }
-            }
-        }
-    }
-}
-
-/// Reachability-prune: keep only blocks reachable from `func.entry`.
-fn remove_unreachable(func: &mut Function) {
-    let mut reachable: HashSet<BlockId> = HashSet::new();
-    let mut stack = vec![func.entry];
-    while let Some(bid) = stack.pop() {
-        if !reachable.insert(bid) { continue; }
-        if let Some(block) = func.blocks.get(&bid) {
-            for edge in block.terminator.successors() {
-                stack.push(edge.target);
-            }
-        }
-    }
-    func.blocks.retain(|bid, _| reachable.contains(bid));
 }
 
 #[cfg(test)]
@@ -665,48 +447,6 @@ mod tests {
         // dest, and the block params on the chain.
         assert!(c.buffer_chain.len() >= 4, "chain too small: {:?}", c.buffer_chain);
         assert_ne!(c.writer_loop, c.reader_loop);
-    }
-
-    #[test]
-    fn fuse_removes_buffer_machinery() {
-        let mut func = build_writer_reader();
-        let cands = find_candidates(&func);
-        assert_eq!(cands.len(), 1);
-        let cand = cands.into_iter().next().unwrap();
-
-        fuse(&mut func, &cand).expect("fuse should succeed for writer-stores-IV");
-
-        // After fusion: no AllocDyn / CowStoreDyn / LoadDyn / RcDec
-        // referencing the buffer chain.
-        let mut alloc_count = 0;
-        let mut cow_store_count = 0;
-        let mut load_count = 0;
-        let mut rc_dec_count = 0;
-        for block in func.blocks.values() {
-            for inst in &block.insts {
-                match inst {
-                    Inst::AllocDyn(..) => alloc_count += 1,
-                    Inst::CowStoreDyn(..) => cow_store_count += 1,
-                    Inst::LoadDyn(..) => load_count += 1,
-                    Inst::RcDec(..) => rc_dec_count += 1,
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(alloc_count, 0, "alloc_dyn survived fusion");
-        assert_eq!(cow_store_count, 0, "cow_store_dyn survived fusion");
-        assert_eq!(load_count, 0, "load_dyn survived fusion");
-        assert_eq!(rc_dec_count, 0, "rc_dec survived fusion");
-
-        // Validate the result — the rewrite shouldn't break any SSA
-        // invariants.
-        let mut module = crate::ssa::Module {
-            functions: std::collections::HashMap::new(),
-            statics: Vec::new(),
-            entry: "wr".to_string(),
-        };
-        module.functions.insert("wr".to_string(), func);
-        crate::ssa::validate::check(&module, "stream_fuse rewrite");
     }
 
     #[test]
