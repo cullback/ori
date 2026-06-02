@@ -316,8 +316,6 @@ fn lower_match(
                     } else {
                         structural_con_layout(&scrutinee_ty, tag, &ctx.fieldless)
                     };
-                // Sanity: binders.len() should match the constructor's
-                // field count. Mismatch means AST→Core lost track.
                 if binders.len() != field_tys.len() {
                     return Err(format!(
                         "core::to_ssa: Match arm for `{tag}` has {} binders but constructor declares {} fields",
@@ -325,15 +323,23 @@ fn lower_match(
                         field_tys.len()
                     ));
                 }
-                // Field binders require a payload. If the union is
-                // fieldless (no payload), reject arms that try to
-                // bind anything.
                 if !binders.is_empty() && payload_val.is_none() {
                     return Err(format!(
                         "core::to_ssa: Match arm for `{tag}` has binders but scrutinee is fieldless"
                     ));
                 }
                 constructor_arms.push((tag_idx, arm, field_tys));
+            }
+            // IntLit patterns dispatch on the literal value as the
+            // SwitchInt arm tag. Works because the scrutinee is itself
+            // the integer being matched. No field binders.
+            Pattern::IntLit(n) => {
+                if payload_val.is_some() {
+                    return Err(format!(
+                        "core::to_ssa: IntLit pattern can't match a multi-slot scrutinee"
+                    ));
+                }
+                constructor_arms.push((*n as u64, arm, vec![]));
             }
             Pattern::Wildcard => {
                 if default_arm.is_some() {
@@ -368,17 +374,17 @@ fn lower_match(
         };
         ctx.builder.switch_to(b);
 
-        // Load each field from the payload + bind to its binder
-        // SymbolId. Skip wildcards (sentinel SymbolId(u32::MAX)).
-        let Pattern::Constructor { binders, .. } = &arm.pattern else {
-            unreachable!("filtered to Constructor arms above")
-        };
+        // Constructor arms with field binders: load each field from
+        // the payload + bind to its binder. IntLit arms have no
+        // binders and no payload to load from.
         let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
-        if let Some(payload_param) = payload_block_param {
-            for (i, (binder, &field_ty)) in binders.iter().zip(field_tys).enumerate() {
-                if binder.0 == u32::MAX { continue; } // wildcard
-                let v = ctx.builder.load(payload_param, i * 8, field_ty);
-                bound.push((*binder, ctx.locals.insert(*binder, v)));
+        if let Pattern::Constructor { binders, .. } = &arm.pattern {
+            if let Some(payload_param) = payload_block_param {
+                for (i, (binder, &field_ty)) in binders.iter().zip(field_tys).enumerate() {
+                    if binder.0 == u32::MAX { continue; } // wildcard
+                    let v = ctx.builder.load(payload_param, i * 8, field_ty);
+                    bound.push((*binder, ctx.locals.insert(*binder, v)));
+                }
             }
         }
 
