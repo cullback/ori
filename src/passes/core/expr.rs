@@ -97,10 +97,13 @@ pub enum Expr {
 
     /// `App(target, args, return_type)` — first-order call to a known
     /// top-level function. After lambda-lift + defunctionalization,
-    /// `target` always resolves to a top-level `SymbolId`; there's no
-    /// `Lam` node and no indirect call.
+    /// `target` always resolves to a top-level definition; we use the
+    /// **mangled display name** (a `String`) rather than `SymbolId`
+    /// because the rest of the type system + SSA `Call.target` work
+    /// in strings, and several callers (resolved `MethodCall` /
+    /// `QualifiedCall`) deliver names directly without a `SymbolId`.
     App {
-        target: SymbolId,
+        target: String,
         args: Vec<Expr>,
         ty: Type,
     },

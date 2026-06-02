@@ -28,29 +28,33 @@
 //! flush out the supporting-context shape before we go wide.
 
 use crate::ast::{Expr as AstExpr, ExprKind, MatchArm as AstMatchArm, Pattern as AstPattern, Stmt};
-use crate::symbol::FieldInterner;
+use crate::symbol::{FieldInterner, SymbolTable};
 
 use super::expr::{Expr, Literal, MatchArm, Pattern};
 
 /// Context for AST→Core lowering — references the supporting tables
-/// that the translation needs (just the field interner for now).
+/// that the translation needs.
+///
+/// - `fields`: resolves `FieldSym` → string for `Record` fields.
+/// - `symbols`: resolves `SymbolId` → mangled display name for `Call`
+///   targets, so the resulting Core::App uniformly carries a `String`
+///   target (same shape as resolved `MethodCall` / `QualifiedCall`).
 pub struct LowerCtx<'a> {
     pub fields: &'a FieldInterner,
+    pub symbols: &'a SymbolTable,
 }
 
-/// Convenience for the common case (no record fields involved) —
-/// callers that don't have a `FieldInterner` to hand can use this
-/// at the cost of `Record` / pattern lowering becoming an error.
-fn empty_field_interner() -> FieldInterner {
-    FieldInterner::new()
-}
-
-/// Lower a single AST expression into Core. Returns `Err(reason)` for
-/// AST shapes we haven't implemented yet — the caller decides whether
-/// to skip the function, fall back to the existing AST→SSA pipeline,
-/// or fail.
+/// Lower a single AST expression into Core. Convenience for tests
+/// that don't touch records or named-call targets — uses empty
+/// supporting tables, so `Call`, `Record`, etc. will surface
+/// "unbound symbol" errors instead of working.
 pub fn lower_expr(ast: &AstExpr<'_>) -> Result<Expr, String> {
-    let ctx = LowerCtx { fields: &empty_field_interner() };
+    static EMPTY_FIELDS: std::sync::OnceLock<FieldInterner> = std::sync::OnceLock::new();
+    static EMPTY_SYMBOLS: std::sync::OnceLock<SymbolTable> = std::sync::OnceLock::new();
+    let ctx = LowerCtx {
+        fields: EMPTY_FIELDS.get_or_init(FieldInterner::new),
+        symbols: EMPTY_SYMBOLS.get_or_init(SymbolTable::new),
+    };
     lower_expr_with(&ctx, ast)
 }
 
@@ -94,7 +98,41 @@ pub fn lower_expr_with(ctx: &LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Expr, St
                 .map(|a| lower_expr_with(ctx, a))
                 .collect::<Result<_, _>>()?;
             Ok(Expr::App {
-                target: *target,
+                target: ctx.symbols.display(*target).to_owned(),
+                args: arg_exprs,
+                ty: ast.ty.clone(),
+            })
+        }
+
+        ExprKind::QualifiedCall { resolved, args, .. } => {
+            let name = resolved
+                .as_ref()
+                .ok_or_else(|| "core::lower_expr: QualifiedCall unresolved".to_string())?;
+            let arg_exprs: Vec<Expr> = args
+                .iter()
+                .map(|a| lower_expr_with(ctx, a))
+                .collect::<Result<_, _>>()?;
+            Ok(Expr::App {
+                target: name.clone(),
+                args: arg_exprs,
+                ty: ast.ty.clone(),
+            })
+        }
+
+        ExprKind::MethodCall { receiver, args, resolved, .. } => {
+            let name = resolved
+                .as_ref()
+                .ok_or_else(|| "core::lower_expr: MethodCall unresolved".to_string())?;
+            // Method calls pass the receiver as the first argument
+            // to the dispatched function, then the rest. This matches
+            // the existing AST→SSA convention.
+            let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len() + 1);
+            arg_exprs.push(lower_expr_with(ctx, receiver)?);
+            for a in args {
+                arg_exprs.push(lower_expr_with(ctx, a)?);
+            }
+            Ok(Expr::App {
+                target: name.clone(),
                 args: arg_exprs,
                 ty: ast.ty.clone(),
             })

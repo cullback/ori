@@ -99,9 +99,8 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
                 .iter()
                 .map(|a| lower(ctx, a))
                 .collect::<Result<_, _>>()?;
-            let name = ctx.symbols.display(*target).to_owned();
             let ret_ty = resolve_scalar_type(ty, &ctx.fieldless);
-            Ok(ctx.builder.call(&name, arg_vals, ret_ty))
+            Ok(ctx.builder.call(target, arg_vals, ret_ty))
         }
 
         Expr::Match { scrutinee, arms, ty } => lower_match(ctx, scrutinee, arms, ty),
@@ -396,7 +395,7 @@ mod tests {
             SymbolKind::Func,
         );
         let core = Expr::App {
-            target: f,
+            target: symbols.display(f).to_owned(),
             args: vec![
                 Expr::Lit { value: Literal::Int(1), ty: i64_ty() },
                 Expr::Lit { value: Literal::Int(2), ty: i64_ty() },

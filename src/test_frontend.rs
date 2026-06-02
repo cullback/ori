@@ -4455,7 +4455,10 @@ main = |n| if n == 0 : True then 1 : False then 0
     crate::passes::lambda::narrow::narrow(&mut mono);
     let decls = crate::passes::decl_info::build(&mono);
 
-    let ctx = crate::passes::core::lower::LowerCtx { fields: &resolved.fields };
+    let ctx = crate::passes::core::lower::LowerCtx {
+        fields: &resolved.fields,
+        symbols: &mono.symbols,
+    };
     let main_decl = mono.module.decls.iter().find(|d| matches!(d,
         crate::ast::Decl::FuncDef { name, .. }
             if mono.symbols.display(*name) == "main"
