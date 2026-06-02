@@ -4387,19 +4387,27 @@ main = |n| n + 1
     crate::passes::lambda::narrow::narrow(&mut mono);
 
     // Find the user's `main` function decl.
-    let main_decl = mono.module.decls.iter().find(|d| matches!(d,
-        crate::ast::Decl::FuncDef { name, .. }
-            if mono.symbols.display(*name) == "main"
-    )).expect("expected `main` decl");
-    let crate::ast::Decl::FuncDef { params, body, .. } = main_decl else {
-        unreachable!();
+    let (n_sym, body_clone) = {
+        let main_decl = mono.module.decls.iter().find(|d| matches!(d,
+            crate::ast::Decl::FuncDef { name, .. }
+                if mono.symbols.display(*name) == "main"
+        )).expect("expected `main` decl");
+        let crate::ast::Decl::FuncDef { params, body, .. } = main_decl else {
+            unreachable!();
+        };
+        assert_eq!(params.len(), 1, "main takes one param");
+        (params[0], body.clone())
     };
-    assert_eq!(params.len(), 1, "main takes one param");
-    let n_sym = params[0];
 
-    // Lower the body AST → Core.
-    let core_body = crate::passes::core::lower::lower_expr(body)
-        .expect("Core lowering should succeed for n + 1");
+    // Lower the body AST → Core via slot-list API.
+    let core_body = {
+        let mut ctx = crate::passes::core::lower::LowerCtx::new(
+            &resolved.fields,
+            &mut mono.symbols,
+        );
+        crate::passes::core::lower::lower_expr(&mut ctx, &body_clone)
+            .expect("Core lowering should succeed for n + 1")
+    };
 
     // Lower Core → SSA by hand: one function, one entry block, with
     // `n` as a function param.
@@ -4455,21 +4463,26 @@ main = |n| if n == 0 : True then 1 : False then 0
     crate::passes::lambda::narrow::narrow(&mut mono);
     let decls = crate::passes::decl_info::build(&mono);
 
-    let ctx = crate::passes::core::lower::LowerCtx {
-        fields: &resolved.fields,
-        symbols: &mono.symbols,
+    let (n_sym, body_clone) = {
+        let main_decl = mono.module.decls.iter().find(|d| matches!(d,
+            crate::ast::Decl::FuncDef { name, .. }
+                if mono.symbols.display(*name) == "main"
+        )).expect("expected `main` decl");
+        let crate::ast::Decl::FuncDef { params, body, .. } = main_decl else {
+            unreachable!();
+        };
+        (params[0], body.clone())
     };
-    let main_decl = mono.module.decls.iter().find(|d| matches!(d,
-        crate::ast::Decl::FuncDef { name, .. }
-            if mono.symbols.display(*name) == "main"
-    )).expect("expected `main` decl");
-    let crate::ast::Decl::FuncDef { params, body, .. } = main_decl else {
-        unreachable!();
-    };
-    let n_sym = params[0];
 
-    let core_body = crate::passes::core::lower::lower_expr_with(&ctx, body)
-        .expect("Core lowering should succeed");
+    let core_body = {
+        let mut ctx = crate::passes::core::lower::LowerCtx::new(
+            &resolved.fields,
+            &mut mono.symbols,
+        );
+        ctx.fieldless = decls.fieldless_tags.clone();
+        crate::passes::core::lower::lower_expr(&mut ctx, &body_clone)
+            .expect("Core lowering should succeed")
+    };
 
     let mut b = crate::ssa::Builder::new();
     let n_val = b.add_func_param(crate::ssa::ScalarType::I64);

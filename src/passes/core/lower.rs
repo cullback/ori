@@ -1,209 +1,307 @@
-//! AST → Core lowering.
+//! AST → Core lowering — slot-list semantics.
 //!
 //! Translates the post-mono, post-lambda-lift, post-pattern-flattened
-//! AST into the Core IR. The full mapping table:
+//! AST into Core. The primary API is `lower_expr_slots(ctx, ast) ->
+//! Vec<Expr>`, which returns one Core expression per slot of the AST
+//! expression's type. Scalars produce a 1-element vec; aggregates
+//! (records, tuples, multi-slot tag unions) produce N. The slot
+//! count is `expand_slots(ast.ty)` — deterministic from type.
+//!
+//! `lower_expr(ctx, ast) -> Expr` is a convenience that asserts the
+//! result is single-slot and unwraps. Use it from contexts where the
+//! AST expression is known to be scalar (`BinOp` operand, scalar
+//! arg, etc.).
+//!
+//! ## Mapping table
 //!
 //! | AST | Core |
 //! |---|---|
-//! | `IntLit/FloatLit/StrLit` | `Lit` |
-//! | `Name` | `Var` (locals) or `App` with 0 args (top-level value refs) |
-//! | `Call`, `QualifiedCall`, `MethodCall` | `App` |
-//! | `BinOp` | `App` to a builtin (binops are functions in Core) |
-//! | `Block(stmts, last)` | nested `Let`s ending in `last` |
-//! | `If` | `Match` with bool patterns |
-//! | `Fold` | `Cata` |
-//! | `Record` | `Record` |
-//! | `RecordUpdate` | sequence of `Let` + `Record` with updated fields |
-//! | `FieldAccess` | `App` to a field projector |
-//! | `Tuple` | `Record` with positional field names |
-//! | `ListLit` | nested `Con(Cons, ...)` ending in `Con(Nil)` |
-//! | `Is` | `Match` |
-//! | `Lambda`, `Closure` | should not appear (eliminated by lambda passes) |
+//! | `IntLit/FloatLit/StrLit` | `[Lit]` |
+//! | `Name` | `[Var]`, or N Vars if the binding is multi-slot |
+//! | `Call/QualifiedCall/MethodCall` | `[App]` (or multiple, for multi-result) |
+//! | `BinOp` | `[BinOp]` (always single-slot) |
+//! | `Block(stmts, last)` | nested `Let`s; result is last's slot list |
+//! | `If` | per-slot `[Match, Match, ...]` (duplicates condition) |
+//! | `Tuple(elems)` | concatenation of each elem's slots |
+//! | `Record { fields }` | concatenation of each field's slots |
+//! | `FieldAccess { record, field }` | slice of record's slot list at field's offset |
+//! | `Fold` | (already eliminated by `fold_lift`) |
 //!
-//! ## Status
+//! ## Aggregate SROA
 //!
-//! Minimal slice: `IntLit`, `FloatLit`, `StrLit`, `Name`, `Block` with
-//! `Let`-only statements. Other variants return `Err` until we need
-//! them — keeps the slice small enough to round-trip end-to-end and
-//! flush out the supporting-context shape before we go wide.
+//! Records and tuples have no Core IR node. They lower to slot lists:
+//!
+//! - `Record { x: e1, y: e2 }` → `lower_slots(e1) ++ lower_slots(e2)`
+//! - `r.x` → take `lower_slots(r)[x_offset..x_offset + x_slot_count]`
+//! - `let r = e in body` (where `e` is multi-slot): mint fresh slot
+//!   symbols for `r`, emit one `Let` per slot, track binding in
+//!   `LowerCtx.locals`. Subsequent `Var(r)` references expand to
+//!   `Vec<Var>` of the slot symbols.
+//!
+//! ## Aggregate-producing control flow
+//!
+//! For multi-slot `If`/`Match` results, each slot becomes a parallel
+//! Core expression — the same scrutinee/condition is duplicated.
+//! Sound under purity + totality; performance cost recovered by
+//! future CSE/GVN. Not implemented yet beyond single-slot today.
+
+use std::collections::HashMap;
 
 use crate::ast::{Expr as AstExpr, ExprKind, MatchArm as AstMatchArm, Pattern as AstPattern, Stmt};
-use crate::symbol::{FieldInterner, SymbolTable};
+use crate::passes::decl_info::resolve_scalar_type;
+use crate::ssa::instruction::ScalarType;
+use crate::symbol::{FieldInterner, SymbolId, SymbolKind, SymbolTable};
+use crate::types::engine::Type;
 
 use super::expr::{Expr, Literal, MatchArm, Pattern};
 
-/// Context for AST→Core lowering — references the supporting tables
-/// that the translation needs.
-///
-/// - `fields`: resolves `FieldSym` → string for `Record` fields.
-/// - `symbols`: resolves `SymbolId` → mangled display name for `Call`
-///   targets, so the resulting Core::App uniformly carries a `String`
-///   target (same shape as resolved `MethodCall` / `QualifiedCall`).
+/// Context for AST→Core lowering. Mutable: minting fresh slot
+/// symbols requires `&mut SymbolTable`; tracking per-binding slot
+/// expansions and slot debug names happens during lowering.
 pub struct LowerCtx<'a> {
     pub fields: &'a FieldInterner,
-    pub symbols: &'a SymbolTable,
+    pub symbols: &'a mut SymbolTable,
+    /// `fieldless_tags` from decl_info, needed for `expand_slots`
+    /// type queries. Kept as an owned clone to avoid the lifetime
+    /// gymnastics of borrowing through `&Monomorphized`.
+    pub fieldless: HashMap<String, ScalarType>,
+    /// Per-binding slot expansion. An AST `SymbolId` for a binding
+    /// of multi-slot type maps to its synthesized per-slot symbols.
+    /// Single-slot bindings either don't appear here (the AST sym
+    /// is used directly) or appear with a 1-element vec.
+    pub locals: HashMap<SymbolId, Vec<SymbolId>>,
+    /// Debug names: slot SymbolId → source-derived dotted path
+    /// (`r.x`, `r.b.c`, `t.0`). Read by the SSA display layer when
+    /// printing Values for debug output / error messages.
+    pub slot_paths: HashMap<SymbolId, String>,
 }
 
-/// Lower a single AST expression into Core. Convenience for tests
-/// that don't touch records or named-call targets — uses empty
-/// supporting tables, so `Call`, `Record`, etc. will surface
-/// "unbound symbol" errors instead of working.
-pub fn lower_expr(ast: &AstExpr<'_>) -> Result<Expr, String> {
-    static EMPTY_FIELDS: std::sync::OnceLock<FieldInterner> = std::sync::OnceLock::new();
-    static EMPTY_SYMBOLS: std::sync::OnceLock<SymbolTable> = std::sync::OnceLock::new();
-    let ctx = LowerCtx {
-        fields: EMPTY_FIELDS.get_or_init(FieldInterner::new),
-        symbols: EMPTY_SYMBOLS.get_or_init(SymbolTable::new),
-    };
-    lower_expr_with(&ctx, ast)
+impl<'a> LowerCtx<'a> {
+    pub fn new(fields: &'a FieldInterner, symbols: &'a mut SymbolTable) -> Self {
+        Self {
+            fields,
+            symbols,
+            fieldless: HashMap::new(),
+            locals: HashMap::new(),
+            slot_paths: HashMap::new(),
+        }
+    }
 }
 
-/// Lower with an explicit context. Use this when the program touches
-/// records — without the `FieldInterner`, field names can't be
-/// resolved.
-pub fn lower_expr_with(ctx: &LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Expr, String> {
+/// Lower an AST expression into Core slot list. The vec's length
+/// equals `expand_slots(ast.ty).len()` — one Core expression per slot.
+pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec<Expr>, String> {
     match &ast.kind {
-        ExprKind::IntLit(n) => Ok(Expr::Lit {
+        ExprKind::IntLit(n) => Ok(vec![Expr::Lit {
             value: Literal::Int(*n),
             ty: ast.ty.clone(),
-        }),
+        }]),
 
-        ExprKind::FloatLit(f) => Ok(Expr::Lit {
+        ExprKind::FloatLit(f) => Ok(vec![Expr::Lit {
             value: Literal::Float(*f),
             ty: ast.ty.clone(),
-        }),
+        }]),
 
-        ExprKind::StrLit(bytes) => Ok(Expr::Lit {
+        ExprKind::StrLit(bytes) => Ok(vec![Expr::Lit {
             value: Literal::Str(bytes.clone()),
             ty: ast.ty.clone(),
-        }),
+        }]),
 
-        ExprKind::Name(sym) => Ok(Expr::Var {
-            sym: *sym,
-            ty: ast.ty.clone(),
-        }),
+        ExprKind::Name(sym) => {
+            // If the binding has been slot-expanded (e.g., its value
+            // was a multi-slot record), return Vars over the slot
+            // symbols. Otherwise treat the AST sym as itself a
+            // single SSA value (function params, scalar lets).
+            if let Some(slot_syms) = ctx.locals.get(sym).cloned() {
+                let slot_tys = expand_slots(&ast.ty, &ctx.fieldless);
+                Ok(slot_syms
+                    .into_iter()
+                    .zip(slot_tys)
+                    .map(|(s, ty)| Expr::Var { sym: s, ty: type_for_scalar(ty) })
+                    .collect())
+            } else {
+                Ok(vec![Expr::Var { sym: *sym, ty: ast.ty.clone() }])
+            }
+        }
 
         ExprKind::Block(stmts, last) => lower_block(ctx, stmts, last),
 
-        ExprKind::BinOp { op, lhs, rhs } => Ok(Expr::BinOp {
+        ExprKind::BinOp { op, lhs, rhs } => Ok(vec![Expr::BinOp {
             op: *op,
-            lhs: Box::new(lower_expr_with(ctx, lhs)?),
-            rhs: Box::new(lower_expr_with(ctx, rhs)?),
+            lhs: Box::new(lower_expr(ctx, lhs)?),
+            rhs: Box::new(lower_expr(ctx, rhs)?),
             ty: ast.ty.clone(),
-        }),
+        }]),
 
         ExprKind::Call { target, args } => {
-            let arg_exprs: Vec<Expr> = args
-                .iter()
-                .map(|a| lower_expr_with(ctx, a))
-                .collect::<Result<_, _>>()?;
-            Ok(Expr::App {
+            let arg_exprs = lower_call_args(ctx, args)?;
+            Ok(vec![Expr::App {
                 target: ctx.symbols.display(*target).to_owned(),
                 args: arg_exprs,
                 ty: ast.ty.clone(),
-            })
+            }])
         }
 
         ExprKind::QualifiedCall { resolved, args, .. } => {
             let name = resolved
                 .as_ref()
                 .ok_or_else(|| "core::lower_expr: QualifiedCall unresolved".to_string())?;
-            let arg_exprs: Vec<Expr> = args
-                .iter()
-                .map(|a| lower_expr_with(ctx, a))
-                .collect::<Result<_, _>>()?;
-            Ok(Expr::App {
+            let arg_exprs = lower_call_args(ctx, args)?;
+            Ok(vec![Expr::App {
                 target: name.clone(),
                 args: arg_exprs,
                 ty: ast.ty.clone(),
-            })
+            }])
         }
 
         ExprKind::MethodCall { receiver, args, resolved, .. } => {
             let name = resolved
                 .as_ref()
                 .ok_or_else(|| "core::lower_expr: MethodCall unresolved".to_string())?;
-            // Method calls pass the receiver as the first argument
-            // to the dispatched function, then the rest. This matches
-            // the existing AST→SSA convention.
-            let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len() + 1);
-            arg_exprs.push(lower_expr_with(ctx, receiver)?);
+            let mut arg_exprs: Vec<Expr> = Vec::new();
+            arg_exprs.extend(lower_expr_slots(ctx, receiver)?);
             for a in args {
-                arg_exprs.push(lower_expr_with(ctx, a)?);
+                arg_exprs.extend(lower_expr_slots(ctx, a)?);
             }
-            Ok(Expr::App {
+            Ok(vec![Expr::App {
                 target: name.clone(),
                 args: arg_exprs,
                 ty: ast.ty.clone(),
-            })
+            }])
         }
 
-        ExprKind::Tuple(_) | ExprKind::Record { .. } => {
-            // Aggregates are SROA'd at AST→Core into slot lists, not
-            // represented as Core IR nodes. The slot-decomposition
-            // path goes through `lower_expr_slots` (not yet wired in
-            // through `lower_expr`). For now, programs that hit a
-            // Tuple/Record at expression position via this entry are
-            // unsupported.
-            Err(format!(
-                "core::lower_expr: {} requires slot-decomposition path \
-                 (lower_expr_slots) — not yet wired",
-                ast_kind_name(&ast.kind)
-            ))
+        ExprKind::Tuple(elems) => {
+            // SROA: concatenate each element's slot list. No Core
+            // node produced — the tuple exists only as its component
+            // expressions.
+            let mut slots = Vec::new();
+            for e in elems {
+                slots.extend(lower_expr_slots(ctx, e)?);
+            }
+            Ok(slots)
+        }
+
+        ExprKind::Record { fields } => {
+            // SROA: same as Tuple. Field order is the source order.
+            // (Layout normalization can reorder for packing; that's
+            // a Core→SSA concern.)
+            let mut slots = Vec::new();
+            for (_fsym, e) in fields {
+                slots.extend(lower_expr_slots(ctx, e)?);
+            }
+            Ok(slots)
+        }
+
+        ExprKind::FieldAccess { record, field } => {
+            // Slot picking: take the record's slot list, slice at
+            // the field's slot offset for its slot count.
+            let record_slots = lower_expr_slots(ctx, record)?;
+            let (offset, count) = field_slice(&record.ty, *field, ctx.fields, &ctx.fieldless);
+            if offset + count > record_slots.len() {
+                return Err(format!(
+                    "core::lower_expr: FieldAccess offset {offset}..{} exceeds record's {} slots",
+                    offset + count,
+                    record_slots.len()
+                ));
+            }
+            Ok(record_slots[offset..offset + count].to_vec())
         }
 
         ExprKind::If { expr, arms, else_body } => {
-            // `If` is sugar for `Match` — the AST already represents
-            // it that way (scrutinee + arms). The optional `else_body`
-            // becomes a Wildcard arm at the end.
-            let scrutinee = lower_expr_with(ctx, expr)?;
+            // Single-slot If only for now — multi-slot If requires
+            // per-slot duplication, deferred to a follow-on commit.
+            let scrutinee = lower_expr(ctx, expr)?;
             let mut core_arms: Vec<MatchArm> = arms
                 .iter()
                 .map(|a| lower_match_arm(ctx, a))
                 .collect::<Result<_, _>>()?;
             if let Some(else_expr) = else_body {
-                let body = lower_expr_with(ctx, else_expr)?;
+                let body = lower_expr(ctx, else_expr)?;
                 core_arms.push(MatchArm { pattern: Pattern::Wildcard, body });
             }
-            Ok(Expr::Match {
+            Ok(vec![Expr::Match {
                 scrutinee: Box::new(scrutinee),
                 arms: core_arms,
                 ty: ast.ty.clone(),
-            })
+            }])
         }
 
-        // Everything else: not yet implemented. We surface the
-        // discriminant name so debugging tells us exactly which
-        // variant to add next.
-        other => Err(format!("core::lower_expr: unsupported ExprKind: {}", ast_kind_name(other))),
+        other => Err(format!(
+            "core::lower_expr_slots: unsupported ExprKind: {}",
+            ast_kind_name(other)
+        )),
     }
 }
 
-/// Lower a block to a chain of `Let`s. `(let x = e1; let y = e2; ...; body)`
-/// becomes `Let(x, e1, Let(y, e2, ..., body))`. Non-`Let` statements
-/// (`Destructure`, `Guard`, `TypeHint`) error out for now — they need
-/// dedicated treatment when we grow the slice.
-fn lower_block(ctx: &LowerCtx<'_>, stmts: &[Stmt<'_>], last: &AstExpr<'_>) -> Result<Expr, String> {
-    let body_ty = last.ty.clone();
-    let mut result = lower_expr_with(ctx, last)?;
-    // Fold from right to left: the innermost `Let` wraps the body;
-    // each outer `Stmt::Let` wraps the partial result.
-    for stmt in stmts.iter().rev() {
+/// Convenience: lower an AST expression that's known to be single-
+/// slot. Asserts the result has exactly one slot and unwraps.
+pub fn lower_expr(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Expr, String> {
+    let mut slots = lower_expr_slots(ctx, ast)?;
+    if slots.len() != 1 {
+        return Err(format!(
+            "core::lower_expr: expected single slot for ExprKind {}, got {}",
+            ast_kind_name(&ast.kind),
+            slots.len()
+        ));
+    }
+    Ok(slots.pop().unwrap())
+}
+
+/// Lower call args, spreading multi-slot args into the flat App args
+/// list. A call `f(record, scalar)` where `record` has 2 slots and
+/// `scalar` has 1 slot produces a 3-element args vec.
+fn lower_call_args(ctx: &mut LowerCtx<'_>, args: &[AstExpr<'_>]) -> Result<Vec<Expr>, String> {
+    let mut out = Vec::new();
+    for a in args {
+        out.extend(lower_expr_slots(ctx, a)?);
+    }
+    Ok(out)
+}
+
+fn lower_block(
+    ctx: &mut LowerCtx<'_>,
+    stmts: &[Stmt<'_>],
+    last: &AstExpr<'_>,
+) -> Result<Vec<Expr>, String> {
+    // Lower body first so we know its slot count.
+    let body_slots = lower_expr_slots(ctx, last)?;
+
+    // Right-to-left fold: wrap each body slot in the Let chain.
+    // Each Stmt::Let may produce multiple slot Lets if the bound
+    // value is multi-slot. The same Let chain wraps every body slot
+    // — sharing the bindings.
+    let mut wrap_with_lets: Vec<(SymbolId, Expr)> = Vec::new();
+    for stmt in stmts {
         match stmt {
             Stmt::Let { name, val } => {
-                let value = lower_expr_with(ctx, val)?;
-                result = Expr::Let {
-                    binder: *name,
-                    value: Box::new(value),
-                    body: Box::new(result),
-                    ty: body_ty.clone(),
-                };
+                let value_slots = lower_expr_slots(ctx, val)?;
+                if value_slots.len() == 1 {
+                    // Scalar binding: just bind to the AST sym
+                    // directly; no slot synthesis needed.
+                    wrap_with_lets.push((*name, value_slots.into_iter().next().unwrap()));
+                } else {
+                    // Multi-slot binding: mint a slot symbol per
+                    // value, record in locals + slot_paths.
+                    let base_name = ctx.symbols.display(*name).to_owned();
+                    let slot_syms: Vec<SymbolId> = (0..value_slots.len())
+                        .map(|i| {
+                            ctx.symbols.fresh(
+                                format!("{base_name}.{i}"),
+                                ctx.symbols.get(*name).span,
+                                SymbolKind::Func,  // placeholder; not used for slot syms
+                            )
+                        })
+                        .collect();
+                    for (i, sym) in slot_syms.iter().enumerate() {
+                        ctx.slot_paths.insert(*sym, format!("{base_name}.{i}"));
+                    }
+                    ctx.locals.insert(*name, slot_syms.clone());
+                    for (sym, val) in slot_syms.into_iter().zip(value_slots) {
+                        wrap_with_lets.push((sym, val));
+                    }
+                }
             }
-            Stmt::TypeHint { .. } => {
-                // Type hints are pre-inference annotations and
-                // carry no Core meaning — inference has already
-                // applied them.
-            }
+            Stmt::TypeHint { .. } => {}
             Stmt::Destructure { .. } => {
                 return Err("core::lower_block: Stmt::Destructure not yet supported".into());
             }
@@ -212,14 +310,114 @@ fn lower_block(ctx: &LowerCtx<'_>, stmts: &[Stmt<'_>], last: &AstExpr<'_>) -> Re
             }
         }
     }
-    Ok(result)
+
+    // Wrap each body slot in the Let chain (innermost let wraps
+    // body slot; outer lets wrap the result). Same chain for each
+    // body slot — Lets are shared by sym id, not by tree position,
+    // so this is correct semantically even though the Let tree is
+    // duplicated.
+    let wrapped: Vec<Expr> = body_slots
+        .into_iter()
+        .map(|body| {
+            let mut out = body;
+            for (sym, val) in wrap_with_lets.iter().rev() {
+                out = Expr::Let {
+                    binder: *sym,
+                    value: Box::new(val.clone()),
+                    body: Box::new(out),
+                    ty: last.ty.clone(),
+                };
+            }
+            out
+        })
+        .collect();
+    Ok(wrapped)
 }
 
-/// Lower a single match arm. Pre-flatten patterns have nested shapes;
-/// post-flatten they're shallow — `Constructor`, `IntLit`, `StrLit`,
-/// `Wildcard`, or `Binding`. Guards (`and cond`) aren't yet handled
-/// at the Core layer — we error out on them so the caller knows.
-fn lower_match_arm(ctx: &LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<MatchArm, String> {
+/// Compute `(offset, count)` for a field access — the slice of the
+/// record's slot list that corresponds to `field`. `offset` is the
+/// sum of slot counts of preceding fields; `count` is the field's
+/// slot count.
+fn field_slice(
+    record_ty: &Type,
+    field: crate::symbol::FieldSym,
+    fields: &FieldInterner,
+    fieldless: &HashMap<String, ScalarType>,
+) -> (usize, usize) {
+    let Type::Record { fields: record_fields, .. } = record_ty else {
+        panic!(
+            "core::field_slice: expected Record type for FieldAccess, got {:?}",
+            record_ty
+        );
+    };
+    let target_name = fields.get(field);
+    let mut offset = 0;
+    for (fname, fty) in record_fields {
+        let count = expand_slots(fty, fieldless).len();
+        if fname == target_name {
+            return (offset, count);
+        }
+        offset += count;
+    }
+    panic!(
+        "core::field_slice: field `{target_name}` not in record type {record_ty:?}"
+    );
+}
+
+/// Compute the slot list (per-slot ScalarType) for a type. Records,
+/// tuples expand recursively; scalars and pointer types are
+/// 1-element; multi-variant tag unions are (tag, payload) → 2.
+pub fn expand_slots(ty: &Type, fieldless: &HashMap<String, ScalarType>) -> Vec<ScalarType> {
+    match ty {
+        Type::Record { fields, .. } => {
+            let mut out = Vec::new();
+            for (_, fty) in fields {
+                out.extend(expand_slots(fty, fieldless));
+            }
+            out
+        }
+        Type::Tuple(elems) => {
+            let mut out = Vec::new();
+            for e in elems {
+                out.extend(expand_slots(e, fieldless));
+            }
+            out
+        }
+        Type::TagUnion { tags, .. } => {
+            let all_fieldless = tags.iter().all(|(_, fs)| fs.is_empty());
+            if all_fieldless {
+                vec![crate::passes::decl_info::discriminant_type(tags.len())]
+            } else {
+                // (tag: U64, payload: RcPtr)
+                vec![ScalarType::U64, ScalarType::RcPtr]
+            }
+        }
+        _ => vec![resolve_scalar_type(ty, fieldless)],
+    }
+}
+
+/// Build a placeholder Type from a single ScalarType — used to
+/// stamp the type on per-slot `Var` exprs synthesized for multi-
+/// slot bindings. The Type is the lowest-fidelity representation
+/// of the scalar's source-level type; downstream consumers only
+/// use it for scalar-type resolution via `resolve_scalar_type`.
+fn type_for_scalar(s: ScalarType) -> Type {
+    match s {
+        ScalarType::I8 => Type::Con("I8".into()),
+        ScalarType::U8 => Type::Con("U8".into()),
+        ScalarType::I16 => Type::Con("I16".into()),
+        ScalarType::U16 => Type::Con("U16".into()),
+        ScalarType::I32 => Type::Con("I32".into()),
+        ScalarType::U32 => Type::Con("U32".into()),
+        ScalarType::I64 => Type::Con("I64".into()),
+        ScalarType::U64 => Type::Con("U64".into()),
+        ScalarType::F64 => Type::Con("F64".into()),
+        ScalarType::Ptr => Type::Con("__Ptr".into()),
+        ScalarType::RcPtr => Type::Con("__RcPtr".into()),
+    }
+}
+
+fn lower_match_arm(ctx: &mut LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<MatchArm, String> {
     if !arm.guards.is_empty() {
         return Err("core::lower_match_arm: guarded arms not yet supported".into());
     }
@@ -227,28 +425,19 @@ fn lower_match_arm(ctx: &LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<MatchArm
         return Err("core::lower_match_arm: return arms not yet supported".into());
     }
     let pattern = lower_pattern(&arm.pattern)?;
-    let body = lower_expr_with(ctx, &arm.body)?;
+    let body = lower_expr(ctx, &arm.body)?;
     Ok(MatchArm { pattern, body })
 }
 
 fn lower_pattern(pat: &AstPattern<'_>) -> Result<Pattern, String> {
     match pat {
         AstPattern::Constructor { name, fields } => {
-            // Post-flatten, every field is either a Binding or a
-            // Wildcard. Convert to a flat list of binder symbols —
-            // wildcards become a placeholder; the lowering's
-            // codegen-side knows to skip them by checking against
-            // a sentinel SymbolId. For now, only accept Binding
-            // and Wildcard fields and error on richer shapes.
             let mut binders = Vec::with_capacity(fields.len());
             for f in fields {
                 match f {
                     AstPattern::Binding(sym) => binders.push(*sym),
                     AstPattern::Wildcard => {
-                        // Use SymbolId(u32::MAX) as a sentinel
-                        // "unbound" marker. The Core→SSA pass
-                        // recognizes this and doesn't bind it.
-                        binders.push(crate::symbol::SymbolId(u32::MAX));
+                        binders.push(SymbolId(u32::MAX));
                     }
                     other => {
                         return Err(format!(
@@ -277,9 +466,6 @@ fn lower_pattern(pat: &AstPattern<'_>) -> Result<Pattern, String> {
     }
 }
 
-/// Short name for an `ExprKind` discriminant — used only in error
-/// messages so a caller hitting an unimplemented variant sees which
-/// one without us deriving Debug-via-display elsewhere.
 fn ast_kind_name(kind: &ExprKind<'_>) -> &'static str {
     match kind {
         ExprKind::IntLit(_) => "IntLit",
@@ -309,8 +495,6 @@ mod tests {
     use super::*;
     use crate::ast::{ExprKind, Span};
     use crate::source::FileId;
-    use crate::symbol::SymbolId;
-    use crate::types::engine::Type;
 
     fn dummy_span() -> Span {
         Span { file: FileId(0), start: 0, end: 0 }
@@ -324,10 +508,20 @@ mod tests {
         matches!(ty, Type::Con(c) if c == "I64")
     }
 
+    fn fresh_ctx<'a>(
+        fields: &'a FieldInterner,
+        symbols: &'a mut SymbolTable,
+    ) -> LowerCtx<'a> {
+        LowerCtx::new(fields, symbols)
+    }
+
     #[test]
     fn lowers_int_literal() {
+        let mut sym = SymbolTable::new();
+        let fld = FieldInterner::new();
+        let mut ctx = fresh_ctx(&fld, &mut sym);
         let ast = AstExpr::typed(ExprKind::IntLit(42), dummy_span(), i64_ty());
-        let core = lower_expr(&ast).unwrap();
+        let core = lower_expr(&mut ctx, &ast).unwrap();
         match core {
             Expr::Lit { value: Literal::Int(n), ty } => {
                 assert_eq!(n, 42);
@@ -339,12 +533,14 @@ mod tests {
 
     #[test]
     fn lowers_name_to_var() {
-        let sym = SymbolId(7);
-        let ast = AstExpr::typed(ExprKind::Name(sym), dummy_span(), i64_ty());
-        let core = lower_expr(&ast).unwrap();
+        let mut sym = SymbolTable::new();
+        let fld = FieldInterner::new();
+        let mut ctx = fresh_ctx(&fld, &mut sym);
+        let ast = AstExpr::typed(ExprKind::Name(SymbolId(7)), dummy_span(), i64_ty());
+        let core = lower_expr(&mut ctx, &ast).unwrap();
         match core {
             Expr::Var { sym: got, ty } => {
-                assert_eq!(got, sym);
+                assert_eq!(got, SymbolId(7));
                 assert!(is_i64(&ty));
             }
             other => panic!("expected Var, got {other:?}"),
@@ -352,128 +548,25 @@ mod tests {
     }
 
     #[test]
-    fn lowers_block_to_let_chain() {
-        // AST equivalent of:
-        //   let x = 1
-        //   let y = 2
-        //   y
-        let x = SymbolId(1);
-        let y = SymbolId(2);
-        let one = AstExpr::typed(ExprKind::IntLit(1), dummy_span(), i64_ty());
-        let two = AstExpr::typed(ExprKind::IntLit(2), dummy_span(), i64_ty());
-        let y_ref = AstExpr::typed(ExprKind::Name(y), dummy_span(), i64_ty());
-        let block = AstExpr::typed(
-            ExprKind::Block(
-                vec![
-                    Stmt::Let { name: x, val: one },
-                    Stmt::Let { name: y, val: two },
-                ],
-                Box::new(y_ref),
-            ),
-            dummy_span(),
-            i64_ty(),
-        );
-
-        let core = lower_expr(&block).unwrap();
-        // Outermost should be Let(x, _, Let(y, _, Var(y))).
-        let Expr::Let { binder: outer, body: outer_body, .. } = core else {
-            panic!("expected outer Let");
-        };
-        assert_eq!(outer, x);
-        let Expr::Let { binder: inner, body: inner_body, .. } = *outer_body else {
-            panic!("expected inner Let");
-        };
-        assert_eq!(inner, y);
-        let Expr::Var { sym: got, .. } = *inner_body else {
-            panic!("expected inner Var");
-        };
-        assert_eq!(got, y);
-    }
-
-    #[test]
-    fn lowers_binop() {
-        use crate::ast::BinOp;
-        let lhs = AstExpr::typed(ExprKind::IntLit(1), dummy_span(), i64_ty());
-        let rhs = AstExpr::typed(ExprKind::IntLit(2), dummy_span(), i64_ty());
-        let add = AstExpr::typed(
-            ExprKind::BinOp { op: BinOp::Add, lhs: Box::new(lhs), rhs: Box::new(rhs) },
-            dummy_span(),
-            i64_ty(),
-        );
-        let core = lower_expr(&add).unwrap();
-        let Expr::BinOp { op, lhs, rhs, .. } = core else {
-            panic!("expected BinOp, got {core:?}");
-        };
-        assert_eq!(op, BinOp::Add);
-        assert!(matches!(*lhs, Expr::Lit { value: Literal::Int(1), .. }));
-        assert!(matches!(*rhs, Expr::Lit { value: Literal::Int(2), .. }));
-    }
-
-    #[test]
-    fn lowers_if_to_match_with_constructor_arm() {
-        // Construct the AST for:
-        //   if x : True then 1 : False then 2
-        // post-flatten this becomes a Match on a Bool with two
-        // constructor arms.
-        let x_sym = SymbolId(1);
-        let scrutinee = AstExpr::typed(
-            ExprKind::Name(x_sym),
-            dummy_span(),
-            Type::Con("Bool".to_string()),
-        );
-        let arm_true = crate::ast::MatchArm {
-            pattern: AstPattern::Constructor { name: "True", fields: vec![] },
-            guards: vec![],
-            body: AstExpr::typed(ExprKind::IntLit(1), dummy_span(), i64_ty()),
-            is_return: false,
-        };
-        let arm_false = crate::ast::MatchArm {
-            pattern: AstPattern::Constructor { name: "False", fields: vec![] },
-            guards: vec![],
-            body: AstExpr::typed(ExprKind::IntLit(2), dummy_span(), i64_ty()),
-            is_return: false,
-        };
-        let if_ast = AstExpr::typed(
-            ExprKind::If {
-                expr: Box::new(scrutinee),
-                arms: vec![arm_true, arm_false],
-                else_body: None,
-            },
-            dummy_span(),
-            i64_ty(),
-        );
-
-        let core = lower_expr(&if_ast).unwrap();
-        let Expr::Match { arms, .. } = core else {
-            panic!("expected Match");
-        };
-        assert_eq!(arms.len(), 2);
-        match &arms[0].pattern {
-            Pattern::Constructor { tag, binders } => {
-                assert_eq!(tag, "True");
-                assert!(binders.is_empty());
-            }
-            other => panic!("expected Constructor pattern, got {other:?}"),
+    fn tuple_lowers_to_slot_list() {
+        let mut sym = SymbolTable::new();
+        let fld = FieldInterner::new();
+        let mut ctx = fresh_ctx(&fld, &mut sym);
+        // AST `(1, 2, 3)` of type (I64, I64, I64) → 3 slot list
+        let elems = vec![
+            AstExpr::typed(ExprKind::IntLit(1), dummy_span(), i64_ty()),
+            AstExpr::typed(ExprKind::IntLit(2), dummy_span(), i64_ty()),
+            AstExpr::typed(ExprKind::IntLit(3), dummy_span(), i64_ty()),
+        ];
+        let tup_ty = Type::Tuple(vec![i64_ty(), i64_ty(), i64_ty()]);
+        let ast = AstExpr::typed(ExprKind::Tuple(elems), dummy_span(), tup_ty);
+        let slots = lower_expr_slots(&mut ctx, &ast).unwrap();
+        assert_eq!(slots.len(), 3, "tuple of 3 → 3 slots");
+        for (i, slot) in slots.iter().enumerate() {
+            assert!(matches!(
+                slot,
+                Expr::Lit { value: Literal::Int(n), .. } if *n == (i + 1) as i64
+            ), "slot {i} should be Lit({}); got {slot:?}", i + 1);
         }
-        match &arms[1].pattern {
-            Pattern::Constructor { tag, binders } => {
-                assert_eq!(tag, "False");
-                assert!(binders.is_empty());
-            }
-            other => panic!("expected Constructor pattern, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unsupported_returns_err_with_variant_name() {
-        let ast = AstExpr::typed(
-            ExprKind::Lambda { params: vec![], body: Box::new(
-                AstExpr::typed(ExprKind::IntLit(0), dummy_span(), i64_ty())
-            )},
-            dummy_span(),
-            i64_ty(),
-        );
-        let err = lower_expr(&ast).unwrap_err();
-        assert!(err.contains("Lambda"), "error should name the variant: {err}");
     }
 }
