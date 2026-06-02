@@ -58,7 +58,32 @@ fn compile(
     passes::lambda::narrow::narrow(&mut mono);
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
-    let (mut ssa_module, input_vals) = lower::lower(&mono, &resolved.fields)?;
+
+    // Try the new Core pipeline first. Two failure modes:
+    //   (a) lower_module returns Err for any unsupported AST/Core
+    //       variant — silent fallback.
+    //   (b) lower_module returns Ok but produces SSA the validator
+    //       rejects — silent fallback (covers cases where Core's
+    //       lowering is unsound for that program shape).
+    // Either way we fall through to the established direct AST→SSA
+    // path. Core is additive — never regresses programs that worked
+    // before, only takes over for ones it handles correctly.
+    let decls = passes::decl_info::build(&mono);
+    let core_attempt = passes::core::pipeline::lower_module(
+        &mut mono, &resolved.fields, &decls,
+    );
+    let core_module = core_attempt.ok().filter(|m| {
+        ssa::validate::validate(m).is_clean()
+    });
+
+    let (mut ssa_module, input_vals) = if let Some(m) = core_module {
+        let main_params = m.functions.get("__main")
+            .map(|f| f.params.clone())
+            .unwrap_or_default();
+        (m, main_params)
+    } else {
+        lower::lower(&mono, &resolved.fields)?
+    };
     run_ssa_pipeline(&mut ssa_module);
     Ok((ssa_module, input_vals))
 }

@@ -47,6 +47,8 @@
 
 use std::collections::HashMap;
 
+use std::collections::HashSet;
+
 use crate::ast::{Expr as AstExpr, ExprKind, MatchArm as AstMatchArm, Pattern as AstPattern, Stmt};
 use crate::passes::decl_info::resolve_scalar_type;
 use crate::ssa::instruction::ScalarType;
@@ -65,6 +67,12 @@ pub struct LowerCtx<'a> {
     /// type queries. Kept as an owned clone to avoid the lifetime
     /// gymnastics of borrowing through `&Monomorphized`.
     pub fieldless: HashMap<String, ScalarType>,
+    /// Names of declared constructors (`"Ok"`, `"Cons"`, `"True"`, ...).
+    /// A `Call` whose target's display name is in this set lowers to
+    /// `Core::Con`, not `Core::App` — keeps constructor dispatch
+    /// visible to `Match` and avoids generating "call to unknown
+    /// function 'Ok'" SSA.
+    pub constructors: HashSet<String>,
     /// Per-binding slot expansion. An AST `SymbolId` for a binding
     /// of multi-slot type maps to its synthesized per-slot symbols.
     /// Single-slot bindings either don't appear here (the AST sym
@@ -82,6 +90,7 @@ impl<'a> LowerCtx<'a> {
             fields,
             symbols,
             fieldless: HashMap::new(),
+            constructors: HashSet::new(),
             locals: HashMap::new(),
             slot_paths: HashMap::new(),
         }
@@ -134,12 +143,21 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
         }]),
 
         ExprKind::Call { target, args } => {
+            let name = ctx.symbols.display(*target).to_owned();
             let arg_exprs = lower_call_args(ctx, args)?;
-            Ok(vec![Expr::App {
-                target: ctx.symbols.display(*target).to_owned(),
-                args: arg_exprs,
-                ty: ast.ty.clone(),
-            }])
+            if ctx.constructors.contains(&name) {
+                Ok(vec![Expr::Con {
+                    tag: name,
+                    args: arg_exprs,
+                    ty: ast.ty.clone(),
+                }])
+            } else {
+                Ok(vec![Expr::App {
+                    target: name,
+                    args: arg_exprs,
+                    ty: ast.ty.clone(),
+                }])
+            }
         }
 
         ExprKind::QualifiedCall { resolved, args, .. } => {
@@ -147,11 +165,19 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 .as_ref()
                 .ok_or_else(|| "core::lower_expr: QualifiedCall unresolved".to_string())?;
             let arg_exprs = lower_call_args(ctx, args)?;
-            Ok(vec![Expr::App {
-                target: name.clone(),
-                args: arg_exprs,
-                ty: ast.ty.clone(),
-            }])
+            if ctx.constructors.contains(name) {
+                Ok(vec![Expr::Con {
+                    tag: name.clone(),
+                    args: arg_exprs,
+                    ty: ast.ty.clone(),
+                }])
+            } else {
+                Ok(vec![Expr::App {
+                    target: name.clone(),
+                    args: arg_exprs,
+                    ty: ast.ty.clone(),
+                }])
+            }
         }
 
         ExprKind::MethodCall { receiver, args, resolved, .. } => {

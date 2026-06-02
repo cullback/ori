@@ -90,6 +90,7 @@ pub fn lower_module(
         let core_body = {
             let mut ctx = LowerCtx::new(fields, &mut mono.symbols);
             ctx.fieldless = decls.fieldless_tags.clone();
+            ctx.constructors = decls.constructors.keys().cloned().collect();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {
                 format!("function `{name_str}`: AST→Core: {e}")
