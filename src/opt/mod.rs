@@ -16,12 +16,12 @@ pub mod jump_threading;
 pub mod merge_blocks;
 pub mod nop_elim;
 pub mod operands;
-pub mod rc_elide_ptr;
 pub mod rc_fuse;
 pub mod retype_statics;
 pub mod static_promote;
 
 use crate::ssa::Module;
+use crate::ssa::validate::check;
 
 // Re-exports for backward compatibility with passes that imported
 // these from `crate::opt::*` directly.
@@ -46,23 +46,33 @@ pub fn optimize(module: &mut Module) {
 }
 
 /// Full SSA optimization pipeline. Single canonical entry point so
-/// the binary and the test harness can't drift apart. Validation
-/// between passes is the caller's responsibility.
+/// the binary and the test harness can't drift apart. `check` runs
+/// after every pass to surface invariant violations at the boundary
+/// they were introduced.
 pub fn run_full_pipeline(module: &mut Module) {
     static_promote::promote(module);
+    check(module, "static_promote");
     optimize(module);
+    check(module, "optimize (post static_promote)");
+    // inline() re-runs ssa_form internally so it leaves the
+    // explicit-block-params invariant intact.
     inline::inline(module);
-    // inline may leave cross-block refs; re-run ssa_form to repair.
-    crate::lower::ssa_form::run(module);
+    check(module, "inline");
     optimize(module);
+    check(module, "optimize (post inline)");
     const_eval::evaluate(module);
+    check(module, "const_eval");
     optimize(module);
-    // const_eval may produce more StaticRefs; retype them and any
-    // values that flow from them. rc_emit only sees the original
-    // (RcPtr) types, so rc ops on now-Ptr-typed values are still in
-    // the IR — rc_elide_ptr deletes them as a follow-on to retype.
+    check(module, "optimize (post const_eval)");
+    // const_eval may produce more StaticRefs; retype them and drop
+    // the rc ops that rc_emit had emitted while their operand was
+    // still RcPtr. retype_statics does both as a single step so the
+    // "no rc op on a Ptr-typed Value" invariant holds atomically
+    // and the validator can enforce it from this boundary on.
     retype_statics::run(module);
-    rc_elide_ptr::run(module);
+    check(module, "retype_statics");
     rc_fuse::run(module);
+    check(module, "rc_fuse");
     optimize(module);
+    check(module, "optimize (final)");
 }

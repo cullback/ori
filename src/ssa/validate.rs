@@ -50,6 +50,26 @@ impl Report {
     }
 }
 
+/// Run `validate` and panic with a labeled message if it produced
+/// any errors or warnings. Use this between passes to surface
+/// breakage at the boundary that caused it rather than as a confusing
+/// runtime failure later.
+pub fn check(module: &Module, pass_name: &str) {
+    let r = validate(module);
+    if !r.is_clean() {
+        panic!(
+            "SSA validation failed after '{pass_name}':\n{}",
+            r.error_summary()
+        );
+    }
+    if !r.warnings.is_empty() {
+        panic!(
+            "SSA soft-validation warnings after '{pass_name}':\n{}",
+            r.warnings.join("\n")
+        );
+    }
+}
+
 /// Validate a module. Returns Ok if no structural errors were found
 /// (warnings may still be present). Errors cause the runtime to
 /// misbehave; warnings flag bugs that today happen to work.
@@ -130,6 +150,21 @@ fn validate_function(
                         bid.0
                     ));
                 }
+            }
+            // RC ops are illegal on Ptr-typed Values: Ptr is the
+            // sentinel-rc class (statics) and has no real refcount.
+            // The invariant becomes meaningful after retype_statics,
+            // and retype_statics drops the offending rc ops atomically
+            // with the retype — so it should hold at every pipeline
+            // boundary the validator gets called at.
+            match inst {
+                Inst::RcInc(v) | Inst::RcDec(v) if v.ty == ScalarType::Ptr => {
+                    r.errors.push(format!(
+                        "{prefix}: b{}:{idx} {inst:?} operates on Ptr-typed value {v}",
+                        bid.0
+                    ));
+                }
+                _ => {}
             }
         }
         for v in block.terminator.operands() {

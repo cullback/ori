@@ -65,30 +65,10 @@ fn compile(
 
 /// Run the full SSA pipeline on a freshly-lowered module. Single
 /// canonical entry — see `opt::run_full_pipeline` for the order.
-/// Validation happens after lower (and the user can re-run after
-/// individual passes via tests).
+/// The pipeline itself calls `check` between passes.
 fn run_ssa_pipeline(module: &mut ssa::Module) {
-    check(module, "lower");
+    ssa::validate::check(module, "lower");
     opt::run_full_pipeline(module);
-    check(module, "optimize (final)");
-}
-
-/// Validate the module after a pass. Aborts the process with a
-/// readable error if validation fails — surfacing pass-induced
-/// breakage at the source instead of as a runtime crash later.
-fn check(module: &ssa::Module, pass: &str) {
-    let r = ssa::validate::validate(module);
-    if !r.is_clean() {
-        eprintln!("SSA validation failed after '{pass}':\n{}", r.error_summary());
-        process::exit(1);
-    }
-    if !r.warnings.is_empty() {
-        eprintln!(
-            "SSA soft-validation warnings after '{pass}':\n{}",
-            r.warnings.join("\n")
-        );
-        process::exit(1);
-    }
 }
 
 fn bytes_to_scalar(bytes: &[u8], heap: &mut ssa::eval::Heap) -> ssa::eval::Scalar {

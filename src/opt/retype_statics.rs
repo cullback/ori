@@ -1,4 +1,5 @@
-//! Retype static-derived Values from `RcPtr` to `Ptr`.
+//! Retype static-derived Values from `RcPtr` to `Ptr` and drop the
+//! refcount instructions that would have operated on them.
 //!
 //! `static_promote` produces `StaticRef` instructions whose dest type
 //! is inherited from the original `Alloc` (always `RcPtr`). Statics
@@ -13,6 +14,11 @@
 //! 2. Propagate: a block param is static if every incoming edge puts a
 //!    static value at that position. Iterate to fixpoint.
 //! 3. Retype: every Value with id in the static set gets `ty = Ptr`.
+//! 4. Drop `RcInc`/`RcDec` whose operand id is in the static set.
+//!    These were emitted by `rc_emit` before this pass ran, when the
+//!    operand was still typed `RcPtr`. The drop is atomic with the
+//!    retype so the invariant "no rc op on a `Ptr`-typed Value" holds
+//!    at every pipeline boundary — and the validator can enforce it.
 //!
 //! Boundaries where a static-typed Value meets an RcPtr-typed position
 //! (Call args, Return, edge args into non-static block params) stay as
@@ -136,6 +142,16 @@ fn retype_function(func: &mut crate::ssa::Function) {
         for p in block.params.iter_mut() {
             retype(p);
         }
+        // Drop rc ops on now-Ptr Values before retyping operands —
+        // simpler to filter by the static_set than to filter by ty
+        // after retype (same effect either way). `rc_emit` emitted
+        // these when the operand was RcPtr; they're no-ops once the
+        // operand becomes Ptr, and leaving them in would break the
+        // "no rc on Ptr" invariant.
+        block.insts.retain(|inst| match inst {
+            Inst::RcInc(v) | Inst::RcDec(v) => !static_set.contains(&v.id),
+            _ => true,
+        });
         for inst in block.insts.iter_mut() {
             for d in inst.dests_mut() {
                 retype(d);

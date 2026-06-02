@@ -205,7 +205,7 @@ fn transfer(
     use crate::ssa::ScalarType;
     match inst {
         Inst::Const(_, bits) => vec![Facts::Const(*bits)],
-        Inst::StaticRef(_, _) => vec![Facts::Top], // tracked at SSA layer (Ptr type + rc_elide_ptr)
+        Inst::StaticRef(_, _) => vec![Facts::Top], // tracked at SSA layer (Ptr type + retype_statics)
         Inst::BinOp(_, op, l, r) => {
             let lf = lookup(*l, facts);
             let rf = lookup(*r, facts);

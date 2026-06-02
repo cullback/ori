@@ -239,10 +239,12 @@ fn lower_inst(
             emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         Inst::RcInc(_) | Inst::RcDec(_) => {
-            // No-op for the bump allocator. Statics' rc ops are
-            // already elided at the SSA layer (opt/rc_elide_ptr), so
-            // anything reaching here is RcPtr-typed — real heap, will
-            // need real rc emission once Phase 5h's RC runtime lands.
+            // No-op for the bump allocator. Statics' rc ops are dropped
+            // at the SSA layer (opt/retype_statics drops them as part
+            // of the RcPtr→Ptr retype, and the validator enforces "no
+            // rc op on Ptr"), so anything reaching here is RcPtr-typed
+            // — real heap, will need real rc emission once Phase 5h's
+            // RC runtime lands.
         }
         Inst::Const(dest, bits) => {
             // Load via MOVZ + (optional MOVKs) for values wider than 16 bits.

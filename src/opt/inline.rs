@@ -30,7 +30,11 @@
 //!
 //! ## Output invariants
 //!
-//! - All input invariants preserved.
+//! - All input invariants preserved, including explicit-block-params.
+//!   The raw splice violates that — callee instructions can now be
+//!   referenced from outside their renumbered blocks — so `inline()`
+//!   calls `ssa_form::run` as its final step to re-thread the
+//!   cross-block uses through block params.
 //! - Inlined calls are gone; their bodies are spliced into the
 //!   caller. The original callee `Function` may become unreachable
 //!   (cleaned up by `dead_functions` inside `opt`).
@@ -39,10 +43,6 @@
 //!
 //! - `MAX_INLINE_INSTS = 30`. Tunable. Higher unlocks more
 //!   optimization opportunities but bloats SSA size.
-//! - Splicing produces Agg/Ptr type mismatches that subsequent opt
-//!   passes (`load_of_agg`, `split_agg_params`, `extract_of_pack`)
-//!   clean up. Inline alone isn't a "clean" transformation; the opt
-//!   pipeline that runs after it is part of the contract.
 
 use std::collections::{HashMap, HashSet};
 
@@ -68,6 +68,12 @@ pub fn inline(module: &mut Module) {
     for func in module.functions.values_mut() {
         inline_calls_in_function(func, &snapshots);
     }
+
+    // Splice violates explicit-block-params (callee instructions can
+    // now be referenced from outside their renumbered blocks).
+    // ssa_form re-threads those uses through block params, restoring
+    // the invariant before any subsequent pass observes the module.
+    crate::lower::ssa_form::run(module);
 }
 
 /// Identify functions small enough to inline.

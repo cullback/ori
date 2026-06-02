@@ -51,7 +51,7 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
     let (ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
-    validate_after(&ssa_module, "lower");
+    crate::ssa::validate::check(&ssa_module, "lower");
     (ssa_module, input_vals)
 }
 
@@ -69,27 +69,10 @@ fn validate_ast_types(mono: &crate::passes::mono::Monomorphized<'_>, after: &str
 fn compile(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Value>) {
     let (mut ssa_module, input_vals) = compile_until_lower(source);
     // Match the binary's pipeline so tests and `cargo run` see the
-    // same optimized SSA. Single source of truth: `opt::run_full_pipeline`.
+    // same optimized SSA. Single source of truth: `opt::run_full_pipeline`,
+    // which calls `validate::check` between every pass.
     crate::opt::run_full_pipeline(&mut ssa_module);
-    validate_after(&ssa_module, "optimize (final)");
     (ssa_module, input_vals)
-}
-
-fn validate_after(module: &crate::ssa::Module, pass: &str) {
-    let r = crate::ssa::validate::validate(module);
-    if !r.is_clean() {
-        panic!("SSA validation failed after '{pass}':\n{}", r.error_summary());
-    }
-    // Soft warnings are type lies that eval tolerates today but
-    // signal real bugs (SROA inconsistency, lowering type drift,
-    // etc.). The CLI exits on them — the test harness should too,
-    // otherwise regressions land silently.
-    if !r.warnings.is_empty() {
-        panic!(
-            "SSA soft-validation warnings after '{pass}':\n{}",
-            r.warnings.join("\n")
-        );
-    }
 }
 
 // ---- Test runners ----
@@ -4256,7 +4239,7 @@ fn audit_ssa_cleanliness_raw() {
 
 /// Compare raw vs optimized SSA on runtime metrics (alloc_count,
 /// fresh_alloc_count, peak_live). Some opt passes (static_promote,
-/// rc_elide_static) move work off the heap without changing IR shape
+/// retype_statics) move work off the heap without changing IR shape
 /// much — inst count alone underestimates their value.
 #[test]
 #[ignore = "diagnostic; run with --ignored --nocapture"]
