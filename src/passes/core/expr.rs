@@ -31,10 +31,13 @@ use crate::types::engine::Type;
 /// fields are interned strings during inference.
 pub type FieldId = String;
 
-/// Constructor tag — the symbol of the constructor function (e.g.
-/// `Cons`, `Nil`, `Ok`, `Err`). After mono these are concrete
-/// constructors; before mono they're polymorphic constructor symbols.
-pub type TagId = SymbolId;
+/// Constructor tag — the source name of the variant (`"Cons"`,
+/// `"Nil"`, `"Ok"`, `"Err"`, `"True"`, ...). Tag unions are
+/// structural in Ori (the tag name identifies the variant within
+/// its union), and the inference/lower layers already key on
+/// strings, so Core does too. Could be interned later if profile
+/// shows it matters.
+pub type TagId = String;
 
 /// A scalar literal value. Matches what `ExprKind::IntLit` /
 /// `FloatLit` / `StrLit` produce in the AST, but we keep the variant
@@ -46,16 +49,26 @@ pub enum Literal {
     Str(Vec<u8>),
 }
 
-/// A pattern in a `Match` arm. Restricted to constructor patterns
-/// over tag unions — pattern flattening runs before Core, so we
-/// don't see nested patterns here.
+/// A pattern in a `Match` arm. Restricted to **shallow** patterns —
+/// `flatten_patterns` runs before Core, so nested constructor /
+/// record / list / tuple patterns have already been desugared into
+/// chains of shallow matches.
 #[derive(Debug, Clone)]
-pub struct Pattern {
-    /// The constructor being matched (e.g. `Cons`, `Nil`, `Ok`, `Err`).
-    pub tag: TagId,
-    /// Fresh symbols bound to the constructor's field positions in
-    /// the arm body.
-    pub binders: Vec<SymbolId>,
+pub enum Pattern {
+    /// `Cons(x, xs)` — a tag-union constructor with field binders.
+    /// Each binder is either a fresh symbol (introducing a binding
+    /// for the arm body) or — represented by an unused symbol — a
+    /// wildcard. After flatten, all fields are at this binding level.
+    Constructor { tag: TagId, binders: Vec<SymbolId> },
+    /// `42` — match a specific integer literal. The scrutinee's
+    /// equality with the literal gates the arm.
+    IntLit(i64),
+    /// `"foo"` — match a specific string literal.
+    StrLit(Vec<u8>),
+    /// `_` — match anything, bind nothing.
+    Wildcard,
+    /// `x` (bare name) — match anything, bind to `x`.
+    Binding(SymbolId),
 }
 
 /// One arm of a `Match` expression.

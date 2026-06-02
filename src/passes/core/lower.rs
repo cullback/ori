@@ -27,10 +27,10 @@
 //! them — keeps the slice small enough to round-trip end-to-end and
 //! flush out the supporting-context shape before we go wide.
 
-use crate::ast::{Expr as AstExpr, ExprKind, Stmt};
+use crate::ast::{Expr as AstExpr, ExprKind, MatchArm as AstMatchArm, Pattern as AstPattern, Stmt};
 use crate::symbol::FieldInterner;
 
-use super::expr::{Expr, Literal};
+use super::expr::{Expr, Literal, MatchArm, Pattern};
 
 /// Context for AST→Core lowering — references the supporting tables
 /// that the translation needs (just the field interner for now).
@@ -122,6 +122,26 @@ pub fn lower_expr_with(ctx: &LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Expr, St
             Ok(Expr::Record { fields: field_exprs, ty: ast.ty.clone() })
         }
 
+        ExprKind::If { expr, arms, else_body } => {
+            // `If` is sugar for `Match` — the AST already represents
+            // it that way (scrutinee + arms). The optional `else_body`
+            // becomes a Wildcard arm at the end.
+            let scrutinee = lower_expr_with(ctx, expr)?;
+            let mut core_arms: Vec<MatchArm> = arms
+                .iter()
+                .map(|a| lower_match_arm(ctx, a))
+                .collect::<Result<_, _>>()?;
+            if let Some(else_expr) = else_body {
+                let body = lower_expr_with(ctx, else_expr)?;
+                core_arms.push(MatchArm { pattern: Pattern::Wildcard, body });
+            }
+            Ok(Expr::Match {
+                scrutinee: Box::new(scrutinee),
+                arms: core_arms,
+                ty: ast.ty.clone(),
+            })
+        }
+
         // Everything else: not yet implemented. We surface the
         // discriminant name so debugging tells us exactly which
         // variant to add next.
@@ -163,6 +183,68 @@ fn lower_block(ctx: &LowerCtx<'_>, stmts: &[Stmt<'_>], last: &AstExpr<'_>) -> Re
         }
     }
     Ok(result)
+}
+
+/// Lower a single match arm. Pre-flatten patterns have nested shapes;
+/// post-flatten they're shallow — `Constructor`, `IntLit`, `StrLit`,
+/// `Wildcard`, or `Binding`. Guards (`and cond`) aren't yet handled
+/// at the Core layer — we error out on them so the caller knows.
+fn lower_match_arm(ctx: &LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<MatchArm, String> {
+    if !arm.guards.is_empty() {
+        return Err("core::lower_match_arm: guarded arms not yet supported".into());
+    }
+    if arm.is_return {
+        return Err("core::lower_match_arm: return arms not yet supported".into());
+    }
+    let pattern = lower_pattern(&arm.pattern)?;
+    let body = lower_expr_with(ctx, &arm.body)?;
+    Ok(MatchArm { pattern, body })
+}
+
+fn lower_pattern(pat: &AstPattern<'_>) -> Result<Pattern, String> {
+    match pat {
+        AstPattern::Constructor { name, fields } => {
+            // Post-flatten, every field is either a Binding or a
+            // Wildcard. Convert to a flat list of binder symbols —
+            // wildcards become a placeholder; the lowering's
+            // codegen-side knows to skip them by checking against
+            // a sentinel SymbolId. For now, only accept Binding
+            // and Wildcard fields and error on richer shapes.
+            let mut binders = Vec::with_capacity(fields.len());
+            for f in fields {
+                match f {
+                    AstPattern::Binding(sym) => binders.push(*sym),
+                    AstPattern::Wildcard => {
+                        // Use SymbolId(u32::MAX) as a sentinel
+                        // "unbound" marker. The Core→SSA pass
+                        // recognizes this and doesn't bind it.
+                        binders.push(crate::symbol::SymbolId(u32::MAX));
+                    }
+                    other => {
+                        return Err(format!(
+                            "core::lower_pattern: nested pattern field not supported \
+                             (post-flatten should have left only Binding/Wildcard, \
+                             saw {other:?})"
+                        ));
+                    }
+                }
+            }
+            Ok(Pattern::Constructor {
+                tag: (*name).to_owned(),
+                binders,
+            })
+        }
+        AstPattern::IntLit(n) => Ok(Pattern::IntLit(*n)),
+        AstPattern::StrLit(bytes) => Ok(Pattern::StrLit(bytes.clone())),
+        AstPattern::Wildcard => Ok(Pattern::Wildcard),
+        AstPattern::Binding(sym) => Ok(Pattern::Binding(*sym)),
+        AstPattern::Record { .. } | AstPattern::List(_) | AstPattern::Tuple(_) => {
+            Err(format!(
+                "core::lower_pattern: nested pattern shape not supported \
+                 (post-flatten should have eliminated these): {pat:?}"
+            ))
+        }
+    }
 }
 
 /// Short name for an `ExprKind` discriminant — used only in error
@@ -295,6 +377,61 @@ mod tests {
         assert_eq!(op, BinOp::Add);
         assert!(matches!(*lhs, Expr::Lit { value: Literal::Int(1), .. }));
         assert!(matches!(*rhs, Expr::Lit { value: Literal::Int(2), .. }));
+    }
+
+    #[test]
+    fn lowers_if_to_match_with_constructor_arm() {
+        // Construct the AST for:
+        //   if x : True then 1 : False then 2
+        // post-flatten this becomes a Match on a Bool with two
+        // constructor arms.
+        let x_sym = SymbolId(1);
+        let scrutinee = AstExpr::typed(
+            ExprKind::Name(x_sym),
+            dummy_span(),
+            Type::Con("Bool".to_string()),
+        );
+        let arm_true = crate::ast::MatchArm {
+            pattern: AstPattern::Constructor { name: "True", fields: vec![] },
+            guards: vec![],
+            body: AstExpr::typed(ExprKind::IntLit(1), dummy_span(), i64_ty()),
+            is_return: false,
+        };
+        let arm_false = crate::ast::MatchArm {
+            pattern: AstPattern::Constructor { name: "False", fields: vec![] },
+            guards: vec![],
+            body: AstExpr::typed(ExprKind::IntLit(2), dummy_span(), i64_ty()),
+            is_return: false,
+        };
+        let if_ast = AstExpr::typed(
+            ExprKind::If {
+                expr: Box::new(scrutinee),
+                arms: vec![arm_true, arm_false],
+                else_body: None,
+            },
+            dummy_span(),
+            i64_ty(),
+        );
+
+        let core = lower_expr(&if_ast).unwrap();
+        let Expr::Match { arms, .. } = core else {
+            panic!("expected Match");
+        };
+        assert_eq!(arms.len(), 2);
+        match &arms[0].pattern {
+            Pattern::Constructor { tag, binders } => {
+                assert_eq!(tag, "True");
+                assert!(binders.is_empty());
+            }
+            other => panic!("expected Constructor pattern, got {other:?}"),
+        }
+        match &arms[1].pattern {
+            Pattern::Constructor { tag, binders } => {
+                assert_eq!(tag, "False");
+                assert!(binders.is_empty());
+            }
+            other => panic!("expected Constructor pattern, got {other:?}"),
+        }
     }
 
     #[test]
