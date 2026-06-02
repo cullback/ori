@@ -135,12 +135,82 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
 
         ExprKind::Block(stmts, last) => lower_block(ctx, stmts, last),
 
-        ExprKind::BinOp { op, lhs, rhs } => Ok(vec![Expr::BinOp {
-            op: *op,
-            lhs: Box::new(lower_expr(ctx, lhs)?),
-            rhs: Box::new(lower_expr(ctx, rhs)?),
-            ty: ast.ty.clone(),
-        }]),
+        ExprKind::BinOp { op, lhs, rhs } => {
+            // Short-circuit booleans desugar to Match — left side
+            // evaluated first; right side conditional on it. This
+            // is semantically equivalent to `if lhs : True then rhs
+            // : False then <False/True default>` and produces the
+            // same SSA as the existing AST→SSA path.
+            use crate::ast::BinOp;
+            match op {
+                BinOp::And => {
+                    // a && b ≡ match a of True -> b | False -> False
+                    let scrutinee = lower_expr(ctx, lhs)?;
+                    let body_true = lower_expr(ctx, rhs)?;
+                    let body_false = Expr::Con {
+                        tag: "False".to_string(),
+                        args: vec![],
+                        ty: ast.ty.clone(),
+                    };
+                    Ok(vec![Expr::Match {
+                        scrutinee: Box::new(scrutinee),
+                        arms: vec![
+                            MatchArm {
+                                pattern: Pattern::Constructor {
+                                    tag: "True".to_string(),
+                                    binders: vec![],
+                                },
+                                body: body_true,
+                            },
+                            MatchArm {
+                                pattern: Pattern::Constructor {
+                                    tag: "False".to_string(),
+                                    binders: vec![],
+                                },
+                                body: body_false,
+                            },
+                        ],
+                        ty: ast.ty.clone(),
+                    }])
+                }
+                BinOp::Or => {
+                    // a || b ≡ match a of True -> True | False -> b
+                    let scrutinee = lower_expr(ctx, lhs)?;
+                    let body_true = Expr::Con {
+                        tag: "True".to_string(),
+                        args: vec![],
+                        ty: ast.ty.clone(),
+                    };
+                    let body_false = lower_expr(ctx, rhs)?;
+                    Ok(vec![Expr::Match {
+                        scrutinee: Box::new(scrutinee),
+                        arms: vec![
+                            MatchArm {
+                                pattern: Pattern::Constructor {
+                                    tag: "True".to_string(),
+                                    binders: vec![],
+                                },
+                                body: body_true,
+                            },
+                            MatchArm {
+                                pattern: Pattern::Constructor {
+                                    tag: "False".to_string(),
+                                    binders: vec![],
+                                },
+                                body: body_false,
+                            },
+                        ],
+                        ty: ast.ty.clone(),
+                    }])
+                }
+                _ => Ok(vec![Expr::BinOp {
+                    op: *op,
+                    lhs: Box::new(lower_expr(ctx, lhs)?),
+                    rhs: Box::new(lower_expr(ctx, rhs)?),
+                    ty: ast.ty.clone(),
+                }]),
+            }
+        }
 
         ExprKind::Call { target, args } => {
             let name = ctx.symbols.display(*target).to_owned();
