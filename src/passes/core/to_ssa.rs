@@ -102,9 +102,63 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(ctx.builder.call(&name, arg_vals, ret_ty))
         }
 
+        Expr::Match { scrutinee, arms, ty } => lower_match(ctx, scrutinee, arms, ty),
+
         _ => Err(format!(
             "core::to_ssa: variant not yet supported: {}",
             variant_name(expr)
+        )),
+    }
+}
+
+/// Lower a `Match` to SSA. v0 scope: arms must be **Wildcard** or
+/// **Binding** only. Constructor / IntLit / StrLit patterns land
+/// next — they need tag-extraction logic and either an SSA branch
+/// chain or a SwitchInt.
+///
+/// For the all-wildcard/binding case the dispatch is trivial: the
+/// first arm always matches. We emit:
+///
+///   <evaluate scrutinee>
+///   <arm 0 body — with Binding's symbol bound to scrutinee>
+///   <branch to merge with the body's result>
+///
+/// Since exactly one arm runs (the first), we don't actually need a
+/// merge block in this slice — the body's last value is the result.
+/// Multi-arm dispatch lands when Constructor patterns do.
+fn lower_match(
+    ctx: &mut Ctx<'_>,
+    scrutinee: &Expr,
+    arms: &[super::expr::MatchArm],
+    _ty: &Type,
+) -> Result<Value, String> {
+    let scrutinee_val = lower(ctx, scrutinee)?;
+
+    // For now: require exactly one Wildcard or Binding arm. This is
+    // enough for `match x of _ -> body` patterns and for `if` with
+    // a final else-Wildcard arm. Multi-arm constructor dispatch
+    // lands as a follow-on.
+    let [arm] = arms else {
+        return Err(format!(
+            "core::to_ssa: Match with {} arms not yet supported (v0 handles 1)",
+            arms.len()
+        ));
+    };
+
+    match &arm.pattern {
+        super::expr::Pattern::Wildcard => lower(ctx, &arm.body),
+        super::expr::Pattern::Binding(sym) => {
+            // Bind the scrutinee to this symbol for the arm body.
+            let prev = ctx.locals.insert(*sym, scrutinee_val);
+            let result = lower(ctx, &arm.body);
+            match prev {
+                Some(p) => { ctx.locals.insert(*sym, p); }
+                None => { ctx.locals.remove(sym); }
+            }
+            result
+        }
+        other => Err(format!(
+            "core::to_ssa: Match pattern not yet supported: {other:?}"
         )),
     }
 }
@@ -290,6 +344,52 @@ mod tests {
         }).expect("expected a Call inst");
         assert_eq!(call.0, "myfunc");
         assert_eq!(call.1.len(), 2, "two args");
+    }
+
+    #[test]
+    fn lowers_match_with_binding_arm() {
+        // Core: match (1 + 2) of x -> x * 10
+        // Expected eval: 30.
+        let x = SymbolId(50);
+        let one_plus_two = Expr::BinOp {
+            op: AstBinOp::Add,
+            lhs: Box::new(Expr::Lit { value: Literal::Int(1), ty: i64_ty() }),
+            rhs: Box::new(Expr::Lit { value: Literal::Int(2), ty: i64_ty() }),
+            ty: i64_ty(),
+        };
+        let body = Expr::BinOp {
+            op: AstBinOp::Mul,
+            lhs: Box::new(Expr::Var { sym: x, ty: i64_ty() }),
+            rhs: Box::new(Expr::Lit { value: Literal::Int(10), ty: i64_ty() }),
+            ty: i64_ty(),
+        };
+        let core = Expr::Match {
+            scrutinee: Box::new(one_plus_two),
+            arms: vec![super::super::expr::MatchArm {
+                pattern: super::super::expr::Pattern::Binding(x),
+                body,
+            }],
+            ty: i64_ty(),
+        };
+
+        let symbols = SymbolTable::new();
+        let mut builder = Builder::new();
+        let _entry = builder.create_block();
+        builder.switch_to(crate::ssa::BlockId(0));
+        let mut ctx = Ctx {
+            builder: &mut builder,
+            symbols: &symbols,
+            locals: HashMap::new(),
+            fieldless: HashMap::new(),
+        };
+        let result = lower(&mut ctx, &core).expect("lowering should succeed");
+        builder.ret(result);
+        builder.finish_function("test", ScalarType::I64);
+        let module = builder.build("test");
+        let mut heap = crate::ssa::eval::new_heap();
+        crate::ssa::eval::load_statics(&module, &mut heap);
+        let result = crate::ssa::eval::eval(&module, &mut heap, &[]);
+        assert_eq!(result, crate::ssa::eval::Scalar::I64(30));
     }
 
     #[test]
