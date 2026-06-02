@@ -19,6 +19,7 @@ pub mod operands;
 pub mod rc_fuse;
 pub mod retype_statics;
 pub mod static_promote;
+pub mod stream_fuse;
 
 use crate::ssa::Module;
 use crate::ssa::validate::check;
