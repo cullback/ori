@@ -4444,6 +4444,7 @@ main = |n| n + 1
         decls: &decls,
         locals,
         fieldless: std::collections::HashMap::new(),
+        transparent: std::collections::HashMap::new(),
     };
     let result = crate::passes::core::to_ssa::lower(&mut ctx, &core_body)
         .expect("Core→SSA should succeed");
@@ -4516,6 +4517,7 @@ main = |n| if n == 0 : True then 1 : False then 0
         decls: &decls,
         locals,
         fieldless: decls.fieldless_tags.clone(),
+        transparent: std::collections::HashMap::new(),
     };
     let result = crate::passes::core::to_ssa::lower(&mut core_ctx, &core_body)
         .expect("Core→SSA should succeed");

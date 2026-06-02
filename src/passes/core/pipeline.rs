@@ -29,7 +29,7 @@ use crate::ssa::{Builder, Module, Value};
 use crate::symbol::{FieldInterner, SymbolId, SymbolKind};
 use crate::types::engine::Type;
 
-use super::lower::{expand_slots, lower_expr_slots, LowerCtx};
+use super::lower::{expand_slots, lower_expr_slots, LowerCtx, TransparentTable};
 use super::to_ssa;
 
 /// Lower a whole monomorphized AST module to SSA via the Core IR.
@@ -58,13 +58,17 @@ pub fn lower_module(
 
     let mut builder = Builder::new();
 
+    // Build transparent table from infer (clone the relevant subset
+    // — InferResult.transparent has the right shape already).
+    let transparent: TransparentTable = mono.infer.transparent.clone();
+
     for (name, params, body) in funcs {
         let name_str = mono.symbols.display(name).to_owned();
 
         // Per-param slot expansion from the function's declared
         // scheme. Synth functions without schemes default to single
         // RcPtr per source param.
-        let per_param_slots = param_slot_types(mono, &name_str, &params, &decls.fieldless_tags);
+        let per_param_slots = param_slot_types(mono, &name_str, &params, &decls.fieldless_tags, &transparent);
 
         // Add SSA function params + build locals for both passes.
         // - to_ssa_locals: SymbolId → SSA Value (used by Core→SSA).
@@ -90,6 +94,7 @@ pub fn lower_module(
         let core_body = {
             let mut ctx = LowerCtx::new(fields, &mut mono.symbols);
             ctx.fieldless = decls.fieldless_tags.clone();
+            ctx.transparent = transparent.clone();
             ctx.constructors = decls.constructors.keys().cloned().collect();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {
@@ -112,6 +117,7 @@ pub fn lower_module(
                 decls,
                 locals: to_ssa_locals,
                 fieldless: decls.fieldless_tags.clone(),
+                transparent: transparent.clone(),
             };
             let mut all = Vec::new();
             for e in &core_body {
@@ -123,13 +129,36 @@ pub fn lower_module(
             all
         };
 
-        // Emit return + finish.
+        // Reconcile body-slot count with declared-return-slot count.
+        // The body's lowering may produce multi-slot (e.g., payload
+        // Con returning [tag, payload]) while the function's declared
+        // return shape is single-slot (e.g., `Result(I64, I64)` which
+        // expand_slots treats as 1 RcPtr because tag-union `:=` types
+        // aren't in `infer.transparent`). Materialize Multi → Single
+        // by emitting alloc + sequential stores + return the shell
+        // pointer — matches existing-lower's convention exactly.
+        let ret_slots = expand_slots(&body.ty, &decls.fieldless_tags, &transparent);
+        let result_vals = if result_vals.len() == ret_slots.len() {
+            result_vals
+        } else if ret_slots.len() == 1 && result_vals.len() > 1 {
+            let shell = builder.alloc(result_vals.len() * 8);
+            for (i, v) in result_vals.iter().enumerate() {
+                builder.store(shell, i * 8, *v);
+            }
+            vec![shell]
+        } else {
+            return Err(format!(
+                "function `{name_str}`: slot count mismatch — body produced {}, return declares {}",
+                result_vals.len(),
+                ret_slots.len()
+            ));
+        };
+
         if result_vals.len() == 1 {
             builder.ret(result_vals[0]);
         } else {
             builder.ret_multi(result_vals);
         }
-        let ret_slots = expand_slots(&body.ty, &decls.fieldless_tags);
         let ssa_name = if name_str == "main" { "__main".to_string() } else { name_str.clone() };
         if ret_slots.len() == 1 {
             builder.finish_function(&ssa_name, ret_slots[0]);
@@ -150,12 +179,13 @@ fn param_slot_types(
     name_str: &str,
     params: &[SymbolId],
     fieldless: &HashMap<String, ScalarType>,
+    transparent: &TransparentTable,
 ) -> Vec<Vec<ScalarType>> {
     mono.infer
         .func_schemes
         .get(name_str)
         .map(|s| match &s.ty {
-            Type::Arrow(ps, _) => ps.iter().map(|t| expand_slots(t, fieldless)).collect(),
+            Type::Arrow(ps, _) => ps.iter().map(|t| expand_slots(t, fieldless, transparent)).collect(),
             _ => vec![vec![ScalarType::RcPtr]; params.len()],
         })
         .unwrap_or_else(|| vec![vec![ScalarType::RcPtr]; params.len()])

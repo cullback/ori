@@ -50,10 +50,42 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::ast::{Expr as AstExpr, ExprKind, MatchArm as AstMatchArm, Pattern as AstPattern, Stmt};
-use crate::passes::decl_info::resolve_scalar_type;
+use crate::passes::decl_info::{resolve_scalar_type, substitute_type_var};
 use crate::ssa::instruction::ScalarType;
 use crate::symbol::{FieldInterner, SymbolId, SymbolKind, SymbolTable};
-use crate::types::engine::Type;
+use crate::types::engine::{Type, TypeVar};
+
+/// Type alias table — maps transparent newtype names to their
+/// (type-params, underlying type). Same shape as `InferResult.transparent`.
+pub type TransparentTable = HashMap<String, (Vec<TypeVar>, Type)>;
+
+/// Unfold transparent type aliases. `Result(I64, I64)` (declared as
+/// `Result(ok, err) := [Ok(ok), Err(err)]`) becomes the structural
+/// `[Ok(I64), Err(I64)]` TagUnion. Recursive aliases unfold to fixed
+/// point. Non-alias types pass through unchanged.
+pub fn resolve_transparent(ty: &Type, transparent: &TransparentTable) -> Type {
+    match ty {
+        Type::App(name, args) => {
+            if let Some((param_vars, underlying)) = transparent.get(name) {
+                let mut result = underlying.clone();
+                for (var, arg) in param_vars.iter().zip(args) {
+                    result = substitute_type_var(&result, *var, arg);
+                }
+                resolve_transparent(&result, transparent)
+            } else {
+                ty.clone()
+            }
+        }
+        Type::Con(name) => {
+            if let Some((_, underlying)) = transparent.get(name) {
+                resolve_transparent(underlying, transparent)
+            } else {
+                ty.clone()
+            }
+        }
+        _ => ty.clone(),
+    }
+}
 
 use super::expr::{Expr, Literal, MatchArm, Pattern};
 
@@ -67,6 +99,10 @@ pub struct LowerCtx<'a> {
     /// type queries. Kept as an owned clone to avoid the lifetime
     /// gymnastics of borrowing through `&Monomorphized`.
     pub fieldless: HashMap<String, ScalarType>,
+    /// Transparent type alias table — `Result(a, e)` → `[Ok(a), Err(e)]`
+    /// etc. Passed to `expand_slots` so transparent aliases get
+    /// resolved before slot-shape computation.
+    pub transparent: TransparentTable,
     /// Names of declared constructors (`"Ok"`, `"Cons"`, `"True"`, ...).
     /// A `Call` whose target's display name is in this set lowers to
     /// `Core::Con`, not `Core::App` — keeps constructor dispatch
@@ -90,6 +126,7 @@ impl<'a> LowerCtx<'a> {
             fields,
             symbols,
             fieldless: HashMap::new(),
+            transparent: HashMap::new(),
             constructors: HashSet::new(),
             locals: HashMap::new(),
             slot_paths: HashMap::new(),
@@ -122,7 +159,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // symbols. Otherwise treat the AST sym as itself a
             // single SSA value (function params, scalar lets).
             if let Some(slot_syms) = ctx.locals.get(sym).cloned() {
-                let slot_tys = expand_slots(&ast.ty, &ctx.fieldless);
+                let slot_tys = expand_slots(&ast.ty, &ctx.fieldless, &ctx.transparent);
                 Ok(slot_syms
                     .into_iter()
                     .zip(slot_tys)
@@ -292,7 +329,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // Slot picking: take the record's slot list, slice at
             // the field's slot offset for its slot count.
             let record_slots = lower_expr_slots(ctx, record)?;
-            let (offset, count) = field_slice(&record.ty, *field, ctx.fields, &ctx.fieldless);
+            let (offset, count) = field_slice(&record.ty, *field, ctx.fields, &ctx.fieldless, &ctx.transparent);
             if offset + count > record_slots.len() {
                 return Err(format!(
                     "core::lower_expr: FieldAccess offset {offset}..{} exceeds record's {} slots",
@@ -401,7 +438,7 @@ fn lower_block(
         match stmt {
             Stmt::Let { name, val } => {
                 let value_slots = lower_expr_slots(ctx, val)?;
-                let expected_slot_count = expand_slots(&val.ty, &ctx.fieldless).len();
+                let expected_slot_count = expand_slots(&val.ty, &ctx.fieldless, &ctx.transparent).len();
 
                 if value_slots.len() == 1 && expected_slot_count == 1 {
                     // Scalar binding — bind to the AST sym directly.
@@ -486,8 +523,10 @@ fn field_slice(
     field: crate::symbol::FieldSym,
     fields: &FieldInterner,
     fieldless: &HashMap<String, ScalarType>,
+    transparent: &TransparentTable,
 ) -> (usize, usize) {
-    let Type::Record { fields: record_fields, .. } = record_ty else {
+    let unwrapped = resolve_transparent(record_ty, transparent);
+    let Type::Record { fields: record_fields, .. } = &unwrapped else {
         panic!(
             "core::field_slice: expected Record type for FieldAccess, got {:?}",
             record_ty
@@ -496,7 +535,7 @@ fn field_slice(
     let target_name = fields.get(field);
     let mut offset = 0;
     for (fname, fty) in record_fields {
-        let count = expand_slots(fty, fieldless).len();
+        let count = expand_slots(fty, fieldless, transparent).len();
         if fname == target_name {
             return (offset, count);
         }
@@ -507,22 +546,28 @@ fn field_slice(
     );
 }
 
-/// Compute the slot list (per-slot ScalarType) for a type. Records,
-/// tuples expand recursively; scalars and pointer types are
-/// 1-element; multi-variant tag unions are (tag, payload) → 2.
-pub fn expand_slots(ty: &Type, fieldless: &HashMap<String, ScalarType>) -> Vec<ScalarType> {
-    match ty {
+/// Compute the slot list (per-slot ScalarType) for a type, unfolding
+/// transparent aliases first. Records and tuples fan out shallowly;
+/// scalars and pointer types are 1-element; multi-variant tag unions
+/// are (tag, payload) → 2.
+pub fn expand_slots(
+    ty: &Type,
+    fieldless: &HashMap<String, ScalarType>,
+    transparent: &TransparentTable,
+) -> Vec<ScalarType> {
+    let unwrapped = resolve_transparent(ty, transparent);
+    match &unwrapped {
         Type::Record { fields, .. } => {
             let mut out = Vec::new();
             for (_, fty) in fields {
-                out.extend(expand_slots(fty, fieldless));
+                out.extend(expand_slots(fty, fieldless, transparent));
             }
             out
         }
         Type::Tuple(elems) => {
             let mut out = Vec::new();
             for e in elems {
-                out.extend(expand_slots(e, fieldless));
+                out.extend(expand_slots(e, fieldless, transparent));
             }
             out
         }
@@ -535,7 +580,7 @@ pub fn expand_slots(ty: &Type, fieldless: &HashMap<String, ScalarType>) -> Vec<S
                 vec![ScalarType::U64, ScalarType::RcPtr]
             }
         }
-        _ => vec![resolve_scalar_type(ty, fieldless)],
+        _ => vec![resolve_scalar_type(&unwrapped, fieldless)],
     }
 }
 

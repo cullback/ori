@@ -45,6 +45,7 @@ pub struct Ctx<'b> {
     pub decls: &'b DeclInfo,
     pub locals: HashMap<SymbolId, Value>,
     pub fieldless: HashMap<String, ScalarType>,
+    pub transparent: super::lower::TransparentTable,
 }
 
 /// Lower a Core expression as a multi-slot SSA result. Returns
@@ -88,7 +89,7 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // App where the return type is multi-slot — emit call_multi
         // and return the result slot list directly.
         Expr::App { target, args, ty } => {
-            let ret_slots = super::lower::expand_slots(ty, &ctx.fieldless);
+            let ret_slots = super::lower::expand_slots(ty, &ctx.fieldless, &ctx.transparent);
             if ret_slots.len() == 1 {
                 return Ok(vec![lower(ctx, expr)?]);
             }
@@ -508,6 +509,7 @@ mod tests {
             decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
+            transparent: HashMap::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         // Finalize so we can introspect the function.
@@ -541,6 +543,7 @@ mod tests {
             decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
+            transparent: HashMap::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -587,6 +590,7 @@ mod tests {
             decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
+            transparent: HashMap::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -641,6 +645,7 @@ mod tests {
             decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
+            transparent: HashMap::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -709,6 +714,7 @@ mod tests {
             decls: &decls,
             locals,
             fieldless,
+            transparent: HashMap::new(),
         };
 
         let core_with_var = Expr::Match {
@@ -748,6 +754,7 @@ mod tests {
             decls: &decls,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
+            transparent: HashMap::new(),
         };
         let err = lower(&mut ctx, &core).unwrap_err();
         assert!(err.contains("#42"), "error should name the unbound symbol: {err}");

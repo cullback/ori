@@ -115,7 +115,7 @@ fn unwrap_transparent(
     }
 }
 
-fn substitute_type_var(ty: &Type, var: TypeVar, replacement: &Type) -> Type {
+pub fn substitute_type_var(ty: &Type, var: TypeVar, replacement: &Type) -> Type {
     match ty {
         Type::Var(v) if *v == var => replacement.clone(),
         Type::App(name, args) => Type::App(
