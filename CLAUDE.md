@@ -90,27 +90,117 @@ block" view never escapes inference.
   type must stay `RcPtr` (a `Result`); sig-changing optimizations must
   exclude it.
 
-## `lower/` vs `opt/`
+## Pipeline layers
+
+Each layer has one job. Code that doesn't fit a layer's job goes in
+the wrong layer.
+
+| Layer | Job |
+|---|---|
+| `src/syntax/` | text → AST (grammar lives here) |
+| `src/passes/` | AST → AST transforms (`resolve`, `mono`, `lambda::lift`, `flatten_patterns`, etc.) |
+| `src/types/` | type inference + unification |
+| `src/lower/` | AST → SSA. **Establishes language semantics 1:1.** |
+| `src/opt/` | SSA → SSA equivalence-preserving rewrites. |
+| `src/codegen/` | SSA → bytes (instructions + ELF/Mach-O container). |
 
 **`lower/` establishes the language's behavior. `opt/` only makes it
 faster.** Deleting every pass under `opt/` leaves a correct, slower
-program — this is a hard invariant, not a goal.
+program — this is a hard invariant, not a goal. Semantic guarantees
+(FBIP, leak-free RC, total termination, strict evaluation order) are
+enforced by `lower/`'s emission choices; never rely on an opt pass
+to clean up.
 
-Concretely:
+`opt/` passes find emergent patterns *within* the natural lowering
+(dead alloc elimination, branch folding, rc fusion, sig changes).
+Each pass is independently deletable. Anything that "looks like" an
+optimization but is semantically required (e.g. FBIP via `cow_*`,
+decomposed aggregate emission) belongs in `lower/`.
 
-- Semantic guarantees (FBIP, leak-free RC, total termination, strict
-  evaluation order) are enforced **by `lower/`'s emission choices.**
-  If a behavior matters for correctness, the lowering must produce it
-  directly — never rely on an opt pass to clean up.
-- `opt/` passes find emergent patterns *within* the natural lowering
-  (dead alloc elimination, branch folding, rc fusion, cross-function
-  sig changes). Each pass should be independently deletable.
-- Anything that "looks like" an optimization but is semantically
-  required (e.g. FBIP via `ReuseOrClone` / `cow_*`, decomposed
-  aggregate emission) belongs in `lower/`. Anything that recognizes
-  a static-analysis opportunity belongs in `opt/`.
+See `src/lower/README.md` and `src/opt/README.md` for module details.
 
-The motivation: keep the semantic surface in one place, so adding or
-deleting opt passes is a low-risk activity and reasoning about
-correctness doesn't span the whole pipeline. See `src/lower/README.md`
-and `src/opt/README.md` for the per-module details.
+## Where optimizations go
+
+**Rule of thumb:** if an optimization is meaningful in `eval` mode
+(no codegen, just the interpreter), it belongs in `src/opt/`. If it
+requires reasoning about specific machine instructions, registers,
+or addressing modes, it belongs in `src/codegen/`. Default to `opt/`
+when ambiguous — more reusable.
+
+Concrete:
+
+- Const folding (`BinOp(Const,Const) → Const`) → `opt/` (helps eval).
+- Dead branch elimination (Branch with Const cond → Jump) → `opt/`.
+- Narrow-store elimination (skip `mov W,W` when register's high bits
+  are provably zero) → `codegen/`.
+- Static-ref tracking for rc-skip → `codegen/` (codegen owns the
+  rc-emit decision; SSA still carries the rc op).
+- Address-mode selection, register allocation → `codegen/`.
+
+**Anti-pattern:** a codegen-level fact lattice that duplicates
+SSA-level const-prop. If you find yourself doing const-prop at
+codegen, strengthen the SSA pass instead.
+
+## Invariants and validation
+
+Each pass documents its **pre-** and **post-conditions** at the
+function level. `ssa::validate::validate` runs at every pass
+boundary (see `check(module, "<pass>")` in `main.rs`). Validator
+catches: unterminated blocks, block-arg arity mismatch, use-before-def,
+mismatched Call arity / Return arity, mismatched types at use sites.
+
+When the validator can't enforce an invariant: add an `assert!` at
+the pass entry with the invariant in the message, and a regression
+test that trips it if violated.
+
+## Make illegal states unrepresentable
+
+Prefer encoding invariants in types over `// INVARIANT:` comments +
+runtime assertions:
+
+- **Newtypes for distinct concepts.** `BlockId(usize)`, `VReg(u8)`,
+  `Label::{Data,Block,Func}` already do this. If you write
+  `// idx into module.functions`, wrap it.
+- **Enums to enumerate cases.** `Terminator` makes "block without a
+  terminator" unrepresentable; `MInst` makes "operand with wrong
+  shape" unrepresentable. Reach for an enum before adding a flag arg.
+- **Avoid sentinel values when an enum would do.** Eval-mode's
+  `RC_STATIC = u64::MAX` is the canonical anti-example — works,
+  but lets you accidentally overflow into "valid" rc. An
+  `Rc::{Static, Counted(u32)}` enum would catch the mistake.
+- **`Result<T,E>` for fallible ops.** Don't return `T` with a magic
+  error value; don't panic in library code a caller might recover from.
+- **Distinct types for distinct kinds.** `Ptr` vs `RcPtr` in SSA.
+  Don't merge them — the distinction enforces the static-vs-heap
+  flow at compile time.
+
+When the type system can't carry the invariant, a builder API that
+rejects invalid construction at the call site is the next best move.
+
+## Gold-standard checklist
+
+Use this when reviewing a pass or module, or cleaning one up:
+
+- [ ] **Single responsibility.** The module's docstring states it in
+      one sentence.
+- [ ] **Pre/post invariants documented.** Function-level docs say what
+      input shape is expected and what's guaranteed on output.
+- [ ] **No silent correctness traps.** `debug_assert!` is for
+      perf-critical checks whose violation is a bug but not a memory
+      corruption. For correctness checks, use `assert!`.
+- [ ] **No HashMap iteration order in observable output.** If
+      iteration order affects emitted bytes, sort first.
+- [ ] **No duplication across layers.** Const-prop in `opt/` AND
+      `codegen/` is a smell — pick one home and reuse.
+- [ ] **Independently deletable** (for opt passes).
+- [ ] **Test fails if the pass is removed** (for lowering). If you
+      delete the pass and the suite still passes, the test coverage
+      is wrong, not the pass.
+- [ ] **Regression test for every fixed bug.**
+- [ ] **Comments explain *why*, not *what*.** Well-named identifiers
+      carry "what." Hidden constraints, subtle invariants, and
+      workarounds need comments. Don't reference current task,
+      caller, or fix history — that rots.
+- [ ] **No back-compat shims after the migration completes.** If you
+      build a "transitional" two-API thing, remove the old API in
+      the same change that finishes the migration.
