@@ -303,6 +303,32 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             Ok(record_slots[offset..offset + count].to_vec())
         }
 
+        ExprKind::Is { expr, pattern } => {
+            // `expr : pattern` is sugar for a 2-arm Match returning Bool.
+            //   match expr of pattern -> True | _ -> False
+            let scrutinee = lower_expr(ctx, expr)?;
+            let pat = lower_pattern(pattern)?;
+            let bool_ty = ast.ty.clone();
+            let true_body = Expr::Con {
+                tag: "True".to_string(),
+                args: vec![],
+                ty: bool_ty.clone(),
+            };
+            let false_body = Expr::Con {
+                tag: "False".to_string(),
+                args: vec![],
+                ty: bool_ty.clone(),
+            };
+            Ok(vec![Expr::Match {
+                scrutinee: Box::new(scrutinee),
+                arms: vec![
+                    MatchArm { pattern: pat, body: true_body },
+                    MatchArm { pattern: Pattern::Wildcard, body: false_body },
+                ],
+                ty: bool_ty,
+            }])
+        }
+
         ExprKind::If { expr, arms, else_body } => {
             // Single-slot If only for now — multi-slot If requires
             // per-slot duplication, deferred to a follow-on commit.
