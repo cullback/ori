@@ -24,13 +24,14 @@
 use std::collections::HashMap;
 
 use crate::ast::BinOp as AstBinOp;
+use crate::lower::constructor::structural_con_layout;
 use crate::passes::decl_info::resolve_scalar_type;
 use crate::ssa::instruction::{BinaryOp, ScalarType};
 use crate::ssa::{Builder, Value};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::engine::Type;
 
-use super::expr::{Expr, Literal};
+use super::expr::{Expr, Literal, MatchArm, Pattern};
 
 /// Lowering context. Mutable: tracks the current locals map as `Let`s
 /// extend it; the `Builder` is borrowed mutably and accumulates the
@@ -111,56 +112,123 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
     }
 }
 
-/// Lower a `Match` to SSA. v0 scope: arms must be **Wildcard** or
-/// **Binding** only. Constructor / IntLit / StrLit patterns land
-/// next — they need tag-extraction logic and either an SSA branch
-/// chain or a SwitchInt.
+/// Lower a `Match` to SSA. Supported shapes:
 ///
-/// For the all-wildcard/binding case the dispatch is trivial: the
-/// first arm always matches. We emit:
+/// 1. **Single-arm Wildcard / Binding** — trivial: the arm always runs.
+/// 2. **Multi-arm Constructor** dispatch over **fieldless** tag unions
+///    — emits a `SwitchInt` on the scalar discriminant; each arm has
+///    its own block; results merge into a block-param of the result
+///    type.
 ///
-///   <evaluate scrutinee>
-///   <arm 0 body — with Binding's symbol bound to scrutinee>
-///   <branch to merge with the body's result>
-///
-/// Since exactly one arm runs (the first), we don't actually need a
-/// merge block in this slice — the body's last value is the result.
-/// Multi-arm dispatch lands when Constructor patterns do.
+/// Still unsupported in this slice:
+/// - Non-fieldless unions (need to decompose into `(tag, payload)` and
+///   bind field values from the payload).
+/// - `IntLit` / `StrLit` patterns (chain of equality checks).
+/// - Mixed pattern kinds in one Match.
 fn lower_match(
     ctx: &mut Ctx<'_>,
     scrutinee: &Expr,
-    arms: &[super::expr::MatchArm],
-    _ty: &Type,
+    arms: &[MatchArm],
+    ty: &Type,
 ) -> Result<Value, String> {
+    let scrutinee_ty = scrutinee.ty().clone();
     let scrutinee_val = lower(ctx, scrutinee)?;
 
-    // For now: require exactly one Wildcard or Binding arm. This is
-    // enough for `match x of _ -> body` patterns and for `if` with
-    // a final else-Wildcard arm. Multi-arm constructor dispatch
-    // lands as a follow-on.
-    let [arm] = arms else {
-        return Err(format!(
-            "core::to_ssa: Match with {} arms not yet supported (v0 handles 1)",
-            arms.len()
-        ));
+    // Single-arm wildcard / binding: no dispatch needed.
+    if arms.len() == 1 {
+        let arm = &arms[0];
+        match &arm.pattern {
+            Pattern::Wildcard => return lower(ctx, &arm.body),
+            Pattern::Binding(sym) => {
+                let prev = ctx.locals.insert(*sym, scrutinee_val);
+                let result = lower(ctx, &arm.body);
+                match prev {
+                    Some(p) => { ctx.locals.insert(*sym, p); }
+                    None => { ctx.locals.remove(sym); }
+                }
+                return result;
+            }
+            _ => {}
+        }
+    }
+
+    // Multi-arm dispatch — require all arms to be Constructor with
+    // no field binders (fieldless unions), or Wildcard (default).
+    // Mixed patterns or payload-carrying constructors are deferred.
+    let result_scalar = resolve_scalar_type(ty, &ctx.fieldless);
+
+    let mut constructor_arms: Vec<(u64, &MatchArm)> = Vec::new();
+    let mut default_arm: Option<&MatchArm> = None;
+    for arm in arms {
+        match &arm.pattern {
+            Pattern::Constructor { tag, binders } => {
+                if !binders.is_empty() {
+                    return Err(format!(
+                        "core::to_ssa: Match arm for `{tag}` carries field binders \
+                         (non-fieldless union not yet supported)"
+                    ));
+                }
+                let (tag_idx, _, _) =
+                    structural_con_layout(&scrutinee_ty, tag, &ctx.fieldless);
+                constructor_arms.push((tag_idx, arm));
+            }
+            Pattern::Wildcard => {
+                if default_arm.is_some() {
+                    return Err("core::to_ssa: Match has multiple Wildcard arms".into());
+                }
+                default_arm = Some(arm);
+            }
+            other => {
+                return Err(format!(
+                    "core::to_ssa: Match pattern in multi-arm dispatch not yet supported: {other:?}"
+                ));
+            }
+        }
+    }
+
+    // Set up: merge block with a result block-param. Each arm gets
+    // its own body block; from the body we jump to merge with its
+    // result.
+    let tag_block = ctx.builder.current_block.expect("expected current block");
+    let merge = ctx.builder.create_block();
+    let merge_param = ctx.builder.add_block_param(merge, result_scalar);
+
+    // Materialize each arm's body block + lower its body, jumping
+    // to merge with the body's result.
+    let mut arm_blocks: Vec<(u64, crate::ssa::BlockId)> = Vec::new();
+    for (tag_idx, arm) in &constructor_arms {
+        let b = ctx.builder.create_block();
+        ctx.builder.switch_to(b);
+        let body_val = lower(ctx, &arm.body)?;
+        ctx.builder.jump(merge, vec![body_val]);
+        arm_blocks.push((*tag_idx, b));
+    }
+    let default_block = if let Some(arm) = default_arm {
+        let b = ctx.builder.create_block();
+        ctx.builder.switch_to(b);
+        let body_val = lower(ctx, &arm.body)?;
+        ctx.builder.jump(merge, vec![body_val]);
+        Some(b)
+    } else {
+        None
     };
 
-    match &arm.pattern {
-        super::expr::Pattern::Wildcard => lower(ctx, &arm.body),
-        super::expr::Pattern::Binding(sym) => {
-            // Bind the scrutinee to this symbol for the arm body.
-            let prev = ctx.locals.insert(*sym, scrutinee_val);
-            let result = lower(ctx, &arm.body);
-            match prev {
-                Some(p) => { ctx.locals.insert(*sym, p); }
-                None => { ctx.locals.remove(sym); }
-            }
-            result
-        }
-        other => Err(format!(
-            "core::to_ssa: Match pattern not yet supported: {other:?}"
-        )),
-    }
+    // Back at the tag block: emit the dispatch.
+    ctx.builder.switch_to(tag_block);
+    let switch_arms: Vec<(u64, crate::ssa::BlockId, Vec<Value>)> = arm_blocks
+        .iter()
+        .map(|(idx, b)| (*idx, *b, vec![]))
+        .collect();
+    ctx.builder.switch_int(
+        scrutinee_val,
+        switch_arms,
+        default_block.map(|b| (b, vec![])),
+    );
+
+    // Continue lowering in the merge block — its block-param is the
+    // result Value.
+    ctx.builder.switch_to(merge);
+    Ok(merge_param)
 }
 
 /// Map AST-level `BinOp` to SSA-level `BinaryOp`. They're a 1:1
@@ -390,6 +458,86 @@ mod tests {
         crate::ssa::eval::load_statics(&module, &mut heap);
         let result = crate::ssa::eval::eval(&module, &mut heap, &[]);
         assert_eq!(result, crate::ssa::eval::Scalar::I64(30));
+    }
+
+    #[test]
+    fn lowers_match_with_two_fieldless_constructor_arms() {
+        // Core for: match (U8 = 1) of True -> 100; False -> 200
+        // The scrutinee carries TagUnion type [True, False]; structural
+        // layout sorts alphabetically (False=0, True=1) so the value 1
+        // selects the True arm. Expected: 100.
+        let bool_ty = Type::TagUnion {
+            tags: vec![
+                ("True".to_string(), vec![]),
+                ("False".to_string(), vec![]),
+            ],
+            rest: None,
+        };
+        // The scrutinee Value type matches what fieldless unions
+        // lower to — a U8 discriminant.
+        let scrutinee = Expr::Lit {
+            value: Literal::Int(1),  // True (after alphabetical sort: False=0, True=1)
+            ty: bool_ty.clone(),
+        };
+        let arms = vec![
+            MatchArm {
+                pattern: Pattern::Constructor { tag: "True".to_string(), binders: vec![] },
+                body: Expr::Lit { value: Literal::Int(100), ty: i64_ty() },
+            },
+            MatchArm {
+                pattern: Pattern::Constructor { tag: "False".to_string(), binders: vec![] },
+                body: Expr::Lit { value: Literal::Int(200), ty: i64_ty() },
+            },
+        ];
+        let core = Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            ty: i64_ty(),
+        };
+
+        let symbols = SymbolTable::new();
+        let mut builder = Builder::new();
+        let _entry = builder.create_block();
+        builder.switch_to(crate::ssa::BlockId(0));
+        // The scrutinee path through the Lit-Int lowering doesn't know
+        // about U8 discriminant typing — emit a U8 const first and
+        // bind it to a sentinel symbol, then have the Match reference
+        // that symbol.
+        let sentinel = SymbolId(9999);
+        let one_u8 = builder.const_u8(1);
+
+        let mut fieldless = HashMap::new();
+        fieldless.insert("Bool".to_string(), ScalarType::U8);
+        let mut locals = HashMap::new();
+        locals.insert(sentinel, one_u8);
+        let mut ctx = Ctx {
+            builder: &mut builder,
+            symbols: &symbols,
+            locals,
+            fieldless,
+        };
+
+        let core_with_var = Expr::Match {
+            scrutinee: Box::new(Expr::Var { sym: sentinel, ty: bool_ty }),
+            arms: match &core {
+                Expr::Match { arms, .. } => arms.clone(),
+                _ => unreachable!(),
+            },
+            ty: i64_ty(),
+        };
+        let result = lower(&mut ctx, &core_with_var).expect("lowering should succeed");
+        // Re-borrow builder after ctx drops.
+        drop(ctx);
+        builder.ret(result);
+        builder.finish_function("test", ScalarType::I64);
+        let module = builder.build("test");
+        crate::ssa::validate::check(&module, "match e2e");
+
+        let mut heap = crate::ssa::eval::new_heap();
+        crate::ssa::eval::load_statics(&module, &mut heap);
+        let r = crate::ssa::eval::eval(&module, &mut heap, &[]);
+        assert_eq!(r, crate::ssa::eval::Scalar::I64(100),
+            "expected True arm (value 100) to fire; got {r:?}");
     }
 
     #[test]
