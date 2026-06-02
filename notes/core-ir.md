@@ -129,10 +129,12 @@ is a Core-level transformation). We can revisit that.
 
 ## The IR
 
-Eight primitives, post-lambda-lift, post-mono, typed, direct-style.
+Eight **structural** primitives + one **scalar** primitive, post-
+lambda-lift, post-mono, typed, direct-style.
 
 ```rust
 enum Core {
+    // Structural — participate in algebraic rewrites
     Var(VarId),                            // typed variable reference
     Lit(Literal),                          // typed scalar literal
     App(FuncId, Vec<Core>),                // first-order call to known top-level
@@ -141,8 +143,18 @@ enum Core {
     Cata(Box<Core>, Box<Core>, Box<Core>), // structural recursion (the ONLY iteration)
     Con(TagId, Vec<Core>),                 // tag-union constructor
     Record(Vec<(FieldId, Core)>),          // non-tagged aggregate
+
+    // Scalar — pass-through to SSA, never touched by fusion
+    BinOp(BinOp, Box<Core>, Box<Core>),    // arithmetic / comparison / boolean
 }
 ```
+
+Note on the split: scalar `BinOp` could be expressed as `App(intrinsic_sym, [lhs, rhs])`,
+matching GHC's approach where primops are functions with special `Id`s.
+We chose the dedicated node instead — `App` then unambiguously means
+"call a user or library function," and we avoid needing an intrinsic-symbol
+registry for what's ultimately pass-through to SSA. The algebraic
+rewrite system doesn't see `BinOp` at all.
 
 Plus the supporting types: `VarId`, `FuncId`, `TagId`, `FieldId`,
 `Literal`, `MatchArm { pattern, body }`, `Pattern { constructor, binders }`.

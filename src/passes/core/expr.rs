@@ -23,6 +23,7 @@
 //! Core direct-style; ANF normalization happens between Core and
 //! SSA if needed.
 
+use crate::ast::BinOp as AstBinOp;
 use crate::symbol::SymbolId;
 use crate::types::engine::Type;
 
@@ -144,6 +145,19 @@ pub enum Expr {
         fields: Vec<(FieldId, Expr)>,
         ty: Type,
     },
+
+    /// `BinOp(op, lhs, rhs, type)` — scalar arithmetic / comparison /
+    /// bitwise / boolean operator. **Not** modeled as `App` to an
+    /// intrinsic symbol — scalar primitives sit outside the algebraic
+    /// rewrite system (fusion laws don't touch them) and `App` should
+    /// mean "call a user or library function." Treating binops as App
+    /// would force an intrinsic-symbol registry for no payoff.
+    BinOp {
+        op: AstBinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        ty: Type,
+    },
 }
 
 impl Expr {
@@ -158,7 +172,8 @@ impl Expr {
             | Self::Match { ty, .. }
             | Self::Cata { ty, .. }
             | Self::Con { ty, .. }
-            | Self::Record { ty, .. } => ty,
+            | Self::Record { ty, .. }
+            | Self::BinOp { ty, .. } => ty,
         }
     }
 }

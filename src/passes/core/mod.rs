@@ -4,11 +4,11 @@
 //! properties unlock, and the empirical gate that justifies adding
 //! rules incrementally.
 //!
-//! ## Eight primitives
+//! ## Primitives
 //!
-//! Post-lambda-lift, post-mono, typed, direct-style. Every primitive
-//! has a corresponding algebraic-rewrite home — that's the test for
-//! whether the IR is "right" vs carrying dead structure.
+//! Post-lambda-lift, post-mono, typed, direct-style. Eight
+//! **structural** primitives — each carries an algebraic rewrite
+//! home, the test for whether the IR earns its shape:
 //!
 //! - `Var` — variable reference
 //! - `Lit` — scalar literal
@@ -18,6 +18,13 @@
 //! - `Cata` — structural recursion (the **only** iteration primitive)
 //! - `Con` — tag-union constructor
 //! - `Record` — non-tagged aggregate
+//!
+//! Plus one **scalar** primitive, `BinOp`, for arithmetic / comparison
+//! / bitwise / boolean operators. Scalar ops sit outside the
+//! algebraic rewrite system (fusion never touches them); they could
+//! be modeled as `App` to intrinsic symbols, but that adds plumbing
+//! for no payoff. Treating them as a dedicated node keeps `App` to
+//! mean "call a user or library function," which is more honest.
 //!
 //! ## Status
 //!

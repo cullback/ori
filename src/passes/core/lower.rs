@@ -59,6 +59,13 @@ pub fn lower_expr(ast: &AstExpr<'_>) -> Result<Expr, String> {
 
         ExprKind::Block(stmts, last) => lower_block(stmts, last),
 
+        ExprKind::BinOp { op, lhs, rhs } => Ok(Expr::BinOp {
+            op: *op,
+            lhs: Box::new(lower_expr(lhs)?),
+            rhs: Box::new(lower_expr(rhs)?),
+            ty: ast.ty.clone(),
+        }),
+
         // Everything else: not yet implemented. We surface the
         // discriminant name so debugging tells us exactly which
         // variant to add next.
@@ -213,6 +220,25 @@ mod tests {
             panic!("expected inner Var");
         };
         assert_eq!(got, y);
+    }
+
+    #[test]
+    fn lowers_binop() {
+        use crate::ast::BinOp;
+        let lhs = AstExpr::typed(ExprKind::IntLit(1), dummy_span(), i64_ty());
+        let rhs = AstExpr::typed(ExprKind::IntLit(2), dummy_span(), i64_ty());
+        let add = AstExpr::typed(
+            ExprKind::BinOp { op: BinOp::Add, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+            dummy_span(),
+            i64_ty(),
+        );
+        let core = lower_expr(&add).unwrap();
+        let Expr::BinOp { op, lhs, rhs, .. } = core else {
+            panic!("expected BinOp, got {core:?}");
+        };
+        assert_eq!(op, BinOp::Add);
+        assert!(matches!(*lhs, Expr::Lit { value: Literal::Int(1), .. }));
+        assert!(matches!(*rhs, Expr::Lit { value: Literal::Int(2), .. }));
     }
 
     #[test]
