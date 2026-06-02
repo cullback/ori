@@ -693,8 +693,11 @@ fn runtime_shim() -> Vec<MInst> {
 ///   [ARGS .. ARENA_SIZE)                 : bump heap
 const STDIN_RAW_SIZE: u16 = 0x800;       // 2 KiB raw bytes from read
 const STDIN_SPREAD_SIZE: u16 = 0x4000;   // 16 KiB (2 KiB * 8)
-const ARENA_SIZE: u16 = 0xF000;          // 60 KiB — keep ≤ 16-bit movz range
-                                          // (~40 KiB of bump heap after fixed setup)
+/// Total arena size, in units of 16 (so the value fits a 16-bit movz
+/// with LSL #16: `imm << 16 = bytes`). 0x10 << 16 = 1 MiB; 0x100 << 16
+/// = 16 MiB. Bench programs (5000 md5 hashes) need ~50 MiB without RC,
+/// so we'd want ~512 here. We start at 256 (= 16 MiB).
+const ARENA_SIZE_HIGH16: u16 = 0x100;    // 16 MiB
 
 /// Block labels reserved for shim-internal loops. Range 0x4000_0000
 /// is free of real block labels (`(func<<16)|bid`) and synth thunks
@@ -730,9 +733,9 @@ fn entry_shim() -> Vec<MInst> {
     let addr_out = VReg(23);
 
     vec![
-        // mmap(addr=0, len=ARENA_SIZE, prot=R|W, flags=PRIVATE|ANON, fd=-1, off=0)
+        // mmap(addr=0, len=ARENA_SIZE_HIGH16<<16, prot=R|W, flags=PRIVATE|ANON, fd=-1, off=0)
         MInst::MovImm { rd: VReg(0), imm: 0 },
-        MInst::MovImm { rd: VReg(1), imm: ARENA_SIZE },
+        MInst::MovImmShl { rd: VReg(1), imm: ARENA_SIZE_HIGH16, shift: 16 },
         MInst::MovImm { rd: VReg(2), imm: 3 },         // prot = R|W
         MInst::MovImm { rd: VReg(3), imm: 0x22 },      // PRIVATE | ANON
         MInst::MovInv { rd: VReg(4), imm: 0 },         // fd = -1

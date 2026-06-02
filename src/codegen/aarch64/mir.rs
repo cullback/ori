@@ -34,6 +34,8 @@ pub enum Label {
 pub enum MInst {
     /// `MOVZ Xd, #imm16, LSL #0` — load a 16-bit unsigned immediate.
     MovImm { rd: VReg, imm: u16 },
+    /// `MOVZ Xd, #imm16, LSL #shift` — load a shifted 16-bit immediate.
+    MovImmShl { rd: VReg, imm: u16, shift: u8 },
     /// `MOVN Xd, #imm16, LSL #0` — load NOT(imm); `MOVN ..., #0` = -1.
     MovInv { rd: VReg, imm: u16 },
     /// `MOVK Xd, #imm16, LSL #(shift)` — keep other bits, patch a 16-bit chunk.

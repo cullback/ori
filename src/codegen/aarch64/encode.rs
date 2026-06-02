@@ -67,6 +67,16 @@ pub fn movz_imm16(rd: Reg, imm: u16) -> u32 {
     0xD280_0000 | (u32::from(imm) << 5) | u32::from(rd.0)
 }
 
+/// Encode `MOVZ Xd, #imm16, LSL #(shift)` — load shifted 16-bit imm.
+/// `shift` must be one of {0, 16, 32, 48}.
+#[must_use]
+pub fn movz_imm16_shl(rd: Reg, imm: u16, shift: u8) -> u32 {
+    debug_assert!(rd.0 < 32, "Rd out of range");
+    debug_assert!(matches!(shift, 0 | 16 | 32 | 48), "MOVZ shift {shift} not in {{0,16,32,48}}");
+    let hw = u32::from(shift) / 16;
+    0xD280_0000 | (hw << 21) | (u32::from(imm) << 5) | u32::from(rd.0)
+}
+
 /// Encode `MOVN Xd, #imm16, LSL #0` — load the bitwise NOT of a 16-bit
 /// immediate into a 64-bit register. `MOVN Xd, #0` is the canonical
 /// way to load `-1` (= `0xFFFF_FFFF_FFFF_FFFF`).

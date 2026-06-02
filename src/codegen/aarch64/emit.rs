@@ -75,6 +75,7 @@ fn encode_inst(inst: &MInst, inst_offset: u64, labels: &LabelMap) -> u32 {
     let v = vreg_to_phys;
     match inst {
         MInst::MovImm { rd, imm } => encode::movz_imm16(v(*rd), *imm),
+        MInst::MovImmShl { rd, imm, shift } => encode::movz_imm16_shl(v(*rd), *imm, *shift),
         MInst::MovInv { rd, imm } => encode::movn_imm16(v(*rd), *imm),
         MInst::MovkImm { rd, imm, shift } => encode::movk_imm16(v(*rd), *imm, *shift),
         MInst::MovReg { rd, rs } => encode::mov_reg(v(*rd), v(*rs)),
