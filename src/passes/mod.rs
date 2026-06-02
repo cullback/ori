@@ -13,8 +13,13 @@
 //                          language-level model and runtime semantics.
 //   9. decl_info         — build metadata tables for lowering
 //  10. reachable         — prune unreachable declarations
-//  11. ssa::lower        (not here — lives with the SSA IR)
+//  11. core              — algebraic-rewriting IR (in development; see
+//                          `notes/core-ir.md`). AST → Core lowering +
+//                          fusion rules + Core → SSA lowering.
+//  12. ssa::lower        (not here — lives with the SSA IR; consumes
+//                          Core once the Core layer is wired in)
 
+pub mod core;
 pub mod decl_info;
 pub mod flatten_patterns;
 pub mod fold_lift;
