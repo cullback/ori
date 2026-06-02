@@ -2,6 +2,12 @@ use crate::passes::resolve::Resolved;
 use crate::source::{FileId, SourceArena};
 use crate::ssa::eval::Scalar;
 
+/// Global counters: (core_taken, fallback_taken). Bumped per
+/// compile_until_lower call when ORI_TEST_CORE_STATS=1. The
+/// diagnostic test `core_coverage_summary` reads + prints.
+static CORE_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FALLBACK_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // ---- Shared pipeline helpers ----
 
 /// Parse source and run resolve (the only IO pass).
@@ -59,10 +65,21 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     let core_attempt = crate::passes::core::pipeline::lower_module(
         &mut mono, &resolved.fields, &decls,
     );
+    if std::env::var("ORI_TEST_CORE_REASONS").is_ok() {
+        if let Err(e) = &core_attempt {
+            use std::collections::HashMap;
+            static REASONS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+            let key = e.split(':').take(3).collect::<Vec<_>>().join(":");
+            let m = REASONS.get_or_init(Default::default);
+            let mut g = m.lock().unwrap();
+            *g.entry(key).or_insert(0) += 1;
+        }
+    }
     let core_module = core_attempt.ok().filter(|m| {
         let r = crate::ssa::validate::validate(m);
         r.is_clean() && r.warnings.is_empty()
     });
+    let used_core = core_module.is_some();
     let (ssa_module, input_vals) = if let Some(m) = core_module {
         let main_params = m.functions.get("__main")
             .map(|f| f.params.clone())
@@ -71,6 +88,11 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     } else {
         crate::lower::lower(&mono, &resolved.fields).unwrap()
     };
+    if used_core {
+        CORE_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        FALLBACK_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     crate::ssa::validate::check(&ssa_module, "lower");
     (ssa_module, input_vals)
 }
@@ -4585,6 +4607,18 @@ main = |n| helper(n) + 1
     let result = crate::ssa::eval::eval(&module, &mut heap, &[Scalar::I64(5)]);
     assert_eq!(result, Scalar::I64(11),
         "helper(5) + 1 should evaluate to 11");
+}
+
+#[test]
+#[ignore = "diagnostic; run with --ignored to see Core coverage"]
+fn core_coverage_summary() {
+    let core = CORE_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+    let fb = FALLBACK_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "Core coverage across the test-suite run that just happened:\n  \
+         used Core: {core}\n  fellback: {fb}\n  pct Core: {:.1}%",
+        100.0 * core as f64 / (core + fb).max(1) as f64
+    );
 }
 
 #[test]
