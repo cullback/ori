@@ -174,33 +174,46 @@ fn emit_load(v: Value, reg: VReg, frame: &Frame, out: &mut Vec<MInst>) {
     });
 }
 
-/// Emit `str Xreg, [sp, #slot]` for the value `v`.
-///
-/// If `v.ty` is narrower than 64 bits, the source register's high
-/// bits are first cleared so the slot's full 8 bytes reflect a
-/// canonical N-bit value. This keeps subsequent loads + comparisons
-/// honest when arithmetic on a narrow type would otherwise leak carry
-/// into the upper bits.
-fn emit_store(v: Value, reg: VReg, frame: &Frame, out: &mut Vec<MInst>) {
+/// Emit `str Xreg, [sp, #slot]` for the value `v`. If `v.ty` is
+/// narrower than 64 bits and the Facts lattice can't already prove
+/// the value fits, prepend a narrowing op (`mov Wreg,Wreg` for U32 or
+/// `and reg, reg, #mask` for U8/U16).
+fn emit_store(
+    v: Value,
+    reg: VReg,
+    frame: &Frame,
+    facts: &HashMap<usize, super::facts::Facts>,
+    out: &mut Vec<MInst>,
+) {
     use crate::ssa::ScalarType;
-    match v.ty {
-        ScalarType::U32 | ScalarType::I32 => {
-            // `mov Wreg, Wreg` zero-extends low 32 bits to 64.
-            out.push(MInst::MovWReg { rd: reg, rs: reg });
+    let needed_zh = match v.ty {
+        ScalarType::U8 | ScalarType::I8 => 56_u8,
+        ScalarType::U16 | ScalarType::I16 => 48,
+        ScalarType::U32 | ScalarType::I32 => 32,
+        _ => 0,
+    };
+    let already_narrow = facts
+        .get(&v.id)
+        .copied()
+        .map_or(0, super::facts::Facts::known_zero_high_bits)
+        >= needed_zh;
+    if needed_zh > 0 && !already_narrow {
+        match v.ty {
+            ScalarType::U32 | ScalarType::I32 => {
+                out.push(MInst::MovWReg { rd: reg, rs: reg });
+            }
+            ScalarType::U8 | ScalarType::I8 | ScalarType::U16 | ScalarType::I16 => {
+                let mask = if matches!(v.ty, ScalarType::U16 | ScalarType::I16) {
+                    0xFFFF_u16
+                } else {
+                    0xFF_u16
+                };
+                let tmp = if reg == VReg(12) { VReg(13) } else { VReg(12) };
+                out.push(MInst::MovImm { rd: tmp, imm: mask });
+                out.push(MInst::AndReg { rd: reg, rn: reg, rm: tmp });
+            }
+            _ => {}
         }
-        ScalarType::U8 | ScalarType::I8 | ScalarType::U16 | ScalarType::I16 => {
-            // Mask to byte/halfword width. Use SCRATCH_C-adjacent reg
-            // for the mask constant; this must not collide with `reg`.
-            let mask = if matches!(v.ty, ScalarType::U16 | ScalarType::I16) {
-                0xFFFF_u16
-            } else {
-                0xFF_u16
-            };
-            let tmp = if reg == VReg(12) { VReg(13) } else { VReg(12) };
-            out.push(MInst::MovImm { rd: tmp, imm: mask });
-            out.push(MInst::AndReg { rd: reg, rn: reg, rm: tmp });
-        }
-        _ => {} // U64, RcPtr, Ptr, F64: pass through unchanged.
     }
     out.push(MInst::StrImm64 {
         rt: reg,
@@ -223,7 +236,7 @@ fn lower_inst(
     match inst {
         Inst::StaticRef(dest, idx) => {
             out.push(MInst::AdrLabel { rd: SCRATCH_C, label: Label::Data(*idx as u32) });
-            emit_store(*dest, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         Inst::RcInc(v) | Inst::RcDec(v) => {
             // Still no-op for the bump allocator (Phase 5e), but
@@ -243,7 +256,7 @@ fn lower_inst(
                     out.push(MInst::MovkImm { rd: SCRATCH_C, imm: chunk, shift });
                 }
             }
-            emit_store(*dest, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         Inst::Alloc(dest, size) => {
             // Size-tracked: alloc 8 bytes of header + size bytes of payload.
@@ -259,7 +272,7 @@ fn lower_inst(
             out.push(MInst::StrImm64 { rt: SCRATCH_B, rn: SCRATCH_A, byte_offset: 0 }); // store size header
             out.push(MInst::AddImm { rd: SCRATCH_C, rn: SCRATCH_A, imm: 8 });       // user_ptr
             out.push(MInst::AddImm { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, imm: aligned_payload + 8 });
-            emit_store(*dest, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         Inst::AllocDyn(dest, size_val) => {
             // Same as Alloc but size is a runtime value. Caller is
@@ -270,7 +283,7 @@ fn lower_inst(
             out.push(MInst::AddImm { rd: SCRATCH_C, rn: SCRATCH_A, imm: 8 });            // user_ptr
             out.push(MInst::AddReg { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, rm: SCRATCH_B });
             out.push(MInst::AddImm { rd: HEAP_BUMP_REG, rn: HEAP_BUMP_REG, imm: 8 });
-            emit_store(*dest, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         Inst::CowResizeDyn(dest, ptr, new_size) => {
             // Allocate a new buffer of `new_size` bytes, copy
@@ -320,7 +333,7 @@ fn lower_inst(
             out.push(MInst::B { target: Label::Block(loop_id) });
             out.push(MInst::BlockStart { idx: done_id });
 
-            emit_store(*dest, new_user, frame, out);
+            emit_store(*dest, new_user, frame, facts, out);
         }
         Inst::Store(ptr, offset, val) => {
             assert!(*offset <= 0x7FF8, "Store offset {offset} out of range");
@@ -334,7 +347,7 @@ fn lower_inst(
             assert!(offset.is_multiple_of(8), "Load offset must be 8-aligned");
             emit_load(*ptr, SCRATCH_A, frame, out);
             out.push(MInst::LdrImm64 { rt: SCRATCH_C, rn: SCRATCH_A, byte_offset: *offset as u32 });
-            emit_store(*dest, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         Inst::LoadDyn(dest, ptr, idx_val) => {
             // Stride 8 uniformly (eval semantics). addr = ptr + idx*8.
@@ -342,7 +355,7 @@ fn lower_inst(
             emit_load(*idx_val, SCRATCH_B, frame, out);
             out.push(MInst::AddRegLsl3 { rd: SCRATCH_C, rn: SCRATCH_A, rm: SCRATCH_B });
             out.push(MInst::LdrImm64 { rt: SCRATCH_C, rn: SCRATCH_C, byte_offset: 0 });
-            emit_store(*dest, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         Inst::StoreDyn(ptr, idx_val, val) => {
             emit_load(*ptr, SCRATCH_A, frame, out);
@@ -369,7 +382,7 @@ fn lower_inst(
                         out.push(MInst::MovkImm { rd: SCRATCH_C, imm: chunk, shift });
                     }
                 }
-                emit_store(*dest, SCRATCH_C, frame, out);
+                emit_store(*dest, SCRATCH_C, frame, facts, out);
                 return;
             }
             emit_load(*lhs, SCRATCH_A, frame, out);
@@ -404,7 +417,7 @@ fn lower_inst(
                 }
                 other => panic!("Phase 5e: unsupported BinOp {other:?}"),
             }
-            emit_store(*dest, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         Inst::Call { results, target, args } => {
             // Builtin: `__crash` is the runtime panic helper called from
@@ -434,7 +447,7 @@ fn lower_inst(
             for (i, r) in results.iter().enumerate() {
                 #[expect(clippy::cast_possible_truncation, reason = "≤ 8 returns")]
                 let src_reg = VReg(i as u8);
-                emit_store(*r, src_reg, frame, out);
+                emit_store(*r, src_reg, frame, facts, out);
             }
         }
         Inst::Cast(dest, src) | Inst::BitCast(dest, src) => {
@@ -443,7 +456,7 @@ fn lower_inst(
             // is also a slot copy (high bits get carried but Ori
             // semantics check the narrowed width at use sites).
             emit_load(*src, SCRATCH_C, frame, out);
-            emit_store(*dest, SCRATCH_C, frame, out);
+            emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
         other => panic!("Phase 5e: unsupported SSA inst: {other:?}"),
     }
@@ -467,6 +480,7 @@ fn emit_edge_moves(
     dest_block: BlockId,
     func: &Function,
     frame: &Frame,
+    facts: &HashMap<usize, super::facts::Facts>,
     out: &mut Vec<MInst>,
 ) {
     let dest = func.blocks.get(&dest_block).expect("edge to nonexistent block");
@@ -476,7 +490,7 @@ fn emit_edge_moves(
             continue;
         }
         emit_load(*arg, SCRATCH_A, frame, out);
-        emit_store(*param, SCRATCH_A, frame, out);
+        emit_store(*param, SCRATCH_A, frame, facts, out);
     }
 }
 
@@ -520,7 +534,7 @@ fn lower_terminator(
             }
         }
         Terminator::Jump(edge) => {
-            emit_edge_moves(edge, edge.target, func, frame, out);
+            emit_edge_moves(edge, edge.target, func, frame, facts, out);
             out.push(MInst::B { target: block_label(func_idx, edge.target) });
         }
         Terminator::Branch { cond, then_edge, else_edge } => {
@@ -529,7 +543,7 @@ fn lower_terminator(
             // taken arm's edge moves + jump.
             if let Facts::Const(c) = fact_of(*cond) {
                 let edge = if c != 0 { then_edge } else { else_edge };
-                emit_edge_moves(edge, edge.target, func, frame, out);
+                emit_edge_moves(edge, edge.target, func, frame, facts, out);
                 out.push(MInst::B { target: block_label(func_idx, edge.target) });
                 return;
             }
@@ -537,10 +551,10 @@ fn lower_terminator(
             out.push(MInst::CmpImm { rn: SCRATCH_A, imm: 0 });
             let thunk_id = synth_branch_thunk_id(func_idx, then_edge.target);
             out.push(MInst::BCond { cond: Cond::Ne, target: Label::Block(thunk_id) });
-            emit_edge_moves(else_edge, else_edge.target, func, frame, out);
+            emit_edge_moves(else_edge, else_edge.target, func, frame, facts, out);
             out.push(MInst::B { target: block_label(func_idx, else_edge.target) });
             out.push(MInst::BlockStart { idx: thunk_id });
-            emit_edge_moves(then_edge, then_edge.target, func, frame, out);
+            emit_edge_moves(then_edge, then_edge.target, func, frame, facts, out);
             out.push(MInst::B { target: block_label(func_idx, then_edge.target) });
         }
         Terminator::SwitchInt { scrutinee, arms, default } => {
@@ -554,7 +568,7 @@ fn lower_terminator(
                     .map(|(_, e)| e)
                     .or(default.as_ref());
                 if let Some(edge) = edge {
-                    emit_edge_moves(edge, edge.target, func, frame, out);
+                    emit_edge_moves(edge, edge.target, func, frame, facts, out);
                     out.push(MInst::B { target: block_label(func_idx, edge.target) });
                 } else {
                     out.push(MInst::Brk { imm: 0 });
@@ -571,7 +585,7 @@ fn lower_terminator(
             }
             match default {
                 Some(edge) => {
-                    emit_edge_moves(edge, edge.target, func, frame, out);
+                    emit_edge_moves(edge, edge.target, func, frame, facts, out);
                     out.push(MInst::B { target: block_label(func_idx, edge.target) });
                 }
                 None => out.push(MInst::Brk { imm: 0 }),
@@ -580,7 +594,7 @@ fn lower_terminator(
                 #[expect(clippy::cast_possible_truncation, reason = "≤ 8 arms in practice")]
                 let thunk_id = synth_switch_thunk_id(func_idx, edge.target, i as u32);
                 out.push(MInst::BlockStart { idx: thunk_id });
-                emit_edge_moves(edge, edge.target, func, frame, out);
+                emit_edge_moves(edge, edge.target, func, frame, facts, out);
                 out.push(MInst::B { target: block_label(func_idx, edge.target) });
             }
         }
@@ -589,7 +603,12 @@ fn lower_terminator(
 
 /// Emit `sub sp, sp, #FRAME`; if non-leaf, save x30 at `lr_offset`.
 /// Then spill each function parameter from x0..xN into its slot.
-fn emit_prologue(func: &Function, frame: &Frame, out: &mut Vec<MInst>) {
+fn emit_prologue(
+    func: &Function,
+    frame: &Frame,
+    facts: &HashMap<usize, super::facts::Facts>,
+    out: &mut Vec<MInst>,
+) {
     if frame.size > 0 {
         out.push(MInst::SubImm { rd: SP_REG, rn: SP_REG, imm: frame.size });
     }
@@ -600,7 +619,7 @@ fn emit_prologue(func: &Function, frame: &Frame, out: &mut Vec<MInst>) {
     for (i, p) in func.params.iter().enumerate() {
         #[expect(clippy::cast_possible_truncation, reason = "≤ 8 params")]
         let src = VReg(i as u8);
-        emit_store(*p, src, frame, out);
+        emit_store(*p, src, frame, facts, out);
     }
 }
 
@@ -878,7 +897,7 @@ fn lower_function(
         out.push(MInst::FuncStart { idx: func_idx });
     }
 
-    emit_prologue(func, &frame, out);
+    emit_prologue(func, &frame, &facts, out);
 
     for (bid, block) in &func.blocks {
         let combined = match block_label(func_idx, *bid) {

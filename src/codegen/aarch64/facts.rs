@@ -38,22 +38,54 @@ pub enum Facts {
     Bottom,
     Const(u64),
     StaticRef(usize),
+    /// The value's top `bits` MSBs are proven zero — i.e. the value
+    /// fits in `64 - bits` bits. After a `ldrb`, `KnownZeroHigh(56)`.
+    /// After a comparison, `KnownZeroHigh(63)`. Subsumes per-type
+    /// narrowing knowledge.
+    KnownZeroHigh(u8),
     Top,
 }
 
 impl Facts {
     /// Lattice meet (greatest lower bound). Used at block joins to
     /// combine facts from multiple incoming edges. Conservative: if
-    /// inputs disagree, the result is `Top`.
+    /// inputs disagree, the result is `Top`. `Const` and
+    /// `KnownZeroHigh` interact: a `Const(c)` carries an implicit
+    /// `KnownZeroHigh(c.leading_zeros())`, so meeting them produces
+    /// the looser `KnownZeroHigh` fact.
     #[must_use]
     pub fn meet(self, other: Self) -> Self {
-        use Facts::{Bottom, Const, StaticRef, Top};
+        use Facts::{Bottom, Const, KnownZeroHigh, StaticRef, Top};
         match (self, other) {
             (Bottom, x) | (x, Bottom) => x,
             (Top, _) | (_, Top) => Top,
             (Const(a), Const(b)) if a == b => Const(a),
             (StaticRef(a), StaticRef(b)) if a == b => StaticRef(a),
+            (KnownZeroHigh(a), KnownZeroHigh(b)) => KnownZeroHigh(a.min(b)),
+            (Const(c), KnownZeroHigh(k)) | (KnownZeroHigh(k), Const(c)) => {
+                let cz = c.leading_zeros() as u8;
+                KnownZeroHigh(cz.min(k))
+            }
+            (Const(a), Const(b)) => {
+                // Different consts — degrade to KnownZeroHigh of the
+                // less-specific path.
+                let za = a.leading_zeros() as u8;
+                let zb = b.leading_zeros() as u8;
+                KnownZeroHigh(za.min(zb))
+            }
             _ => Top,
+        }
+    }
+
+    /// How many top bits are proven zero. Used by emit-time consumers
+    /// to decide whether narrowing is necessary.
+    #[must_use]
+    pub fn known_zero_high_bits(self) -> u8 {
+        match self {
+            Self::Bottom => 64, // unreachable — any narrowing trivially holds
+            Self::Const(c) => c.leading_zeros() as u8,
+            Self::KnownZeroHigh(n) => n,
+            Self::StaticRef(_) | Self::Top => 0,
         }
     }
 
@@ -165,12 +197,26 @@ pub fn analyze(func: &Function) -> HashMap<usize, Facts> {
     facts
 }
 
+/// Width-implied `KnownZeroHigh` for a scalar type. After a load /
+/// cast / narrow store, the high bits are zero per the SSA's
+/// 8-byte-slot zero-pad invariant.
+fn known_zero_high_for_type(ty: crate::ssa::ScalarType) -> u8 {
+    use crate::ssa::ScalarType;
+    match ty {
+        ScalarType::U8 | ScalarType::I8 => 56,
+        ScalarType::U16 | ScalarType::I16 => 48,
+        ScalarType::U32 | ScalarType::I32 => 32,
+        _ => 0,
+    }
+}
+
 /// Per-instruction transfer function. Returns one `Facts` per dest.
 fn transfer(
     inst: &Inst,
     facts: &HashMap<usize, Facts>,
     lookup: &impl Fn(Value, &HashMap<usize, Facts>) -> Facts,
 ) -> Vec<Facts> {
+    use crate::ssa::ScalarType;
     match inst {
         Inst::Const(_, bits) => vec![Facts::Const(*bits)],
         Inst::StaticRef(_, idx) => vec![Facts::StaticRef(*idx)],
@@ -179,19 +225,41 @@ fn transfer(
             let rf = lookup(*r, facts);
             match (lf, rf) {
                 (Facts::Const(a), Facts::Const(b)) => vec![eval_binop(*op, a, b)],
+                // Comparisons always produce 0 or 1 regardless of
+                // operand facts (cset writes the full reg to 0/1).
+                _ if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::Lt | BinaryOp::Le
+                        | BinaryOp::Gt | BinaryOp::Ge
+                ) => vec![Facts::KnownZeroHigh(63)],
+                // Arithmetic on narrow types in our 64-bit register
+                // model CAN overflow into the upper 32 bits. Don't
+                // claim KZH from declared type — that would let
+                // emit_store skip a needed narrowing.
                 _ => vec![Facts::Top],
             }
         }
         Inst::Cast(_, src) | Inst::BitCast(_, src) => {
-            // Bit-preserving for our 64-bit register model — if source
-            // is a known const, the cast doesn't change its low bits.
-            // (Narrowing semantics are enforced by emit_store's mask;
-            // a Const that was wider than dest.ty would already have
-            // been folded with the appropriate width.)
+            // Bit-preserving copy in our register model — fact flows
+            // through unchanged. The dest type's narrowness is
+            // enforced at emit_store time when needed.
             vec![lookup(*src, facts)]
         }
-        // Producers we can't (yet) summarize.
-        Inst::Alloc(..) | Inst::AllocDyn(..) | Inst::Load(..) | Inst::LoadDyn(..)
+        Inst::Load(dest, _, _) | Inst::LoadDyn(dest, _, _) => {
+            // Loads from 8-byte slots return the slot's stored value.
+            // emit_store always narrows on the *previous* write, so
+            // the slot's high bits are guaranteed zero for narrow
+            // dest types — the loaded value carries that KZH.
+            let zh = known_zero_high_for_type(dest.ty);
+            if zh > 0 {
+                vec![Facts::KnownZeroHigh(zh)]
+            } else {
+                vec![Facts::Top]
+            }
+        }
+        // Producers we can't (yet) summarize. Their results go to
+        // Top — emit_store will narrow if needed.
+        Inst::Alloc(..) | Inst::AllocDyn(..)
         | Inst::Call { .. } | Inst::CowStore(..) | Inst::CowStoreDyn(..)
         | Inst::CowResizeDyn(..) | Inst::CowMoveOut { .. } => {
             inst.dests().iter().map(|_| Facts::Top).collect()
@@ -211,17 +279,31 @@ mod tests {
         Value { id, ty }
     }
 
-    /// Lattice meet behaves like a lattice: `Bottom` is identity,
-    /// `Top` absorbs, equal elements collapse, unequal ⟶ `Top`.
+    /// Lattice meet: `Bottom` is identity, `Top` absorbs, equal
+    /// elements collapse, unequal-but-comparable degrades to the
+    /// weakest fact that subsumes both (`KnownZeroHigh` when both
+    /// arms are scalar).
     #[test]
     fn meet_lattice_laws() {
+        // Bottom = identity.
         assert_eq!(Facts::Bottom.meet(Facts::Const(3)), Facts::Const(3));
         assert_eq!(Facts::Const(3).meet(Facts::Bottom), Facts::Const(3));
+        // Top absorbs.
         assert_eq!(Facts::Top.meet(Facts::Const(3)), Facts::Top);
+        // Equal elements collapse.
         assert_eq!(Facts::Const(3).meet(Facts::Const(3)), Facts::Const(3));
-        assert_eq!(Facts::Const(3).meet(Facts::Const(4)), Facts::Top);
         assert_eq!(Facts::StaticRef(0).meet(Facts::StaticRef(0)), Facts::StaticRef(0));
+        // Different consts: degrade to KnownZeroHigh of the lower
+        // bound (3 has 62 leading zeros, 4 has 61 → meet is 61).
+        assert_eq!(Facts::Const(3).meet(Facts::Const(4)), Facts::KnownZeroHigh(61));
+        // Const + KnownZeroHigh: take the lower (looser).
+        assert_eq!(
+            Facts::Const(3).meet(Facts::KnownZeroHigh(56)),
+            Facts::KnownZeroHigh(56),
+        );
+        // Disjoint static refs lose specificity entirely.
         assert_eq!(Facts::StaticRef(0).meet(Facts::StaticRef(1)), Facts::Top);
+        // Cross-category meets stay Top (scalar vs pointer).
         assert_eq!(Facts::Const(3).meet(Facts::StaticRef(0)), Facts::Top);
     }
 
