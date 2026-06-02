@@ -4363,3 +4363,22 @@ fn audit_ssa_cleanliness_inner(run_opt: bool) {
         eprintln!("{m}");
     }
 }
+
+#[test]
+fn loop_analysis_recognizes_walk() {
+    // A range-driven walk that lower emits as a header/body/exit
+    // loop with an IV (the counter) and an accumulator. The
+    // analysis should find exactly one loop in __main with step 1.
+    let source = "\
+main : I64 -> I64
+main = |n| (
+    List.range(0, 100).walk(0, |acc, _| acc + 1)
+)";
+    let module = compile_to_ssa(source);
+    let main_func = module.functions.get("__main")
+        .expect("__main not present");
+    let info = crate::ssa::loops::analyze(main_func);
+    assert!(!info.loops.is_empty(), "expected at least one loop in __main, got none.\nIR:\n{}", main_func);
+    let lp = &info.loops[0];
+    assert_eq!(lp.step, 1, "expected step=1 from range, got {}", lp.step);
+}

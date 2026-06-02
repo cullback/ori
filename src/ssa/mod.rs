@@ -2,6 +2,7 @@ pub mod builder;
 mod display;
 pub mod eval;
 pub mod instruction;
+pub mod loops;
 pub mod validate;
 
 #[allow(unused_imports)]
