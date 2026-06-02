@@ -315,6 +315,27 @@ mod tests {
         assert_eq!(out.stdout, b"nonzero", "md5(\"a\")[0] = 0x0c ≠ 0");
     }
 
+    /// Phase 5g stage 1: Facts lattice consumers shrink the binary
+    /// for programs the existing opt pipeline leaves with constant
+    /// scrutinees (the SSA still has `switch 1_u8` after const_fold;
+    /// our SwitchInt consumer collapses it to an unconditional B).
+    /// The constant-arith program should be measurably smaller than
+    /// the runtime-arith one, even though both evaluate to the same
+    /// branch.
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn facts_const_fold_shrinks_constant_arith() {
+        let constant = "main : List(Str), Str -> Result(Str, Str)\nmain = |a,i| (\n    x = 2 + 3 + 4 + 5\n    if x > 0 then Ok(\"big\") else Ok(\"small\")\n)\n";
+        let runtime = "main : List(Str), Str -> Result(Str, Str)\nmain = |a,i| (\n    x = a.len() + 1\n    if x > 0 then Ok(\"big\") else Ok(\"small\")\n)\n";
+        let (const_bytes, _) = compile_and_run_with_stdin(constant, b"");
+        let (runtime_bytes, _) = compile_and_run_with_stdin(runtime, b"");
+        assert!(
+            const_bytes.len() < runtime_bytes.len(),
+            "facts lattice should shrink the const-arith binary; got const={} runtime={}",
+            const_bytes.len(), runtime_bytes.len(),
+        );
+    }
+
     /// Phase 5f: md5_hash output round-trips as bytes. md5("a") =
     /// 0cc175b9c0f1b6a831c399e269772661.
     #[test]

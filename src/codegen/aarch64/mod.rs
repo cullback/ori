@@ -10,6 +10,7 @@
 
 pub mod emit;
 pub mod encode;
+pub mod facts;
 pub mod lower_main;
 pub mod mir;
 pub mod select;
