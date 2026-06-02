@@ -27,16 +27,20 @@ use crate::ast::BinOp as AstBinOp;
 use crate::passes::decl_info::resolve_scalar_type;
 use crate::ssa::instruction::{BinaryOp, ScalarType};
 use crate::ssa::{Builder, Value};
-use crate::symbol::SymbolId;
+use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::engine::Type;
 
 use super::expr::{Expr, Literal};
 
 /// Lowering context. Mutable: tracks the current locals map as `Let`s
 /// extend it; the `Builder` is borrowed mutably and accumulates the
-/// emitted instructions in its current block.
+/// emitted instructions in its current block. The `SymbolTable` is
+/// borrowed to resolve `App` targets to mangled name strings (SSA
+/// `Call.target` is a string, by design — keeps codegen independent
+/// of the symbol-ID allocator).
 pub struct Ctx<'b> {
     pub builder: &'b mut Builder,
+    pub symbols: &'b SymbolTable,
     pub locals: HashMap<SymbolId, Value>,
     pub fieldless: HashMap<String, ScalarType>,
 }
@@ -84,6 +88,18 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
             let ssa_op = map_binop(*op);
             Ok(ctx.builder.binop(ssa_op, l, r, result_ty))
+        }
+
+        Expr::App { target, args, ty } => {
+            // Lower each arg first (left-to-right per the language's
+            // strict eval order). Then emit the SSA call.
+            let arg_vals: Vec<Value> = args
+                .iter()
+                .map(|a| lower(ctx, a))
+                .collect::<Result<_, _>>()?;
+            let name = ctx.symbols.display(*target).to_owned();
+            let ret_ty = resolve_scalar_type(ty, &ctx.fieldless);
+            Ok(ctx.builder.call(&name, arg_vals, ret_ty))
         }
 
         _ => Err(format!(
@@ -178,8 +194,10 @@ mod tests {
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
+        let symbols = SymbolTable::new();
         let mut ctx = Ctx {
             builder: &mut builder,
+            symbols: &symbols,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
         };
@@ -207,8 +225,10 @@ mod tests {
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
+        let symbols = SymbolTable::new();
         let mut ctx = Ctx {
             builder: &mut builder,
+            symbols: &symbols,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
         };
@@ -227,13 +247,61 @@ mod tests {
     }
 
     #[test]
-    fn unbound_var_reports_symbol() {
-        let core = Expr::Var { sym: SymbolId(42), ty: i64_ty() };
+    fn lowers_app_to_ssa_call() {
+        // Build Core for `f(1, 2)` where `f` is a top-level function
+        // named "myfunc" (registered in the symbol table).
+        use crate::ast::Span;
+        use crate::source::FileId;
+        use crate::symbol::SymbolKind;
+        let mut symbols = SymbolTable::new();
+        let f = symbols.fresh(
+            "myfunc",
+            Span { file: FileId(0), start: 0, end: 0 },
+            SymbolKind::Func,
+        );
+        let core = Expr::App {
+            target: f,
+            args: vec![
+                Expr::Lit { value: Literal::Int(1), ty: i64_ty() },
+                Expr::Lit { value: Literal::Int(2), ty: i64_ty() },
+            ],
+            ty: i64_ty(),
+        };
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
         let mut ctx = Ctx {
             builder: &mut builder,
+            symbols: &symbols,
+            locals: HashMap::new(),
+            fieldless: HashMap::new(),
+        };
+        let result = lower(&mut ctx, &core).expect("lowering should succeed");
+        builder.ret(result);
+        builder.finish_function("test", ScalarType::I64);
+        let module = builder.build("test");
+        // Inspect the emitted Call instruction in the finished function.
+        let func = &module.functions["test"];
+        let entry = &func.blocks[&crate::ssa::BlockId(0)];
+        let call = entry.insts.iter().find_map(|i| {
+            if let crate::ssa::Inst::Call { target, args, .. } = i {
+                Some((target.clone(), args.clone()))
+            } else { None }
+        }).expect("expected a Call inst");
+        assert_eq!(call.0, "myfunc");
+        assert_eq!(call.1.len(), 2, "two args");
+    }
+
+    #[test]
+    fn unbound_var_reports_symbol() {
+        let core = Expr::Var { sym: SymbolId(42), ty: i64_ty() };
+        let mut builder = Builder::new();
+        let _entry = builder.create_block();
+        builder.switch_to(crate::ssa::BlockId(0));
+        let symbols = SymbolTable::new();
+        let mut ctx = Ctx {
+            builder: &mut builder,
+            symbols: &symbols,
             locals: HashMap::new(),
             fieldless: HashMap::new(),
         };

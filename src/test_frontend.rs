@@ -4365,6 +4365,71 @@ fn audit_ssa_cleanliness_inner(run_opt: bool) {
 }
 
 #[test]
+fn core_lowering_roundtrips_simple_arithmetic() {
+    // End-to-end validation that AST → Core → SSA produces a working
+    // program for the slice we've implemented so far.
+    //
+    // Source: `main = |n| n + 1`. Expected eval result on input 5: 6.
+    let source = "\
+main : I64 -> I64
+main = |n| n + 1
+";
+    let (_arena, _file_id, mut resolved) = parse_and_resolve(source);
+    let infer_result = through_infer(&mut resolved);
+    let mut mono = crate::passes::mono::specialize(
+        resolved.module,
+        infer_result,
+        resolved.symbols,
+    );
+    crate::passes::lambda::lift::lift(&mut mono);
+    let lambda_solution = crate::passes::lambda::solve::solve(&mono);
+    crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
+    crate::passes::lambda::narrow::narrow(&mut mono);
+
+    // Find the user's `main` function decl.
+    let main_decl = mono.module.decls.iter().find(|d| matches!(d,
+        crate::ast::Decl::FuncDef { name, .. }
+            if mono.symbols.display(*name) == "main"
+    )).expect("expected `main` decl");
+    let crate::ast::Decl::FuncDef { params, body, .. } = main_decl else {
+        unreachable!();
+    };
+    assert_eq!(params.len(), 1, "main takes one param");
+    let n_sym = params[0];
+
+    // Lower the body AST → Core.
+    let core_body = crate::passes::core::lower::lower_expr(body)
+        .expect("Core lowering should succeed for n + 1");
+
+    // Lower Core → SSA by hand: one function, one entry block, with
+    // `n` as a function param.
+    let mut b = crate::ssa::Builder::new();
+    let n_val = b.add_func_param(crate::ssa::ScalarType::I64);
+    let _entry = b.create_block();
+    b.switch_to(crate::ssa::BlockId(0));
+    let mut locals = std::collections::HashMap::new();
+    locals.insert(n_sym, n_val);
+    let mut ctx = crate::passes::core::to_ssa::Ctx {
+        builder: &mut b,
+        symbols: &mono.symbols,
+        locals,
+        fieldless: std::collections::HashMap::new(),
+    };
+    let result = crate::passes::core::to_ssa::lower(&mut ctx, &core_body)
+        .expect("Core→SSA should succeed");
+    b.ret(result);
+    b.finish_function("__main", crate::ssa::ScalarType::I64);
+    let module = b.build("__main");
+    crate::ssa::validate::check(&module, "core e2e");
+
+    // Eval with n=5.
+    let mut heap = crate::ssa::eval::new_heap();
+    crate::ssa::eval::load_statics(&module, &mut heap);
+    let result = crate::ssa::eval::eval(&module, &mut heap, &[Scalar::I64(5)]);
+    assert_eq!(result, Scalar::I64(6), "5 + 1 should evaluate to 6");
+}
+
+#[test]
 fn loop_analysis_recognizes_walk() {
     // A range-driven walk that lower emits as a header/body/exit
     // loop with an IV (the counter) and an accumulator. The

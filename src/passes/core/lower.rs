@@ -66,6 +66,16 @@ pub fn lower_expr(ast: &AstExpr<'_>) -> Result<Expr, String> {
             ty: ast.ty.clone(),
         }),
 
+        ExprKind::Call { target, args } => {
+            let arg_exprs: Vec<Expr> =
+                args.iter().map(lower_expr).collect::<Result<_, _>>()?;
+            Ok(Expr::App {
+                target: *target,
+                args: arg_exprs,
+                ty: ast.ty.clone(),
+            })
+        }
+
         // Everything else: not yet implemented. We surface the
         // discriminant name so debugging tells us exactly which
         // variant to add next.
