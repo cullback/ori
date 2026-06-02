@@ -38,4 +38,5 @@
 pub mod expr;
 pub mod lower;
 pub mod pipeline;
+pub mod rules;
 pub mod to_ssa;

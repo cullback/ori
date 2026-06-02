@@ -97,6 +97,10 @@ pub fn lower_module(
             })?
         };
 
+        // Apply Core-level rewrite rules. Currently algebraic
+        // identities only (x + 0, x * 1); fusion rules land here.
+        let core_body: Vec<_> = core_body.into_iter().map(super::rules::simplify).collect();
+
         // Core → SSA (immutable borrow on mono.symbols).
         let result_vals: Vec<Value> = {
             let mut ctx = to_ssa::Ctx {
