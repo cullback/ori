@@ -50,7 +50,27 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     validate_ast_types(&mono, "after lambda passes");
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
-    let (ssa_module, input_vals) = crate::lower::lower(&mono, &resolved.fields).unwrap();
+
+    // Mirror main.rs::compile — try Core first, fall back to direct
+    // AST→SSA on Err or invalid SSA. This exercises the Core path in
+    // every test that can use it; programs Core doesn't yet support
+    // (lists, payload-carrying constructors, etc.) silently fall back.
+    let decls = crate::passes::decl_info::build(&mono);
+    let core_attempt = crate::passes::core::pipeline::lower_module(
+        &mut mono, &resolved.fields, &decls,
+    );
+    let core_module = core_attempt.ok().filter(|m| {
+        let r = crate::ssa::validate::validate(m);
+        r.is_clean() && r.warnings.is_empty()
+    });
+    let (ssa_module, input_vals) = if let Some(m) = core_module {
+        let main_params = m.functions.get("__main")
+            .map(|f| f.params.clone())
+            .unwrap_or_default();
+        (m, main_params)
+    } else {
+        crate::lower::lower(&mono, &resolved.fields).unwrap()
+    };
     crate::ssa::validate::check(&ssa_module, "lower");
     (ssa_module, input_vals)
 }

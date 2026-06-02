@@ -73,7 +73,8 @@ fn compile(
         &mut mono, &resolved.fields, &decls,
     );
     let core_module = core_attempt.ok().filter(|m| {
-        ssa::validate::validate(m).is_clean()
+        let r = ssa::validate::validate(m);
+        r.is_clean() && r.warnings.is_empty()
     });
 
     let (mut ssa_module, input_vals) = if let Some(m) = core_module {

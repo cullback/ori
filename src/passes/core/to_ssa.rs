@@ -85,6 +85,15 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         }
 
         Expr::BinOp { op, lhs, rhs, ty } => {
+            // Short-circuit booleans (And/Or) need to lower as Match
+            // (left side conditional on right side's evaluation), not
+            // as a strict binop. Not yet implemented at Core level —
+            // bail so caller falls back to direct AST→SSA.
+            if matches!(op, AstBinOp::And | AstBinOp::Or) {
+                return Err(format!(
+                    "core::to_ssa: short-circuit {op:?} needs Match-desugaring (not yet implemented)"
+                ));
+            }
             let l = lower(ctx, lhs)?;
             let r = lower(ctx, rhs)?;
             let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
@@ -106,27 +115,36 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         Expr::Match { scrutinee, arms, ty } => lower_match(ctx, scrutinee, arms, ty),
 
         Expr::Con { tag, args, ty } => {
-            // Fieldless constructor — emit the discriminant scalar
-            // directly. Payload-carrying constructors need the
-            // aggregate-decomposition refactor (lower returning
-            // Vec<Value> for the (tag, payload) shape) and land
-            // when that's in place.
+            // Only fieldless unions are supported in this slice —
+            // emit the discriminant scalar. Payload-carrying unions
+            // need the (tag, payload) representation, which requires
+            // multi-slot Con lowering (returns 2 values). That ships
+            // when Core→SSA grows multi-result semantics.
+            //
+            // The "args.is_empty()" check is insufficient — a variant
+            // like Nil in `[Nil, Cons(a, List(a))]` has no args but
+            // its union is payload-carrying, so the result type is
+            // (tag, payload) not a bare discriminant. Cross-check
+            // via the resolved scalar type: fieldless unions resolve
+            // to an integer discriminant; payload-carrying ones
+            // resolve to RcPtr.
             if !args.is_empty() {
                 return Err(format!(
-                    "core::to_ssa: Con `{tag}` carries {} args (payload constructors not yet supported)",
+                    "core::to_ssa: Con `{tag}` carries {} payload args (not yet supported)",
                     args.len()
+                ));
+            }
+            let disc = resolve_scalar_type(ty, &ctx.fieldless);
+            if disc.is_heap_ptr() {
+                return Err(format!(
+                    "core::to_ssa: Con `{tag}` of payload-carrying union (disc resolves to {disc:?}); only fieldless unions supported"
                 ));
             }
             let tag_idx = if let Some(meta) = ctx.decls.constructors.get(tag) {
                 meta.tag_index
             } else {
-                // Structural fieldless union — sort tags alphabetically,
-                // take the position. Need the scrutinee-type context
-                // which we don't have here, so fall back via the
-                // result type which IS the union type.
                 structural_con_layout(ty, tag, &ctx.fieldless).0
             };
-            let disc = resolve_scalar_type(ty, &ctx.fieldless);
             Ok(emit_tag_const(ctx.builder, tag_idx, disc))
         }
 
@@ -285,9 +303,10 @@ fn map_binop(op: AstBinOp) -> BinaryOp {
         AstBinOp::Le => BinaryOp::Le,
         AstBinOp::Ge => BinaryOp::Ge,
         AstBinOp::And | AstBinOp::Or => {
-            // Short-circuit booleans lower as Match in Core, not BinOp.
-            // If a Core::BinOp carries And/Or we have an upstream bug.
-            panic!("core::to_ssa: And/Or should not appear as BinOp at Core level")
+            // Caller must check before calling map_binop — the
+            // Expr::BinOp arm in `lower` short-circuits earlier with
+            // an Err return for And/Or.
+            unreachable!("And/Or should be handled before map_binop")
         }
     }
 }
