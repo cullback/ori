@@ -418,7 +418,7 @@ fn lower_block(
             let mut out = body;
             for (sym, val) in wrap_with_lets.iter().rev() {
                 out = Expr::Let {
-                    binder: *sym,
+                    binders: vec![*sym],
                     value: Box::new(val.clone()),
                     body: Box::new(out),
                     ty: last.ty.clone(),

@@ -55,8 +55,8 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
-        Expr::Let { binder, value, body, ty } => Expr::Let {
-            binder,
+        Expr::Let { binders, value, body, ty } => Expr::Let {
+            binders,
             value: Box::new(simplify(*value)),
             body: Box::new(simplify(*body)),
             ty,

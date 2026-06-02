@@ -104,11 +104,13 @@ pub enum Expr {
         ty: Type,
     },
 
-    /// `Let(binder, value, body)` — bind `value` to `binder` for the
-    /// scope of `body`. The bound variable's type is on the binder's
-    /// `Var` references; the `Let` itself takes the body's type.
+    /// `Let(binders, value, body)` — bind `value`'s N slots to N
+    /// `binders` for the scope of `body`. Single-slot bindings have
+    /// `binders.len() == 1`; multi-slot (when `value` is a multi-
+    /// result call, payload constructor, etc.) has `binders.len() ==
+    /// expand_slots(value.ty).len()`.
     Let {
-        binder: SymbolId,
+        binders: Vec<SymbolId>,
         value: Box<Expr>,
         body: Box<Expr>,
         ty: Type,

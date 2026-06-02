@@ -71,15 +71,25 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Err("core::to_ssa: Lit::Str requires static promotion — not yet implemented".into())
         }
 
-        Expr::Let { binder, value, body, .. } => {
+        Expr::Let { binders, value, body, .. } => {
+            // Single-binder Let with single-slot value is the common
+            // case. Multi-binder Let (binders.len() > 1) implies a
+            // multi-slot value (multi-result call, payload Con);
+            // we'd lower with `lower_slots` once that lands. For now
+            // we only support single-binder Lets via this scalar path.
+            if binders.len() != 1 {
+                return Err(format!(
+                    "core::to_ssa: multi-binder Let (binders.len()={}) not yet supported",
+                    binders.len()
+                ));
+            }
+            let binder = binders[0];
             let v = lower(ctx, value)?;
-            let prev = ctx.locals.insert(*binder, v);
+            let prev = ctx.locals.insert(binder, v);
             let result = lower(ctx, body);
-            // Restore the shadowed binding so sibling scopes don't see
-            // this binder (Core blocks are lexically scoped).
             match prev {
-                Some(p) => { ctx.locals.insert(*binder, p); }
-                None => { ctx.locals.remove(binder); }
+                Some(p) => { ctx.locals.insert(binder, p); }
+                None => { ctx.locals.remove(&binder); }
             }
             result
         }
@@ -366,7 +376,7 @@ mod tests {
             ty: i64_ty(),
         };
         let body = Expr::Let {
-            binder: x,
+            binders: vec![x],
             value: Box::new(one_plus_two),
             body: Box::new(x_plus_three),
             ty: i64_ty(),
