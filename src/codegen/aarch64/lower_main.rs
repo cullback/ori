@@ -694,10 +694,11 @@ fn runtime_shim() -> Vec<MInst> {
 const STDIN_RAW_SIZE: u16 = 0x800;       // 2 KiB raw bytes from read
 const STDIN_SPREAD_SIZE: u16 = 0x4000;   // 16 KiB (2 KiB * 8)
 /// Total arena size, in units of 16 (so the value fits a 16-bit movz
-/// with LSL #16: `imm << 16 = bytes`). 0x10 << 16 = 1 MiB; 0x100 << 16
-/// = 16 MiB. Bench programs (5000 md5 hashes) need ~50 MiB without RC,
-/// so we'd want ~512 here. We start at 256 (= 16 MiB).
-const ARENA_SIZE_HIGH16: u16 = 0x100;    // 16 MiB
+/// with LSL #16: `imm << 16 = bytes`). Without real RC, allocations
+/// leak monotonically — the bench at N=5000 needs ~80 MiB; we leave
+/// generous headroom. mmap of anonymous pages is lazy, so this only
+/// costs address space, not committed memory.
+const ARENA_SIZE_HIGH16: u16 = 0x4000;   // 1 GiB (anonymous pages are lazy)
 
 /// Block labels reserved for shim-internal loops. Range 0x4000_0000
 /// is free of real block labels (`(func<<16)|bid`) and synth thunks
