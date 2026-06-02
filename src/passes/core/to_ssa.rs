@@ -249,15 +249,31 @@ fn lower_match(
     ty: &Type,
 ) -> Result<Value, String> {
     let scrutinee_ty = scrutinee.ty().clone();
-    let scrutinee_val = lower(ctx, scrutinee)?;
+    let scrutinee_slots = lower_slots(ctx, scrutinee)?;
 
-    // Single-arm wildcard / binding: no dispatch needed.
+    // Determine union shape from scrutinee's slot count:
+    // - 1 slot  = fieldless union (the slot IS the discriminant)
+    // - 2 slots = (tag, payload_ptr) non-fieldless
+    let (tag_val, payload_val) = match scrutinee_slots.as_slice() {
+        [v] => (*v, None),
+        [t, p] => (*t, Some(*p)),
+        _ => return Err(format!(
+            "core::to_ssa: Match scrutinee produced {} slots (expected 1 or 2)",
+            scrutinee_slots.len()
+        )),
+    };
+
+    // Single-arm wildcard / binding — no dispatch.
     if arms.len() == 1 {
         let arm = &arms[0];
         match &arm.pattern {
             Pattern::Wildcard => return lower(ctx, &arm.body),
             Pattern::Binding(sym) => {
-                let prev = ctx.locals.insert(*sym, scrutinee_val);
+                // For multi-slot scrutinee, binding binds to the
+                // first slot (the discriminant). This is sufficient
+                // for simple uses; multi-slot Binding requires the
+                // multi-binder Let machinery.
+                let prev = ctx.locals.insert(*sym, tag_val);
                 let result = lower(ctx, &arm.body);
                 match prev {
                     Some(p) => { ctx.locals.insert(*sym, p); }
@@ -269,34 +285,37 @@ fn lower_match(
         }
     }
 
-    // Multi-arm dispatch — require all arms to be Constructor with
-    // no field binders (fieldless unions), or Wildcard (default).
-    // Mixed patterns or payload-carrying constructors are deferred.
     let result_scalar = resolve_scalar_type(ty, &ctx.fieldless);
 
-    let mut constructor_arms: Vec<(u64, &MatchArm)> = Vec::new();
+    let mut constructor_arms: Vec<(u64, &MatchArm, Vec<ScalarType>)> = Vec::new();
     let mut default_arm: Option<&MatchArm> = None;
     for arm in arms {
         match &arm.pattern {
             Pattern::Constructor { tag, binders } => {
-                if !binders.is_empty() {
+                let (tag_idx, _max_fields, field_tys) =
+                    if let Some(meta) = ctx.decls.constructors.get(tag) {
+                        (meta.tag_index, meta.max_fields, meta.field_types.clone())
+                    } else {
+                        structural_con_layout(&scrutinee_ty, tag, &ctx.fieldless)
+                    };
+                // Sanity: binders.len() should match the constructor's
+                // field count. Mismatch means AST→Core lost track.
+                if binders.len() != field_tys.len() {
                     return Err(format!(
-                        "core::to_ssa: Match arm for `{tag}` carries field binders \
-                         (non-fieldless union not yet supported)"
+                        "core::to_ssa: Match arm for `{tag}` has {} binders but constructor declares {} fields",
+                        binders.len(),
+                        field_tys.len()
                     ));
                 }
-                // Declared constructors (Bool's True/False, Maybe's
-                // Some/None, etc.) live in decl_info.constructors —
-                // their tag_index is fixed by the type's declaration
-                // order. Structural unions (anonymous `[Foo, Bar]`)
-                // aren't in the map and use alphabetical sort via
-                // structural_con_layout.
-                let tag_idx = if let Some(meta) = ctx.decls.constructors.get(tag) {
-                    meta.tag_index
-                } else {
-                    structural_con_layout(&scrutinee_ty, tag, &ctx.fieldless).0
-                };
-                constructor_arms.push((tag_idx, arm));
+                // Field binders require a payload. If the union is
+                // fieldless (no payload), reject arms that try to
+                // bind anything.
+                if !binders.is_empty() && payload_val.is_none() {
+                    return Err(format!(
+                        "core::to_ssa: Match arm for `{tag}` has binders but scrutinee is fieldless"
+                    ));
+                }
+                constructor_arms.push((tag_idx, arm, field_tys));
             }
             Pattern::Wildcard => {
                 if default_arm.is_some() {
@@ -312,22 +331,56 @@ fn lower_match(
         }
     }
 
-    // Set up: merge block with a result block-param. Each arm gets
-    // its own body block; from the body we jump to merge with its
-    // result.
     let tag_block = ctx.builder.current_block.expect("expected current block");
     let merge = ctx.builder.create_block();
     let merge_param = ctx.builder.add_block_param(merge, result_scalar);
 
-    // Materialize each arm's body block + lower its body, jumping
-    // to merge with the body's result.
-    let mut arm_blocks: Vec<(u64, crate::ssa::BlockId)> = Vec::new();
-    for (tag_idx, arm) in &constructor_arms {
+    // For each arm: create body block. If the arm binds fields,
+    // pass the payload through as a block-arg so the block can load
+    // fields from it. Each binder is a single SSA slot from the
+    // payload at its declared offset; bind locals before lowering
+    // the arm body.
+    let mut arm_blocks: Vec<(u64, crate::ssa::BlockId, Vec<Value>)> = Vec::new();
+    for (tag_idx, arm, field_tys) in &constructor_arms {
         let b = ctx.builder.create_block();
+        let payload_block_param = if !field_tys.is_empty() && payload_val.is_some() {
+            Some(ctx.builder.add_block_param(b, ScalarType::RcPtr))
+        } else {
+            None
+        };
         ctx.builder.switch_to(b);
+
+        // Load each field from the payload + bind to its binder
+        // SymbolId. Skip wildcards (sentinel SymbolId(u32::MAX)).
+        let Pattern::Constructor { binders, .. } = &arm.pattern else {
+            unreachable!("filtered to Constructor arms above")
+        };
+        let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
+        if let Some(payload_param) = payload_block_param {
+            for (i, (binder, &field_ty)) in binders.iter().zip(field_tys).enumerate() {
+                if binder.0 == u32::MAX { continue; } // wildcard
+                let v = ctx.builder.load(payload_param, i * 8, field_ty);
+                bound.push((*binder, ctx.locals.insert(*binder, v)));
+            }
+        }
+
         let body_val = lower(ctx, &arm.body)?;
         ctx.builder.jump(merge, vec![body_val]);
-        arm_blocks.push((*tag_idx, b));
+
+        // Restore shadowed bindings.
+        for (binder, prev) in bound.into_iter().rev() {
+            match prev {
+                Some(p) => { ctx.locals.insert(binder, p); }
+                None => { ctx.locals.remove(&binder); }
+            }
+        }
+
+        let switch_args = if payload_block_param.is_some() {
+            vec![payload_val.unwrap()]
+        } else {
+            vec![]
+        };
+        arm_blocks.push((*tag_idx, b, switch_args));
     }
     let default_block = if let Some(arm) = default_arm {
         let b = ctx.builder.create_block();
@@ -339,20 +392,13 @@ fn lower_match(
         None
     };
 
-    // Back at the tag block: emit the dispatch.
     ctx.builder.switch_to(tag_block);
-    let switch_arms: Vec<(u64, crate::ssa::BlockId, Vec<Value>)> = arm_blocks
-        .iter()
-        .map(|(idx, b)| (*idx, *b, vec![]))
-        .collect();
     ctx.builder.switch_int(
-        scrutinee_val,
-        switch_arms,
+        tag_val,
+        arm_blocks,
         default_block.map(|b| (b, vec![])),
     );
 
-    // Continue lowering in the merge block — its block-param is the
-    // result Value.
     ctx.builder.switch_to(merge);
     Ok(merge_param)
 }
