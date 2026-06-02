@@ -121,10 +121,34 @@ See `src/lower/README.md` and `src/opt/README.md` for module details.
 
 ## Where optimizations go
 
-**Rule of thumb:** **all SSA-to-SSA equivalence-preserving rewrites
-belong in `src/opt/`.** They benefit every downstream consumer — eval
-today, aarch64-linux codegen, a future macOS or x86_64 codegen, a
-future bytecode interpreter — without duplication.
+Three rewriting paradigms, each at the level where its information
+is visible. Putting one at the wrong level forces the SCEV pattern:
+reconstructing structure that an earlier layer threw away.
+
+| Layer | Style | Examples |
+|---|---|---|
+| `passes/core/` (planned) | Algebraic rewriting on Core IR | fusion, beta, eta, case-of-case, banana, free theorems |
+| `src/opt/` | Local SSA peephole / dataflow | const-fold, branch-fold, DCE, GVN, rc-fusion, LICM |
+| `src/lower/` | Declarative emission (no rewrites) | FBIP via `cow_*`, RC traffic, aggregate decomposition |
+
+See `notes/core-ir.md` for the Core IR design + rationale.
+
+**Rule of thumb for `src/opt/`:** **SSA-to-SSA equivalence-preserving
+rewrites whose natural form is SSA** (scalar dataflow, def-use
+rewrites, dead-store/dead-alloc elimination, branch folding,
+const propagation) belong here. They benefit every downstream consumer
+— eval today, aarch64-linux codegen, a future codegen, a future
+bytecode interpreter — without duplication.
+
+**Rewrites whose natural form is algebraic** (`map f . map g = map (f∘g)`,
+`foldr f z (build g) = g f z`, hylomorphism deforestation, case-of-case,
+parametric free theorems) **do not** belong in `src/opt/`. Their input
+shape is the algebraic structure of the program — `Cata`, `Map`, `Con`
+— which SSA has decomposed into parallel `Value`s, loops with block
+params, and `cow_store_dyn` chains. Recreating the algebra at SSA is
+the SCEV pattern: thousands of lines to recover what the front-end
+already knew. These belong at the Core layer, before `lower/` destroys
+the structure.
 
 `src/codegen/` only hosts work that **exists because of target-specific
 representation choices**:
