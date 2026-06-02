@@ -28,14 +28,36 @@
 //! flush out the supporting-context shape before we go wide.
 
 use crate::ast::{Expr as AstExpr, ExprKind, Stmt};
+use crate::symbol::FieldInterner;
 
 use super::expr::{Expr, Literal};
+
+/// Context for AST→Core lowering — references the supporting tables
+/// that the translation needs (just the field interner for now).
+pub struct LowerCtx<'a> {
+    pub fields: &'a FieldInterner,
+}
+
+/// Convenience for the common case (no record fields involved) —
+/// callers that don't have a `FieldInterner` to hand can use this
+/// at the cost of `Record` / pattern lowering becoming an error.
+fn empty_field_interner() -> FieldInterner {
+    FieldInterner::new()
+}
 
 /// Lower a single AST expression into Core. Returns `Err(reason)` for
 /// AST shapes we haven't implemented yet — the caller decides whether
 /// to skip the function, fall back to the existing AST→SSA pipeline,
 /// or fail.
 pub fn lower_expr(ast: &AstExpr<'_>) -> Result<Expr, String> {
+    let ctx = LowerCtx { fields: &empty_field_interner() };
+    lower_expr_with(&ctx, ast)
+}
+
+/// Lower with an explicit context. Use this when the program touches
+/// records — without the `FieldInterner`, field names can't be
+/// resolved.
+pub fn lower_expr_with(ctx: &LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Expr, String> {
     match &ast.kind {
         ExprKind::IntLit(n) => Ok(Expr::Lit {
             value: Literal::Int(*n),
@@ -57,23 +79,47 @@ pub fn lower_expr(ast: &AstExpr<'_>) -> Result<Expr, String> {
             ty: ast.ty.clone(),
         }),
 
-        ExprKind::Block(stmts, last) => lower_block(stmts, last),
+        ExprKind::Block(stmts, last) => lower_block(ctx, stmts, last),
 
         ExprKind::BinOp { op, lhs, rhs } => Ok(Expr::BinOp {
             op: *op,
-            lhs: Box::new(lower_expr(lhs)?),
-            rhs: Box::new(lower_expr(rhs)?),
+            lhs: Box::new(lower_expr_with(ctx, lhs)?),
+            rhs: Box::new(lower_expr_with(ctx, rhs)?),
             ty: ast.ty.clone(),
         }),
 
         ExprKind::Call { target, args } => {
-            let arg_exprs: Vec<Expr> =
-                args.iter().map(lower_expr).collect::<Result<_, _>>()?;
+            let arg_exprs: Vec<Expr> = args
+                .iter()
+                .map(|a| lower_expr_with(ctx, a))
+                .collect::<Result<_, _>>()?;
             Ok(Expr::App {
                 target: *target,
                 args: arg_exprs,
                 ty: ast.ty.clone(),
             })
+        }
+
+        ExprKind::Tuple(elems) => {
+            // Tuples lower to records with positional field names —
+            // "0", "1", "2", ... — same convention the existing
+            // lowering uses for naming tuple slots.
+            let fields: Vec<(super::expr::FieldId, Expr)> = elems
+                .iter()
+                .enumerate()
+                .map(|(i, e)| Ok((i.to_string(), lower_expr_with(ctx, e)?)))
+                .collect::<Result<_, String>>()?;
+            Ok(Expr::Record { fields, ty: ast.ty.clone() })
+        }
+
+        ExprKind::Record { fields } => {
+            let field_exprs: Vec<(super::expr::FieldId, Expr)> = fields
+                .iter()
+                .map(|(fsym, e)| {
+                    Ok((ctx.fields.get(*fsym).to_string(), lower_expr_with(ctx, e)?))
+                })
+                .collect::<Result<_, String>>()?;
+            Ok(Expr::Record { fields: field_exprs, ty: ast.ty.clone() })
         }
 
         // Everything else: not yet implemented. We surface the
@@ -87,15 +133,15 @@ pub fn lower_expr(ast: &AstExpr<'_>) -> Result<Expr, String> {
 /// becomes `Let(x, e1, Let(y, e2, ..., body))`. Non-`Let` statements
 /// (`Destructure`, `Guard`, `TypeHint`) error out for now — they need
 /// dedicated treatment when we grow the slice.
-fn lower_block(stmts: &[Stmt<'_>], last: &AstExpr<'_>) -> Result<Expr, String> {
+fn lower_block(ctx: &LowerCtx<'_>, stmts: &[Stmt<'_>], last: &AstExpr<'_>) -> Result<Expr, String> {
     let body_ty = last.ty.clone();
-    let mut result = lower_expr(last)?;
+    let mut result = lower_expr_with(ctx, last)?;
     // Fold from right to left: the innermost `Let` wraps the body;
     // each outer `Stmt::Let` wraps the partial result.
     for stmt in stmts.iter().rev() {
         match stmt {
             Stmt::Let { name, val } => {
-                let value = lower_expr(val)?;
+                let value = lower_expr_with(ctx, val)?;
                 result = Expr::Let {
                     binder: *name,
                     value: Box::new(value),
