@@ -47,6 +47,64 @@ pub struct Ctx<'b> {
     pub fieldless: HashMap<String, ScalarType>,
 }
 
+/// Lower a Core expression as a multi-slot SSA result. Returns
+/// `Vec<Value>` whose length matches `expand_slots(expr.ty)`.
+///
+/// Most Core variants are single-slot; we delegate to `lower` and
+/// wrap in a 1-element vec. The variants that are intrinsically
+/// multi-slot (payload `Con`, multi-result `App`, multi-slot
+/// `Match` result) have their own handlers.
+pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String> {
+    match expr {
+        // Payload-carrying Con: (tag, payload_ptr) two slots. We
+        // allocate the payload, store each arg's slots at consecutive
+        // offsets, return [tag, payload].
+        Expr::Con { tag, args, ty } => {
+            let disc = resolve_scalar_type(ty, &ctx.fieldless);
+            if !disc.is_heap_ptr() {
+                // Fieldless — single-slot. Delegate.
+                return Ok(vec![lower(ctx, expr)?]);
+            }
+            // Payload-carrying: emit alloc + stores + return (tag, payload).
+            let tag_idx = if let Some(meta) = ctx.decls.constructors.get(tag) {
+                meta.tag_index
+            } else {
+                structural_con_layout(ty, tag, &ctx.fieldless).0
+            };
+            // Lower each arg's slots and store at consecutive 8-byte offsets.
+            let mut all_slots: Vec<Value> = Vec::new();
+            for arg in args {
+                all_slots.extend(lower_slots(ctx, arg)?);
+            }
+            let alloc_size = all_slots.len() * 8;
+            let payload = ctx.builder.alloc(alloc_size);
+            for (i, v) in all_slots.iter().enumerate() {
+                ctx.builder.store(payload, i * 8, *v);
+            }
+            let tag_v = ctx.builder.const_u64(tag_idx);
+            Ok(vec![tag_v, payload])
+        }
+
+        // App where the return type is multi-slot — emit call_multi
+        // and return the result slot list directly.
+        Expr::App { target, args, ty } => {
+            let ret_slots = super::lower::expand_slots(ty, &ctx.fieldless);
+            if ret_slots.len() == 1 {
+                return Ok(vec![lower(ctx, expr)?]);
+            }
+            // Multi-result call. Spread each arg's slots, emit call_multi.
+            let mut arg_vals: Vec<Value> = Vec::new();
+            for a in args {
+                arg_vals.extend(lower_slots(ctx, a)?);
+            }
+            Ok(ctx.builder.call_multi(target, arg_vals, &ret_slots))
+        }
+
+        // All other variants are single-slot today; delegate.
+        _ => Ok(vec![lower(ctx, expr)?]),
+    }
+}
+
 /// Lower a Core expression into SSA, returning the `Value` holding
 /// the result. Errors when the Core variant isn't yet supported by
 /// this slice.
@@ -72,24 +130,30 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         }
 
         Expr::Let { binders, value, body, .. } => {
-            // Single-binder Let with single-slot value is the common
-            // case. Multi-binder Let (binders.len() > 1) implies a
-            // multi-slot value (multi-result call, payload Con);
-            // we'd lower with `lower_slots` once that lands. For now
-            // we only support single-binder Lets via this scalar path.
-            if binders.len() != 1 {
+            // For multi-binder Let, the value is a single Core Expr
+            // that produces N SSA slots (multi-result call, payload
+            // Con, etc.). Lower via lower_slots and bind each slot.
+            let vals = lower_slots(ctx, value)?;
+            if vals.len() != binders.len() {
                 return Err(format!(
-                    "core::to_ssa: multi-binder Let (binders.len()={}) not yet supported",
+                    "core::to_ssa: Let value produced {} slots but binders.len()={}",
+                    vals.len(),
                     binders.len()
                 ));
             }
-            let binder = binders[0];
-            let v = lower(ctx, value)?;
-            let prev = ctx.locals.insert(binder, v);
+            let mut prev = Vec::with_capacity(binders.len());
+            for (binder, val) in binders.iter().zip(vals) {
+                prev.push((*binder, ctx.locals.insert(*binder, val)));
+            }
             let result = lower(ctx, body);
-            match prev {
-                Some(p) => { ctx.locals.insert(binder, p); }
-                None => { ctx.locals.remove(&binder); }
+            // Restore in reverse so any shadowed bindings revert
+            // correctly even if a binder appeared multiple times
+            // (it shouldn't, but be safe).
+            for (binder, p) in prev.into_iter().rev() {
+                match p {
+                    Some(prev_val) => { ctx.locals.insert(binder, prev_val); }
+                    None => { ctx.locals.remove(&binder); }
+                }
             }
             result
         }

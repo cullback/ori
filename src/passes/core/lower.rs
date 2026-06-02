@@ -366,35 +366,45 @@ fn lower_block(
     // Each Stmt::Let may produce multiple slot Lets if the bound
     // value is multi-slot. The same Let chain wraps every body slot
     // — sharing the bindings.
-    let mut wrap_with_lets: Vec<(SymbolId, Expr)> = Vec::new();
+    // (binders, value) — single-binder for scalar lets; multi-binder
+    // for Core Exprs that produce N slots from one expression (multi-
+    // result Call, payload Con). Each Let in `wrap_with_lets` wraps
+    // each body slot once.
+    let mut wrap_with_lets: Vec<(Vec<SymbolId>, Expr)> = Vec::new();
     for stmt in stmts {
         match stmt {
             Stmt::Let { name, val } => {
                 let value_slots = lower_expr_slots(ctx, val)?;
-                if value_slots.len() == 1 {
-                    // Scalar binding: just bind to the AST sym
-                    // directly; no slot synthesis needed.
-                    wrap_with_lets.push((*name, value_slots.into_iter().next().unwrap()));
-                } else {
-                    // Multi-slot binding: mint a slot symbol per
-                    // value, record in locals + slot_paths.
-                    let base_name = ctx.symbols.display(*name).to_owned();
-                    let slot_syms: Vec<SymbolId> = (0..value_slots.len())
-                        .map(|i| {
-                            ctx.symbols.fresh(
-                                format!("{base_name}.{i}"),
-                                ctx.symbols.get(*name).span,
-                                SymbolKind::Func,  // placeholder; not used for slot syms
-                            )
-                        })
-                        .collect();
-                    for (i, sym) in slot_syms.iter().enumerate() {
-                        ctx.slot_paths.insert(*sym, format!("{base_name}.{i}"));
-                    }
+                let expected_slot_count = expand_slots(&val.ty, &ctx.fieldless).len();
+
+                if value_slots.len() == 1 && expected_slot_count == 1 {
+                    // Scalar binding — bind to the AST sym directly.
+                    wrap_with_lets.push((
+                        vec![*name],
+                        value_slots.into_iter().next().unwrap(),
+                    ));
+                } else if value_slots.len() == expected_slot_count {
+                    // Aggregate literal — N parallel single-binder Lets.
+                    let slot_syms = mint_slot_syms(ctx, *name, expected_slot_count);
                     ctx.locals.insert(*name, slot_syms.clone());
                     for (sym, val) in slot_syms.into_iter().zip(value_slots) {
-                        wrap_with_lets.push((sym, val));
+                        wrap_with_lets.push((vec![sym], val));
                     }
+                } else if value_slots.len() == 1 && expected_slot_count > 1 {
+                    // One Core Expr producing N slots (multi-result
+                    // Call, payload Con) — single multi-binder Let.
+                    let slot_syms = mint_slot_syms(ctx, *name, expected_slot_count);
+                    ctx.locals.insert(*name, slot_syms.clone());
+                    wrap_with_lets.push((
+                        slot_syms,
+                        value_slots.into_iter().next().unwrap(),
+                    ));
+                } else {
+                    return Err(format!(
+                        "core::lower_block: slot count mismatch — value_slots={}, expected={}",
+                        value_slots.len(),
+                        expected_slot_count
+                    ));
                 }
             }
             Stmt::TypeHint { .. } => {}
@@ -407,18 +417,13 @@ fn lower_block(
         }
     }
 
-    // Wrap each body slot in the Let chain (innermost let wraps
-    // body slot; outer lets wrap the result). Same chain for each
-    // body slot — Lets are shared by sym id, not by tree position,
-    // so this is correct semantically even though the Let tree is
-    // duplicated.
     let wrapped: Vec<Expr> = body_slots
         .into_iter()
         .map(|body| {
             let mut out = body;
-            for (sym, val) in wrap_with_lets.iter().rev() {
+            for (binders, val) in wrap_with_lets.iter().rev() {
                 out = Expr::Let {
-                    binders: vec![*sym],
+                    binders: binders.clone(),
                     value: Box::new(val.clone()),
                     body: Box::new(out),
                     ty: last.ty.clone(),
@@ -428,6 +433,22 @@ fn lower_block(
         })
         .collect();
     Ok(wrapped)
+}
+
+fn mint_slot_syms(
+    ctx: &mut LowerCtx<'_>,
+    base: SymbolId,
+    count: usize,
+) -> Vec<SymbolId> {
+    let base_name = ctx.symbols.display(base).to_owned();
+    let span = ctx.symbols.get(base).span;
+    let syms: Vec<SymbolId> = (0..count)
+        .map(|i| ctx.symbols.fresh(format!("{base_name}.{i}"), span, SymbolKind::Func))
+        .collect();
+    for (i, sym) in syms.iter().enumerate() {
+        ctx.slot_paths.insert(*sym, format!("{base_name}.{i}"));
+    }
+    syms
 }
 
 /// Compute `(offset, count)` for a field access — the slice of the
