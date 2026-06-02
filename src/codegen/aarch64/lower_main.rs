@@ -238,13 +238,11 @@ fn lower_inst(
             out.push(MInst::AdrLabel { rd: SCRATCH_C, label: Label::Data(*idx as u32) });
             emit_store(*dest, SCRATCH_C, frame, facts, out);
         }
-        Inst::RcInc(v) | Inst::RcDec(v) => {
-            // Still no-op for the bump allocator (Phase 5e), but
-            // facts-aware: when RC lands, `StaticRef`-tracked Values
-            // will be skipped at codegen time without a runtime check.
-            // Today this is observable only as an `assert` in tests
-            // that future RC paths don't touch static-known ptrs.
-            let _ = fact_of(*v);
+        Inst::RcInc(_) | Inst::RcDec(_) => {
+            // No-op for the bump allocator. Statics' rc ops are
+            // already elided at the SSA layer (opt/rc_elide_ptr), so
+            // anything reaching here is RcPtr-typed — real heap, will
+            // need real rc emission once Phase 5h's RC runtime lands.
         }
         Inst::Const(dest, bits) => {
             // Load via MOVZ + (optional MOVKs) for values wider than 16 bits.
@@ -365,26 +363,9 @@ fn lower_inst(
             out.push(MInst::StrImm64 { rt: SCRATCH_C, rn: SCRATCH_A, byte_offset: 0 });
         }
         Inst::BinOp(dest, op, lhs, rhs) => {
-            // Facts consumer: if both operands fold to Const, the
-            // dest's fact is also Const (computed by `facts::analyze`)
-            // — emit a MovImm of that const directly, skipping the
-            // ldr/op/str sequence.
-            if let Facts::Const(c) = fact_of(*dest)
-                && matches!(fact_of(*lhs), Facts::Const(_))
-                && matches!(fact_of(*rhs), Facts::Const(_))
-            {
-                // Materialize via the same Const lowering as above.
-                let low = (c & 0xFFFF) as u16;
-                out.push(MInst::MovImm { rd: SCRATCH_C, imm: low });
-                for shift in [16_u8, 32, 48] {
-                    let chunk = ((c >> shift) & 0xFFFF) as u16;
-                    if chunk != 0 {
-                        out.push(MInst::MovkImm { rd: SCRATCH_C, imm: chunk, shift });
-                    }
-                }
-                emit_store(*dest, SCRATCH_C, frame, facts, out);
-                return;
-            }
+            // BinOp(Const, Const) is folded at the SSA layer by
+            // opt/const_fold — by the time we get here both operands
+            // are runtime values.
             emit_load(*lhs, SCRATCH_A, frame, out);
             emit_load(*rhs, SCRATCH_B, frame, out);
             let cmp_then = |cond: Cond, out: &mut Vec<MInst>| {
@@ -538,15 +519,8 @@ fn lower_terminator(
             out.push(MInst::B { target: block_label(func_idx, edge.target) });
         }
         Terminator::Branch { cond, then_edge, else_edge } => {
-            // Facts consumer: if `cond` folds to a Const, branch is
-            // unconditional — skip the cmp + b.cond and emit only the
-            // taken arm's edge moves + jump.
-            if let Facts::Const(c) = fact_of(*cond) {
-                let edge = if c != 0 { then_edge } else { else_edge };
-                emit_edge_moves(edge, edge.target, func, frame, facts, out);
-                out.push(MInst::B { target: block_label(func_idx, edge.target) });
-                return;
-            }
+            // Branch with Const cond is folded to Jump at SSA layer
+            // by opt/const_term_fold — by here cond is runtime.
             emit_load(*cond, SCRATCH_A, frame, out);
             out.push(MInst::CmpImm { rn: SCRATCH_A, imm: 0 });
             let thunk_id = synth_branch_thunk_id(func_idx, then_edge.target);
@@ -558,23 +532,8 @@ fn lower_terminator(
             out.push(MInst::B { target: block_label(func_idx, then_edge.target) });
         }
         Terminator::SwitchInt { scrutinee, arms, default } => {
-            // Facts consumer: if scrutinee is a Const, jump straight
-            // to the matching arm. Skips the cmp/b.cond chain and all
-            // arms' thunks.
-            if let Facts::Const(c) = fact_of(*scrutinee) {
-                let edge = arms
-                    .iter()
-                    .find(|(v, _)| *v == c)
-                    .map(|(_, e)| e)
-                    .or(default.as_ref());
-                if let Some(edge) = edge {
-                    emit_edge_moves(edge, edge.target, func, frame, facts, out);
-                    out.push(MInst::B { target: block_label(func_idx, edge.target) });
-                } else {
-                    out.push(MInst::Brk { imm: 0 });
-                }
-                return;
-            }
+            // SwitchInt with Const scrutinee is folded to Jump at SSA
+            // layer by opt/const_term_fold — by here scrutinee is runtime.
             emit_load(*scrutinee, SCRATCH_A, frame, out);
             for (i, (val, edge)) in arms.iter().enumerate() {
                 let val_u32 = u32::try_from(*val).expect("Phase 5e: switch arm value > u32");

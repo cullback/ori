@@ -1,22 +1,24 @@
 //! Forward dataflow over SSA Values, computing what we statically
-//! know about each Value at codegen time.
+//! know about each Value **at codegen time** — i.e. facts that aren't
+//! representable at the SSA layer because they're about machine-model
+//! artifacts (64-bit register bit patterns, future allocation-site
+//! dispatch for free-helper emission).
 //!
-//! The lattice is intentionally small (4 elements) so this file can
-//! grow without re-architecting. Each element subsumes an existing
-//! pattern or unblocks an upcoming feature; consumers in `lower_main`
-//! consult facts at emit-time rather than re-deriving knowledge from
-//! the SSA structure.
+//! The lattice deliberately does NOT carry facts that the SSA can
+//! already reason about (constant propagation, static-ref provenance):
+//! those are SSA-to-SSA equivalence rewrites and live in `src/opt/`
+//! where every downstream consumer benefits. See CLAUDE.md's
+//! "Where optimizations go" rule.
 //!
-//!   `Bottom`          - unreachable (meet identity).
-//!   `Const(bits)`     - subsumes parts of `const_fold` at emit time.
-//!   `StaticRef(idx)`  - unblocks rc-skip for the upcoming RC runtime;
-//!                       lets us drop the sentinel-rc convention.
-//!   `Top`             - unknown.
-//!
-//! Stage 1 does not propagate facts through `Call`, `Load`, or
-//! `LoadDyn` (all yield `Top`); those need either summaries or richer
-//! lattice elements (`HeapAlloc(site)`, `KnownZeroHigh`, etc.) which
-//! land in later stages as use cases appear.
+//!   `Bottom`            - unreachable (meet identity).
+//!   `KnownZeroHigh(N)`  - the value's top N MSBs are proven zero.
+//!                         Lets `emit_store` skip the narrow op when
+//!                         the source already fits.
+//!   `Const(bits)`       - kept ONLY as a derivation source for
+//!                         `KnownZeroHigh` (small consts have leading
+//!                         zeros). NOT consumed for const-prop — that
+//!                         already happened in `opt/const_fold`.
+//!   `Top`               - unknown.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -36,67 +38,51 @@ use crate::ssa::{BinaryOp, Function, Inst, Terminator, Value};
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Facts {
     Bottom,
+    /// Known bit pattern. Carried because `Const(c)` implies
+    /// `c.leading_zeros()` zero high bits — used as a derivation
+    /// source for `KnownZeroHigh`. NOT consumed for const-folding;
+    /// that's done at the SSA layer by `opt/const_fold`.
     Const(u64),
-    StaticRef(usize),
-    /// The value's top `bits` MSBs are proven zero — i.e. the value
-    /// fits in `64 - bits` bits. After a `ldrb`, `KnownZeroHigh(56)`.
-    /// After a comparison, `KnownZeroHigh(63)`. Subsumes per-type
-    /// narrowing knowledge.
+    /// The value's top `bits` MSBs are proven zero.
     KnownZeroHigh(u8),
     Top,
 }
 
 impl Facts {
     /// Lattice meet (greatest lower bound). Used at block joins to
-    /// combine facts from multiple incoming edges. Conservative: if
-    /// inputs disagree, the result is `Top`. `Const` and
-    /// `KnownZeroHigh` interact: a `Const(c)` carries an implicit
-    /// `KnownZeroHigh(c.leading_zeros())`, so meeting them produces
-    /// the looser `KnownZeroHigh` fact.
+    /// combine facts from multiple incoming edges.
     #[must_use]
     pub fn meet(self, other: Self) -> Self {
-        use Facts::{Bottom, Const, KnownZeroHigh, StaticRef, Top};
+        use Facts::{Bottom, Const, KnownZeroHigh, Top};
         match (self, other) {
             (Bottom, x) | (x, Bottom) => x,
             (Top, _) | (_, Top) => Top,
             (Const(a), Const(b)) if a == b => Const(a),
-            (StaticRef(a), StaticRef(b)) if a == b => StaticRef(a),
             (KnownZeroHigh(a), KnownZeroHigh(b)) => KnownZeroHigh(a.min(b)),
             (Const(c), KnownZeroHigh(k)) | (KnownZeroHigh(k), Const(c)) => {
                 let cz = c.leading_zeros() as u8;
                 KnownZeroHigh(cz.min(k))
             }
             (Const(a), Const(b)) => {
-                // Different consts — degrade to KnownZeroHigh of the
-                // less-specific path.
+                // Different consts degrade to the weaker
+                // KnownZeroHigh bound that subsumes both.
                 let za = a.leading_zeros() as u8;
                 let zb = b.leading_zeros() as u8;
                 KnownZeroHigh(za.min(zb))
             }
-            _ => Top,
         }
     }
 
     /// How many top bits are proven zero. Used by emit-time consumers
-    /// to decide whether narrowing is necessary.
+    /// to decide whether the per-type narrowing op is necessary.
     #[must_use]
     pub fn known_zero_high_bits(self) -> u8 {
         match self {
             Self::Bottom => 64, // unreachable — any narrowing trivially holds
             Self::Const(c) => c.leading_zeros() as u8,
             Self::KnownZeroHigh(n) => n,
-            Self::StaticRef(_) | Self::Top => 0,
+            Self::Top => 0,
         }
-    }
-
-    #[must_use]
-    pub fn as_const(self) -> Option<u64> {
-        if let Self::Const(v) = self { Some(v) } else { None }
-    }
-
-    #[must_use]
-    pub fn as_static_ref(self) -> Option<usize> {
-        if let Self::StaticRef(idx) = self { Some(idx) } else { None }
     }
 }
 
@@ -219,7 +205,7 @@ fn transfer(
     use crate::ssa::ScalarType;
     match inst {
         Inst::Const(_, bits) => vec![Facts::Const(*bits)],
-        Inst::StaticRef(_, idx) => vec![Facts::StaticRef(*idx)],
+        Inst::StaticRef(_, _) => vec![Facts::Top], // tracked at SSA layer (Ptr type + rc_elide_ptr)
         Inst::BinOp(_, op, l, r) => {
             let lf = lookup(*l, facts);
             let rf = lookup(*r, facts);
@@ -292,19 +278,14 @@ mod tests {
         assert_eq!(Facts::Top.meet(Facts::Const(3)), Facts::Top);
         // Equal elements collapse.
         assert_eq!(Facts::Const(3).meet(Facts::Const(3)), Facts::Const(3));
-        assert_eq!(Facts::StaticRef(0).meet(Facts::StaticRef(0)), Facts::StaticRef(0));
         // Different consts: degrade to KnownZeroHigh of the lower
         // bound (3 has 62 leading zeros, 4 has 61 → meet is 61).
         assert_eq!(Facts::Const(3).meet(Facts::Const(4)), Facts::KnownZeroHigh(61));
-        // Const + KnownZeroHigh: take the lower (looser).
+        // Const + KnownZeroHigh: take the looser.
         assert_eq!(
             Facts::Const(3).meet(Facts::KnownZeroHigh(56)),
             Facts::KnownZeroHigh(56),
         );
-        // Disjoint static refs lose specificity entirely.
-        assert_eq!(Facts::StaticRef(0).meet(Facts::StaticRef(1)), Facts::Top);
-        // Cross-category meets stay Top (scalar vs pointer).
-        assert_eq!(Facts::Const(3).meet(Facts::StaticRef(0)), Facts::Top);
     }
 
     /// `Const(2) + Const(3)` folds to `Const(5)`.
@@ -341,28 +322,30 @@ mod tests {
         assert_eq!(f[&v_sum.id], Facts::Const(5));
     }
 
-    /// `static_ref @7` is tracked as `StaticRef(7)`.
+    /// `Load(U8)` carries `KnownZeroHigh(56)` — the slot was narrowed
+    /// when stored, so loads inherit the narrow property.
     #[test]
-    fn static_ref_tracked() {
-        let v = val(0, ScalarType::Ptr);
+    fn load_u8_known_zero_high() {
+        let v_ptr = val(0, ScalarType::RcPtr);
+        let v_byte = val(1, ScalarType::U8);
         let block = Block {
             params: vec![],
-            insts: vec![Inst::StaticRef(v, 7)],
-            terminator: Terminator::Return(vec![v]),
+            insts: vec![Inst::Load(v_byte, v_ptr, 0)],
+            terminator: Terminator::Return(vec![v_byte]),
         };
         let mut blocks = BTreeMap::new();
         blocks.insert(BlockId(0), block);
         let func = Function {
             name: "test".to_string(),
-            params: vec![],
+            params: vec![v_ptr],
             blocks,
-            return_type: vec![ScalarType::Ptr],
+            return_type: vec![ScalarType::U8],
             entry: BlockId(0),
             next_block: 1,
         };
 
         let f = analyze(&func);
-        assert_eq!(f[&v.id], Facts::StaticRef(7));
+        assert_eq!(f[&v_byte.id], Facts::KnownZeroHigh(56));
     }
 
     /// A `BinOp` with one `Top` operand stays `Top` — facts are

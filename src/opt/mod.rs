@@ -9,12 +9,14 @@
 pub mod branch_fold;
 pub mod const_eval;
 pub mod const_fold;
+pub mod const_term_fold;
 pub mod dce;
 pub mod inline;
 pub mod jump_threading;
 pub mod merge_blocks;
 pub mod nop_elim;
 pub mod operands;
+pub mod rc_elide_ptr;
 pub mod rc_fuse;
 pub mod retype_statics;
 pub mod static_promote;
@@ -31,6 +33,7 @@ pub use operands::{rewrite_operands, rewrite_terminator_operands};
 pub fn optimize(module: &mut Module) {
     for func in module.functions.values_mut() {
         const_fold::run(func);
+        const_term_fold::run(func);
         nop_elim::run(func);
         jump_threading::run(func);
         branch_fold::run(func);
@@ -55,9 +58,11 @@ pub fn run_full_pipeline(module: &mut Module) {
     const_eval::evaluate(module);
     optimize(module);
     // const_eval may produce more StaticRefs; retype them and any
-    // values that flow from them. rc_emit's needs_rc_emit then skips
-    // these Ptr-typed values automatically — no rc_elide_static needed.
+    // values that flow from them. rc_emit only sees the original
+    // (RcPtr) types, so rc ops on now-Ptr-typed values are still in
+    // the IR — rc_elide_ptr deletes them as a follow-on to retype.
     retype_statics::run(module);
+    rc_elide_ptr::run(module);
     rc_fuse::run(module);
     optimize(module);
 }
