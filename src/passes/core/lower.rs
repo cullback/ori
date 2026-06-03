@@ -331,6 +331,20 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             let name = resolved
                 .as_ref()
                 .ok_or_else(|| "core::lower_expr: MethodCall unresolved".to_string())?;
+            if let Some(op) = builtin_to_binop(name) {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "core::lower_expr: __builtin binop `{name}` expects 1 arg, got {}",
+                        args.len()
+                    ));
+                }
+                return Ok(vec![Expr::BinOp {
+                    op,
+                    lhs: Box::new(lower_expr(ctx, receiver)?),
+                    rhs: Box::new(lower_expr(ctx, &args[0])?),
+                    ty: ast.ty.clone(),
+                }]);
+            }
             if name.starts_with("__builtin.") {
                 return Err(format!(
                     "core::lower_expr: MethodCall to intrinsic `{name}` not yet handled"
@@ -514,6 +528,25 @@ pub fn lower_expr(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Expr, Str
 /// Lower call args, spreading multi-slot args into the flat App args
 /// list. A call `f(record, scalar)` where `record` has 2 slots and
 /// `scalar` has 1 slot produces a 3-element args vec.
+/// Map a `__builtin.<op>` intrinsic name to its Core `BinOp` if it
+/// corresponds to a 2-input scalar binop. Builtins that need
+/// special-case lowering (`equals` over polymorphic types,
+/// `compare` producing an Order tag union, etc.) return None and
+/// fall through to the fallback path.
+fn builtin_to_binop(name: &str) -> Option<crate::ast::BinOp> {
+    use crate::ast::BinOp;
+    Some(match name {
+        "__builtin.add" => BinOp::Add,
+        "__builtin.sub" => BinOp::Sub,
+        "__builtin.mul" => BinOp::Mul,
+        "__builtin.div" => BinOp::Div,
+        "__builtin.mod" => BinOp::Rem,
+        "__builtin.bit_or" => BinOp::BitOr,
+        "__builtin.bit_xor" => BinOp::BitXor,
+        _ => return None,
+    })
+}
+
 fn lower_call_args(ctx: &mut LowerCtx<'_>, args: &[AstExpr<'_>]) -> Result<Vec<Expr>, String> {
     let mut out = Vec::new();
     for a in args {
