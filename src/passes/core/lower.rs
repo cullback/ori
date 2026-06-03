@@ -353,6 +353,36 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             Ok(record_slots[offset..offset + count].to_vec())
         }
 
+        ExprKind::ListLit(elems) => {
+            // Element type from List(T) — unfold transparent first
+            // (Str := List(U8)).
+            let unwrapped = resolve_transparent(&ast.ty, &ctx.transparent);
+            let elem_ty = match &unwrapped {
+                Type::App(name, args) if name == "List" && args.len() == 1 => args[0].clone(),
+                _ => return Err(format!(
+                    "core::lower_expr: ListLit type not List(_): {:?}",
+                    ast.ty
+                )),
+            };
+            // Each element must be single-slot for now. Multi-slot
+            // element types (records, tuples, lists-of-lists) need
+            // inlined-slot layout — falls back.
+            if expand_slots(&elem_ty, &ctx.fieldless, &ctx.transparent).len() != 1 {
+                return Err(format!(
+                    "core::lower_expr: ListLit with multi-slot element type {elem_ty:?} not yet supported"
+                ));
+            }
+            let elements: Vec<Expr> = elems
+                .iter()
+                .map(|e| lower_expr(ctx, e))
+                .collect::<Result<_, _>>()?;
+            Ok(vec![Expr::ListLit {
+                elements,
+                elem_ty,
+                ty: ast.ty.clone(),
+            }])
+        }
+
         ExprKind::Is { expr, pattern } => {
             // `expr : pattern` is sugar for a 2-arm Match returning Bool.
             //   match expr of pattern -> True | _ -> False

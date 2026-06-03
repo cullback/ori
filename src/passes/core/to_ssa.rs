@@ -204,6 +204,29 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(ctx.builder.call(target, arg_vals, ret_ty))
         }
 
+        Expr::ListLit { elements, .. } => {
+            // Same shape as existing-lower's ListLit:
+            //   data = alloc(n * 8)
+            //   store each elem at data[i*8]
+            //   header = alloc(24)
+            //   store len, cap, data
+            //   return header
+            // Single-slot elements only; the AST→Core layer bails
+            // before producing a ListLit with multi-slot elements.
+            let n = elements.len();
+            let data = ctx.builder.alloc(n * 8);
+            for (i, elem) in elements.iter().enumerate() {
+                let v = lower(ctx, elem)?;
+                ctx.builder.store(data, i * 8, v);
+            }
+            let header = ctx.builder.alloc(24);
+            let len_val = ctx.builder.const_u64(n as u64);
+            ctx.builder.store(header, 0, len_val);
+            ctx.builder.store(header, 8, len_val);
+            ctx.builder.store(header, 16, data);
+            Ok(header)
+        }
+
         Expr::Match { scrutinee, arms, ty } => lower_match(ctx, scrutinee, arms, ty),
 
         Expr::Con { tag, args, ty } => {
@@ -520,6 +543,7 @@ fn variant_name(expr: &Expr) -> &'static str {
         Expr::Cata { .. } => "Cata",
         Expr::Con { .. } => "Con",
         Expr::BinOp { .. } => "BinOp",
+        Expr::ListLit { .. } => "ListLit",
     }
 }
 

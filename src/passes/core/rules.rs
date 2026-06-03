@@ -86,6 +86,12 @@ fn recurse(expr: Expr) -> Expr {
             args: args.into_iter().map(simplify).collect(),
             ty,
         },
+
+        Expr::ListLit { elements, elem_ty, ty } => Expr::ListLit {
+            elements: elements.into_iter().map(simplify).collect(),
+            elem_ty,
+            ty,
+        },
     }
 }
 

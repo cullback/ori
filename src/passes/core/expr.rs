@@ -169,6 +169,19 @@ pub enum Expr {
         rhs: Box<Expr>,
         ty: Type,
     },
+
+    /// `ListLit(elements, elem_ty, ty)` — list literal `[a, b, c]`.
+    /// Lowers to alloc + N stores + header alloc, matching existing-
+    /// lower's convention. Doesn't decompose at SROA (lists are
+    /// heap-resident; only their `(len, cap, data)` header decomposes
+    /// at function-boundary use, which Core handles via expand_slots).
+    /// Each element must be single-slot for now; multi-slot elements
+    /// (List of records, etc.) need inlined-element layout support.
+    ListLit {
+        elements: Vec<Expr>,
+        elem_ty: Type,
+        ty: Type,
+    },
 }
 
 impl Expr {
@@ -183,7 +196,8 @@ impl Expr {
             | Self::Match { ty, .. }
             | Self::Cata { ty, .. }
             | Self::Con { ty, .. }
-            | Self::BinOp { ty, .. } => ty,
+            | Self::BinOp { ty, .. }
+            | Self::ListLit { ty, .. } => ty,
         }
     }
 }
