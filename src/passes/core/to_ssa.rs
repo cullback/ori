@@ -526,14 +526,37 @@ fn lower_match(
     let merge = ctx.builder.create_block();
     let merge_param = ctx.builder.add_block_param(merge, result_scalar);
 
+    // Per-tag chain table: for each arm index, what's the next
+    // arm with the *same* constructor tag? Guarded arms whose
+    // guard fails fall through to this next arm's block (which
+    // re-binds and tries its own guard); the last arm in a tag
+    // chain falls through to the default block. Built once
+    // upfront so the per-arm loop can look up its successor.
+    let mut next_same_tag: Vec<Option<usize>> = vec![None; constructor_arms.len()];
+    for i in 0..constructor_arms.len() {
+        for j in (i + 1)..constructor_arms.len() {
+            if constructor_arms[j].0 == constructor_arms[i].0 {
+                next_same_tag[i] = Some(j);
+                break;
+            }
+        }
+    }
+
+    // Pre-create default block (if any), so guarded arms can jump
+    // to it on fall-through. Filled in after the arm loop.
+    let default_block_id: Option<crate::ssa::BlockId> = default_arm.map(|_| ctx.builder.create_block());
+
     // For each arm: create body block. If the arm binds fields,
     // pass the payload through as a block-arg so the block can load
     // fields from it. Each binder is a single SSA slot from the
     // payload at its declared offset; bind locals before lowering
     // the arm body.
+    let arm_block_ids: Vec<crate::ssa::BlockId> = (0..constructor_arms.len())
+        .map(|_| ctx.builder.create_block())
+        .collect();
     let mut arm_blocks: Vec<(u64, crate::ssa::BlockId, Vec<Value>)> = Vec::new();
-    for (tag_idx, arm, field_tys) in &constructor_arms {
-        let b = ctx.builder.create_block();
+    for (arm_i, (tag_idx, arm, field_tys)) in constructor_arms.iter().enumerate() {
+        let b = arm_block_ids[arm_i];
         let payload_block_param = if !field_tys.is_empty() && payload_val.is_some() {
             Some(ctx.builder.add_block_param(b, ScalarType::RcPtr))
         } else {
@@ -602,18 +625,46 @@ fn lower_match(
             }
         }
 
-        // Guards: each is a Bool expression evaluated in the arm's
-        // scope. If any guard is False, we currently bail to the
-        // fallback — proper guard support needs a per-arm fall-
-        // through block that jumps to the next candidate arm or
-        // the default. Stays at Err so the rest of the existing
-        // arm-binding work above isn't wasted: validators will
-        // surface the partial-state breakage early.
+        // Guards: each is a Bool (U8 discriminant) expression
+        // evaluated in the arm's scope. If any is False, jump to
+        // the next arm with the same tag (so it can try its own
+        // bindings/guards) or to the default block. If no
+        // fall-through target exists, bail to the fallback —
+        // we'd need to synthesize an unreachable sink.
         if !arm.guards.is_empty() {
-            return Err(format!(
-                "core::to_ssa: Match arm guards not yet supported ({} guard(s))",
-                arm.guards.len()
-            ));
+            let fallthrough_block = next_same_tag[arm_i]
+                .and_then(|j| {
+                    let next_target = arm_block_ids[j];
+                    // The next-same-tag block expects a payload
+                    // arg iff that arm has binders + payload_val.
+                    let next_args = if !constructor_arms[j].2.is_empty() && payload_val.is_some() {
+                        vec![payload_val.unwrap()]
+                    } else {
+                        vec![]
+                    };
+                    Some((next_target, next_args))
+                })
+                .or_else(|| default_block_id.map(|b| (b, vec![])));
+            let Some((fail_block, fail_args)) = fallthrough_block else {
+                return Err(format!(
+                    "core::to_ssa: Match arm guards for `{:?}` have no fall-through target (no later same-tag arm, no default)",
+                    arm.pattern
+                ));
+            };
+            // Emit a body block to run guard-passed work; guards
+            // chain via branch instructions in the current block.
+            let body_block = ctx.builder.create_block();
+            for guard in &arm.guards {
+                let g_val = lower(ctx, guard)?;
+                let next_check = ctx.builder.create_block();
+                ctx.builder.branch(g_val, next_check, vec![], fail_block, fail_args.clone());
+                ctx.builder.switch_to(next_check);
+            }
+            // All guards passed: jump to body block (so the
+            // unreachable bool-check trailing block above
+            // terminates somewhere).
+            ctx.builder.jump(body_block, vec![]);
+            ctx.builder.switch_to(body_block);
         }
 
         // Lower the body via lower_slots so payload Con works. If
@@ -662,7 +713,7 @@ fn lower_match(
         arm_blocks.push((*tag_idx, b, switch_args));
     }
     let default_block = if let Some(arm) = default_arm {
-        let b = ctx.builder.create_block();
+        let b = default_block_id.expect("default_block_id pre-created when default_arm exists");
         ctx.builder.switch_to(b);
         let arm_slots = lower_slots(ctx, &arm.body)?;
         let body_val = if arm_slots.len() == 1 {
