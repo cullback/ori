@@ -262,6 +262,26 @@ pub enum Expr {
         slot_idx: usize,
         ty: Type,
     },
+
+    /// `BufLoad(buf, idx, ty)` — unchecked indexed load from a
+    /// buffer pointer. The leaf primitive backing `List.get`'s
+    /// success branch and the only memory-read op Core emits for
+    /// the buffer family. Combined with a bounds-check `Match`,
+    /// `List.get(xs, i)` desugars to:
+    ///
+    /// ```text
+    /// if i < ProjSlot(xs, 0)
+    ///   then Ok(BufLoad(ProjSlot(xs, 2), i, T))
+    ///   else Err(OutOfBounds)
+    /// ```
+    ///
+    /// Like `ProjSlot` it doesn't fuse — it lowers 1:1 to SSA
+    /// `load_dyn`.
+    BufLoad {
+        buf: Box<Expr>,
+        idx: Box<Expr>,
+        ty: Type,
+    },
 }
 
 impl Expr {
@@ -278,7 +298,8 @@ impl Expr {
             | Self::Con { ty, .. }
             | Self::BinOp { ty, .. }
             | Self::ListLit { ty, .. }
-            | Self::ProjSlot { ty, .. } => ty,
+            | Self::ProjSlot { ty, .. }
+            | Self::BufLoad { ty, .. } => ty,
         }
     }
 }

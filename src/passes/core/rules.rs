@@ -101,6 +101,12 @@ fn recurse(expr: Expr) -> Expr {
             slot_idx,
             ty,
         },
+
+        Expr::BufLoad { buf, idx, ty } => Expr::BufLoad {
+            buf: Box::new(simplify(*buf)),
+            idx: Box::new(simplify(*idx)),
+            ty,
+        },
     }
 }
 

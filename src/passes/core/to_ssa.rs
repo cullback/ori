@@ -328,6 +328,17 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 
         Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => lower_match(ctx, scrutinee_slots, scrutinee_ty, arms, ty),
 
+        // Unchecked indexed load from a buffer pointer. Lowers to
+        // SSA `load_dyn(buf, idx, scalar_ty)` — one instruction.
+        // The bounds check that makes `List.get` safe lives in the
+        // surrounding `Match` synthesized at AST→Core time.
+        Expr::BufLoad { buf, idx, ty } => {
+            let buf_val = lower(ctx, buf)?;
+            let idx_val = lower(ctx, idx)?;
+            let scalar = resolve_scalar_type(ty, &ctx.fieldless);
+            Ok(ctx.builder.load_dyn(buf_val, idx_val, scalar))
+        }
+
         // Pick a slot from `source_slots`. Two shapes show up:
         // (a) the source is already decomposed (e.g. a Tuple
         //     argument that came in as parallel SSA values) —
