@@ -3,10 +3,13 @@ use crate::source::{FileId, SourceArena};
 use crate::ssa::eval::Scalar;
 
 /// Global counters: (core_taken, fallback_taken). Bumped per
-/// compile_until_lower call when ORI_TEST_CORE_STATS=1. The
-/// diagnostic test `core_coverage_summary` reads + prints.
+/// compile_until_lower call. The diagnostic test
+/// `core_coverage_summary` reads + prints.
 static CORE_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static FALLBACK_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FALLBACK_REASONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
 
 // ---- Shared pipeline helpers ----
 
@@ -65,15 +68,20 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     let core_attempt = crate::passes::core::pipeline::lower_module(
         &mut mono, &resolved.fields, &decls,
     );
-    if std::env::var("ORI_TEST_CORE_REASONS").is_ok() {
-        if let Err(e) = &core_attempt {
-            use std::collections::HashMap;
-            static REASONS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
-            let key = e.split(':').take(3).collect::<Vec<_>>().join(":");
-            let m = REASONS.get_or_init(Default::default);
-            let mut g = m.lock().unwrap();
-            *g.entry(key).or_insert(0) += 1;
-        }
+    if let Err(e) = &core_attempt {
+        // Strip the leading "function `<name>`: <Stage>: " prefix so
+        // similar errors group regardless of which function or stage
+        // hit them.
+        let key = e
+            .split("core::")
+            .nth(1)
+            .map(|s| s.split(" (").next().unwrap_or(s))
+            .map(|s| s.split(" got ").next().unwrap_or(s))
+            .unwrap_or(e.as_str())
+            .to_string();
+        let m = FALLBACK_REASONS.get_or_init(Default::default);
+        let mut g = m.lock().unwrap();
+        *g.entry(key).or_insert(0) += 1;
     }
     let core_module = core_attempt.ok().filter(|m| {
         let r = crate::ssa::validate::validate(m);
@@ -4619,6 +4627,15 @@ fn core_coverage_summary() {
          used Core: {core}\n  fellback: {fb}\n  pct Core: {:.1}%",
         100.0 * core as f64 / (core + fb).max(1) as f64
     );
+    if let Some(m) = FALLBACK_REASONS.get() {
+        let g = m.lock().unwrap();
+        let mut entries: Vec<_> = g.iter().collect();
+        entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        eprintln!("\nTop fallback reasons:");
+        for (reason, count) in entries.iter().take(15) {
+            eprintln!("  {count:4}  {reason}");
+        }
+    }
 }
 
 #[test]
