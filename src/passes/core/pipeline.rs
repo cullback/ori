@@ -137,6 +137,17 @@ pub fn lower_module(
                     _ => None,
                 })
                 .collect();
+            ctx.constructor_return_types = decls
+                .constructor_schemes
+                .iter()
+                .map(|(name, s)| {
+                    let ret = match &s.ty {
+                        Type::Arrow(_, r) => (**r).clone(),
+                        other => other.clone(),
+                    };
+                    (name.clone(), ret)
+                })
+                .collect();
             ctx.payload_unions = payload_unions.clone();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {

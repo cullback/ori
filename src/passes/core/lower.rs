@@ -115,6 +115,14 @@ pub struct LowerCtx<'a> {
     /// needs slot syms minted) — the AST itself only carries the
     /// surface binder names without enough type info.
     pub constructor_field_types: HashMap<String, Vec<Type>>,
+    /// Per-constructor source-level *return* type (the parent
+    /// union). Read when lowering `Name(constructor)` so the
+    /// produced `Con` carries the union's type rather than the
+    /// expression-level type of the AST node — for lambda
+    /// constructors the latter is the closure's return type
+    /// (`I64`), which loses the fieldless-discriminant shape
+    /// to_ssa needs.
+    pub constructor_return_types: HashMap<String, Type>,
     /// Names of declared **payload-carrying** unions (`Result`, `Maybe`,
     /// custom user types with field-bearing variants). `expand_slots`
     /// for an `App(name, _)` whose `name` is in this set returns
@@ -142,6 +150,7 @@ impl<'a> LowerCtx<'a> {
             transparent: HashMap::new(),
             constructors: HashSet::new(),
             constructor_field_types: HashMap::new(),
+            constructor_return_types: HashMap::new(),
             payload_unions: HashSet::new(),
             locals: HashMap::new(),
             slot_paths: HashMap::new(),
@@ -188,12 +197,26 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // Resolve via `SymbolKind::Constructor` rather than name
             // alone so we don't have to round-trip through display
             // (which panics for unallocated test-only sym IDs).
+            //
+            // The Con's stored type is the *constructor's* return type
+            // (looked up via `constructor_field_types` — the parent
+            // union from the scheme), not `ast.ty`. Lambda narrow
+            // sometimes leaves `Name(__lambda_0)`'s expression-level
+            // type as the lambda's *return* type (`I64`) rather than
+            // the closure-set TagUnion; using ast.ty there would make
+            // resolve_scalar_type return I64 at to_ssa, killing the
+            // fieldless discriminant path.
             if sym_is_constructor(ctx.symbols, *sym) {
                 let name = ctx.symbols.display(*sym).to_owned();
+                let ty = ctx
+                    .constructor_return_types
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| ast.ty.clone());
                 return Ok(vec![Expr::Con {
                     tag: name,
                     args: vec![],
-                    ty: ast.ty.clone(),
+                    ty,
                 }]);
             }
             Ok(vec![Expr::Var { sym: *sym, ty: ast.ty.clone() }])
