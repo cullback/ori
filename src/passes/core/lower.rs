@@ -370,6 +370,29 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             Ok(slots)
         }
 
+        ExprKind::RecordUpdate { base, updates } => {
+            // SROA: lower the base into slots, then replace each
+            // updated field's slot range with the new value's slots.
+            // field_slice gives (offset, count) into the base's slot
+            // list — derived from the base's source type, which after
+            // inference matches our `expand_slots`-shaped slot list.
+            let mut slots = lower_expr_slots(ctx, base)?;
+            for (field, val) in updates {
+                let (offset, count) = field_slice(
+                    &base.ty, *field, ctx.fields, &ctx.fieldless, &ctx.transparent,
+                );
+                let new_slots = lower_expr_slots(ctx, val)?;
+                if new_slots.len() != count {
+                    return Err(format!(
+                        "core::lower_expr: RecordUpdate field has {} slots, expected {}",
+                        new_slots.len(), count
+                    ));
+                }
+                slots.splice(offset..offset + count, new_slots);
+            }
+            Ok(slots)
+        }
+
         ExprKind::FieldAccess { record, field } => {
             // Slot picking: take the record's slot list, slice at
             // the field's slot offset for its slot count.
