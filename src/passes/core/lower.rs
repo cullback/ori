@@ -677,6 +677,24 @@ fn try_lower_stdlib_intrinsic(
 ) -> Result<Option<Vec<Expr>>, String> {
     let base = name.split("__").next().unwrap_or(name);
     match base {
+        "crash" => {
+            // `crash(msg)` rewrites to a call to the runtime
+            // `__crash` function. Diverging; whatever return type
+            // surrounds it gets a dummy value here that the runtime
+            // never produces (because __crash doesn't return).
+            if args.len() != 1 {
+                return Err(format!(
+                    "core::lower_expr: crash expects 1 arg, got {}",
+                    args.len()
+                ));
+            }
+            let msg_slots = lower_expr_slots(ctx, &args[0])?;
+            Ok(Some(vec![Expr::App {
+                target: "__crash".to_string(),
+                args: msg_slots,
+                ty: ret_ty.clone(),
+            }]))
+        }
         "List.len" => {
             if args.len() != 1 {
                 return Err(format!(
