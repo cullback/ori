@@ -23,7 +23,7 @@
 //! rule-writing pattern**. Bigger wins (fusion, beta reduction,
 //! case-of-case, free theorems) land as we grow the set.
 
-use crate::ast::BinOp as AstBinOp;
+use crate::ssa::BinaryOp as SsaBinaryOp;
 
 use super::expr::{Expr, Literal, MatchArm, Pattern};
 
@@ -101,24 +101,24 @@ fn recurse(expr: Expr) -> Expr {
 fn apply_local_rules(expr: Expr) -> Expr {
     match expr {
         // Additive identity: x + 0 → x, 0 + x → x.
-        Expr::BinOp { op: AstBinOp::Add, lhs, rhs, ty } => {
+        Expr::BinOp { op: SsaBinaryOp::Add, lhs, rhs, ty } => {
             if is_int_zero(&rhs) {
                 *lhs
             } else if is_int_zero(&lhs) {
                 *rhs
             } else {
-                Expr::BinOp { op: AstBinOp::Add, lhs, rhs, ty }
+                Expr::BinOp { op: SsaBinaryOp::Add, lhs, rhs, ty }
             }
         }
 
         // Multiplicative identity: x * 1 → x, 1 * x → x.
-        Expr::BinOp { op: AstBinOp::Mul, lhs, rhs, ty } => {
+        Expr::BinOp { op: SsaBinaryOp::Mul, lhs, rhs, ty } => {
             if is_int_one(&rhs) {
                 *lhs
             } else if is_int_one(&lhs) {
                 *rhs
             } else {
-                Expr::BinOp { op: AstBinOp::Mul, lhs, rhs, ty }
+                Expr::BinOp { op: SsaBinaryOp::Mul, lhs, rhs, ty }
             }
         }
 
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn add_zero_collapses() {
         let e = Expr::BinOp {
-            op: AstBinOp::Add,
+            op: SsaBinaryOp::Add,
             lhs: Box::new(var(1)),
             rhs: Box::new(lit_int(0)),
             ty: i64_ty(),
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn mul_one_collapses() {
         let e = Expr::BinOp {
-            op: AstBinOp::Mul,
+            op: SsaBinaryOp::Mul,
             lhs: Box::new(lit_int(1)),
             rhs: Box::new(var(2)),
             ty: i64_ty(),
@@ -186,15 +186,15 @@ mod tests {
     fn rule_recurses_into_children() {
         // (x + 0) + (y * 1) → x + y
         let e = Expr::BinOp {
-            op: AstBinOp::Add,
+            op: SsaBinaryOp::Add,
             lhs: Box::new(Expr::BinOp {
-                op: AstBinOp::Add,
+                op: SsaBinaryOp::Add,
                 lhs: Box::new(var(1)),
                 rhs: Box::new(lit_int(0)),
                 ty: i64_ty(),
             }),
             rhs: Box::new(Expr::BinOp {
-                op: AstBinOp::Mul,
+                op: SsaBinaryOp::Mul,
                 lhs: Box::new(var(2)),
                 rhs: Box::new(lit_int(1)),
                 ty: i64_ty(),
@@ -205,7 +205,7 @@ mod tests {
         let Expr::BinOp { op, lhs, rhs, .. } = simplified else {
             panic!("expected BinOp");
         };
-        assert_eq!(op, AstBinOp::Add);
+        assert_eq!(op, SsaBinaryOp::Add);
         assert!(matches!(*lhs, Expr::Var { sym: SymbolId(1), .. }));
         assert!(matches!(*rhs, Expr::Var { sym: SymbolId(2), .. }));
     }
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn unrelated_expressions_pass_through() {
         let e = Expr::BinOp {
-            op: AstBinOp::Add,
+            op: SsaBinaryOp::Add,
             lhs: Box::new(var(1)),
             rhs: Box::new(var(2)),
             ty: i64_ty(),
@@ -221,6 +221,6 @@ mod tests {
         let simplified = simplify(e);
         // Unchanged
         let Expr::BinOp { op, .. } = simplified else { panic!("expected BinOp"); };
-        assert_eq!(op, AstBinOp::Add);
+        assert_eq!(op, SsaBinaryOp::Add);
     }
 }

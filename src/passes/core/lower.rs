@@ -297,7 +297,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     }])
                 }
                 _ => Ok(vec![Expr::BinOp {
-                    op: *op,
+                    op: ast_binop_to_ssa(*op),
                     lhs: Box::new(lower_expr(ctx, lhs)?),
                     rhs: Box::new(lower_expr(ctx, rhs)?),
                     ty: ast.ty.clone(),
@@ -609,18 +609,49 @@ fn sym_is_constructor(symbols: &SymbolTable, sym: SymbolId) -> bool {
 /// special-case lowering (`equals` over polymorphic types,
 /// `compare` producing an Order tag union, etc.) return None and
 /// fall through to the fallback path.
-fn builtin_to_binop(name: &str) -> Option<crate::ast::BinOp> {
-    use crate::ast::BinOp;
+fn builtin_to_binop(name: &str) -> Option<crate::ssa::BinaryOp> {
+    use crate::ssa::BinaryOp;
     Some(match name {
-        "__builtin.add" => BinOp::Add,
-        "__builtin.sub" => BinOp::Sub,
-        "__builtin.mul" => BinOp::Mul,
-        "__builtin.div" => BinOp::Div,
-        "__builtin.mod" => BinOp::Rem,
-        "__builtin.bit_or" => BinOp::BitOr,
-        "__builtin.bit_xor" => BinOp::BitXor,
+        "__builtin.add" => BinaryOp::Add,
+        "__builtin.sub" => BinaryOp::Sub,
+        "__builtin.mul" => BinaryOp::Mul,
+        "__builtin.div" => BinaryOp::Div,
+        "__builtin.mod" => BinaryOp::Rem,
+        "__builtin.bit_and" => BinaryOp::And,
+        "__builtin.bit_or" => BinaryOp::Or,
+        "__builtin.bit_xor" => BinaryOp::Xor,
+        "__builtin.shl" => BinaryOp::Shl,
+        "__builtin.shr" => BinaryOp::Shr,
         _ => return None,
     })
+}
+
+/// Map an AST surface `BinOp` to its SSA `BinaryOp`. The two enums
+/// were near-1:1 before bit_and/shl/shr entered Core via builtin
+/// intrinsics; this is the canonical join point.
+fn ast_binop_to_ssa(op: crate::ast::BinOp) -> crate::ssa::BinaryOp {
+    use crate::ast::BinOp as A;
+    use crate::ssa::BinaryOp as S;
+    match op {
+        A::Add => S::Add,
+        A::Sub => S::Sub,
+        A::Mul => S::Mul,
+        A::Div => S::Div,
+        A::Rem => S::Rem,
+        A::BitOr => S::Or,
+        A::BitXor => S::Xor,
+        A::Eq => S::Eq,
+        A::Neq => S::Neq,
+        A::Lt => S::Lt,
+        A::Gt => S::Gt,
+        A::Le => S::Le,
+        A::Ge => S::Ge,
+        // And/Or are short-circuit booleans — desugared to Match
+        // upstream of this mapping. Hitting them here is a bug.
+        A::And | A::Or => unreachable!(
+            "ast_binop_to_ssa: short-circuit boolean reached the scalar path"
+        ),
+    }
 }
 
 fn lower_call_args(ctx: &mut LowerCtx<'_>, args: &[AstExpr<'_>]) -> Result<Vec<Expr>, String> {

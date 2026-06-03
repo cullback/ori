@@ -105,7 +105,7 @@ pub fn total_byte_size(field_types: &[ScalarType]) -> usize {
 }
 
 /// Binary operations on scalars.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
     Sub,

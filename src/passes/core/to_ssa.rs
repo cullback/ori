@@ -23,10 +23,9 @@
 
 use std::collections::HashMap;
 
-use crate::ast::BinOp as AstBinOp;
 use crate::lower::constructor::structural_con_layout;
 use crate::passes::decl_info::{DeclInfo, resolve_scalar_type};
-use crate::ssa::instruction::{BinaryOp, ScalarType};
+use crate::ssa::instruction::ScalarType;
 use crate::ssa::{Builder, Value};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::engine::Type;
@@ -239,20 +238,13 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         }
 
         Expr::BinOp { op, lhs, rhs, ty } => {
-            // Short-circuit booleans (And/Or) need to lower as Match
-            // (left side conditional on right side's evaluation), not
-            // as a strict binop. Not yet implemented at Core level —
-            // bail so caller falls back to direct AST→SSA.
-            if matches!(op, AstBinOp::And | AstBinOp::Or) {
-                return Err(format!(
-                    "core::to_ssa: short-circuit {op:?} needs Match-desugaring (not yet implemented)"
-                ));
-            }
+            // Core's BinOp uses ssa::BinaryOp directly — short-
+            // circuit And/Or were desugared to Match at AST→Core
+            // time and don't appear here.
             let l = lower(ctx, lhs)?;
             let r = lower(ctx, rhs)?;
             let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
-            let ssa_op = map_binop(*op);
-            Ok(ctx.builder.binop(ssa_op, l, r, result_ty))
+            Ok(ctx.builder.binop(*op, l, r, result_ty))
         }
 
         Expr::App { target, args, ty } => {
@@ -672,34 +664,6 @@ fn lower_match(
     Ok(merge_param)
 }
 
-/// Map AST-level `BinOp` to SSA-level `BinaryOp`. They're a 1:1
-/// correspondence except for `And`/`Or` (short-circuit booleans),
-/// which we error on here — they need lazy lowering that we'd handle
-/// as `Match` at the Core layer rather than as binops.
-fn map_binop(op: AstBinOp) -> BinaryOp {
-    match op {
-        AstBinOp::Add => BinaryOp::Add,
-        AstBinOp::Sub => BinaryOp::Sub,
-        AstBinOp::Mul => BinaryOp::Mul,
-        AstBinOp::Div => BinaryOp::Div,
-        AstBinOp::Rem => BinaryOp::Rem,
-        AstBinOp::BitOr => BinaryOp::Or,
-        AstBinOp::BitXor => BinaryOp::Xor,
-        AstBinOp::Eq => BinaryOp::Eq,
-        AstBinOp::Neq => BinaryOp::Neq,
-        AstBinOp::Lt => BinaryOp::Lt,
-        AstBinOp::Gt => BinaryOp::Gt,
-        AstBinOp::Le => BinaryOp::Le,
-        AstBinOp::Ge => BinaryOp::Ge,
-        AstBinOp::And | AstBinOp::Or => {
-            // Caller must check before calling map_binop — the
-            // Expr::BinOp arm in `lower` short-circuits earlier with
-            // an Err return for And/Or.
-            unreachable!("And/Or should be handled before map_binop")
-        }
-    }
-}
-
 /// True when `ty` resolves (via transparent unfolding) to a
 /// single-variant tag union — the Phase-E direct-fanout case where
 /// a Con of this type produces only the variant's fields with no
@@ -761,8 +725,7 @@ fn variant_name(expr: &Expr) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::BinOp as AstBinOp;
-    use crate::ssa::ScalarType;
+    use crate::ssa::{BinaryOp as SsaBinaryOp, ScalarType};
 
     fn i64_ty() -> Type {
         Type::Con("I64".to_string())
@@ -774,7 +737,7 @@ mod tests {
         let one = Expr::Lit { value: Literal::Int(1), ty: i64_ty() };
         let two = Expr::Lit { value: Literal::Int(2), ty: i64_ty() };
         let one_plus_two = Expr::BinOp {
-            op: AstBinOp::Add,
+            op: SsaBinaryOp::Add,
             lhs: Box::new(one),
             rhs: Box::new(two),
             ty: i64_ty(),
@@ -782,7 +745,7 @@ mod tests {
         let x_ref = Expr::Var { sym: x, ty: i64_ty() };
         let three = Expr::Lit { value: Literal::Int(3), ty: i64_ty() };
         let x_plus_three = Expr::BinOp {
-            op: AstBinOp::Add,
+            op: SsaBinaryOp::Add,
             lhs: Box::new(x_ref),
             rhs: Box::new(three),
             ty: i64_ty(),
@@ -918,13 +881,13 @@ mod tests {
         // Expected eval: 30.
         let x = SymbolId(50);
         let one_plus_two = Expr::BinOp {
-            op: AstBinOp::Add,
+            op: SsaBinaryOp::Add,
             lhs: Box::new(Expr::Lit { value: Literal::Int(1), ty: i64_ty() }),
             rhs: Box::new(Expr::Lit { value: Literal::Int(2), ty: i64_ty() }),
             ty: i64_ty(),
         };
         let body = Expr::BinOp {
-            op: AstBinOp::Mul,
+            op: SsaBinaryOp::Mul,
             lhs: Box::new(Expr::Var { sym: x, ty: i64_ty() }),
             rhs: Box::new(Expr::Lit { value: Literal::Int(10), ty: i64_ty() }),
             ty: i64_ty(),

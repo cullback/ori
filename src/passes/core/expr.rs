@@ -23,7 +23,7 @@
 //! Core direct-style; ANF normalization happens between Core and
 //! SSA if needed.
 
-use crate::ast::BinOp as AstBinOp;
+use crate::ssa::BinaryOp;
 use crate::symbol::SymbolId;
 use crate::types::engine::Type;
 
@@ -179,13 +179,17 @@ pub enum Expr {
     },
 
     /// `BinOp(op, lhs, rhs, type)` — scalar arithmetic / comparison /
-    /// bitwise / boolean operator. **Not** modeled as `App` to an
-    /// intrinsic symbol — scalar primitives sit outside the algebraic
-    /// rewrite system (fusion laws don't touch them) and `App` should
-    /// mean "call a user or library function." Treating binops as App
-    /// would force an intrinsic-symbol registry for no payoff.
+    /// bitwise / shift / boolean operator. **Not** modeled as `App`
+    /// to an intrinsic symbol — scalar primitives sit outside the
+    /// algebraic rewrite system (fusion laws don't touch them) and
+    /// `App` should mean "call a user or library function."
+    ///
+    /// Uses the SSA-level `BinaryOp` directly rather than the AST's
+    /// narrower `BinOp` so Core can carry bitwise-and / shl / shr —
+    /// ops the surface syntax exposes only through `__builtin.*`
+    /// intrinsic methods (no infix form).
     BinOp {
-        op: AstBinOp,
+        op: BinaryOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
         ty: Type,
