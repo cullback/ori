@@ -502,18 +502,14 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     ast.ty
                 )),
             };
-            // Each element must be single-slot for now. Multi-slot
-            // element types (records, tuples, lists-of-lists) need
-            // inlined-slot layout — falls back.
-            if expand_slots_with(&elem_ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions).len() != 1 {
-                return Err(format!(
-                    "core::lower_expr: ListLit with multi-slot element type {elem_ty:?} not yet supported"
-                ));
+            // Each element's slot list is concatenated into the
+            // ListLit's flat element vec. to_ssa knows the
+            // per-element slot count via `elem_ty` (looking up
+            // expand_slots) and emits stores at the right stride.
+            let mut elements: Vec<Expr> = Vec::new();
+            for e in elems {
+                elements.extend(lower_expr_slots(ctx, e)?);
             }
-            let elements: Vec<Expr> = elems
-                .iter()
-                .map(|e| lower_expr(ctx, e))
-                .collect::<Result<_, _>>()?;
             Ok(vec![Expr::ListLit {
                 elements,
                 elem_ty,

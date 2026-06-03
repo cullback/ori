@@ -268,17 +268,24 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(ctx.builder.call(target, arg_vals, ret_ty))
         }
 
-        Expr::ListLit { elements, .. } => {
-            // Same shape as existing-lower's ListLit:
-            //   data = alloc(n * 8)
-            //   store each elem at data[i*8]
-            //   header = alloc(24)
-            //   store len, cap, data
-            //   return header
-            // Single-slot elements only; the AST→Core layer bails
-            // before producing a ListLit with multi-slot elements.
-            let n = elements.len();
-            let data = ctx.builder.alloc(n * 8);
+        Expr::ListLit { elements, elem_ty, .. } => {
+            // Element layout: each source-level element occupies
+            // `slot_count` consecutive 8-byte slots in the data
+            // buffer. `elements` is already flat (AST→Core
+            // concatenated each element's slot list), so the
+            // source-level element count is `elements.len() /
+            // slot_count` and stores fan out in source order.
+            let slot_count = super::lower::expand_slots_with(
+                elem_ty,
+                &ctx.fieldless,
+                &ctx.transparent,
+                &ctx.payload_unions,
+            )
+            .len()
+            .max(1);
+            let total_slots = elements.len();
+            let n = total_slots / slot_count;
+            let data = ctx.builder.alloc(total_slots * 8);
             for (i, elem) in elements.iter().enumerate() {
                 let v = lower(ctx, elem)?;
                 ctx.builder.store(data, i * 8, v);
