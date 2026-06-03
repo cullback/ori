@@ -95,6 +95,12 @@ fn recurse(expr: Expr) -> Expr {
             elem_ty,
             ty,
         },
+
+        Expr::ProjSlot { source_slots, slot_idx, ty } => Expr::ProjSlot {
+            source_slots: source_slots.into_iter().map(simplify).collect(),
+            slot_idx,
+            ty,
+        },
     }
 }
 

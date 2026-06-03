@@ -248,6 +248,20 @@ pub enum Expr {
         elem_ty: Type,
         ty: Type,
     },
+
+    /// `ProjSlot(source_slots, slot_idx, ty)` — pick one slot out of
+    /// a multi-slot value's decomposition. The first leaf primitive
+    /// in the List-as-buffer family: `List.len(xs)` lowers to
+    /// `ProjSlot(xs.slots, 0, U64)` — the (len, cap, data) trio's
+    /// first element. Doesn't participate in algebraic rewrites
+    /// (no fusion law touches a header projection); lowers 1:1 to
+    /// the SSA `Value` already produced by `source_slots`'s
+    /// per-slot lowering.
+    ProjSlot {
+        source_slots: Vec<Expr>,
+        slot_idx: usize,
+        ty: Type,
+    },
 }
 
 impl Expr {
@@ -263,7 +277,8 @@ impl Expr {
             | Self::Cata { ty, .. }
             | Self::Con { ty, .. }
             | Self::BinOp { ty, .. }
-            | Self::ListLit { ty, .. } => ty,
+            | Self::ListLit { ty, .. }
+            | Self::ProjSlot { ty, .. } => ty,
         }
     }
 }

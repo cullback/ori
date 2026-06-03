@@ -307,16 +307,16 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
 
         ExprKind::Call { target, args } => {
             let name = ctx.symbols.display(*target).to_owned();
-            // Stdlib intrinsics (List.len / get / append / set /
-            // range, crash) get inlined by existing-lower with
-            // direct knowledge of the (len, cap, data) list
-            // decomposition. Core would emit them as `call` to
-            // names the SSA module doesn't register — SSA
-            // validation rejects with "calls unknown function".
-            // Bail so fallback handles them. The synth helpers
-            // (__lifted_N, __fold_N, __apply_*) often reference
-            // these intrinsics in their bodies, which is why we
-            // see this on closure-using programs.
+            // Stdlib intrinsics (List.* / crash) get inlined by
+            // existing-lower with direct knowledge of the
+            // (len, cap, data) list decomposition. Core lowers
+            // the ones it understands into a small primitive set
+            // (`ProjSlot` for header reads, `BufLoad` /
+            // `BufCowStore` / `BufAlloc` for buffer ops); the
+            // remainder still bail so fallback handles them.
+            if let Some(prim) = try_lower_stdlib_intrinsic(ctx, &name, args, &ast.ty)? {
+                return Ok(prim);
+            }
             if is_stdlib_intrinsic(&name) {
                 return Err(format!(
                     "core::lower_expr: stdlib intrinsic `{name}` needs existing-lower's expanded layout"
@@ -416,6 +416,9 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     "core::lower_expr: QualifiedCall to intrinsic `{name}` not yet handled"
                 ));
             }
+            if let Some(prim) = try_lower_stdlib_intrinsic(ctx, name, args, &ast.ty)? {
+                return Ok(prim);
+            }
             if is_stdlib_intrinsic(name) {
                 return Err(format!(
                     "core::lower_expr: stdlib intrinsic `{name}` needs existing-lower's expanded layout"
@@ -460,7 +463,15 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     "core::lower_expr: MethodCall to intrinsic `{name}` not yet handled"
                 ));
             }
+            // Method form: synthesize a positional arg list with
+            // the receiver in front, then try the standard intrinsic
+            // lowering. Same primitive set as Call/QualifiedCall.
             if is_stdlib_intrinsic(name) {
+                let mut combined = vec![(**receiver).clone()];
+                combined.extend(args.iter().cloned());
+                if let Some(prim) = try_lower_stdlib_intrinsic(ctx, name, &combined, &ast.ty)? {
+                    return Ok(prim);
+                }
                 return Err(format!(
                     "core::lower_expr: stdlib intrinsic `{name}` (method form) needs existing-lower's expanded layout"
                 ));
@@ -648,6 +659,40 @@ fn sym_is_constructor(symbols: &SymbolTable, sym: SymbolId) -> bool {
     symbols
         .try_get(sym)
         .is_some_and(|info| matches!(info.kind, SymbolKind::Constructor))
+}
+
+/// Try to lower a stdlib intrinsic call as Core primitives.
+/// Returns `Ok(Some(slots))` when the intrinsic has a Core
+/// expansion, `Ok(None)` when the name isn't an intrinsic (caller
+/// falls through to App), and `Err` for malformed calls.
+///
+/// The first port is `List.len(xs)` → `ProjSlot(xs, 0, U64)`.
+/// `List.get` and the COW writers land here next, lowered through
+/// `BufLoad` / `BufCowStore` primitives once those exist.
+fn try_lower_stdlib_intrinsic(
+    ctx: &mut LowerCtx<'_>,
+    name: &str,
+    args: &[AstExpr<'_>],
+    ret_ty: &Type,
+) -> Result<Option<Vec<Expr>>, String> {
+    let base = name.split("__").next().unwrap_or(name);
+    match base {
+        "List.len" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "core::lower_expr: List.len expects 1 arg, got {}",
+                    args.len()
+                ));
+            }
+            let source_slots = lower_expr_slots(ctx, &args[0])?;
+            Ok(Some(vec![Expr::ProjSlot {
+                source_slots,
+                slot_idx: 0,
+                ty: ret_ty.clone(),
+            }]))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// True if `name` is a stdlib intrinsic that existing-lower

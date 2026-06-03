@@ -328,6 +328,33 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 
         Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => lower_match(ctx, scrutinee_slots, scrutinee_ty, arms, ty),
 
+        // Pick a slot from `source_slots`. Two shapes show up:
+        // (a) the source is already decomposed (e.g. a Tuple
+        //     argument that came in as parallel SSA values) —
+        //     pick the `slot_idx`-th lowered value directly, no
+        //     SSA emitted. Detected by `source_slots.len() > 1`.
+        // (b) the source is a single RcPtr header pointing at a
+        //     (len, cap, data) or similar buffer — load
+        //     `slot_idx * 8` bytes in, typed as the projection's
+        //     scalar type. The common shape today since Core's
+        //     `expand_slots` treats `List(T)` as one RcPtr.
+        Expr::ProjSlot { source_slots, slot_idx, ty } => {
+            let mut all = Vec::new();
+            for e in source_slots {
+                all.extend(lower_slots(ctx, e)?);
+            }
+            if all.len() > 1 {
+                return all.into_iter().nth(*slot_idx).ok_or_else(|| format!(
+                    "core::to_ssa: ProjSlot index {slot_idx} out of range"
+                ));
+            }
+            if all.len() == 1 {
+                let scalar = resolve_scalar_type(ty, &ctx.fieldless);
+                return Ok(ctx.builder.load(all[0], slot_idx * 8, scalar));
+            }
+            Err("core::to_ssa: ProjSlot has empty source_slots".into())
+        }
+
         Expr::Con { tag, args, ty } => {
             // Only fieldless unions handled in the single-slot path
             // today. Payload Cons that the caller actually wants as
