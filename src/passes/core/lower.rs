@@ -267,13 +267,33 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             }
         }
 
-        ExprKind::QualifiedCall { resolved, args, .. } => {
-            let name = resolved
-                .as_ref()
-                .ok_or_else(|| "core::lower_expr: QualifiedCall unresolved".to_string())?;
-            // `__builtin.*` calls are intrinsics handled by existing-
-            // lower (Cast / BitCast / numeric ops). We don't emit
-            // specialized SSA for them yet — bail to trigger fallback.
+        ExprKind::QualifiedCall { resolved, args, segments, .. } => {
+            // Mirror existing-lower's QualifiedCall fallback at the
+            // very end: when `resolved` is None, fall back to the
+            // joined segments as the call name. Most affected tests
+            // are top-level qualified calls (`List.range`, `Type.method`)
+            // that mono should have populated but in some shapes
+            // didn't. Calls to local-variable receivers / __builtin
+            // intrinsics keep their existing bail-out paths.
+            let synthesized;
+            let name: &String = match resolved.as_ref() {
+                Some(n) => n,
+                None => {
+                    // Local-variable method-call form: segments[0] is
+                    // a local. Existing-lower handles this via the
+                    // receiver_lv code path; we don't.
+                    if segments.len() >= 2
+                        && ctx.locals.contains_key(&segments[0].parse::<u32>().map(crate::symbol::SymbolId).unwrap_or(crate::symbol::SymbolId(u32::MAX)))
+                    {
+                        return Err(format!(
+                            "core::lower_expr: QualifiedCall on local receiver `{}` not yet handled",
+                            segments[0]
+                        ));
+                    }
+                    synthesized = segments.join(".");
+                    &synthesized
+                }
+            };
             if name.starts_with("__builtin.") {
                 return Err(format!(
                     "core::lower_expr: QualifiedCall to intrinsic `{name}` not yet handled"

@@ -200,12 +200,14 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         }
 
         Expr::App { target, args, ty } => {
-            // Lower each arg first (left-to-right per the language's
-            // strict eval order). Then emit the SSA call.
-            let arg_vals: Vec<Value> = args
-                .iter()
-                .map(|a| lower(ctx, a))
-                .collect::<Result<_, _>>()?;
+            // Use lower_slots for args so multi-slot args (records,
+            // payload Cons, multi-result Calls) spread into multiple
+            // SSA call args. Single-result return; multi-result goes
+            // through lower_slots's own App handler.
+            let mut arg_vals: Vec<Value> = Vec::new();
+            for a in args {
+                arg_vals.extend(lower_slots(ctx, a)?);
+            }
             let ret_ty = resolve_scalar_type(ty, &ctx.fieldless);
             Ok(ctx.builder.call(target, arg_vals, ret_ty))
         }
@@ -266,7 +268,10 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             } else {
                 structural_con_layout(ty, tag, &ctx.fieldless).0
             };
-            Ok(emit_tag_const(ctx.builder, tag_idx, disc))
+            emit_tag_const(ctx.builder, tag_idx, disc)
+                .ok_or_else(|| format!(
+                    "core::to_ssa: Con `{tag}` has unsupported discriminant type {disc:?}"
+                ))
         }
 
         _ => Err(format!(
@@ -298,11 +303,29 @@ fn lower_match(
     let scrutinee_ty = scrutinee.ty().clone();
     let scrutinee_slots = lower_slots(ctx, scrutinee)?;
 
-    // Determine union shape from scrutinee's slot count:
-    // - 1 slot  = fieldless union (the slot IS the discriminant)
-    // - 2 slots = (tag, payload_ptr) non-fieldless
+    // Determine union shape:
+    // - 1 slot + multi-variant payload-carrying union (in App form
+    //   that didn't unfold via transparent): unbox the heap shell
+    //   via Load(shell, 0, U64) for tag + Load(shell, 8, RcPtr) for
+    //   payload. Matches existing-lower's shell convention.
+    // - 1 slot fieldless union: the slot IS the discriminant.
+    // - 2 slots (tag, payload): use directly.
+    let unwrapped_ty = super::lower::resolve_transparent(&scrutinee_ty, &ctx.transparent);
+    let is_payload_carrying_union = matches!(
+        &unwrapped_ty,
+        Type::TagUnion { tags, .. } if tags.len() > 1 && tags.iter().any(|(_, fs)| !fs.is_empty())
+    );
     let (tag_val, payload_val) = match scrutinee_slots.as_slice() {
-        [v] => (*v, None),
+        [v] => {
+            if is_payload_carrying_union {
+                let shell = *v;
+                let tag = ctx.builder.load(shell, 0, ScalarType::U64);
+                let payload = ctx.builder.load(shell, 8, ScalarType::RcPtr);
+                (tag, Some(payload))
+            } else {
+                (*v, None)
+            }
+        }
         [t, p] => (*t, Some(*p)),
         _ => return Err(format!(
             "core::to_ssa: Match scrutinee produced {} slots (expected 1 or 2)",
@@ -508,15 +531,17 @@ fn map_binop(op: AstBinOp) -> BinaryOp {
     }
 }
 
-/// Emit a constant of `disc` type holding `tag_idx`. The width of the
-/// discriminant determines which `const_*` Builder method to use.
-fn emit_tag_const(b: &mut Builder, tag_idx: u64, disc: ScalarType) -> Value {
+/// Emit a constant of `disc` type holding `tag_idx`. Returns None if
+/// the resolved discriminant type isn't an unsigned integer — caller
+/// should propagate as Err to trigger fallback rather than emit a
+/// wrong-typed const.
+fn emit_tag_const(b: &mut Builder, tag_idx: u64, disc: ScalarType) -> Option<Value> {
     match disc {
-        ScalarType::U8 => b.const_u8(tag_idx as u8),
-        ScalarType::U16 => b.const_u16(tag_idx as u16),
-        ScalarType::U32 => b.const_u32(tag_idx as u32),
-        ScalarType::U64 => b.const_u64(tag_idx),
-        other => panic!("core::to_ssa: unexpected discriminant type {other:?}"),
+        ScalarType::U8 => Some(b.const_u8(tag_idx as u8)),
+        ScalarType::U16 => Some(b.const_u16(tag_idx as u16)),
+        ScalarType::U32 => Some(b.const_u32(tag_idx as u32)),
+        ScalarType::U64 => Some(b.const_u64(tag_idx)),
+        _ => None,
     }
 }
 
