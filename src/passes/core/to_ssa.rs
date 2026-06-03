@@ -46,6 +46,11 @@ pub struct Ctx<'b> {
     pub locals: HashMap<SymbolId, Value>,
     pub fieldless: HashMap<String, ScalarType>,
     pub transparent: super::lower::TransparentTable,
+    /// Used by `lower(Let)` to unbox a single-shell value into N slots
+    /// when binders > value slot count. NOT used for App return-type
+    /// decisions — those follow the existing-lower single-shell
+    /// convention to keep call-result compatibility.
+    pub payload_unions: std::collections::HashSet<String>,
 }
 
 /// Lower a Core expression as a multi-slot SSA result. Returns
@@ -61,22 +66,38 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // allocate the payload, store each arg's slots at consecutive
         // offsets, return [tag, payload].
         Expr::Con { tag, args, ty } => {
+            // Lower each arg's slots once — used by all three cases
+            // (fieldless, Phase E direct fanout, multi-variant shell).
+            let mut all_slots: Vec<Value> = Vec::new();
+            for arg in args {
+                all_slots.extend(lower_slots(ctx, arg)?);
+            }
+            // Phase E: single-variant payload union decomposes to
+            // exactly the variant's fields — no tag, no payload heap.
+            // expand_slots returns the captures' slot list; if it
+            // matches what the args produced, just return the args.
+            let con_slots = super::lower::expand_slots_with(
+                ty,
+                &ctx.fieldless,
+                &ctx.transparent,
+                &ctx.payload_unions,
+            );
+            if con_slots.len() == all_slots.len() && !all_slots.is_empty() {
+                return Ok(all_slots);
+            }
             let disc = resolve_scalar_type(ty, &ctx.fieldless);
             if !disc.is_heap_ptr() {
-                // Fieldless — single-slot. Delegate.
+                // Fieldless — single-slot. Delegate to the scalar Con
+                // path. all_slots should be empty for fieldless cons.
                 return Ok(vec![lower(ctx, expr)?]);
             }
-            // Payload-carrying: emit alloc + stores + return (tag, payload).
+            // Multi-variant payload-carrying: alloc + stores + return
+            // (tag, payload).
             let tag_idx = if let Some(meta) = ctx.decls.constructors.get(tag) {
                 meta.tag_index
             } else {
                 structural_con_layout(ty, tag, &ctx.fieldless).0
             };
-            // Lower each arg's slots and store at consecutive 8-byte offsets.
-            let mut all_slots: Vec<Value> = Vec::new();
-            for arg in args {
-                all_slots.extend(lower_slots(ctx, arg)?);
-            }
             let alloc_size = all_slots.len() * 8;
             let payload = ctx.builder.alloc(alloc_size);
             for (i, v) in all_slots.iter().enumerate() {
@@ -89,7 +110,7 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // App where the return type is multi-slot — emit call_multi
         // and return the result slot list directly.
         Expr::App { target, args, ty } => {
-            let ret_slots = super::lower::expand_slots(ty, &ctx.fieldless, &ctx.transparent);
+            let ret_slots = super::lower::expand_slots_with(ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
             if ret_slots.len() == 1 {
                 return Ok(vec![lower(ctx, expr)?]);
             }
@@ -151,7 +172,29 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             // Lower body via lower_slots (so multi-slot results work)
             // and materialize to single if needed — same convention
             // as the function-return and match-arm boundaries.
-            let vals = lower_slots(ctx, value)?;
+            let mut vals = lower_slots(ctx, value)?;
+            // If value returned a single Value (heap shell from a Call
+            // to a payload-union-returning function) but binders want
+            // multiple slots, unbox by loading N values from the shell
+            // at consecutive offsets. The slot types come from
+            // expand_slots on the value's type — needs payload_unions
+            // so App-form unions resolve correctly.
+            if vals.len() == 1 && binders.len() > 1 {
+                let slot_tys = super::lower::expand_slots_with(
+                    value.ty(),
+                    &ctx.fieldless,
+                    &ctx.transparent,
+                    &ctx.payload_unions,
+                );
+                if slot_tys.len() == binders.len() {
+                    let shell = vals[0];
+                    vals = slot_tys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &ty)| ctx.builder.load(shell, i * 8, ty))
+                        .collect();
+                }
+            }
             if vals.len() != binders.len() {
                 return Err(format!(
                     "core::to_ssa: Let value produced {} slots but binders.len()={}",
@@ -235,7 +278,7 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(header)
         }
 
-        Expr::Match { scrutinee, arms, ty } => lower_match(ctx, scrutinee, arms, ty),
+        Expr::Match { scrutinee_slots, arms, ty } => lower_match(ctx, scrutinee_slots, arms, ty),
 
         Expr::Con { tag, args, ty } => {
             // Only fieldless unions are supported in this slice —
@@ -296,12 +339,22 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 /// - Mixed pattern kinds in one Match.
 fn lower_match(
     ctx: &mut Ctx<'_>,
-    scrutinee: &Expr,
+    scrutinee_slots_exprs: &[Expr],
     arms: &[MatchArm],
     ty: &Type,
 ) -> Result<Value, String> {
-    let scrutinee_ty = scrutinee.ty().clone();
-    let scrutinee_slots = lower_slots(ctx, scrutinee)?;
+    // Match.scrutinee_slots is a parallel slot-expr list (length 1 for
+    // single-slot scrutinees, length > 1 for multi-slot decompositions).
+    // Take the first slot's type as the "scrutinee type" — it's the
+    // source-level type that union-shape inference reads from.
+    let scrutinee_ty = scrutinee_slots_exprs
+        .first()
+        .map(|e| e.ty().clone())
+        .ok_or_else(|| "core::to_ssa: Match has empty scrutinee_slots".to_string())?;
+    let mut scrutinee_slots: Vec<Value> = Vec::new();
+    for e in scrutinee_slots_exprs {
+        scrutinee_slots.extend(lower_slots(ctx, e)?);
+    }
 
     // Determine union shape:
     // - 1 slot + multi-variant payload-carrying union (in App form
@@ -311,10 +364,32 @@ fn lower_match(
     // - 1 slot fieldless union: the slot IS the discriminant.
     // - 2 slots (tag, payload): use directly.
     let unwrapped_ty = super::lower::resolve_transparent(&scrutinee_ty, &ctx.transparent);
-    let is_payload_carrying_union = matches!(
+    // Two routes to "this scrutinee is a multi-variant payload union":
+    // (1) Structural — the unwrapped type IS a TagUnion with multiple
+    //     variants, at least one payload-carrying.
+    // (2) Declared (Result, Maybe, user types) — the unwrapped type
+    //     is still App(name, _) because `:=` tag unions aren't in
+    //     `transparent`. Detect by checking if any arm's constructor
+    //     name is in decl_info.constructors with max_fields > 0
+    //     AND the constructor has at least one sibling (multi-variant).
+    let is_structural_payload = matches!(
         &unwrapped_ty,
         Type::TagUnion { tags, .. } if tags.len() > 1 && tags.iter().any(|(_, fs)| !fs.is_empty())
     );
+    // Look up the scrutinee's union name in payload_unions, which is
+    // already filtered to (multi-variant AND payload-carrying). This
+    // is more accurate than checking arm-by-arm — avoids false-
+    // positives for single-variant unions that happen to have payload
+    // constructors (where the scrutinee fans out directly, no shell).
+    let scrutinee_union_name = match &unwrapped_ty {
+        Type::App(name, _) => Some(name.as_str()),
+        Type::Con(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let is_declared_payload = scrutinee_union_name
+        .map(|n| ctx.payload_unions.contains(n))
+        .unwrap_or(false);
+    let is_payload_carrying_union = is_structural_payload || is_declared_payload;
     let (tag_val, payload_val) = match scrutinee_slots.as_slice() {
         [v] => {
             if is_payload_carrying_union {
@@ -348,6 +423,29 @@ fn lower_match(
                 match prev {
                     Some(p) => { ctx.locals.insert(*sym, p); }
                     None => { ctx.locals.remove(sym); }
+                }
+                return result;
+            }
+            // Phase E shape: a single-variant union whose scrutinee
+            // expanded to its captures directly (no tag, no payload
+            // heap). The single Constructor arm binds each binder to
+            // a scrutinee slot — no payload load, no dispatch. This
+            // is how `apply__narrow0(f, ...)` deconstructs `f`'s
+            // captures into registers.
+            Pattern::Constructor { binders, .. }
+                if payload_val.is_none() && binders.len() == scrutinee_slots.len() =>
+            {
+                let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
+                for (binder, slot_val) in binders.iter().zip(&scrutinee_slots) {
+                    if binder.0 == u32::MAX { continue; }
+                    bound.push((*binder, ctx.locals.insert(*binder, *slot_val)));
+                }
+                let result = lower(ctx, &arm.body);
+                for (binder, prev) in bound.into_iter().rev() {
+                    match prev {
+                        Some(p) => { ctx.locals.insert(binder, p); }
+                        None => { ctx.locals.remove(&binder); }
+                    }
                 }
                 return result;
             }
@@ -429,13 +527,63 @@ fn lower_match(
         // Constructor arms with field binders: load each field from
         // the payload + bind to its binder. IntLit arms have no
         // binders and no payload to load from.
+        //
+        // Each binder's source type may decompose to multiple slots
+        // (e.g. binding `left: Tree` where Tree is a payload union
+        // expanded to [U64, RcPtr]). Multi-slot binders need slot
+        // symbols + a multi-slot local mapping that AST→Core doesn't
+        // know to mint — bail and fall back to existing-lower for
+        // those. Single-slot binders bind normally.
         let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
-        if let Pattern::Constructor { binders, .. } = &arm.pattern {
+        if let Pattern::Constructor { tag, binders } = &arm.pattern {
             if let Some(payload_param) = payload_block_param {
-                for (i, (binder, &field_ty)) in binders.iter().zip(field_tys).enumerate() {
-                    if binder.0 == u32::MAX { continue; } // wildcard
-                    let v = ctx.builder.load(payload_param, i * 8, field_ty);
+                // Per-binder source-level Type (preferred, from
+                // constructor_schemes) so we can expand multi-slot
+                // binders. Fall back to per-binder ScalarType (from
+                // decl_info.constructors.field_types) when no scheme
+                // is recorded — that's the case for synth lambda
+                // constructors. Bail if the binder's source type
+                // expands to >1 slot.
+                let scheme_tys = ctx
+                    .decls
+                    .constructor_schemes
+                    .get(tag)
+                    .and_then(|s| match &s.ty {
+                        Type::Arrow(ps, _) => Some(ps.clone()),
+                        _ => None,
+                    });
+                let scalar_fallback: Vec<ScalarType> = ctx
+                    .decls
+                    .constructors
+                    .get(tag)
+                    .map(|m| m.field_types.clone())
+                    .unwrap_or_else(|| vec![ScalarType::RcPtr; binders.len()]);
+                let mut offset = 0usize;
+                for (i, binder) in binders.iter().enumerate() {
+                    let load_ty = if let Some(ref ps) = scheme_tys {
+                        let slot_tys = super::lower::expand_slots_with(
+                            &ps[i],
+                            &ctx.fieldless,
+                            &ctx.transparent,
+                            &ctx.payload_unions,
+                        );
+                        if slot_tys.len() != 1 {
+                            return Err(format!(
+                                "core::to_ssa: Match arm binder for `{tag}` has multi-slot type ({} slots) — not yet supported",
+                                slot_tys.len()
+                            ));
+                        }
+                        slot_tys[0]
+                    } else {
+                        scalar_fallback[i]
+                    };
+                    if binder.0 == u32::MAX {
+                        offset += 8;
+                        continue;
+                    }
+                    let v = ctx.builder.load(payload_param, offset, load_ty);
                     bound.push((*binder, ctx.locals.insert(*binder, v)));
+                    offset += 8;
                 }
             }
         }
@@ -631,6 +779,7 @@ mod tests {
             locals: HashMap::new(),
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
+            payload_unions: std::collections::HashSet::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         // Finalize so we can introspect the function.
@@ -665,6 +814,7 @@ mod tests {
             locals: HashMap::new(),
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
+            payload_unions: std::collections::HashSet::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -712,6 +862,7 @@ mod tests {
             locals: HashMap::new(),
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
+            payload_unions: std::collections::HashSet::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -747,7 +898,7 @@ mod tests {
             ty: i64_ty(),
         };
         let core = Expr::Match {
-            scrutinee: Box::new(one_plus_two),
+            scrutinee_slots: vec![one_plus_two],
             arms: vec![super::super::expr::MatchArm {
                 pattern: super::super::expr::Pattern::Binding(x),
                 body,
@@ -767,6 +918,7 @@ mod tests {
             locals: HashMap::new(),
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
+            payload_unions: std::collections::HashSet::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -808,7 +960,7 @@ mod tests {
             },
         ];
         let core = Expr::Match {
-            scrutinee: Box::new(scrutinee),
+            scrutinee_slots: vec![scrutinee],
             arms,
             ty: i64_ty(),
         };
@@ -836,10 +988,11 @@ mod tests {
             locals,
             fieldless,
             transparent: HashMap::new(),
+            payload_unions: std::collections::HashSet::new(),
         };
 
         let core_with_var = Expr::Match {
-            scrutinee: Box::new(Expr::Var { sym: sentinel, ty: bool_ty }),
+            scrutinee_slots: vec![Expr::Var { sym: sentinel, ty: bool_ty }],
             arms: match &core {
                 Expr::Match { arms, .. } => arms.clone(),
                 _ => unreachable!(),
@@ -876,6 +1029,7 @@ mod tests {
             locals: HashMap::new(),
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
+            payload_unions: std::collections::HashSet::new(),
         };
         let err = lower(&mut ctx, &core).unwrap_err();
         assert!(err.contains("#42"), "error should name the unbound symbol: {err}");

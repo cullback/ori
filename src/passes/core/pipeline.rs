@@ -29,7 +29,7 @@ use crate::ssa::{Builder, Module, Value};
 use crate::symbol::{FieldInterner, SymbolId, SymbolKind};
 use crate::types::engine::Type;
 
-use super::lower::{expand_slots, lower_expr_slots, LowerCtx, TransparentTable};
+use super::lower::{expand_slots_with, lower_expr_slots, LowerCtx, TransparentTable};
 use super::to_ssa;
 
 /// Lower a whole monomorphized AST module to SSA via the Core IR.
@@ -62,31 +62,46 @@ pub fn lower_module(
     // — InferResult.transparent has the right shape already).
     let transparent: TransparentTable = mono.infer.transparent.clone();
 
-    // Build payload-carrying-union name set from decl_info.constructors.
-    // For each constructor with max_fields > 0, find its return type's
-    // name (Ok → Result, Cons → List, etc.) by walking the constructor
-    // scheme's Arrow → return type → App/Con name.
-    let mut payload_unions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Build a map: union name → (variant count, any-payload-carrying).
+    // The "payload_unions" set we expose is the subset that's
+    // multi-variant AND has at least one payload-carrying constructor.
+    // Single-variant unions (like `Wrapped(I64)`) are not treated as
+    // (tag, payload) — their expand_slots fans out the variant's
+    // fields directly per existing-lower's convention.
+    let mut by_union: std::collections::HashMap<String, (usize, bool)> = std::collections::HashMap::new();
     for (con_name, meta) in &decls.constructors {
-        if meta.max_fields == 0 { continue; }
         if let Some(scheme) = decls.constructor_schemes.get(con_name) {
             let ret_ty = match &scheme.ty {
                 Type::Arrow(_, ret) => ret.as_ref(),
                 other => other,
             };
             if let Some(name) = union_name_of(ret_ty) {
-                payload_unions.insert(name);
+                let entry = by_union.entry(name).or_insert((0, false));
+                entry.0 += 1;
+                if meta.max_fields > 0 { entry.1 = true; }
             }
         }
     }
+    let payload_unions: std::collections::HashSet<String> = by_union
+        .into_iter()
+        .filter_map(|(name, (count, has_payload))| {
+            if count > 1 && has_payload { Some(name) } else { None }
+        })
+        .collect();
 
     for (name, params, body) in funcs {
         let name_str = mono.symbols.display(name).to_owned();
+        // `main` is the ABI boundary to the Rust eval driver: its
+        // params and return stay single-slot (RcPtr for aggregates),
+        // matching existing-lower's __main convention. Multi-slot
+        // expansion only applies inside user-to-user calls.
+        let is_main = name_str == "main";
 
         // Per-param slot expansion from the function's declared
         // scheme. Synth functions without schemes default to single
         // RcPtr per source param.
-        let per_param_slots = param_slot_types(mono, &name_str, &params, &decls.fieldless_tags, &transparent);
+        let param_payload_unions = if is_main { std::collections::HashSet::new() } else { payload_unions.clone() };
+        let per_param_slots = param_slot_types(mono, &name_str, &params, &decls.fieldless_tags, &transparent, &param_payload_unions);
 
         // Add SSA function params + build locals for both passes.
         // - to_ssa_locals: SymbolId → SSA Value (used by Core→SSA).
@@ -137,6 +152,7 @@ pub fn lower_module(
                 locals: to_ssa_locals,
                 fieldless: decls.fieldless_tags.clone(),
                 transparent: transparent.clone(),
+                payload_unions: payload_unions.clone(),
             };
             let mut all = Vec::new();
             for e in &core_body {
@@ -156,7 +172,8 @@ pub fn lower_module(
         // aren't in `infer.transparent`). Materialize Multi → Single
         // by emitting alloc + sequential stores + return the shell
         // pointer — matches existing-lower's convention exactly.
-        let ret_slots = expand_slots(&body.ty, &decls.fieldless_tags, &transparent);
+        let ret_payload_unions = if is_main { std::collections::HashSet::new() } else { payload_unions.clone() };
+        let ret_slots = expand_slots_with(&body.ty, &decls.fieldless_tags, &transparent, &ret_payload_unions);
         let result_vals = if result_vals.len() == ret_slots.len() {
             result_vals
         } else if ret_slots.len() == 1 && result_vals.len() > 1 {
@@ -210,12 +227,13 @@ fn param_slot_types(
     params: &[SymbolId],
     fieldless: &HashMap<String, ScalarType>,
     transparent: &TransparentTable,
+    payload_unions: &std::collections::HashSet<String>,
 ) -> Vec<Vec<ScalarType>> {
     mono.infer
         .func_schemes
         .get(name_str)
         .map(|s| match &s.ty {
-            Type::Arrow(ps, _) => ps.iter().map(|t| expand_slots(t, fieldless, transparent)).collect(),
+            Type::Arrow(ps, _) => ps.iter().map(|t| expand_slots_with(t, fieldless, transparent, payload_unions)).collect(),
             _ => vec![vec![ScalarType::RcPtr]; params.len()],
         })
         .unwrap_or_else(|| vec![vec![ScalarType::RcPtr]; params.len()])

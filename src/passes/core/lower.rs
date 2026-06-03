@@ -198,7 +198,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                         ty: ast.ty.clone(),
                     };
                     Ok(vec![Expr::Match {
-                        scrutinee: Box::new(scrutinee),
+                        scrutinee_slots: vec![scrutinee],
                         arms: vec![
                             MatchArm {
                                 pattern: Pattern::Constructor {
@@ -228,7 +228,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     };
                     let body_false = lower_expr(ctx, rhs)?;
                     Ok(vec![Expr::Match {
-                        scrutinee: Box::new(scrutinee),
+                        scrutinee_slots: vec![scrutinee],
                         arms: vec![
                             MatchArm {
                                 pattern: Pattern::Constructor {
@@ -414,7 +414,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
         ExprKind::Is { expr, pattern } => {
             // `expr : pattern` is sugar for a 2-arm Match returning Bool.
             //   match expr of pattern -> True | _ -> False
-            let scrutinee = lower_expr(ctx, expr)?;
+            let scrutinee_slots = lower_expr_slots(ctx, expr)?;
             let pat = lower_pattern(pattern)?;
             let bool_ty = ast.ty.clone();
             let true_body = Expr::Con {
@@ -428,7 +428,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 ty: bool_ty.clone(),
             };
             Ok(vec![Expr::Match {
-                scrutinee: Box::new(scrutinee),
+                scrutinee_slots,
                 arms: vec![
                     MatchArm { pattern: pat, body: true_body },
                     MatchArm { pattern: Pattern::Wildcard, body: false_body },
@@ -438,9 +438,12 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
         }
 
         ExprKind::If { expr, arms, else_body } => {
-            // Single-slot If only for now — multi-slot If requires
-            // per-slot duplication, deferred to a follow-on commit.
-            let scrutinee = lower_expr(ctx, expr)?;
+            // The scrutinee may be multi-slot (e.g., matching on a
+            // Maybe parameter whose params decomposed to (tag,
+            // payload)). lower_expr_slots returns the parallel slot
+            // list; to_ssa flattens it into the SSA Values it dispatches
+            // on.
+            let scrutinee_slots = lower_expr_slots(ctx, expr)?;
             let mut core_arms: Vec<MatchArm> = arms
                 .iter()
                 .map(|a| lower_match_arm(ctx, a))
@@ -450,7 +453,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 core_arms.push(MatchArm { pattern: Pattern::Wildcard, body });
             }
             Ok(vec![Expr::Match {
-                scrutinee: Box::new(scrutinee),
+                scrutinee_slots,
                 arms: core_arms,
                 ty: ast.ty.clone(),
             }])
@@ -497,13 +500,6 @@ fn lower_block(
     let body_slots = lower_expr_slots(ctx, last)?;
 
     // Right-to-left fold: wrap each body slot in the Let chain.
-    // Each Stmt::Let may produce multiple slot Lets if the bound
-    // value is multi-slot. The same Let chain wraps every body slot
-    // — sharing the bindings.
-    // (binders, value) — single-binder for scalar lets; multi-binder
-    // for Core Exprs that produce N slots from one expression (multi-
-    // result Call, payload Con). Each Let in `wrap_with_lets` wraps
-    // each body slot once.
     let mut wrap_with_lets: Vec<(Vec<SymbolId>, Expr)> = Vec::new();
     for stmt in stmts {
         match stmt {
@@ -692,11 +688,17 @@ pub fn expand_slots_with(
     payload_unions: &HashSet<String>,
 ) -> Vec<ScalarType> {
     let unwrapped = resolve_transparent(ty, transparent);
-    // App to a declared payload-carrying union (Result, Maybe, custom
-    // user types) — return (tag, payload_ptr) shape even though the
-    // type doesn't unfold via transparent. `:=` tag unions aren't in
-    // the transparent table by design.
-    if let Type::App(name, _) = &unwrapped {
+    // Named reference to a declared payload-carrying union (Result,
+    // Maybe, custom user types) — return (tag, payload_ptr) shape even
+    // though the type doesn't unfold via transparent. `:=` and `:`
+    // declarations aren't in the transparent table; they appear in
+    // schemes as Type::App or Type::Con by name.
+    let union_name = match &unwrapped {
+        Type::App(name, _) => Some(name.as_str()),
+        Type::Con(name) => Some(name.as_str()),
+        _ => None,
+    };
+    if let Some(name) = union_name {
         if payload_unions.contains(name) {
             return vec![ScalarType::U64, ScalarType::RcPtr];
         }
@@ -720,6 +722,13 @@ pub fn expand_slots_with(
             let all_fieldless = tags.iter().all(|(_, fs)| fs.is_empty());
             if all_fieldless {
                 vec![crate::passes::decl_info::discriminant_type(tags.len())]
+            } else if tags.len() == 1 {
+                // Single non-fieldless variant (Phase E closure shape,
+                // single-constructor newtypes): decompose directly to
+                // the variant's fields — no tag, no payload heap.
+                // Matches existing-lower's convention exactly so HOF
+                // narrowing → register captures still works.
+                tags[0].1.iter().flat_map(|t| expand_slots_with(t, fieldless, transparent, payload_unions)).collect()
             } else {
                 // (tag: U64, payload: RcPtr)
                 vec![ScalarType::U64, ScalarType::RcPtr]
