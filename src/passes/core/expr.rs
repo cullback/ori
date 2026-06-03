@@ -74,10 +74,30 @@ pub enum Pattern {
 }
 
 /// One arm of a `Match` expression.
+///
+/// `guards` are predicate expressions that must all evaluate to
+/// `True` after the pattern matches; an arm with an unsatisfied
+/// guard falls through to the next arm. `is_return` flips the arm
+/// from "produce a value for the match" to "return this value from
+/// the enclosing function" — the `?` operator desugars to a return
+/// arm in the `Err` branch.
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    pub guards: Vec<Expr>,
     pub body: Expr,
+    pub is_return: bool,
+}
+
+impl MatchArm {
+    /// Bare-arm constructor: pattern + body, no guards, no return.
+    /// Most call sites synthesizing arms (And/Or desugar, Is sugar,
+    /// the multi-arm Match in If/Match) build this shape; the
+    /// guarded / return variants are added by `lower_match_arm`
+    /// when reading guards / is_return off the AST arm.
+    pub fn plain(pattern: Pattern, body: Expr) -> Self {
+        Self { pattern, guards: vec![], body, is_return: false }
+    }
 }
 
 /// The Core IR expression. Eight primitives — see module docs for

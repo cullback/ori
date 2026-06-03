@@ -69,7 +69,9 @@ fn recurse(expr: Expr) -> Expr {
                 .into_iter()
                 .map(|a| MatchArm {
                     pattern: a.pattern,
+                    guards: a.guards.into_iter().map(simplify).collect(),
                     body: simplify(a.body),
+                    is_return: a.is_return,
                 })
                 .collect(),
             ty,

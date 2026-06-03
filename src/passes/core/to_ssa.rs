@@ -602,6 +602,20 @@ fn lower_match(
             }
         }
 
+        // Guards: each is a Bool expression evaluated in the arm's
+        // scope. If any guard is False, we currently bail to the
+        // fallback — proper guard support needs a per-arm fall-
+        // through block that jumps to the next candidate arm or
+        // the default. Stays at Err so the rest of the existing
+        // arm-binding work above isn't wasted: validators will
+        // surface the partial-state breakage early.
+        if !arm.guards.is_empty() {
+            return Err(format!(
+                "core::to_ssa: Match arm guards not yet supported ({} guard(s))",
+                arm.guards.len()
+            ));
+        }
+
         // Lower the body via lower_slots so payload Con works. If
         // the arm produces multiple slots but the Match result is
         // single-slot (which happens when the Match's result type is
@@ -609,16 +623,28 @@ fn lower_match(
         // the slots into a single heap shell — same convention as
         // pipeline.rs uses for the function return boundary.
         let arm_slots = lower_slots(ctx, &arm.body)?;
-        let body_val = if arm_slots.len() == 1 {
-            arm_slots[0]
-        } else {
-            let shell = ctx.builder.alloc(arm_slots.len() * 8);
-            for (i, v) in arm_slots.iter().enumerate() {
-                ctx.builder.store(shell, i * 8, *v);
+        if arm.is_return {
+            // Return arm: short-circuit the enclosing function
+            // rather than merging into the Match's result. Used by
+            // the `?` operator's Err arm and explicit `: pat return
+            // body` syntax.
+            if arm_slots.len() == 1 {
+                ctx.builder.ret(arm_slots[0]);
+            } else {
+                ctx.builder.ret_multi(arm_slots.clone());
             }
-            shell
-        };
-        ctx.builder.jump(merge, vec![body_val]);
+        } else {
+            let body_val = if arm_slots.len() == 1 {
+                arm_slots[0]
+            } else {
+                let shell = ctx.builder.alloc(arm_slots.len() * 8);
+                for (i, v) in arm_slots.iter().enumerate() {
+                    ctx.builder.store(shell, i * 8, *v);
+                }
+                shell
+            };
+            ctx.builder.jump(merge, vec![body_val]);
+        }
 
         // Restore shadowed bindings.
         for (binder, prev) in bound.into_iter().rev() {
@@ -896,10 +922,10 @@ mod tests {
         let core = Expr::Match {
             scrutinee_slots: vec![one_plus_two],
             scrutinee_ty: i64_ty(),
-            arms: vec![super::super::expr::MatchArm {
-                pattern: super::super::expr::Pattern::Binding(x),
+            arms: vec![super::super::expr::MatchArm::plain(
+                super::super::expr::Pattern::Binding(x),
                 body,
-            }],
+            )],
             ty: i64_ty(),
         };
 
@@ -947,14 +973,14 @@ mod tests {
             ty: bool_ty.clone(),
         };
         let arms = vec![
-            MatchArm {
-                pattern: Pattern::Constructor { tag: "True".to_string(), binders: vec![] },
-                body: Expr::Lit { value: Literal::Int(100), ty: i64_ty() },
-            },
-            MatchArm {
-                pattern: Pattern::Constructor { tag: "False".to_string(), binders: vec![] },
-                body: Expr::Lit { value: Literal::Int(200), ty: i64_ty() },
-            },
+            MatchArm::plain(
+                Pattern::Constructor { tag: "True".to_string(), binders: vec![] },
+                Expr::Lit { value: Literal::Int(100), ty: i64_ty() },
+            ),
+            MatchArm::plain(
+                Pattern::Constructor { tag: "False".to_string(), binders: vec![] },
+                Expr::Lit { value: Literal::Int(200), ty: i64_ty() },
+            ),
         ];
         let core = Expr::Match {
             scrutinee_slots: vec![scrutinee],

@@ -246,20 +246,14 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                         scrutinee_slots: vec![scrutinee],
                         scrutinee_ty,
                         arms: vec![
-                            MatchArm {
-                                pattern: Pattern::Constructor {
-                                    tag: "True".to_string(),
-                                    binders: vec![],
-                                },
-                                body: body_true,
-                            },
-                            MatchArm {
-                                pattern: Pattern::Constructor {
-                                    tag: "False".to_string(),
-                                    binders: vec![],
-                                },
-                                body: body_false,
-                            },
+                            MatchArm::plain(
+                                Pattern::Constructor { tag: "True".to_string(), binders: vec![] },
+                                body_true,
+                            ),
+                            MatchArm::plain(
+                                Pattern::Constructor { tag: "False".to_string(), binders: vec![] },
+                                body_false,
+                            ),
                         ],
                         ty: ast.ty.clone(),
                     }])
@@ -278,20 +272,14 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                         scrutinee_slots: vec![scrutinee],
                         scrutinee_ty,
                         arms: vec![
-                            MatchArm {
-                                pattern: Pattern::Constructor {
-                                    tag: "True".to_string(),
-                                    binders: vec![],
-                                },
-                                body: body_true,
-                            },
-                            MatchArm {
-                                pattern: Pattern::Constructor {
-                                    tag: "False".to_string(),
-                                    binders: vec![],
-                                },
-                                body: body_false,
-                            },
+                            MatchArm::plain(
+                                Pattern::Constructor { tag: "True".to_string(), binders: vec![] },
+                                body_true,
+                            ),
+                            MatchArm::plain(
+                                Pattern::Constructor { tag: "False".to_string(), binders: vec![] },
+                                body_false,
+                            ),
                         ],
                         ty: ast.ty.clone(),
                     }])
@@ -538,8 +526,8 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 scrutinee_slots,
                 scrutinee_ty,
                 arms: vec![
-                    MatchArm { pattern: pat, body: true_body },
-                    MatchArm { pattern: Pattern::Wildcard, body: false_body },
+                    MatchArm::plain(pat, true_body),
+                    MatchArm::plain(Pattern::Wildcard, false_body),
                 ],
                 ty: bool_ty,
             }])
@@ -559,7 +547,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 .collect::<Result<_, _>>()?;
             if let Some(else_expr) = else_body {
                 let body = lower_expr(ctx, else_expr)?;
-                core_arms.push(MatchArm { pattern: Pattern::Wildcard, body });
+                core_arms.push(MatchArm::plain(Pattern::Wildcard, body));
             }
             Ok(vec![Expr::Match {
                 scrutinee_slots,
@@ -962,12 +950,6 @@ fn type_for_scalar(s: ScalarType) -> Type {
 }
 
 fn lower_match_arm(ctx: &mut LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<MatchArm, String> {
-    if !arm.guards.is_empty() {
-        return Err("core::lower_match_arm: guarded arms not yet supported".into());
-    }
-    if arm.is_return {
-        return Err("core::lower_match_arm: return arms not yet supported".into());
-    }
     let mut pattern = lower_pattern(&arm.pattern)?;
 
     // For each constructor binder whose source type expands to
@@ -1002,6 +984,15 @@ fn lower_match_arm(ctx: &mut LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<Matc
         }
     }
 
+    // Guards and body lower in the arm's scope (so they can see the
+    // pattern binders). Each guard is a Bool-typed expression that
+    // must evaluate to True for the arm to fire; to_ssa chains them
+    // as branches that fall through to subsequent arms on False.
+    let guards: Vec<Expr> = arm
+        .guards
+        .iter()
+        .map(|g| lower_expr(ctx, g))
+        .collect::<Result<_, _>>()?;
     let body = lower_expr(ctx, &arm.body)?;
 
     // Restore the outer scope's `ctx.locals` so sibling arms don't
@@ -1014,7 +1005,7 @@ fn lower_match_arm(ctx: &mut LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<Matc
         }
     }
 
-    Ok(MatchArm { pattern, body })
+    Ok(MatchArm { pattern, guards, body, is_return: arm.is_return })
 }
 
 fn lower_pattern(pat: &AstPattern<'_>) -> Result<Pattern, String> {
