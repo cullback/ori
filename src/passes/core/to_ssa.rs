@@ -357,6 +357,7 @@ fn lower_match(
         scrutinee_slots.extend(lower_slots(ctx, e)?);
     }
 
+
     // Determine union shape:
     // - 1 slot + multi-variant payload-carrying union (in App form
     //   that didn't unfold via transparent): unbox the heap shell
