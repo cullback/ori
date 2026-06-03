@@ -120,12 +120,35 @@ pub fn lower_module(
             }
         }
     }
-    let payload_unions: std::collections::HashSet<String> = by_union
+    let mut payload_unions: std::collections::HashSet<String> = by_union
         .into_iter()
         .filter_map(|(name, (count, has_payload))| {
             if count > 1 && has_payload { Some(name) } else { None }
         })
         .collect();
+    // Synth closure types (`__Closure_xxx`) declared by the lambda
+    // passes aren't in `decl_info.constructors` because the
+    // constructors are registered after inference. Walk the
+    // TagUnion TypeAnnos directly so multi-variant payload-carrying
+    // lambda sets land in `payload_unions` and `expand_slots` picks
+    // them up as (tag, payload) — without this the __apply
+    // dispatchers see their closure params as a bare discriminant.
+    for decl in &mono.module.decls {
+        if let Decl::TypeAnno {
+            name,
+            ty: crate::ast::TypeExpr::TagUnion(tags, _),
+            ..
+        } = decl
+        {
+            let union_name = mono.symbols.display(*name).to_owned();
+            if !union_name.starts_with("__") {
+                continue;
+            }
+            if tags.len() > 1 && tags.iter().any(|t| !t.fields.is_empty()) {
+                payload_unions.insert(union_name);
+            }
+        }
+    }
 
     for (name, params, body) in funcs {
         let name_str = mono.symbols.display(name).to_owned();
