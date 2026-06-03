@@ -304,7 +304,15 @@ fn build_apply_function<'src>(
         }
     }
 
-    let scrutinee = Expr::new(ExprKind::Name(closure_param), span);
+    // Stamp the closure type on the scrutinee Name so downstream
+    // type-aware lowering (Core's `expand_slots` for the Match
+    // scrutinee, `scrutinee_ty` recovery) sees the real shape
+    // instead of the placeholder `TypeVar(0)` that `Expr::new`
+    // leaves behind. `register_apply_scheme` runs after this
+    // function but the param type is statically known: the
+    // closure-set's Con name.
+    let closure_ty = Type::Con(ls.closure_type_name.clone());
+    let scrutinee = Expr::typed(ExprKind::Name(closure_param), span, closure_ty);
     let mut body = Expr::new(
         ExprKind::If {
             expr: Box::new(scrutinee),
