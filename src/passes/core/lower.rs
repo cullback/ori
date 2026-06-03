@@ -484,8 +484,8 @@ fn lower_block(
                 }
             }
             Stmt::TypeHint { .. } => {}
-            Stmt::Destructure { .. } => {
-                return Err("core::lower_block: Stmt::Destructure not yet supported".into());
+            Stmt::Destructure { pattern, val } => {
+                lower_destructure(ctx, pattern, val, &mut wrap_with_lets)?;
             }
             Stmt::Guard { .. } => {
                 return Err("core::lower_block: Stmt::Guard not yet supported".into());
@@ -509,6 +509,62 @@ fn lower_block(
         })
         .collect();
     Ok(wrapped)
+}
+
+/// Lower a `let pat = val` destructure into one or more bindings in
+/// `wrap_with_lets`. Today supports `Pattern::Tuple` with single-slot
+/// Binding sub-patterns (no Wildcards, no nesting). The value is
+/// either an aggregate literal (Vec<Expr> matching the sub-pattern
+/// count) or a single multi-slot Core Expr (multi-binder Let).
+fn lower_destructure(
+    ctx: &mut LowerCtx<'_>,
+    pattern: &AstPattern<'_>,
+    val: &AstExpr<'_>,
+    wrap_with_lets: &mut Vec<(Vec<SymbolId>, Expr)>,
+) -> Result<(), String> {
+    let value_slots = lower_expr_slots(ctx, val)?;
+    let expected_slot_count = expand_slots(&val.ty, &ctx.fieldless, &ctx.transparent).len();
+    let sub_pats: &[AstPattern<'_>] = match pattern {
+        AstPattern::Tuple(ps) => ps,
+        other => return Err(format!(
+            "core::lower_destructure: unsupported pattern shape: {other:?}"
+        )),
+    };
+    // For simplicity, each sub-pattern must be a Binding. Nested
+    // patterns + Wildcards land later.
+    let binders: Vec<SymbolId> = sub_pats
+        .iter()
+        .map(|p| match p {
+            AstPattern::Binding(sym) => Ok(*sym),
+            other => Err(format!(
+                "core::lower_destructure: only top-level Binding sub-patterns supported, got {other:?}"
+            )),
+        })
+        .collect::<Result<_, _>>()?;
+    if sub_pats.len() != expected_slot_count {
+        return Err(format!(
+            "core::lower_destructure: Tuple pattern has {} elements but value type expands to {} slots",
+            sub_pats.len(),
+            expected_slot_count
+        ));
+    }
+
+    if value_slots.len() == binders.len() {
+        // Aggregate literal — parallel single-binder Lets.
+        for (sym, val) in binders.into_iter().zip(value_slots) {
+            wrap_with_lets.push((vec![sym], val));
+        }
+    } else if value_slots.len() == 1 && binders.len() > 1 {
+        // Multi-slot Call etc. — single multi-binder Let.
+        wrap_with_lets.push((binders, value_slots.into_iter().next().unwrap()));
+    } else {
+        return Err(format!(
+            "core::lower_destructure: slot count mismatch — value_slots={}, binders={}",
+            value_slots.len(),
+            binders.len()
+        ));
+    }
+    Ok(())
 }
 
 fn mint_slot_syms(
