@@ -109,6 +109,13 @@ pub struct LowerCtx<'a> {
     /// visible to `Match` and avoids generating "call to unknown
     /// function 'Ok'" SSA.
     pub constructors: HashSet<String>,
+    /// Names of declared **payload-carrying** unions (`Result`, `Maybe`,
+    /// custom user types with field-bearing variants). `expand_slots`
+    /// for an `App(name, _)` whose `name` is in this set returns
+    /// 2 slots `[U64, RcPtr]` even when the type doesn't unfold via
+    /// `transparent` — these `:=` tag unions aren't in the transparent
+    /// table by design (see `infer::Pass 2a`).
+    pub payload_unions: HashSet<String>,
     /// Per-binding slot expansion. An AST `SymbolId` for a binding
     /// of multi-slot type maps to its synthesized per-slot symbols.
     /// Single-slot bindings either don't appear here (the AST sym
@@ -128,6 +135,7 @@ impl<'a> LowerCtx<'a> {
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
             constructors: HashSet::new(),
+            payload_unions: HashSet::new(),
             locals: HashMap::new(),
             slot_paths: HashMap::new(),
         }
@@ -159,7 +167,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // symbols. Otherwise treat the AST sym as itself a
             // single SSA value (function params, scalar lets).
             if let Some(slot_syms) = ctx.locals.get(sym).cloned() {
-                let slot_tys = expand_slots(&ast.ty, &ctx.fieldless, &ctx.transparent);
+                let slot_tys = expand_slots_with(&ast.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
                 Ok(slot_syms
                     .into_iter()
                     .zip(slot_tys)
@@ -387,7 +395,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // Each element must be single-slot for now. Multi-slot
             // element types (records, tuples, lists-of-lists) need
             // inlined-slot layout — falls back.
-            if expand_slots(&elem_ty, &ctx.fieldless, &ctx.transparent).len() != 1 {
+            if expand_slots_with(&elem_ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions).len() != 1 {
                 return Err(format!(
                     "core::lower_expr: ListLit with multi-slot element type {elem_ty:?} not yet supported"
                 ));
@@ -501,7 +509,7 @@ fn lower_block(
         match stmt {
             Stmt::Let { name, val } => {
                 let value_slots = lower_expr_slots(ctx, val)?;
-                let expected_slot_count = expand_slots(&val.ty, &ctx.fieldless, &ctx.transparent).len();
+                let expected_slot_count = expand_slots_with(&val.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions).len();
 
                 if value_slots.len() == 1 && expected_slot_count == 1 {
                     // Scalar binding — bind to the AST sym directly.
@@ -573,7 +581,7 @@ fn lower_destructure(
     wrap_with_lets: &mut Vec<(Vec<SymbolId>, Expr)>,
 ) -> Result<(), String> {
     let value_slots = lower_expr_slots(ctx, val)?;
-    let expected_slot_count = expand_slots(&val.ty, &ctx.fieldless, &ctx.transparent).len();
+    let expected_slot_count = expand_slots_with(&val.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions).len();
     let sub_pats: &[AstPattern<'_>] = match pattern {
         AstPattern::Tuple(ps) => ps,
         other => return Err(format!(
@@ -674,7 +682,25 @@ pub fn expand_slots(
     fieldless: &HashMap<String, ScalarType>,
     transparent: &TransparentTable,
 ) -> Vec<ScalarType> {
+    expand_slots_with(ty, fieldless, transparent, &HashSet::new())
+}
+
+pub fn expand_slots_with(
+    ty: &Type,
+    fieldless: &HashMap<String, ScalarType>,
+    transparent: &TransparentTable,
+    payload_unions: &HashSet<String>,
+) -> Vec<ScalarType> {
     let unwrapped = resolve_transparent(ty, transparent);
+    // App to a declared payload-carrying union (Result, Maybe, custom
+    // user types) — return (tag, payload_ptr) shape even though the
+    // type doesn't unfold via transparent. `:=` tag unions aren't in
+    // the transparent table by design.
+    if let Type::App(name, _) = &unwrapped {
+        if payload_unions.contains(name) {
+            return vec![ScalarType::U64, ScalarType::RcPtr];
+        }
+    }
     match &unwrapped {
         Type::Record { fields, .. } => {
             let mut out = Vec::new();

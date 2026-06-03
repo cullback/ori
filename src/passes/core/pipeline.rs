@@ -62,6 +62,24 @@ pub fn lower_module(
     // — InferResult.transparent has the right shape already).
     let transparent: TransparentTable = mono.infer.transparent.clone();
 
+    // Build payload-carrying-union name set from decl_info.constructors.
+    // For each constructor with max_fields > 0, find its return type's
+    // name (Ok → Result, Cons → List, etc.) by walking the constructor
+    // scheme's Arrow → return type → App/Con name.
+    let mut payload_unions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (con_name, meta) in &decls.constructors {
+        if meta.max_fields == 0 { continue; }
+        if let Some(scheme) = decls.constructor_schemes.get(con_name) {
+            let ret_ty = match &scheme.ty {
+                Type::Arrow(_, ret) => ret.as_ref(),
+                other => other,
+            };
+            if let Some(name) = union_name_of(ret_ty) {
+                payload_unions.insert(name);
+            }
+        }
+    }
+
     for (name, params, body) in funcs {
         let name_str = mono.symbols.display(name).to_owned();
 
@@ -96,6 +114,7 @@ pub fn lower_module(
             ctx.fieldless = decls.fieldless_tags.clone();
             ctx.transparent = transparent.clone();
             ctx.constructors = decls.constructors.keys().cloned().collect();
+            ctx.payload_unions = payload_unions.clone();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {
                 format!("function `{name_str}`: AST→Core: {e}")
@@ -174,6 +193,17 @@ pub fn lower_module(
 /// `infer.func_schemes` (authoritative for declared functions);
 /// falls back to one RcPtr per source param for synth functions
 /// without schemes.
+/// Extract the type name for `App(name, _)` or `Con(name)` — used to
+/// reverse-look-up a constructor's parent union. Returns None for
+/// non-named types (Record, Tuple, function arrows, etc.).
+fn union_name_of(ty: &Type) -> Option<String> {
+    match ty {
+        Type::App(name, _) => Some(name.clone()),
+        Type::Con(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
 fn param_slot_types(
     mono: &Monomorphized<'_>,
     name_str: &str,
