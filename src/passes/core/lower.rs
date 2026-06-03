@@ -691,6 +691,105 @@ fn try_lower_stdlib_intrinsic(
                 ty: ret_ty.clone(),
             }]))
         }
+        "List.get" => {
+            if args.len() != 2 {
+                return Err(format!(
+                    "core::lower_expr: List.get expects 2 args, got {}",
+                    args.len()
+                ));
+            }
+            // Desugar `List.get(xs, idx)` into a bounds-checked
+            // `Match` over `idx < ProjSlot(xs, 0)` whose arms build
+            // `Ok(BufLoad(ProjSlot(xs, 2), idx, T))` or
+            // `Err(OutOfBounds)`. The result of the Match is the
+            // single-shell Result; the two ProjSlot reads at the
+            // end unbox it into (tag, payload) so multi-slot
+            // callers (the typical `.unwrap()` chain) see the
+            // proper Result decomposition.
+            let xs_slots = lower_expr_slots(ctx, &args[0])?;
+            let idx_expr = lower_expr(ctx, &args[1])?;
+            let u64_ty = Type::Con("U64".to_string());
+            let bool_ty = Type::TagUnion {
+                tags: vec![("True".to_string(), vec![]), ("False".to_string(), vec![])],
+                rest: None,
+            };
+            let elem_ty = match &args[0].ty {
+                Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
+                other => return Err(format!(
+                    "core::lower_expr: List.get on non-List type {other:?}"
+                )),
+            };
+            let len = Expr::ProjSlot {
+                source_slots: xs_slots.clone(),
+                slot_idx: 0,
+                ty: u64_ty.clone(),
+            };
+            let data = Expr::ProjSlot {
+                source_slots: xs_slots,
+                slot_idx: 2,
+                ty: Type::Con("__RcPtr".to_string()),
+            };
+            let bounds_check = Expr::BinOp {
+                op: crate::ssa::BinaryOp::Lt,
+                lhs: Box::new(idx_expr.clone()),
+                rhs: Box::new(len),
+                ty: bool_ty.clone(),
+            };
+            let elem = Expr::BufLoad {
+                buf: Box::new(data),
+                idx: Box::new(idx_expr),
+                ty: elem_ty.clone(),
+            };
+            let ok_body = Expr::Con {
+                tag: "Ok".to_string(),
+                args: vec![elem],
+                ty: ret_ty.clone(),
+            };
+            let oob_union_ty = Type::TagUnion {
+                tags: vec![("OutOfBounds".to_string(), vec![])],
+                rest: None,
+            };
+            let oob = Expr::Con {
+                tag: "OutOfBounds".to_string(),
+                args: vec![],
+                ty: oob_union_ty,
+            };
+            let err_body = Expr::Con {
+                tag: "Err".to_string(),
+                args: vec![oob],
+                ty: ret_ty.clone(),
+            };
+            let match_result = Expr::Match {
+                scrutinee_slots: vec![bounds_check],
+                scrutinee_ty: bool_ty,
+                arms: vec![
+                    MatchArm::plain(
+                        Pattern::Constructor { tag: "True".to_string(), binders: vec![] },
+                        ok_body,
+                    ),
+                    MatchArm::plain(
+                        Pattern::Constructor { tag: "False".to_string(), binders: vec![] },
+                        err_body,
+                    ),
+                ],
+                ty: ret_ty.clone(),
+            };
+            // The Match's result is a single shell (RcPtr); unbox
+            // into Result's (tag, payload) slot pair so the
+            // multi-slot caller doesn't see a shell.
+            Ok(Some(vec![
+                Expr::ProjSlot {
+                    source_slots: vec![match_result.clone()],
+                    slot_idx: 0,
+                    ty: u64_ty,
+                },
+                Expr::ProjSlot {
+                    source_slots: vec![match_result],
+                    slot_idx: 1,
+                    ty: Type::Con("__RcPtr".to_string()),
+                },
+            ]))
+        }
         _ => Ok(None),
     }
 }
