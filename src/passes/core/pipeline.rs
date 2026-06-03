@@ -243,11 +243,25 @@ pub fn lower_module(
         let result_vals = if result_vals.len() == ret_slots.len() {
             result_vals
         } else if ret_slots.len() == 1 && result_vals.len() > 1 {
+            // Body produced multi-slot but the function's return
+            // type is single-slot — materialize into an RcPtr shell.
             let shell = builder.alloc(result_vals.len() * 8);
             for (i, v) in result_vals.iter().enumerate() {
                 builder.store(shell, i * 8, *v);
             }
             vec![shell]
+        } else if result_vals.len() == 1 && ret_slots.len() > 1 {
+            // Body produced a single RcPtr shell (typically because
+            // the Core::Match lowering merges arms through a
+            // single-slot block param) but the function's return
+            // shape is multi-slot. Unbox by loading N values from
+            // the shell at consecutive offsets, typed per ret_slots.
+            let shell = result_vals[0];
+            ret_slots
+                .iter()
+                .enumerate()
+                .map(|(i, &ty)| builder.load(shell, i * 8, ty))
+                .collect()
         } else {
             return Err(format!(
                 "function `{name_str}`: slot count mismatch — body produced {}, return declares {}",

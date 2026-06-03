@@ -753,14 +753,20 @@ fn lower_destructure(
             "core::lower_destructure: unsupported pattern shape: {other:?}"
         )),
     };
-    // For simplicity, each sub-pattern must be a Binding. Nested
-    // patterns + Wildcards land later.
+    // Each sub-pattern must be a Binding or Wildcard at the top
+    // level. Wildcards get a sentinel SymbolId (`u32::MAX`) so the
+    // shared Let-emission code uses one branch for both; the
+    // SSA pipeline drops Lets whose binder is unused, so the
+    // wildcard's value just doesn't get bound. Nested sub-patterns
+    // need pre-flattening (the AST already does this for nested
+    // ctor patterns inside Match arms).
     let binders: Vec<SymbolId> = sub_pats
         .iter()
         .map(|p| match p {
             AstPattern::Binding(sym) => Ok(*sym),
+            AstPattern::Wildcard => Ok(SymbolId(u32::MAX)),
             other => Err(format!(
-                "core::lower_destructure: only top-level Binding sub-patterns supported, got {other:?}"
+                "core::lower_destructure: only top-level Binding/Wildcard sub-patterns supported, got {other:?}"
             )),
         })
         .collect::<Result<_, _>>()?;
