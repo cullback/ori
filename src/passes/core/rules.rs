@@ -62,8 +62,9 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
-        Expr::Match { scrutinee_slots, arms, ty } => Expr::Match {
+        Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => Expr::Match {
             scrutinee_slots: scrutinee_slots.into_iter().map(simplify).collect(),
+            scrutinee_ty,
             arms: arms
                 .into_iter()
                 .map(|a| MatchArm {

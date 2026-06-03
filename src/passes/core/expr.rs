@@ -116,10 +116,11 @@ pub enum Expr {
         ty: Type,
     },
 
-    /// `Match(scrutinee_slots, arms, type)` — non-recursive case
-    /// analysis on a tag union. Distinct from `Cata` because not
-    /// every case-of is a fold (`Maybe`, `Result`, single-variant
-    /// unions are non-recursive). Every arm has the same `ty`.
+    /// `Match(scrutinee_slots, scrutinee_ty, arms, type)` — non-
+    /// recursive case analysis on a tag union. Distinct from `Cata`
+    /// because not every case-of is a fold (`Maybe`, `Result`,
+    /// single-variant unions are non-recursive). Every arm has the
+    /// same `ty`.
     ///
     /// `scrutinee_slots` is a parallel slot list (length matches
     /// `expand_slots` of the scrutinee's source type): single-slot
@@ -127,8 +128,15 @@ pub enum Expr {
     /// matching on a `Maybe` parameter that decomposed to (tag,
     /// payload)) carry both slots. to_ssa flattens this into the
     /// `Value` list it uses to derive `tag_val` / `payload_val`.
+    ///
+    /// `scrutinee_ty` is the **source-level** type of the scrutinee,
+    /// preserved here because the individual slot exprs may carry
+    /// per-slot scalar placeholder types (`Con("U64")`,
+    /// `Con("__RcPtr")`) that lose the union shape needed for
+    /// structural-constructor layout.
     Match {
         scrutinee_slots: Vec<Expr>,
+        scrutinee_ty: Type,
         arms: Vec<MatchArm>,
         ty: Type,
     },

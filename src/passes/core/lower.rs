@@ -190,6 +190,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             match op {
                 BinOp::And => {
                     // a && b ≡ match a of True -> b | False -> False
+                    let scrutinee_ty = lhs.ty.clone();
                     let scrutinee = lower_expr(ctx, lhs)?;
                     let body_true = lower_expr(ctx, rhs)?;
                     let body_false = Expr::Con {
@@ -199,6 +200,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     };
                     Ok(vec![Expr::Match {
                         scrutinee_slots: vec![scrutinee],
+                        scrutinee_ty,
                         arms: vec![
                             MatchArm {
                                 pattern: Pattern::Constructor {
@@ -220,6 +222,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 }
                 BinOp::Or => {
                     // a || b ≡ match a of True -> True | False -> b
+                    let scrutinee_ty = lhs.ty.clone();
                     let scrutinee = lower_expr(ctx, lhs)?;
                     let body_true = Expr::Con {
                         tag: "True".to_string(),
@@ -229,6 +232,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     let body_false = lower_expr(ctx, rhs)?;
                     Ok(vec![Expr::Match {
                         scrutinee_slots: vec![scrutinee],
+                        scrutinee_ty,
                         arms: vec![
                             MatchArm {
                                 pattern: Pattern::Constructor {
@@ -414,6 +418,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
         ExprKind::Is { expr, pattern } => {
             // `expr : pattern` is sugar for a 2-arm Match returning Bool.
             //   match expr of pattern -> True | _ -> False
+            let scrutinee_ty = expr.ty.clone();
             let scrutinee_slots = lower_expr_slots(ctx, expr)?;
             let pat = lower_pattern(pattern)?;
             let bool_ty = ast.ty.clone();
@@ -429,6 +434,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             };
             Ok(vec![Expr::Match {
                 scrutinee_slots,
+                scrutinee_ty,
                 arms: vec![
                     MatchArm { pattern: pat, body: true_body },
                     MatchArm { pattern: Pattern::Wildcard, body: false_body },
@@ -443,6 +449,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // payload)). lower_expr_slots returns the parallel slot
             // list; to_ssa flattens it into the SSA Values it dispatches
             // on.
+            let scrutinee_ty = expr.ty.clone();
             let scrutinee_slots = lower_expr_slots(ctx, expr)?;
             let mut core_arms: Vec<MatchArm> = arms
                 .iter()
@@ -454,6 +461,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             }
             Ok(vec![Expr::Match {
                 scrutinee_slots,
+                scrutinee_ty,
                 arms: core_arms,
                 ty: ast.ty.clone(),
             }])
@@ -496,11 +504,13 @@ fn lower_block(
     stmts: &[Stmt<'_>],
     last: &AstExpr<'_>,
 ) -> Result<Vec<Expr>, String> {
-    // Lower body first so we know its slot count.
-    let body_slots = lower_expr_slots(ctx, last)?;
-
-    // Right-to-left fold: wrap each body slot in the Let chain.
+    // Lower stmts in source order so multi-slot bindings (records,
+    // tuples, payload-union calls) register their slot syms in
+    // `ctx.locals` before the body — or before subsequent stmts —
+    // dereference them via `Name(p)`. The body lowers last so it
+    // sees the full local table.
     let mut wrap_with_lets: Vec<(Vec<SymbolId>, Expr)> = Vec::new();
+    let mut shadowed: Vec<(SymbolId, Option<Vec<SymbolId>>)> = Vec::new();
     for stmt in stmts {
         match stmt {
             Stmt::Let { name, val } => {
@@ -516,7 +526,7 @@ fn lower_block(
                 } else if value_slots.len() == expected_slot_count {
                     // Aggregate literal — N parallel single-binder Lets.
                     let slot_syms = mint_slot_syms(ctx, *name, expected_slot_count);
-                    ctx.locals.insert(*name, slot_syms.clone());
+                    shadowed.push((*name, ctx.locals.insert(*name, slot_syms.clone())));
                     for (sym, val) in slot_syms.into_iter().zip(value_slots) {
                         wrap_with_lets.push((vec![sym], val));
                     }
@@ -524,7 +534,7 @@ fn lower_block(
                     // One Core Expr producing N slots (multi-result
                     // Call, payload Con) — single multi-binder Let.
                     let slot_syms = mint_slot_syms(ctx, *name, expected_slot_count);
-                    ctx.locals.insert(*name, slot_syms.clone());
+                    shadowed.push((*name, ctx.locals.insert(*name, slot_syms.clone())));
                     wrap_with_lets.push((
                         slot_syms,
                         value_slots.into_iter().next().unwrap(),
@@ -544,6 +554,19 @@ fn lower_block(
             Stmt::Guard { .. } => {
                 return Err("core::lower_block: Stmt::Guard not yet supported".into());
             }
+        }
+    }
+
+    let body_slots = lower_expr_slots(ctx, last)?;
+
+    // Restore outer scope's `ctx.locals` entries shadowed by this
+    // block's bindings. The Lets we wrap with preserve the names for
+    // the SSA layer; we only need to undo our changes to the lookup
+    // table so siblings of this block don't see our slot syms.
+    for (name, prev) in shadowed.into_iter().rev() {
+        match prev {
+            Some(p) => { ctx.locals.insert(name, p); }
+            None => { ctx.locals.remove(&name); }
         }
     }
 

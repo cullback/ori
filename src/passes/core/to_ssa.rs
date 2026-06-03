@@ -278,7 +278,7 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(header)
         }
 
-        Expr::Match { scrutinee_slots, arms, ty } => lower_match(ctx, scrutinee_slots, arms, ty),
+        Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => lower_match(ctx, scrutinee_slots, scrutinee_ty, arms, ty),
 
         Expr::Con { tag, args, ty } => {
             // Only fieldless unions are supported in this slice —
@@ -340,17 +340,15 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 fn lower_match(
     ctx: &mut Ctx<'_>,
     scrutinee_slots_exprs: &[Expr],
+    scrutinee_ty: &Type,
     arms: &[MatchArm],
     ty: &Type,
 ) -> Result<Value, String> {
     // Match.scrutinee_slots is a parallel slot-expr list (length 1 for
     // single-slot scrutinees, length > 1 for multi-slot decompositions).
-    // Take the first slot's type as the "scrutinee type" — it's the
-    // source-level type that union-shape inference reads from.
-    let scrutinee_ty = scrutinee_slots_exprs
-        .first()
-        .map(|e| e.ty().clone())
-        .ok_or_else(|| "core::to_ssa: Match has empty scrutinee_slots".to_string())?;
+    // The source-level type comes from `scrutinee_ty` — per-slot exprs
+    // carry placeholder scalar types that lose the union shape.
+    let scrutinee_ty = scrutinee_ty.clone();
     let mut scrutinee_slots: Vec<Value> = Vec::new();
     for e in scrutinee_slots_exprs {
         scrutinee_slots.extend(lower_slots(ctx, e)?);
@@ -899,6 +897,7 @@ mod tests {
         };
         let core = Expr::Match {
             scrutinee_slots: vec![one_plus_two],
+            scrutinee_ty: i64_ty(),
             arms: vec![super::super::expr::MatchArm {
                 pattern: super::super::expr::Pattern::Binding(x),
                 body,
@@ -961,6 +960,7 @@ mod tests {
         ];
         let core = Expr::Match {
             scrutinee_slots: vec![scrutinee],
+            scrutinee_ty: bool_ty.clone(),
             arms,
             ty: i64_ty(),
         };
@@ -992,7 +992,8 @@ mod tests {
         };
 
         let core_with_var = Expr::Match {
-            scrutinee_slots: vec![Expr::Var { sym: sentinel, ty: bool_ty }],
+            scrutinee_slots: vec![Expr::Var { sym: sentinel, ty: bool_ty.clone() }],
+            scrutinee_ty: bool_ty,
             arms: match &core {
                 Expr::Match { arms, .. } => arms.clone(),
                 _ => unreachable!(),
