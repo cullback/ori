@@ -320,6 +320,20 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     &synthesized
                 }
             };
+            if let Some(op) = builtin_to_binop(name) {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "core::lower_expr: __builtin binop `{name}` expects 2 args, got {}",
+                        args.len()
+                    ));
+                }
+                return Ok(vec![Expr::BinOp {
+                    op,
+                    lhs: Box::new(lower_expr(ctx, &args[0])?),
+                    rhs: Box::new(lower_expr(ctx, &args[1])?),
+                    ty: ast.ty.clone(),
+                }]);
+            }
             if name.starts_with("__builtin.") {
                 return Err(format!(
                     "core::lower_expr: QualifiedCall to intrinsic `{name}` not yet handled"
