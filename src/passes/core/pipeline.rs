@@ -99,22 +99,36 @@ pub fn lower_module(
     // Build transparent table from infer (clone the relevant subset
     // — InferResult.transparent has the right shape already).
     let mut transparent: TransparentTable = mono.infer.transparent.clone();
-    // Synth `__Closure_xxx` types — registered by lambda passes as
-    // `Decl::TypeAnno`s but not threaded into `infer.transparent`.
-    // Add them so `expand_slots` can unfold a `Type::Con(closure_name)`
-    // into the underlying TagUnion, then to (tag, payload) for
-    // multi-variant payload-bearing sets, or to Phase E fanout for
-    // singletons. Restricted to `__` prefixes so we don't perturb
-    // declared user TagUnions.
+    // Push synth `__Closure_*` types and source-level `: alias`
+    // TagUnion declarations into the transparent table.
+    //
+    // `__Closure_*` types come from the lambda passes' `Decl::TypeAnno`
+    // synthesis but never reach `infer.transparent` — without unfolding,
+    // `expand_slots(Con("__Closure_..."))` falls through to a heap-ptr
+    // default and the `__apply_*` dispatcher's closure param gets a
+    // single RcPtr instead of the fanned-out captures.
+    //
+    // `: alias` declarations (`Pair : [MkPair(I64, I64)]`) similarly
+    // stay as `Type::Con("Pair")` at use sites — inference doesn't
+    // eagerly substitute them. Adding them to `transparent` makes
+    // `expand_slots` and friends see the underlying TagUnion shape,
+    // which is required for matches like `if pair : MkPair(a, b) then …`
+    // to recognize the scrutinee as a single-variant Phase-E fanout.
     for decl in &mono.module.decls {
         if let Decl::TypeAnno {
             name,
             ty: crate::ast::TypeExpr::TagUnion(tags, _),
+            kind,
             ..
         } = decl
         {
+            use crate::ast::TypeDeclKind;
             let union_name = mono.symbols.display(*name).to_owned();
-            if !union_name.starts_with("__") {
+            // Only `:` aliases and synth `__` types — `:=` is already
+            // in `infer.transparent`, and `::` is opaque on purpose.
+            let synth = union_name.starts_with("__");
+            let alias = matches!(kind, TypeDeclKind::Alias);
+            if !synth && !alias {
                 continue;
             }
             let tagged: Vec<(String, Vec<Type>)> = tags

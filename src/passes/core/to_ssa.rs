@@ -334,10 +334,21 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             // a multi-slot result are lowered through lower_slots
             // and the caller would have invoked that directly.
             if !args.is_empty() {
-                return Err(format!(
-                    "core::to_ssa: Con `{tag}` carries {} payload args (not yet supported)",
-                    args.len()
-                ));
+                // Fall through to lower_slots and materialize as
+                // shell — needed when a single-slot caller wants
+                // the Con's value but we'd otherwise produce a
+                // multi-slot Phase-E fanout. Single-slot caller
+                // gets back the shell; multi-slot caller would
+                // have used lower_slots directly.
+                let slots = lower_slots(ctx, expr)?;
+                if slots.len() == 1 {
+                    return Ok(slots[0]);
+                }
+                let shell = ctx.builder.alloc(slots.len() * 8);
+                for (i, v) in slots.iter().enumerate() {
+                    ctx.builder.store(shell, i * 8, *v);
+                }
+                return Ok(shell);
             }
             let disc = resolve_scalar_type(ty, &ctx.fieldless);
             if disc.is_heap_ptr() {
@@ -424,6 +435,17 @@ fn lower_match(
         .map(|n| ctx.payload_unions.contains(n))
         .unwrap_or(false);
     let is_payload_carrying_union = is_structural_payload || is_declared_payload;
+    // Phase-E scrutinees: a single-variant union (typically a
+    // closure with N captures) whose scrutinee_slots are *already*
+    // the variant's fields fanned out — no tag, no payload heap.
+    // When we see this, the multi-arm dispatch below would otherwise
+    // misinterpret scrutinee_slots[1..] as a payload pointer and
+    // emit RcPtr block params for it. Detect via the unwrapped
+    // TagUnion's variant count: exactly one non-fieldless tag.
+    let is_phase_e_scrutinee = matches!(
+        &unwrapped_ty,
+        Type::TagUnion { tags, .. } if tags.len() == 1 && tags.iter().any(|(_, fs)| !fs.is_empty())
+    );
     let (tag_val, payload_val) = match scrutinee_slots.as_slice() {
         [v] => {
             if is_payload_carrying_union {
@@ -473,7 +495,7 @@ fn lower_match(
             // which handles fieldless single-arm matches via a
             // SwitchInt with one target.
             Pattern::Constructor { binders, .. }
-                if payload_val.is_none()
+                if (payload_val.is_none() || is_phase_e_scrutinee)
                     && !binders.is_empty()
                     && binders.iter().map(|b| b.len()).sum::<usize>() == scrutinee_slots.len() =>
             {
