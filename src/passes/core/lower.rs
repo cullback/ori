@@ -168,14 +168,28 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // single SSA value (function params, scalar lets).
             if let Some(slot_syms) = ctx.locals.get(sym).cloned() {
                 let slot_tys = expand_slots_with(&ast.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
-                Ok(slot_syms
+                return Ok(slot_syms
                     .into_iter()
                     .zip(slot_tys)
                     .map(|(s, ty)| Expr::Var { sym: s, ty: type_for_scalar(ty) })
-                    .collect())
-            } else {
-                Ok(vec![Expr::Var { sym: *sym, ty: ast.ty.clone() }])
+                    .collect());
             }
+            // A Name referring to a constructor — used as a 0-arg
+            // value, like `Nil` in `Cons(1, Nil)` — lowers to a Con
+            // with no args. Without this branch the Name path produces
+            // a Var into a SymbolId that to_ssa has no binding for.
+            // Resolve via `SymbolKind::Constructor` rather than name
+            // alone so we don't have to round-trip through display
+            // (which panics for unallocated test-only sym IDs).
+            if sym_is_constructor(ctx.symbols, *sym) {
+                let name = ctx.symbols.display(*sym).to_owned();
+                return Ok(vec![Expr::Con {
+                    tag: name,
+                    args: vec![],
+                    ty: ast.ty.clone(),
+                }]);
+            }
+            Ok(vec![Expr::Var { sym: *sym, ty: ast.ty.clone() }])
         }
 
         ExprKind::Block(stmts, last) => lower_block(ctx, stmts, last),
@@ -528,6 +542,17 @@ pub fn lower_expr(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Expr, Str
 /// Lower call args, spreading multi-slot args into the flat App args
 /// list. A call `f(record, scalar)` where `record` has 2 slots and
 /// `scalar` has 1 slot produces a 3-element args vec.
+/// Return true if `sym` is registered in the SymbolTable as a
+/// tag-union constructor (declared or structural). Returns false
+/// when the symbol is missing — keeps the AST→Core entry point
+/// usable from unit tests that hand-allocate SymbolIds without
+/// populating the table.
+fn sym_is_constructor(symbols: &SymbolTable, sym: SymbolId) -> bool {
+    symbols
+        .try_get(sym)
+        .is_some_and(|info| matches!(info.kind, SymbolKind::Constructor))
+}
+
 /// Map a `__builtin.<op>` intrinsic name to its Core `BinOp` if it
 /// corresponds to a 2-input scalar binop. Builtins that need
 /// special-case lowering (`equals` over polymorphic types,

@@ -168,6 +168,14 @@ impl SymbolTable {
         &self.entries[id.0 as usize]
     }
 
+    /// Like `get`, but returns None for SymbolIds that haven't been
+    /// allocated. Useful when a value may carry a SymbolId from a
+    /// different table (or a hand-allocated one in unit tests) and
+    /// we'd rather skip the lookup than panic.
+    pub fn try_get(&self, id: SymbolId) -> Option<&SymbolInfo> {
+        self.entries.get(id.0 as usize)
+    }
+
     /// Shortcut for the common case of just needing the rendered name.
     #[allow(
         dead_code,

@@ -136,7 +136,14 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             .locals
             .get(sym)
             .copied()
-            .ok_or_else(|| format!("core::to_ssa: unbound Var #{}", sym.0)),
+            .ok_or_else(|| {
+                let name = ctx
+                    .symbols
+                    .try_get(*sym)
+                    .map(|info| info.display.as_str())
+                    .unwrap_or("?");
+                format!("core::to_ssa: unbound Var #{} ({name})", sym.0)
+            }),
 
         Expr::Lit { value: Literal::Int(n), ty } => {
             // Type-directed const emission. Programs with U64, U8, I32,
@@ -532,16 +539,17 @@ fn lower_match(
         // symbols + a multi-slot local mapping that AST→Core doesn't
         // know to mint — bail and fall back to existing-lower for
         // those. Single-slot binders bind normally.
+        //
+        // Per-binder source-level Type comes from constructor_schemes
+        // (declared `:=` payload unions and named structural ones the
+        // infer pass registered) or, for synth lambda constructors,
+        // from the scrutinee's TagUnion shape. ScalarType fallback
+        // (RcPtr) only applies when neither is available — in which
+        // case we can't accurately reason about multi-slot shape, so
+        // we have to trust the call site.
         let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
         if let Pattern::Constructor { tag, binders } = &arm.pattern {
             if let Some(payload_param) = payload_block_param {
-                // Per-binder source-level Type (preferred, from
-                // constructor_schemes) so we can expand multi-slot
-                // binders. Fall back to per-binder ScalarType (from
-                // decl_info.constructors.field_types) when no scheme
-                // is recorded — that's the case for synth lambda
-                // constructors. Bail if the binder's source type
-                // expands to >1 slot.
                 let scheme_tys = ctx
                     .decls
                     .constructor_schemes

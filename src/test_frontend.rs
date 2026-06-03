@@ -82,6 +82,9 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
         let m = FALLBACK_REASONS.get_or_init(Default::default);
         let mut g = m.lock().unwrap();
         *g.entry(key).or_insert(0) += 1;
+        if std::env::var("ORI_DUMP_FALLBACK_SOURCE").is_ok() {
+            eprintln!("[fallback-source]\n{e}\n---SOURCE---\n{source}\n---END---");
+        }
     }
     let core_module = core_attempt.ok().filter(|m| {
         let r = crate::ssa::validate::validate(m);
