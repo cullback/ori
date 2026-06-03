@@ -294,19 +294,10 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => lower_match(ctx, scrutinee_slots, scrutinee_ty, arms, ty),
 
         Expr::Con { tag, args, ty } => {
-            // Only fieldless unions are supported in this slice —
-            // emit the discriminant scalar. Payload-carrying unions
-            // need the (tag, payload) representation, which requires
-            // multi-slot Con lowering (returns 2 values). That ships
-            // when Core→SSA grows multi-result semantics.
-            //
-            // The "args.is_empty()" check is insufficient — a variant
-            // like Nil in `[Nil, Cons(a, List(a))]` has no args but
-            // its union is payload-carrying, so the result type is
-            // (tag, payload) not a bare discriminant. Cross-check
-            // via the resolved scalar type: fieldless unions resolve
-            // to an integer discriminant; payload-carrying ones
-            // resolve to RcPtr.
+            // Only fieldless unions handled in the single-slot path
+            // today. Payload Cons that the caller actually wants as
+            // a multi-slot result are lowered through lower_slots
+            // and the caller would have invoked that directly.
             if !args.is_empty() {
                 return Err(format!(
                     "core::to_ssa: Con `{tag}` carries {} payload args (not yet supported)",
