@@ -129,6 +129,14 @@ pub fn lower_module(
             ctx.fieldless = decls.fieldless_tags.clone();
             ctx.transparent = transparent.clone();
             ctx.constructors = decls.constructors.keys().cloned().collect();
+            ctx.constructor_field_types = decls
+                .constructor_schemes
+                .iter()
+                .filter_map(|(name, s)| match &s.ty {
+                    Type::Arrow(ps, _) => Some((name.clone(), ps.clone())),
+                    _ => None,
+                })
+                .collect();
             ctx.payload_unions = payload_unions.clone();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {

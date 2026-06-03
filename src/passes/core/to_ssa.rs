@@ -74,15 +74,21 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             }
             // Phase E: single-variant payload union decomposes to
             // exactly the variant's fields — no tag, no payload heap.
-            // expand_slots returns the captures' slot list; if it
-            // matches what the args produced, just return the args.
+            // Only applies when the Con's type is genuinely single-
+            // variant. For multi-variant unions like
+            // `Nat : [Zero, Succ(Nat)]`, `Succ(Zero)`'s args happen
+            // to produce the same 2-slot shape as the parent union
+            // (Zero unboxes to (tag, payload) == [U64, RcPtr] which
+            // matches Nat's expand_slots), but that's a coincidence
+            // — the union still needs the (tag, payload) shell.
+            let is_single_variant = is_single_variant_union(ty, &ctx.transparent);
             let con_slots = super::lower::expand_slots_with(
                 ty,
                 &ctx.fieldless,
                 &ctx.transparent,
                 &ctx.payload_unions,
             );
-            if con_slots.len() == all_slots.len() && !all_slots.is_empty() {
+            if is_single_variant && con_slots.len() == all_slots.len() && !all_slots.is_empty() {
                 return Ok(all_slots);
             }
             let disc = resolve_scalar_type(ty, &ctx.fieldless);
@@ -436,20 +442,35 @@ fn lower_match(
             // heap). The single Constructor arm binds each binder to
             // a scrutinee slot — no payload load, no dispatch. This
             // is how `apply__narrow0(f, ...)` deconstructs `f`'s
-            // captures into registers.
+            // captures into registers. Each binder may itself be
+            // multi-slot (a closure that captures a multi-slot
+            // record), so iterate per-slot. Only applies when the
+            // binder slot total matches the scrutinee's fan-out;
+            // otherwise we fall through to the multi-arm dispatch
+            // which handles fieldless single-arm matches via a
+            // SwitchInt with one target.
             Pattern::Constructor { binders, .. }
-                if payload_val.is_none() && binders.len() == scrutinee_slots.len() =>
+                if payload_val.is_none()
+                    && !binders.is_empty()
+                    && binders.iter().map(|b| b.len()).sum::<usize>() == scrutinee_slots.len() =>
             {
                 let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
-                for (binder, slot_val) in binders.iter().zip(&scrutinee_slots) {
-                    if binder.0 == u32::MAX { continue; }
-                    bound.push((*binder, ctx.locals.insert(*binder, *slot_val)));
+                let mut idx = 0;
+                for binder_slots in binders {
+                    for &sym in binder_slots {
+                        if sym.0 == u32::MAX {
+                            idx += 1;
+                            continue;
+                        }
+                        bound.push((sym, ctx.locals.insert(sym, scrutinee_slots[idx])));
+                        idx += 1;
+                    }
                 }
                 let result = lower(ctx, &arm.body);
-                for (binder, prev) in bound.into_iter().rev() {
+                for (sym, prev) in bound.into_iter().rev() {
                     match prev {
-                        Some(p) => { ctx.locals.insert(binder, p); }
-                        None => { ctx.locals.remove(&binder); }
+                        Some(p) => { ctx.locals.insert(sym, p); }
+                        None => { ctx.locals.remove(&sym); }
                     }
                 }
                 return result;
@@ -529,24 +550,16 @@ fn lower_match(
         };
         ctx.builder.switch_to(b);
 
-        // Constructor arms with field binders: load each field from
-        // the payload + bind to its binder. IntLit arms have no
-        // binders and no payload to load from.
+        // Constructor arms with field binders: load each field's
+        // slot list from the payload at consecutive 8-byte offsets,
+        // binding every slot value to its slot sym in `ctx.locals`.
+        // IntLit arms have no binders and no payload to load.
         //
-        // Each binder's source type may decompose to multiple slots
-        // (e.g. binding `left: Tree` where Tree is a payload union
-        // expanded to [U64, RcPtr]). Multi-slot binders need slot
-        // symbols + a multi-slot local mapping that AST→Core doesn't
-        // know to mint — bail and fall back to existing-lower for
-        // those. Single-slot binders bind normally.
-        //
-        // Per-binder source-level Type comes from constructor_schemes
-        // (declared `:=` payload unions and named structural ones the
-        // infer pass registered) or, for synth lambda constructors,
-        // from the scrutinee's TagUnion shape. ScalarType fallback
-        // (RcPtr) only applies when neither is available — in which
-        // case we can't accurately reason about multi-slot shape, so
-        // we have to trust the call site.
+        // Per-binder slot ScalarType comes from constructor_schemes
+        // expanded with payload_unions. For synth lambda constructors
+        // (no scheme recorded) we fall back to decl_info's per-binder
+        // ScalarType — those constructors only carry scalar captures
+        // by construction.
         let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
         if let Pattern::Constructor { tag, binders } = &arm.pattern {
             if let Some(payload_param) = payload_block_param {
@@ -565,31 +578,35 @@ fn lower_match(
                     .map(|m| m.field_types.clone())
                     .unwrap_or_else(|| vec![ScalarType::RcPtr; binders.len()]);
                 let mut offset = 0usize;
-                for (i, binder) in binders.iter().enumerate() {
-                    let load_ty = if let Some(ref ps) = scheme_tys {
-                        let slot_tys = super::lower::expand_slots_with(
+                for (i, binder_slots) in binders.iter().enumerate() {
+                    let slot_tys: Vec<ScalarType> = if let Some(ref ps) = scheme_tys {
+                        super::lower::expand_slots_with(
                             &ps[i],
                             &ctx.fieldless,
                             &ctx.transparent,
                             &ctx.payload_unions,
-                        );
-                        if slot_tys.len() != 1 {
-                            return Err(format!(
-                                "core::to_ssa: Match arm binder for `{tag}` has multi-slot type ({} slots) — not yet supported",
-                                slot_tys.len()
-                            ));
-                        }
-                        slot_tys[0]
+                        )
                     } else {
-                        scalar_fallback[i]
+                        vec![scalar_fallback[i]]
                     };
-                    if binder.0 == u32::MAX {
-                        offset += 8;
-                        continue;
+                    if binder_slots.len() != slot_tys.len() {
+                        return Err(format!(
+                            "core::to_ssa: Match arm binder for `{tag}` slot \
+                             count mismatch — pattern has {} slot syms but type \
+                             expands to {}",
+                            binder_slots.len(),
+                            slot_tys.len()
+                        ));
                     }
-                    let v = ctx.builder.load(payload_param, offset, load_ty);
-                    bound.push((*binder, ctx.locals.insert(*binder, v)));
-                    offset += 8;
+                    for (&sym, &slot_ty) in binder_slots.iter().zip(&slot_tys) {
+                        if sym.0 == u32::MAX {
+                            offset += 8;
+                            continue;
+                        }
+                        let v = ctx.builder.load(payload_param, offset, slot_ty);
+                        bound.push((sym, ctx.locals.insert(sym, v)));
+                        offset += 8;
+                    }
                 }
             }
         }
@@ -683,6 +700,17 @@ fn map_binop(op: AstBinOp) -> BinaryOp {
             unreachable!("And/Or should be handled before map_binop")
         }
     }
+}
+
+/// True when `ty` resolves (via transparent unfolding) to a
+/// single-variant tag union — the Phase-E direct-fanout case where
+/// a Con of this type produces only the variant's fields with no
+/// tag and no payload heap object. Multi-variant and non-TagUnion
+/// types return false; the caller's coincidence check (slot counts
+/// match) alone isn't enough to distinguish them.
+fn is_single_variant_union(ty: &Type, transparent: &super::lower::TransparentTable) -> bool {
+    let unwrapped = super::lower::resolve_transparent(ty, transparent);
+    matches!(unwrapped, Type::TagUnion { tags, .. } if tags.len() == 1)
 }
 
 /// Emit a constant of `disc` type holding `tag_idx`. Returns None if

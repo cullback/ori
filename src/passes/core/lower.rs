@@ -109,6 +109,12 @@ pub struct LowerCtx<'a> {
     /// visible to `Match` and avoids generating "call to unknown
     /// function 'Ok'" SSA.
     pub constructors: HashSet<String>,
+    /// Per-constructor source-level field types, projected from
+    /// `decl_info.constructor_schemes`. Match arm binders consult
+    /// this to decide whether a binder is multi-slot (and thus
+    /// needs slot syms minted) — the AST itself only carries the
+    /// surface binder names without enough type info.
+    pub constructor_field_types: HashMap<String, Vec<Type>>,
     /// Names of declared **payload-carrying** unions (`Result`, `Maybe`,
     /// custom user types with field-bearing variants). `expand_slots`
     /// for an `App(name, _)` whose `name` is in this set returns
@@ -135,6 +141,7 @@ impl<'a> LowerCtx<'a> {
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
             constructors: HashSet::new(),
+            constructor_field_types: HashMap::new(),
             payload_unions: HashSet::new(),
             locals: HashMap::new(),
             slot_paths: HashMap::new(),
@@ -614,6 +621,16 @@ fn lower_block(
 
                 if value_slots.len() == 1 && expected_slot_count == 1 {
                     // Scalar binding — bind to the AST sym directly.
+                    // If `name` was previously mapped to multi-slot
+                    // syms by an outer scope (e.g. shadowed by
+                    // fold_lift's recursive-result Let inside a
+                    // Match arm whose pattern bound `name` to a
+                    // multi-slot inductive), drop the old mapping
+                    // so subsequent `Name(name)` references the new
+                    // single-slot value, not the old slot Vars.
+                    if let Some(prev) = ctx.locals.remove(name) {
+                        shadowed.push((*name, Some(prev)));
+                    }
                     wrap_with_lets.push((
                         vec![*name],
                         value_slots.into_iter().next().unwrap(),
@@ -884,20 +901,64 @@ fn lower_match_arm(ctx: &mut LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<Matc
     if arm.is_return {
         return Err("core::lower_match_arm: return arms not yet supported".into());
     }
-    let pattern = lower_pattern(&arm.pattern)?;
+    let mut pattern = lower_pattern(&arm.pattern)?;
+
+    // For each constructor binder whose source type expands to
+    // multiple slots, mint slot syms and register them in
+    // `ctx.locals` so `Name(binder)` in the arm body expands to the
+    // per-slot Vars. Wildcards (sym = u32::MAX) skip the lookup.
+    // Single-slot binders keep their AST sym — no minting needed.
+    let mut shadowed: Vec<(SymbolId, Option<Vec<SymbolId>>)> = Vec::new();
+    if let Pattern::Constructor { tag, binders } = &mut pattern {
+        if let Some(field_tys) = ctx.constructor_field_types.get(tag).cloned() {
+            for (i, binder_slots) in binders.iter_mut().enumerate() {
+                if i >= field_tys.len() {
+                    break;
+                }
+                if binder_slots.len() != 1 || binder_slots[0].0 == u32::MAX {
+                    continue;
+                }
+                let slot_tys = expand_slots_with(
+                    &field_tys[i],
+                    &ctx.fieldless,
+                    &ctx.transparent,
+                    &ctx.payload_unions,
+                );
+                if slot_tys.len() <= 1 {
+                    continue;
+                }
+                let ast_sym = binder_slots[0];
+                let slot_syms = mint_slot_syms(ctx, ast_sym, slot_tys.len());
+                shadowed.push((ast_sym, ctx.locals.insert(ast_sym, slot_syms.clone())));
+                *binder_slots = slot_syms;
+            }
+        }
+    }
+
     let body = lower_expr(ctx, &arm.body)?;
+
+    // Restore the outer scope's `ctx.locals` so sibling arms don't
+    // see this arm's slot syms. The Pattern still carries them so
+    // to_ssa can load values at the right offsets.
+    for (sym, prev) in shadowed.into_iter().rev() {
+        match prev {
+            Some(p) => { ctx.locals.insert(sym, p); }
+            None => { ctx.locals.remove(&sym); }
+        }
+    }
+
     Ok(MatchArm { pattern, body })
 }
 
 fn lower_pattern(pat: &AstPattern<'_>) -> Result<Pattern, String> {
     match pat {
         AstPattern::Constructor { name, fields } => {
-            let mut binders = Vec::with_capacity(fields.len());
+            let mut binders: Vec<Vec<SymbolId>> = Vec::with_capacity(fields.len());
             for f in fields {
                 match f {
-                    AstPattern::Binding(sym) => binders.push(*sym),
+                    AstPattern::Binding(sym) => binders.push(vec![*sym]),
                     AstPattern::Wildcard => {
-                        binders.push(SymbolId(u32::MAX));
+                        binders.push(vec![SymbolId(u32::MAX)]);
                     }
                     other => {
                         return Err(format!(

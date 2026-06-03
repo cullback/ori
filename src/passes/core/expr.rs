@@ -52,10 +52,16 @@ pub enum Literal {
 #[derive(Debug, Clone)]
 pub enum Pattern {
     /// `Cons(x, xs)` — a tag-union constructor with field binders.
-    /// Each binder is either a fresh symbol (introducing a binding
-    /// for the arm body) or — represented by an unused symbol — a
-    /// wildcard. After flatten, all fields are at this binding level.
-    Constructor { tag: TagId, binders: Vec<SymbolId> },
+    /// Each outer entry corresponds to one source-level binder; the
+    /// inner Vec holds the slot symbols for that binder. Single-slot
+    /// binders (a binder of scalar type, or of an aggregate that
+    /// stays heap-resident) have a 1-element inner vec carrying the
+    /// AST binder sym directly. Multi-slot binders (e.g. binding
+    /// `rest: Lnk` where Lnk decomposes to (tag, payload)) have an
+    /// N-element inner vec of minted slot syms — those are what
+    /// `ctx.locals` maps the source binder to in `Name` expansion.
+    /// A wildcard binder has its `SymbolId` set to `u32::MAX`.
+    Constructor { tag: TagId, binders: Vec<Vec<SymbolId>> },
     /// `42` — match a specific integer literal. The scrutinee's
     /// equality with the literal gates the arm.
     IntLit(i64),
