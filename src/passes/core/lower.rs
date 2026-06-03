@@ -309,10 +309,21 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             let name = ctx.symbols.display(*target).to_owned();
             let arg_exprs = lower_call_args(ctx, args)?;
             if ctx.constructors.contains(&name) {
+                // Same caveat as the Name path: inference / lambda
+                // narrow can leave the Call's expression-level type
+                // as the lambda's *return* type (`I64`) for
+                // closure constructors. Use the constructor's
+                // parent-union type from `constructor_return_types`
+                // when registered.
+                let ty = ctx
+                    .constructor_return_types
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| ast.ty.clone());
                 Ok(vec![Expr::Con {
                     tag: name,
                     args: arg_exprs,
-                    ty: ast.ty.clone(),
+                    ty,
                 }])
             } else {
                 Ok(vec![Expr::App {

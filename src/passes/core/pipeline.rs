@@ -56,6 +56,44 @@ pub fn lower_module(
         })
         .collect();
 
+    // Lambda-set synth closure types (`__Closure_xxx`) are TagUnion
+    // TypeAnnos in module.decls but their tags (`__lambda_N`) are
+    // *not* in `constructor_schemes`. Harvest their return-type
+    // shape directly so Name→Con can stamp the correct TagUnion
+    // for closure values. Restrict to synth `__` prefixes to avoid
+    // overriding the inference-recorded shapes for user-declared
+    // tag unions (those carry App/Con references with type-param
+    // arguments that the trivial TypeExpr→Type projection here
+    // would drop).
+    let mut synth_con_return_types: std::collections::HashMap<String, Type> =
+        std::collections::HashMap::new();
+    for decl in &mono.module.decls {
+        if let Decl::TypeAnno {
+            name,
+            ty: crate::ast::TypeExpr::TagUnion(tags, _),
+            ..
+        } = decl
+        {
+            let union_name = mono.symbols.display(*name).to_owned();
+            if !union_name.starts_with("__") {
+                continue;
+            }
+            let tagged: Vec<(String, Vec<Type>)> = tags
+                .iter()
+                .map(|t| {
+                    let fs: Vec<Type> = t.fields.iter().map(type_expr_to_type).collect();
+                    (t.name.to_string(), fs)
+                })
+                .collect();
+            let union_ty = Type::TagUnion { tags: tagged.clone(), rest: None };
+            for (tag_name, _) in &tagged {
+                synth_con_return_types
+                    .entry(tag_name.clone())
+                    .or_insert_with(|| union_ty.clone());
+            }
+        }
+    }
+
     let mut builder = Builder::new();
 
     // Build transparent table from infer (clone the relevant subset
@@ -148,6 +186,15 @@ pub fn lower_module(
                     (name.clone(), ret)
                 })
                 .collect();
+            // Lambda-set synth constructors aren't in
+            // constructor_schemes — pick them up from the
+            // module-level TypeAnno harvest above so Con-from-Name
+            // can stamp the proper TagUnion type.
+            for (k, v) in &synth_con_return_types {
+                ctx.constructor_return_types
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
+            }
             ctx.payload_unions = payload_unions.clone();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {
@@ -229,6 +276,24 @@ pub fn lower_module(
 /// `infer.func_schemes` (authoritative for declared functions);
 /// falls back to one RcPtr per source param for synth functions
 /// without schemes.
+/// Minimal `TypeExpr` → `Type` projection sufficient for the
+/// constructor-return-type harvest. We only need to handle the
+/// shapes that appear in synth lambda type annotations: `Named`
+/// (closure capture types, today always `I64`) and `App` (parametric
+/// references). Anything else degrades to `Type::Con("__unknown")`
+/// — downstream uses this only for `union_name_of` / `expand_slots`
+/// shape queries, so a placeholder is safe.
+fn type_expr_to_type(t: &crate::ast::TypeExpr<'_>) -> Type {
+    use crate::ast::TypeExpr;
+    match t {
+        TypeExpr::Named(name) => Type::Con((*name).to_owned()),
+        TypeExpr::App(name, args) => {
+            Type::App((*name).to_owned(), args.iter().map(type_expr_to_type).collect())
+        }
+        _ => Type::Con("__unknown".to_owned()),
+    }
+}
+
 /// Extract the type name for `App(name, _)` or `Con(name)` — used to
 /// reverse-look-up a constructor's parent union. Returns None for
 /// non-named types (Record, Tuple, function arrows, etc.).
