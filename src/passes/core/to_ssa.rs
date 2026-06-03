@@ -148,9 +148,9 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         }
 
         Expr::Let { binders, value, body, .. } => {
-            // For multi-binder Let, the value is a single Core Expr
-            // that produces N SSA slots (multi-result call, payload
-            // Con, etc.). Lower via lower_slots and bind each slot.
+            // Lower body via lower_slots (so multi-slot results work)
+            // and materialize to single if needed — same convention
+            // as the function-return and match-arm boundaries.
             let vals = lower_slots(ctx, value)?;
             if vals.len() != binders.len() {
                 return Err(format!(
@@ -163,17 +163,23 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             for (binder, val) in binders.iter().zip(vals) {
                 prev.push((*binder, ctx.locals.insert(*binder, val)));
             }
-            let result = lower(ctx, body);
-            // Restore in reverse so any shadowed bindings revert
-            // correctly even if a binder appeared multiple times
-            // (it shouldn't, but be safe).
+            let result_slots = lower_slots(ctx, body);
             for (binder, p) in prev.into_iter().rev() {
                 match p {
                     Some(prev_val) => { ctx.locals.insert(binder, prev_val); }
                     None => { ctx.locals.remove(&binder); }
                 }
             }
-            result
+            let result_slots = result_slots?;
+            if result_slots.len() == 1 {
+                Ok(result_slots[0])
+            } else {
+                let shell = ctx.builder.alloc(result_slots.len() * 8);
+                for (i, v) in result_slots.iter().enumerate() {
+                    ctx.builder.store(shell, i * 8, *v);
+                }
+                Ok(shell)
+            }
         }
 
         Expr::BinOp { op, lhs, rhs, ty } => {
