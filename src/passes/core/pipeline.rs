@@ -98,7 +98,37 @@ pub fn lower_module(
 
     // Build transparent table from infer (clone the relevant subset
     // — InferResult.transparent has the right shape already).
-    let transparent: TransparentTable = mono.infer.transparent.clone();
+    let mut transparent: TransparentTable = mono.infer.transparent.clone();
+    // Synth `__Closure_xxx` types — registered by lambda passes as
+    // `Decl::TypeAnno`s but not threaded into `infer.transparent`.
+    // Add them so `expand_slots` can unfold a `Type::Con(closure_name)`
+    // into the underlying TagUnion, then to (tag, payload) for
+    // multi-variant payload-bearing sets, or to Phase E fanout for
+    // singletons. Restricted to `__` prefixes so we don't perturb
+    // declared user TagUnions.
+    for decl in &mono.module.decls {
+        if let Decl::TypeAnno {
+            name,
+            ty: crate::ast::TypeExpr::TagUnion(tags, _),
+            ..
+        } = decl
+        {
+            let union_name = mono.symbols.display(*name).to_owned();
+            if !union_name.starts_with("__") {
+                continue;
+            }
+            let tagged: Vec<(String, Vec<Type>)> = tags
+                .iter()
+                .map(|t| {
+                    let fs: Vec<Type> = t.fields.iter().map(type_expr_to_type).collect();
+                    (t.name.to_string(), fs)
+                })
+                .collect();
+            transparent
+                .entry(union_name)
+                .or_insert((vec![], Type::TagUnion { tags: tagged, rest: None }));
+        }
+    }
 
     // Build a map: union name → (variant count, any-payload-carrying).
     // The "payload_unions" set we expose is the subset that's

@@ -183,7 +183,19 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // symbols. Otherwise treat the AST sym as itself a
             // single SSA value (function params, scalar lets).
             if let Some(slot_syms) = ctx.locals.get(sym).cloned() {
-                let slot_tys = expand_slots_with(&ast.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
+                // `ast.ty` may be a `Type::Var` left unresolved by
+                // inference (the __apply closure-param case), in
+                // which case `expand_slots_with` returns fewer slots
+                // than `ctx.locals[sym]` actually carries. The
+                // binding's slot count is the authoritative source
+                // here — pad the slot-type list with `__RcPtr`
+                // placeholders so every minted slot sym surfaces as
+                // its own `Var`. `Match`'s scrutinee_ty is what's
+                // used for actual shape resolution downstream.
+                let mut slot_tys = expand_slots_with(&ast.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
+                while slot_tys.len() < slot_syms.len() {
+                    slot_tys.push(ScalarType::RcPtr);
+                }
                 return Ok(slot_syms
                     .into_iter()
                     .zip(slot_tys)
