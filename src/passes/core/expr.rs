@@ -167,20 +167,41 @@ pub enum Expr {
         ty: Type,
     },
 
-    /// `Cata(alg, init, target)` — structural recursion over an
-    /// inductive value. **The only iteration primitive in Core.**
-    /// `alg` is the step function (a `SymbolId` of a lifted top-level
-    /// after lambda-lift); `init` is the initial accumulator; `target`
-    /// is the inductive value being consumed. Type is `init`'s type
-    /// (folds always produce the accumulator's type).
+    /// `Cata(fold_fn, target, extra_args)` — structural recursion
+    /// over an inductive value. The **only iteration primitive in
+    /// Core**.
     ///
-    /// Generic over the inductive type. Lists, trees, user-defined
-    /// inductives all use the same node — the `target`'s type tells
-    /// us which inductive we're folding over.
+    /// Represents a call to a fold-shaped recursive function: one
+    /// that pattern-matches `target` against the inductive type's
+    /// variants and recurses into the recursive fields. After
+    /// `fold_lift` runs, every `fold` expression in source has been
+    /// rewritten to this shape; AST→Core promotes calls to those
+    /// `__fold_N` helpers into `Cata` so that algebraic rewrites
+    /// can pattern-match on them.
+    ///
+    /// `fold_fn` is the mangled function name (matches an SSA
+    /// `Call.target`). `target` is the inductive value being
+    /// consumed. `extra_args` are the trailing parameters of the
+    /// fold function — captured free variables from the original
+    /// `fold` expression, plus any accumulator passed alongside the
+    /// inductive value.
+    ///
+    /// At Core→SSA the lowering is identical to an `App` call;
+    /// `Cata`'s value lives at the rewrite layer (rules.rs), where
+    /// `Cata ∘ Cata` fusion, `Cata ∘ Map → Cata`, `Cata` of a
+    /// literal list constant-folding, etc. become syntactic
+    /// rewrites instead of SCEV-style reconstruction.
     Cata {
-        alg: SymbolId,
-        init: Box<Expr>,
-        target: Box<Expr>,
+        fold_fn: String,
+        /// Parallel slot list for the inductive value. Multi-slot
+        /// inductives (Lnk, Tree, Nat — multi-variant payload
+        /// unions) decompose to (tag, payload) at the SSA layer
+        /// and arrive here as a 2-element vec; single-slot
+        /// inductives (Phase E singleton closures with one
+        /// capture, or `:=` aliases that scalar_type collapses)
+        /// use a 1-element vec.
+        target_slots: Vec<Expr>,
+        extra_args: Vec<Expr>,
         ty: Type,
     },
 

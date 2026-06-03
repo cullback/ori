@@ -127,6 +127,28 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             Ok(ctx.builder.call_multi(target, arg_vals, &ret_slots))
         }
 
+        // Cata lowers to the same SSA as the equivalent App — both
+        // call the same `__fold_N` helper. Cata's value is purely at
+        // the rewrite layer (rules.rs); to_ssa treats it as a labeled
+        // App so the resulting SSA matches what existing-lower
+        // produces from `fold_lift`'s output verbatim.
+        Expr::Cata { fold_fn, target_slots, extra_args, ty } => {
+            let ret_slots = super::lower::expand_slots_with(ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
+            let mut arg_vals: Vec<Value> = Vec::new();
+            for s in target_slots {
+                arg_vals.extend(lower_slots(ctx, s)?);
+            }
+            for a in extra_args {
+                arg_vals.extend(lower_slots(ctx, a)?);
+            }
+            if ret_slots.len() == 1 {
+                let ret_ty = resolve_scalar_type(ty, &ctx.fieldless);
+                Ok(vec![ctx.builder.call(fold_fn, arg_vals, ret_ty)])
+            } else {
+                Ok(ctx.builder.call_multi(fold_fn, arg_vals, &ret_slots))
+            }
+        }
+
         // All other variants are single-slot today; delegate.
         _ => Ok(vec![lower(ctx, expr)?]),
     }
@@ -260,6 +282,20 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(ctx.builder.call(target, arg_vals, ret_ty))
         }
 
+        // Single-slot Cata path: identical SSA shape to App, since
+        // Cata is just a labeled fold-shaped call at the IR level.
+        Expr::Cata { fold_fn, target_slots, extra_args, ty } => {
+            let mut arg_vals: Vec<Value> = Vec::new();
+            for s in target_slots {
+                arg_vals.extend(lower_slots(ctx, s)?);
+            }
+            for a in extra_args {
+                arg_vals.extend(lower_slots(ctx, a)?);
+            }
+            let ret_ty = resolve_scalar_type(ty, &ctx.fieldless);
+            Ok(ctx.builder.call(fold_fn, arg_vals, ret_ty))
+        }
+
         Expr::ListLit { elements, elem_ty, .. } => {
             // Element layout: each source-level element occupies
             // `slot_count` consecutive 8-byte slots in the data
@@ -320,10 +356,6 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
                 ))
         }
 
-        _ => Err(format!(
-            "core::to_ssa: variant not yet supported: {}",
-            variant_name(expr)
-        )),
     }
 }
 
@@ -783,20 +815,6 @@ fn emit_int_const(b: &mut Builder, n: i64, ty: ScalarType) -> Value {
         // type system should reject before this point. Treat as an
         // inference bug.
         other => panic!("core::to_ssa: integer literal can't have type {other:?}"),
-    }
-}
-
-fn variant_name(expr: &Expr) -> &'static str {
-    match expr {
-        Expr::Var { .. } => "Var",
-        Expr::Lit { .. } => "Lit",
-        Expr::App { .. } => "App",
-        Expr::Let { .. } => "Let",
-        Expr::Match { .. } => "Match",
-        Expr::Cata { .. } => "Cata",
-        Expr::Con { .. } => "Con",
-        Expr::BinOp { .. } => "BinOp",
-        Expr::ListLit { .. } => "ListLit",
     }
 }
 

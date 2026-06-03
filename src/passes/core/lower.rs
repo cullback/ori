@@ -313,6 +313,27 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     args: arg_exprs,
                     ty,
                 }])
+            } else if name.starts_with("__fold_") && !args.is_empty() {
+                // Recognize calls to fold_lift's synth helpers as
+                // `Cata`. The first source-level arg is the
+                // inductive value being folded (multi-slot for
+                // recursive payload unions); remaining source args
+                // are captured free variables threaded through
+                // the original `fold` expression. Lower each
+                // source arg separately so the boundary survives —
+                // a flat `lower_call_args` spread would collapse
+                // the target's slots into the extras vec.
+                let target_slots = lower_expr_slots(ctx, &args[0])?;
+                let mut extras: Vec<Expr> = Vec::new();
+                for a in &args[1..] {
+                    extras.extend(lower_expr_slots(ctx, a)?);
+                }
+                Ok(vec![Expr::Cata {
+                    fold_fn: name,
+                    target_slots,
+                    extra_args: extras,
+                    ty: ast.ty.clone(),
+                }])
             } else {
                 Ok(vec![Expr::App {
                     target: name,

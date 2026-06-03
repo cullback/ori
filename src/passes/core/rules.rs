@@ -77,10 +77,10 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
-        Expr::Cata { alg, init, target, ty } => Expr::Cata {
-            alg,
-            init: Box::new(simplify(*init)),
-            target: Box::new(simplify(*target)),
+        Expr::Cata { fold_fn, target_slots, extra_args, ty } => Expr::Cata {
+            fold_fn,
+            target_slots: target_slots.into_iter().map(simplify).collect(),
+            extra_args: extra_args.into_iter().map(simplify).collect(),
             ty,
         },
 
