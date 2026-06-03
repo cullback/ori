@@ -307,6 +307,21 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
 
         ExprKind::Call { target, args } => {
             let name = ctx.symbols.display(*target).to_owned();
+            // Stdlib intrinsics (List.len / get / append / set /
+            // range, crash) get inlined by existing-lower with
+            // direct knowledge of the (len, cap, data) list
+            // decomposition. Core would emit them as `call` to
+            // names the SSA module doesn't register — SSA
+            // validation rejects with "calls unknown function".
+            // Bail so fallback handles them. The synth helpers
+            // (__lifted_N, __fold_N, __apply_*) often reference
+            // these intrinsics in their bodies, which is why we
+            // see this on closure-using programs.
+            if is_stdlib_intrinsic(&name) {
+                return Err(format!(
+                    "core::lower_expr: stdlib intrinsic `{name}` needs existing-lower's expanded layout"
+                ));
+            }
             let arg_exprs = lower_call_args(ctx, args)?;
             if ctx.constructors.contains(&name) {
                 // Same caveat as the Name path: inference / lambda
@@ -401,6 +416,11 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     "core::lower_expr: QualifiedCall to intrinsic `{name}` not yet handled"
                 ));
             }
+            if is_stdlib_intrinsic(name) {
+                return Err(format!(
+                    "core::lower_expr: stdlib intrinsic `{name}` needs existing-lower's expanded layout"
+                ));
+            }
             let arg_exprs = lower_call_args(ctx, args)?;
             if ctx.constructors.contains(name) {
                 Ok(vec![Expr::Con {
@@ -438,6 +458,11 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             if name.starts_with("__builtin.") {
                 return Err(format!(
                     "core::lower_expr: MethodCall to intrinsic `{name}` not yet handled"
+                ));
+            }
+            if is_stdlib_intrinsic(name) {
+                return Err(format!(
+                    "core::lower_expr: stdlib intrinsic `{name}` (method form) needs existing-lower's expanded layout"
                 ));
             }
             let mut arg_exprs: Vec<Expr> = Vec::new();
@@ -623,6 +648,22 @@ fn sym_is_constructor(symbols: &SymbolTable, sym: SymbolId) -> bool {
     symbols
         .try_get(sym)
         .is_some_and(|info| matches!(info.kind, SymbolKind::Constructor))
+}
+
+/// True if `name` is a stdlib intrinsic that existing-lower
+/// implements inline (operating on the expanded (len, cap, data)
+/// list shape) rather than via a registered SSA function.
+/// Catches both bare names (`List.get`) and monomorphized
+/// suffixes (`List.get__I64`).
+fn is_stdlib_intrinsic(name: &str) -> bool {
+    let base = name.split("__").next().unwrap_or(name);
+    matches!(
+        base,
+        "List.len" | "List.get" | "List.append" | "List.set"
+        | "List.range" | "List.walk" | "List.walk_until"
+        | "List.reverse" | "List.repeat" | "List.map"
+        | "crash"
+    )
 }
 
 /// Map a `__builtin.<op>` intrinsic name to its Core `BinOp` if it
