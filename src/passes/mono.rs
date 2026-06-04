@@ -535,13 +535,32 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
             }
             ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => {}
             ExprKind::Closure { func, captures } => {
-                // Specialize the closure's target using the concrete
-                // closure type (available on expr.ty after substitution).
-                if let Some(new_sym) = self.specialize_target(*func, &expr.ty) {
-                    *func = new_sym;
-                }
+                // Recurse into captures first so their types are
+                // substituted to their concrete form before we use
+                // them in the lifted func's specialization key.
                 for c in captures.iter_mut() {
                     self.rewrite_calls_in_expr(c);
+                }
+                // Build the concrete type for the lifted function:
+                // capture types prepended to the closure's callable
+                // params. The Closure node's `ty` is the *callable*
+                // view (Arrow(remaining_params, ret)) — the lifted
+                // function's scheme is Arrow(captures + remaining,
+                // ret), so mono needs the full arrow to extract type
+                // substitutions correctly. (See `infer_closure`.)
+                let concrete = match &expr.ty {
+                    Type::Arrow(call_params, ret) => {
+                        let mut full = Vec::with_capacity(captures.len() + call_params.len());
+                        for c in captures.iter() {
+                            full.push(c.ty.clone());
+                        }
+                        full.extend_from_slice(call_params);
+                        Type::Arrow(full, ret.clone())
+                    }
+                    other => other.clone(),
+                };
+                if let Some(new_sym) = self.specialize_target(*func, &concrete) {
+                    *func = new_sym;
                 }
             }
         }

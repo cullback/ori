@@ -741,8 +741,43 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 Ok(base_ty)
             }
 
-            ExprKind::Closure { .. } => {
-                panic!("Closure should not exist during type inference")
+            ExprKind::Closure { func, captures } => {
+                // Pre-infer lift emits these in place of every Lambda.
+                // Type = Arrow(remaining_params, ret), where remaining =
+                // lifted func's params minus the leading N captures.
+                // Each capture expr's type must match the corresponding
+                // capture-param type from the lifted function.
+                let name = self.symbols.display(*func).to_owned();
+                let scheme = self.lookup(&name).cloned().ok_or_else(|| {
+                    Self::type_error(
+                        expr.span,
+                        &format!("lifted function '{name}' not in scope at closure site"),
+                    )
+                })?;
+                let func_ty = self.engine.instantiate(&scheme);
+                let Type::Arrow(all_params, ret) = func_ty else {
+                    return Err(Self::type_error(
+                        expr.span,
+                        &format!("lifted function '{name}' has non-arrow type"),
+                    ));
+                };
+                let n_caps = captures.len();
+                if all_params.len() < n_caps {
+                    return Err(Self::type_error(
+                        expr.span,
+                        &format!(
+                            "lifted function '{name}' has {} params but closure expects {n_caps} captures",
+                            all_params.len()
+                        ),
+                    ));
+                }
+                let cap_param_tys = &all_params[..n_caps];
+                let remaining: Vec<Type> = all_params[n_caps..].to_vec();
+                for (cap_expr, cap_param_ty) in captures.iter().zip(cap_param_tys) {
+                    let cap_ty = self.infer_expr(cap_expr)?;
+                    self.unify_at(&cap_ty, cap_param_ty, cap_expr.span)?;
+                }
+                Ok(Type::Arrow(remaining, ret))
             }
         }
     }

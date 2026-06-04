@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, Decl, Expr, ExprKind, Module, Span, Stmt, TagDecl, TypeDeclKind, TypeExpr};
+use crate::ast::{self, Decl, Expr, ExprKind, Module, Span, Stmt};
 use crate::passes::mono::Monomorphized;
 use crate::passes::resolve::Resolved;
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
@@ -28,23 +28,21 @@ pub fn lift(mono: &mut Monomorphized<'_>) {
 }
 
 /// Pre-inference lambda lift: convert every `Lambda` into a
-/// top-level `FuncDef` + a `TypeAnno` declaring a single-variant
-/// closure tag union + a `Call(closure_tag, captures)` constructor
-/// call at the lambda site. **Runs before inference.** All
-/// synthesized types use placeholder `Type::placeholder()` — infer
-/// fills them in.
+/// top-level `FuncDef __lifted_N(captures..., params...)` plus an
+/// `ExprKind::Closure { func: __lifted_N, captures: [Name(c0), ...] }`
+/// at the lambda site. **Runs before inference.**
 ///
-/// This is the destination architecture per
-/// `notes/lambda-set-specialization.md`: closures are tag unions
-/// from inference onward. No `ExprKind::Closure` nodes are
-/// produced; that variant becomes unused (and will be deleted in a
-/// later cleanup phase).
+/// Inference types the `Closure` node by looking up `__lifted_N`'s
+/// scheme (computed during this same infer pass, ordered first by
+/// topo) and producing `Arrow(remaining_params, ret)` after dropping
+/// the leading N capture params. That keeps closures Arrow-typed at
+/// inference time — sidestepping the Arrow-vs-TagUnion unification
+/// gap — while still freeing later passes to synthesize per-call-site
+/// closure tag unions in `lambda::specialize`.
 ///
 /// After this runs:
-/// - Every former `Lambda` is a `Call(closure_tag_sym, [Name(c0), ...])`.
+/// - Every former `Lambda` is `ExprKind::Closure { func, captures }`.
 /// - Top-level `__lifted_N` FuncDefs exist for the lambda bodies.
-/// - Top-level `TypeAnno __ClosureType_N := [__ClosureTag_N(t0, t1, ...)]`
-///   decls exist for each lifted closure, with type-params per capture.
 /// - `func_schemes` is *not* touched — that table doesn't exist yet
 ///   pre-infer; inference will populate it.
 pub fn lift_pre_infer(resolved: &mut Resolved<'_>) {
@@ -216,20 +214,23 @@ impl<'src> PreInferLiftCtx<'_, 'src> {
         }
     }
 
-    /// Convert a Lambda expression to the destination shape:
-    ///   1. Mint __lifted_N, __ClosureType_N, __ClosureTag_N symbols.
+    /// Convert a Lambda expression to a lifted FuncDef + a Closure
+    /// node at the call site.
+    ///
+    ///   1. Mint __lifted_N symbol.
     ///   2. Compute captures (lexical free vars w.r.t. lambda params).
-    ///   3. Synthesize a TagDecl: __ClosureType_N has type-params
-    ///      `__cap_0, __cap_1, ...`, one per capture; its single
-    ///      variant __ClosureTag_N takes those type-params as fields.
-    ///   4. Synthesize a FuncDef __lifted_N(c0, c1, ..., p0, p1, ...)
+    ///   3. Synthesize a FuncDef __lifted_N(c0, c1, ..., p0, p1, ...)
     ///      whose body is the lambda body with captures substituted
     ///      to the new capture parameters.
-    ///   5. Return a Call expression `Call(__ClosureTag_N, [Name(c0), ...])`
+    ///   4. Return ExprKind::Closure { func: __lifted_N, captures }
     ///      at the lambda site.
     ///
     /// No type information is consulted. Captures are detected
-    /// lexically. Inference fills in `.ty` on synthesized nodes.
+    /// lexically. Inference will type the Closure node by looking up
+    /// __lifted_N's scheme and dropping the leading N capture params.
+    /// Downstream lambda passes (solve/specialize/narrow) operate on
+    /// Closure nodes as today; specialize is still responsible for
+    /// synthesizing closure tag unions per call-site set.
     fn lift_lambda(
         &mut self,
         params: Vec<SymbolId>,
@@ -238,27 +239,19 @@ impl<'src> PreInferLiftCtx<'_, 'src> {
     ) -> Expr<'src> {
         let id = self.fresh_id();
         let lifted_name = format!("__lifted_{id}");
-        let closure_type_name = format!("__ClosureType_{id}");
-        let closure_tag_name = format!("__ClosureTag_{id}");
-
         let lifted_sym = self.symbols.fresh(&lifted_name, span, SymbolKind::Func);
-        let closure_type_sym = self.symbols.fresh(&closure_type_name, span, SymbolKind::Type);
-        let closure_tag_sym = self.symbols.fresh(&closure_tag_name, span, SymbolKind::Func);
 
         // Lexical captures: free names of the body that aren't the
-        // lambda's own params, scoped to non-local (top-level)
-        // bindings being NOT captured. Local bindings ARE captured.
-        // `is_known` returns true to EXCLUDE the symbol — so we
-        // exclude top-level constructors/functions; locals fall
-        // through and are captured.
+        // lambda's own params. `is_known` returns true to EXCLUDE the
+        // symbol — so we exclude top-level constructors/functions;
+        // locals fall through and are captured.
         let bound: HashSet<SymbolId> = params.iter().copied().collect();
         let captures = ast::free_names(&body, &bound, &mut HashSet::new(), &|sym| {
             !matches!(self.symbols.get(sym).kind, SymbolKind::Local)
         });
 
         // Mint fresh capture parameter symbols for the lifted
-        // function. Each `name_cap` mirrors the captured local's
-        // display name for readability of dumps / errors.
+        // function.
         let capture_params: Vec<SymbolId> = captures
             .iter()
             .map(|&cap| {
@@ -271,36 +264,8 @@ impl<'src> PreInferLiftCtx<'_, 'src> {
         // corresponding capture parameter sym.
         let body = substitute_captures(&body, &captures, &capture_params);
 
-        // Mint type-parameter NAMES for the closure type — one per
-        // capture, plus N for the lifted function's value params.
-        // These are leaked strings because TypeExpr stores `&'src str`.
-        // (The `_n` suffix prevents shadowing with user type names.)
-        let cap_param_names: Vec<&'static str> = (0..captures.len())
-            .map(|i| leak_str(&format!("__cap_t{id}_{i}")))
-            .collect();
-
-        // Build TypeAnno for the closure type:
-        //   __ClosureType_N(cap_t_0, cap_t_1, ...) := [__ClosureTag_N(cap_t_0, cap_t_1, ...)]
-        // Transparent (single-variant), so consumers see-through to
-        // the variant's fields when matching.
-        let tag_decl = TagDecl {
-            name: leak_str(&closure_tag_name),
-            fields: cap_param_names.iter().map(|n| TypeExpr::Named(n)).collect(),
-        };
-        let closure_type_decl = Decl::TypeAnno {
-            span,
-            name: closure_type_sym,
-            type_params: cap_param_names.clone(),
-            ty: TypeExpr::TagUnion(vec![tag_decl], false),
-            where_clause: Vec::new(),
-            methods: Vec::new(),
-            kind: TypeDeclKind::Transparent,
-            doc: None,
-        };
-        self.synthesized.push(closure_type_decl);
-
-        // Build FuncDef for the lifted function. Body has captures
-        // substituted. No TypeAnno — inference derives the type.
+        // Build FuncDef for the lifted function: captures first,
+        // then original params. Inference derives its scheme.
         let mut all_params = capture_params.clone();
         all_params.extend(params);
         let lifted_decl = Decl::FuncDef {
@@ -312,25 +277,22 @@ impl<'src> PreInferLiftCtx<'_, 'src> {
         };
         self.synthesized.push(lifted_decl);
 
-        // Replace the Lambda with a Call to the closure tag
-        // constructor. Captures are Name refs to the captured
-        // locals (still in scope where the lambda appeared).
-        let capture_args: Vec<Expr<'src>> = captures
+        // Replace the Lambda with a Closure node. Captures are Name
+        // refs to the captured locals (still in scope where the
+        // lambda appeared). Type is left as the inference placeholder
+        // — infer's ExprKind::Closure arm fills it in.
+        let capture_exprs: Vec<Expr<'src>> = captures
             .iter()
             .map(|&cap| Expr::new(ExprKind::Name(cap), span))
             .collect();
         Expr::new(
-            ExprKind::Call {
-                target: closure_tag_sym,
-                args: capture_args,
+            ExprKind::Closure {
+                func: lifted_sym,
+                captures: capture_exprs,
             },
             span,
         )
     }
-}
-
-fn leak_str(s: &str) -> &'static str {
-    Box::leak(s.to_owned().into_boxed_str())
 }
 
 fn lift_module<'src>(
