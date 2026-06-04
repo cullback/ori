@@ -100,9 +100,24 @@ The row-polymorphism template already exists in `Type::Record` and
     `Expr::App`. Closes Pos/Neg/Wrapped/Wrap-style patterns.
   - **M, N, O**: not started.
 
-**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5%** (24 more
-tests through Core total; +15 in the most recent push). All 308
-tests pass throughout.
+**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5% → 93.9%**
+(+17 tests through Core in this session push). All 308 tests pass
+throughout.
+
+### Phase H+ (92.5% → 93.9%, +3 tests)
+
+* **`List.walk_until` in Core for scalar accs**: `Expr::ListWalkUntil`
+  added; to_ssa emits the loop mirroring `ListWalk`, with the step
+  call returning `(tag, payload_ptr)` and tag-dispatch after each
+  iteration deciding Continue→header vs Break→done.
+* **Guard for complex acc types**: `has_nested_multi_slot_field`
+  bails to fallback when the acc is a `List`/`Str` or a Record/Tuple
+  containing one. Core's recursive `expand_slots` would fan those
+  out (3 slots for `List`), but existing-lower compiles the lifted
+  closure with `scalar_type`-per-field (1 slot for `List`). Without
+  the guard the arity mismatch surfaces as wrong-typed `Eq` at
+  runtime (the Phase H regression from before). Simple scalar accs
+  bypass the divergence and work in Core.
 
 ### Phase L+++ session (91.2% → 92.5%, +4 tests)
 
