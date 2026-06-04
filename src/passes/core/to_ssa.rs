@@ -975,6 +975,55 @@ fn lower_match(
         &unwrapped_ty,
         Type::TagUnion { tags, .. } if tags.len() == 1 && tags.iter().any(|(_, fs)| !fs.is_empty())
     );
+    // Phase-E single-variant scrutinee with N slots (N >= 1): the
+    // scrutinee IS the variant's payload fanned out — no tag to
+    // dispatch on. There's at most one matching arm (the
+    // constructor pattern); bind its binders to the slots directly
+    // and lower the body.
+    if is_phase_e_scrutinee && scrutinee_slots.len() >= 3 {
+        // Find the single Constructor arm (or fall through to a
+        // wildcard / binding arm). Pattern-matching a single-
+        // variant union has exactly one tag, so any tag-equivalent
+        // arm matches every value.
+        for arm in arms {
+            let binders_opt: Option<&Vec<Vec<SymbolId>>> = match &arm.pattern {
+                Pattern::Constructor { binders, .. } => Some(binders),
+                Pattern::Wildcard | Pattern::Binding(_) => None,
+                _ => continue,
+            };
+            // Bind each slot to the corresponding binder sym. For a
+            // Constructor pattern, `binders` is per-field; for
+            // Wildcard / Binding, just bind the whole thing.
+            let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
+            if let Some(binders) = binders_opt {
+                let mut slot_idx = 0;
+                for binder_slots in binders {
+                    for &sym in binder_slots {
+                        if slot_idx >= scrutinee_slots.len() {
+                            break;
+                        }
+                        let v = scrutinee_slots[slot_idx];
+                        if sym.0 != u32::MAX {
+                            bound.push((sym, ctx.locals.insert(sym, v)));
+                        }
+                        slot_idx += 1;
+                    }
+                }
+            } else if let Pattern::Binding(sym) = &arm.pattern {
+                bound.push((*sym, ctx.locals.insert(*sym, scrutinee_slots[0])));
+            }
+            let result = lower_arm_body_slots(ctx, &arm.body);
+            // Restore locals.
+            for (sym, prev) in bound {
+                match prev {
+                    Some(p) => { ctx.locals.insert(sym, p); }
+                    None => { ctx.locals.remove(&sym); }
+                }
+            }
+            return result;
+        }
+        // No matching arm — fall through to error.
+    }
     let (tag_val, payload_val) = match scrutinee_slots.as_slice() {
         [v] => {
             if is_payload_carrying_union {
