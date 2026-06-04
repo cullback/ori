@@ -100,9 +100,27 @@ The row-polymorphism template already exists in `Type::Record` and
     `Expr::App`. Closes Pos/Neg/Wrapped/Wrap-style patterns.
   - **M, N, O**: not started.
 
-**Test coverage on Core: 82.9% → 86.4% → 91.2%** (20 more tests
-through Core total; +11 in the most recent push). All 308 tests
-pass throughout.
+**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5%** (24 more
+tests through Core total; +15 in the most recent push). All 308
+tests pass throughout.
+
+### Phase L+++ session (91.2% → 92.5%, +4 tests)
+
+After the +11-test L++ push, four more fallback categories closed:
+
+  - **type_expr_to_type handles Tuple**: `:` aliases like
+    `Wrap : [MkWrap((I64, I64))]` were registering MkWrap's field
+    as `Con("__unknown")` because the converter only handled Named
+    and App. Fixed (Tuple now flows through). +1 test.
+  - **Let value 2 slots, binders 1**: bind the source name to the
+    full slot list as multi-slot local — parallel to how Match
+    arm binders handle the same shape. +1 test.
+  - **else_body uses lower_expr_slots**: Tuple-returning fns have
+    multi-slot else branches; the single-slot lower errored.
+    Switched to multi-slot. +1 test.
+  - **lower_destructure flattens nested Tuple sub-patterns**:
+    `((a, b), (c, d)) = t` is now flattened recursively to a flat
+    binder list (the value's slot list is already flat). +1 test.
 
 ### Phase L++ session (86.4% → 91.2%, +11 tests)
 
