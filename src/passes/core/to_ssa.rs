@@ -1371,17 +1371,45 @@ fn lower_match(
             // Emit a body block to run guard-passed work; guards
             // chain via branch instructions in the current block.
             let body_block = ctx.builder.create_block();
+            // Track bindings introduced by Is-guards so we can
+            // restore the outer scope after the arm body lowers.
+            let mut guard_bindings: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
             for guard in &arm.guards {
-                let g_val = lower(ctx, guard)?;
-                let next_check = ctx.builder.create_block();
-                ctx.builder.branch(g_val, next_check, vec![], fail_block, fail_args.clone());
-                ctx.builder.switch_to(next_check);
+                // Special case: guard is an `Is { expr, pattern }`
+                // (lowered to a 2-arm Match returning Bool with the
+                // pattern's binders). flatten_patterns produces this
+                // for nested patterns like `Boxed(Ok(x))`. We need
+                // to BIND those binders in the surrounding scope —
+                // not just check the bool — so the arm body can
+                // reference `x`.
+                if let Some((scrutinee, pat)) = extract_is_guard(guard) {
+                    let scrutinee_vals = lower_slots(ctx, scrutinee)?;
+                    let next_check = ctx.builder.create_block();
+                    emit_is_guard(
+                        ctx,
+                        &scrutinee_vals,
+                        pat,
+                        next_check,
+                        fail_block,
+                        &fail_args,
+                        &mut guard_bindings,
+                    )?;
+                    ctx.builder.switch_to(next_check);
+                } else {
+                    let g_val = lower(ctx, guard)?;
+                    let next_check = ctx.builder.create_block();
+                    ctx.builder.branch(g_val, next_check, vec![], fail_block, fail_args.clone());
+                    ctx.builder.switch_to(next_check);
+                }
             }
             // All guards passed: jump to body block (so the
             // unreachable bool-check trailing block above
             // terminates somewhere).
             ctx.builder.jump(body_block, vec![]);
             ctx.builder.switch_to(body_block);
+            // Record guard bindings into the arm's `bound` list so
+            // they restore alongside the regular pattern binders.
+            bound.extend(guard_bindings);
         }
 
         // Lower the body's slot list. Each arm produces N values
@@ -1462,6 +1490,175 @@ fn lower_match(
 /// True when `ty` resolves (via transparent unfolding) to a
 /// single-variant tag union — the Phase-E direct-fanout case where
 /// a Con of this type produces only the variant's fields with no
+/// Match a guard expression against the `Is`-with-binding-pattern
+/// shape that `flatten_patterns` produces for nested patterns. The
+/// `is` lowering at AST→Core time desugars to:
+///
+///   `Match { scrutinee, arms: [Constructor(tag, binders) → True,
+///                              Wildcard → False] }`
+///
+/// Detecting that shape lets us bind the constructor's binders in
+/// the surrounding scope when the guard succeeds, rather than
+/// throwing the bindings away as the standard bool-evaluation would.
+fn extract_is_guard<'g>(guard: &'g Expr) -> Option<(&'g Expr, &'g Pattern)> {
+    let Expr::Match { scrutinee_slots, arms, .. } = guard else {
+        return None;
+    };
+    if scrutinee_slots.len() != 1 {
+        return None;
+    }
+    if arms.len() != 2 {
+        return None;
+    }
+    let true_arm = &arms[0];
+    let false_arm = &arms[1];
+    // True arm: Constructor(_, _) body == [Con("True", [], ...)]
+    let con_pat = match &true_arm.pattern {
+        Pattern::Constructor { .. } => &true_arm.pattern,
+        _ => return None,
+    };
+    if !matches!(false_arm.pattern, Pattern::Wildcard) {
+        return None;
+    }
+    // Confirm the bodies are True/False constants (the standard `is`
+    // desugar) — otherwise we'd hijack a user-written Match.
+    let is_bool_con = |body: &[Expr], target: &str| {
+        body.len() == 1
+            && matches!(
+                &body[0],
+                Expr::Con { tag, args, .. } if tag == target && args.is_empty()
+            )
+    };
+    if !is_bool_con(&true_arm.body, "True") {
+        return None;
+    }
+    if !is_bool_con(&false_arm.body, "False") {
+        return None;
+    }
+    Some((&scrutinee_slots[0], con_pat))
+}
+
+/// Lower an Is-guard: dispatch on the scrutinee, bind the
+/// constructor pattern's binders into ctx.locals on the success
+/// branch, and continue to `next_check`. On mismatch, branch to
+/// `fail_block` with `fail_args`. Records every binding in
+/// `guard_bindings` so the caller can restore the outer scope after
+/// the arm body lowers.
+fn emit_is_guard(
+    ctx: &mut Ctx<'_>,
+    scrutinee_vals: &[Value],
+    pattern: &Pattern,
+    next_check: crate::ssa::BlockId,
+    fail_block: crate::ssa::BlockId,
+    fail_args: &[Value],
+    guard_bindings: &mut Vec<(SymbolId, Option<Vec<Value>>)>,
+) -> Result<(), String> {
+    use crate::ssa::{BinaryOp, ScalarType};
+    let Pattern::Constructor { tag, binders } = pattern else {
+        return Err("emit_is_guard: pattern must be Constructor".into());
+    };
+    // Resolve the tag's index.
+    let tag_idx = ctx
+        .decls
+        .constructors
+        .get(tag)
+        .ok_or_else(|| format!("emit_is_guard: constructor `{tag}` not in decl_info"))?
+        .tag_index;
+    // Dispatch the scrutinee: for [tag, payload_ptr] D2 shape, the
+    // tag is slot 0 and payload is slot 1. For single-variant Phase-E
+    // scrutinees, scrutinee_vals IS the variant's fields fanned out
+    // — no tag check needed (the pattern's constructor must match).
+    let (tag_v, payload) = match scrutinee_vals {
+        [t, p] => (*t, Some(*p)),
+        [v] => (*v, None),
+        _ => {
+            // Phase-E: bind every binder directly from scrutinee_vals.
+            let mut slot_idx = 0;
+            for binder_slots in binders {
+                for &sym in binder_slots {
+                    if slot_idx >= scrutinee_vals.len() {
+                        break;
+                    }
+                    let v = scrutinee_vals[slot_idx];
+                    if sym.0 != u32::MAX {
+                        guard_bindings.push((sym, ctx.locals.insert(sym, vec![v])));
+                    }
+                    slot_idx += 1;
+                }
+            }
+            ctx.builder.jump(next_check, vec![]);
+            return Ok(());
+        }
+    };
+    // Compare tag against the expected constructor's index.
+    let expected = ctx.builder.const_u64(tag_idx);
+    let is_match = ctx.builder.binop(BinaryOp::Eq, tag_v, expected, ScalarType::U8);
+    let success = ctx.builder.create_block();
+    ctx.builder.branch(is_match, success, vec![], fail_block, fail_args.to_vec());
+    ctx.builder.switch_to(success);
+    // Bind binders by loading from the payload at i*8 offsets.
+    if let Some(payload_ptr) = payload {
+        let scheme_tys = ctx
+            .decls
+            .constructor_schemes
+            .get(tag)
+            .and_then(|s| match &s.ty {
+                Type::Arrow(ps, _, _) => Some(ps.clone()),
+                _ => None,
+            });
+        let scalar_fallback: Vec<ScalarType> = ctx
+            .decls
+            .constructors
+            .get(tag)
+            .map(|m| m.field_types.clone())
+            .unwrap_or_else(|| vec![ScalarType::RcPtr; binders.len()]);
+        for (i, binder_slots) in binders.iter().enumerate() {
+            let slot_tys: Vec<ScalarType> = if let Some(ref ps) = scheme_tys {
+                super::lower::expand_slots_with(
+                    &ps[i],
+                    &ctx.fieldless,
+                    &ctx.transparent,
+                    &ctx.payload_unions,
+                )
+            } else {
+                vec![scalar_fallback[i]]
+            };
+            let offset = i * 8;
+            if binder_slots.len() == 1 && slot_tys.len() > 1 {
+                let sym = binder_slots[0];
+                if sym.0 != u32::MAX {
+                    let wrapper = ctx.builder.load(payload_ptr, offset, ScalarType::RcPtr);
+                    let slot_vals: Vec<Value> = slot_tys
+                        .iter()
+                        .enumerate()
+                        .map(|(j, &t)| ctx.builder.load(wrapper, j * 8, t))
+                        .collect();
+                    guard_bindings.push((sym, ctx.locals.insert(sym, slot_vals)));
+                }
+                continue;
+            }
+            if binder_slots.len() == 1 && slot_tys.len() == 1 {
+                let sym = binder_slots[0];
+                if sym.0 != u32::MAX {
+                    let v = ctx.builder.load(payload_ptr, offset, slot_tys[0]);
+                    guard_bindings.push((sym, ctx.locals.insert(sym, vec![v])));
+                }
+            } else if binder_slots.len() == slot_tys.len() {
+                let wrapper = ctx.builder.load(payload_ptr, offset, ScalarType::RcPtr);
+                for (k, (&sym, &t)) in binder_slots.iter().zip(&slot_tys).enumerate() {
+                    if sym.0 == u32::MAX {
+                        continue;
+                    }
+                    let v = ctx.builder.load(wrapper, k * 8, t);
+                    guard_bindings.push((sym, ctx.locals.insert(sym, vec![v])));
+                }
+            }
+        }
+    }
+    ctx.builder.jump(next_check, vec![]);
+    Ok(())
+}
+
 /// tag and no payload heap object. Multi-variant and non-TagUnion
 /// types return false; the caller's coincidence check (slot counts
 /// match) alone isn't enough to distinguish them.
