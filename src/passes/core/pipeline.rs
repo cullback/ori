@@ -349,7 +349,6 @@ pub fn lower_module(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.target_func.clone()))
                 .collect();
-            ctx.ho_param_closures = mono.ho_param_closures.clone();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {
                 format!("function `{name_str}`: AST→Core: {e}")
@@ -518,18 +517,11 @@ fn param_slot_types(
     transparent: &TransparentTable,
     payload_unions: &std::collections::HashSet<String>,
 ) -> Vec<Vec<ScalarType>> {
-    // NOTE: HO params still carry `Type::Arrow` in the scheme
-    // (`lambda_specialize` doesn't update the original function's
-    // scheme). `mono.ho_param_closures` projects the concrete
-    // closure-union shape, but using it here breaks consistency
-    // with existing-lower (which doesn't see the map) and with
-    // synthesized helpers (`__fold_N`, walk apply lifters) that
-    // derived their own signatures from the original Arrow-typed
-    // scheme. A complete fix would also re-flow the body's
-    // arg/return types through everything that reads schemes.
-    // Tracked as the HO closure-shape problem; for now Arrow →
-    // 1 RcPtr default keeps callee+caller consistent and existing-
-    // lower handles HO via shell-wrap materialization.
+    // HO params still carry `Type::Arrow` in the scheme — Arrow
+    // expands to 1 RcPtr slot via the default path below, which
+    // keeps callee+caller consistent. existing-lower handles HO
+    // values via shell-wrap materialization (`to_slots`'
+    // Multi→Single).
     let _ = mono;
     mono.infer
         .func_schemes

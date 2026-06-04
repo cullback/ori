@@ -54,16 +54,6 @@ pub fn specialize(mono: &mut Monomorphized<'_>, solution: &LambdaSolution) {
     mono.module = new_module;
     mono.singletons = singletons;
     mono.tag_targets = tag_targets;
-    // Project the (func, param_idx) → closure-union-type-name view
-    // onto mono so Core's `param_slot_types` can resolve HO params
-    // whose `func_schemes` entry still carries `Type::Arrow`.
-    mono.ho_param_closures = solution
-        .param_to_set
-        .iter()
-        .map(|((fname, idx), &ls_idx)| {
-            ((fname.clone(), *idx), solution.sets[ls_idx].closure_type_name.clone())
-        })
-        .collect();
 }
 
 fn specialize_module<'src>(

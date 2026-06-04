@@ -144,14 +144,6 @@ pub struct LowerCtx<'a> {
     /// resolve the direct-call function for a fresh-closure
     /// `Call(closure_tag, captures)` at the walk call site.
     pub tag_targets: HashMap<String, String>,
-    /// HO param closures: `(callee name, param index) → synth
-    /// closure-union type name`. Read at every Call/QualifiedCall/
-    /// MethodCall to override the arg's `Type::Arrow` shape when the
-    /// callee's param position is a higher-order parameter. Without
-    /// this override, `expand_slots(Arrow)` returns 1 slot and the
-    /// emitted Call doesn't match `__apply_K`'s 2-slot closure
-    /// parameter expectation.
-    pub ho_param_closures: HashMap<(String, usize), String>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -168,7 +160,6 @@ impl<'a> LowerCtx<'a> {
             locals: HashMap::new(),
             slot_paths: HashMap::new(),
             tag_targets: HashMap::new(),
-            ho_param_closures: HashMap::new(),
         }
     }
 }

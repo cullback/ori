@@ -214,7 +214,120 @@ No tag was stored. No heap object was allocated for any closure. Two direct call
 
 That collapse is what the lambda set machinery exists to deliver. Every higher-order Ori program is compiled toward this shape; the only deviations are the truly heterogeneous cases, where the cost is one tag compare.
 
-## Migration: reorder lift before infer (TODO)
+## Migration: reorder lift before infer (DONE, with a pivot)
+
+**Implemented in commits on `lambda-rewrite` branch (June 2026).** What
+actually shipped differs from the original plan in one load-bearing
+way: closures are kept **Arrow-typed through inference** (via the
+existing `ExprKind::Closure` node) rather than emitted as
+`Call(__ClosureTag_N, captures)` and natively typed as tag unions.
+
+### Why the pivot
+
+The original plan assumed inference could unify a synthesized
+closure-union type (`__ClosureType_N`) with any `Type::Arrow` flowing
+into a higher-order parameter — the way Roc unifies via lambda-set
+rows. Ori's HM unifier doesn't have lambda-set rows: `Type::Arrow`
+has no row variable for the set of closures it admits. So
+`cannot unify (state, U64) -> Step(state) with __ClosureType_0`
+falls out the first time a stdlib HOF (e.g. `walk_until`) sees a
+synthesized closure-tag constructor call.
+
+Adding lambda sets to `Type::Arrow` (and to unification + mono) is a
+multi-week type-system project. Far smaller: pivot `lift_pre_infer`
+to emit `ExprKind::Closure { func, captures }` and teach infer to
+type that node as the lifted function's Arrow (minus the leading
+capture params). Closures stay Arrow-typed; the downstream
+post-mono pipeline (solve / specialize / narrow) keeps doing its
+job.
+
+### What the pivot ships
+
+1. **`lambda::lift_pre_infer`** — new pass, runs after `flatten_patterns`,
+   before `topo` and `infer`. Walks every body, lifts each `Lambda`
+   to a top-level `FuncDef __lifted_N(captures..., params...)` whose
+   body has captures substituted to fresh capture-param symbols.
+   Emits `ExprKind::Closure { func: __lifted_N, captures: [Name(c0)..] }`
+   at the lambda site. No TagDecl synthesis; no `func_schemes`
+   touching.
+
+2. **`types::infer`** — `ExprKind::Closure` arm looks up the lifted
+   func's scheme (already inferred earlier in topo order),
+   instantiates, unifies each `cap_expr` with the corresponding
+   capture param type, and returns `Type::Arrow(remaining_params, ret)`
+   — the closure's *callable* view. No Arrow-vs-TagUnion mismatch
+   because closures stay Arrow-typed.
+
+3. **`types::post_infer`** eta-expansion — now emits
+   `ExprKind::Closure { func: __lifted_eta_K, captures: [] }`
+   instead of `ExprKind::Lambda`. The synthesized
+   `__lifted_eta_K(params) = body` FuncDefs and their monomorphic
+   schemes are spliced into the module + `func_schemes` after the
+   rewrite walk.
+
+4. **`mono`** — `ExprKind::Closure` handler builds the *full* concrete
+   arrow for the lifted func (capture types prepended to the
+   closure's callable params), unwrapping transparent-newtype
+   applications via `resolve_transparent` before calling
+   `specialize_target`. `extract_substitution_with` itself takes
+   the transparent table and unwraps on shape mismatch — so
+   `App("Set", [V])` vs the underlying record now binds V.
+   `SpecRequest` carries an `extra_mapping` for vars that appear
+   in `scheme.ty` but not `scheme.vars` (foreign vars from the
+   enclosing scope leaking into a lifted scheme.ty) — process_request
+   layers it into the body's substitution mapping.
+
+5. **`Scheme`** — gains `var_concretes: HashMap<TypeVar, Type>`
+   carrying post-infer resolutions for vars that were generalized
+   polymorphic but later bound to a *fully concrete* type at a call
+   site (e.g. a method-constraint ret var resolving at a closure use
+   site). The "fully concrete" filter is critical: a var resolving
+   to a type containing another scheme's vars would carry foreign
+   vars through mono.
+
+6. **`engine.instantiate`** — preserves `expr_id` and `span` when
+   re-pushing constraints. Polymorphic schemes with a method-on-tvar
+   body otherwise never record `MethodCall.resolved` — the
+   body-inference constraint's tvar never binds (each call site
+   instantiates to a fresh tvar), so the fresh constraint's
+   `expr_id` is the only one verify_constraints can write back.
+
+7. **`register_methods`** — pre-mono method schemes are
+   **polymorphic** over the fresh placeholder vars (not `Scheme::mono`).
+   Otherwise those vars stay free in env, every Pass-2b caller
+   unifies with the same env-resident vars, leaving cross-scheme
+   aliases that break generalization.
+
+8. **`solve` / `specialize` / `narrow`** — unchanged in structure.
+   They still operate on `ExprKind::Closure` nodes the way they did
+   when lift ran post-mono. specialize still does the `Closure → Call`
+   rewrite + TagDecl synthesis. narrow still does scheme rewriting +
+   per-call-site cloning. existing-lower still does shell-wrap
+   materialization for HO call boundaries. The "drop scheme
+   rewriting" / "remove shell-wrap" / "remove ho_param_closures"
+   ideas from the original plan presupposed TagUnion-typed closures
+   from infer — they don't apply to the pivot. (`ho_param_closures`
+   itself was dead plumbing and is now removed; the others stay.)
+
+9. **Dead Lambda walks** — every pass that runs *after* `lift_pre_infer`
+   (infer, post_infer, mono, solve, specialize, narrow, reachable,
+   core/pipeline, lower) has its `ExprKind::Lambda` match arm
+   replaced with `unreachable!()`. `is_syntactic_value`,
+   `infer_lambda`, and `check_lambda` in `types/infer.rs` are
+   deleted.
+
+### What's left for a future "real" cleanup
+
+The shell-wrap path in `lower::to_slots` (Multi→Single materialization)
+and `narrow::retype_scheme_params` exist because HO param positions
+in `func_schemes` still carry `Type::Arrow` rather than the concrete
+closure-union shape. Re-flowing the body's arg/return types through
+every consumer that reads schemes would let both go away — but that's
+the same multi-week scope as adding lambda sets to `Type::Arrow`
+directly. Worth doing iff the runtime cost or maintenance cost of
+the workarounds becomes load-bearing.
+
+## Migration: reorder lift before infer (original plan, superseded)
 
 The current pipeline runs lift AFTER mono+infer. That ordering forces lift to materialize types it doesn't strictly need (`func_schemes` for `__lifted_N`, `.ty` on Closure captures) and creates a two-source-of-truth problem downstream: schemes say one shape (Arrow for HO params), bodies expect another (closure-union for `__apply_K`). The mismatch surfaces in lowering as arity errors, type warnings, and the need for shell-wrap workarounds.
 
