@@ -1177,7 +1177,7 @@ fn lower_match(
                     .constructor_schemes
                     .get(tag)
                     .and_then(|s| match &s.ty {
-                        Type::Arrow(ps, r) => {
+                        Type::Arrow(ps, r, _) => {
                             let subst = collect_subst(r, &scrutinee_ty);
                             Some(ps.iter().map(|p| apply_subst(p, &subst)).collect::<Vec<_>>())
                         }
@@ -1458,7 +1458,7 @@ fn walk_for_subst(
                 walk_for_subst(sa, mb, out);
             }
         }
-        (Type::Arrow(ap, ar), Type::Arrow(bp, br)) => {
+        (Type::Arrow(ap, ar, _), Type::Arrow(bp, br, _)) => {
             for (sa, mb) in ap.iter().zip(bp.iter()) {
                 walk_for_subst(sa, mb, out);
             }

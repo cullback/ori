@@ -41,7 +41,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
     fn nominal_slot_count(&self, type_name: &str) -> Option<usize> {
         for (con_name, scheme) in &self.infer.constructor_schemes {
             let ret_ty = match &scheme.ty {
-                Type::Arrow(_, ret) => ret.as_ref(),
+                Type::Arrow(_, ret, _) => ret.as_ref(),
                 other => other,
             };
             if let Type::App(ret_name, _) = ret_ty {

@@ -154,7 +154,7 @@ pub fn lower_module(
     for (con_name, meta) in &decls.constructors {
         if let Some(scheme) = decls.constructor_schemes.get(con_name) {
             let ret_ty = match &scheme.ty {
-                Type::Arrow(_, ret) => ret.as_ref(),
+                Type::Arrow(_, ret, _) => ret.as_ref(),
                 other => other,
             };
             if let Some(name) = union_name_of(ret_ty) {
@@ -236,7 +236,7 @@ pub fn lower_module(
                 .func_schemes
                 .get(&name_str)
                 .and_then(|s| match &s.ty {
-                    Type::Arrow(ps, _) => Some(ps.clone()),
+                    Type::Arrow(ps, _, _) => Some(ps.clone()),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -319,7 +319,7 @@ pub fn lower_module(
                 .constructor_schemes
                 .iter()
                 .filter_map(|(name, s)| match &s.ty {
-                    Type::Arrow(ps, _) => Some((name.clone(), ps.clone())),
+                    Type::Arrow(ps, _, _) => Some((name.clone(), ps.clone())),
                     _ => None,
                 })
                 .collect();
@@ -328,7 +328,7 @@ pub fn lower_module(
                 .iter()
                 .map(|(name, s)| {
                     let ret = match &s.ty {
-                        Type::Arrow(_, r) => (**r).clone(),
+                        Type::Arrow(_, r, _) => (**r).clone(),
                         other => other.clone(),
                     };
                     (name.clone(), ret)
@@ -527,7 +527,7 @@ fn param_slot_types(
         .func_schemes
         .get(name_str)
         .map(|s| match &s.ty {
-            Type::Arrow(ps, _) => ps
+            Type::Arrow(ps, _, _) => ps
                 .iter()
                 .map(|t| expand_slots_with(t, fieldless, transparent, payload_unions))
                 .collect(),

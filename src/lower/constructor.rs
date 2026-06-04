@@ -22,7 +22,7 @@ use super::LowerCtx;
 impl<'a, 'src> LowerCtx<'a, 'src> {
     pub(super) fn specialize_con_fields(&self, con_name: &str, ctx_ty: &Type) -> Option<Vec<ScalarType>> {
         let scheme = self.decls.constructor_schemes.get(con_name)?;
-        let Type::Arrow(params, ret) = &scheme.ty else {
+        let Type::Arrow(params, ret, _) = &scheme.ty else {
             return None;
         };
         let resolved_ctx = self.resolve_transparent(ctx_ty);

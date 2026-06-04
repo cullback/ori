@@ -1402,7 +1402,7 @@ fn walk_pattern_subst(
                 walk_pattern_subst(sa, mb, out);
             }
         }
-        (Type::Arrow(ap, ar), Type::Arrow(bp, br)) => {
+        (Type::Arrow(ap, ar, _), Type::Arrow(bp, br, _)) => {
             for (sa, mb) in ap.iter().zip(bp.iter()) {
                 walk_pattern_subst(sa, mb, out);
             }

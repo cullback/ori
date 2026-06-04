@@ -436,7 +436,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         }
         if let Some(scheme) = self.infer.func_schemes.get(name) {
             let ret = match &scheme.ty {
-                Type::Arrow(_, ret) => ret.as_ref(),
+                Type::Arrow(_, ret, _) => ret.as_ref(),
                 other => other,
             };
             return self.repr_type(ret);
@@ -451,7 +451,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .func_schemes
             .get(func)
             .map(|scheme| match &scheme.ty {
-                Type::Arrow(_, ret) => self.expand_slots(ret),
+                Type::Arrow(_, ret, _) => self.expand_slots(ret),
                 other => self.expand_slots(other),
             })
             .unwrap_or_else(|| vec![ScalarType::RcPtr])
@@ -465,7 +465,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .func_schemes
             .get(func)
             .map(|scheme| match &scheme.ty {
-                Type::Arrow(params, _) => {
+                Type::Arrow(params, _, _) => {
                     params.iter().map(|t| self.expand_slots(t)).collect()
                 }
                 _ => vec![vec![ScalarType::RcPtr]; num_args],
@@ -612,7 +612,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             .func_schemes
             .get(name)
             .map(|scheme| match &scheme.ty {
-                Type::Arrow(params, _) => params.iter().map(|t| self.expand_slots(t)).collect(),
+                Type::Arrow(params, _, _) => params.iter().map(|t| self.expand_slots(t)).collect(),
                 _ => vec![vec![ScalarType::RcPtr]; param_syms.len()],
             })
             .unwrap_or_else(|| vec![vec![ScalarType::RcPtr]; param_syms.len()]);
@@ -1283,7 +1283,7 @@ fn lower_to_ssa<'src>(
         .func_schemes
         .get("main")
         .and_then(|s| match &s.ty {
-            Type::Arrow(ps, _) => Some(ps.iter().map(|t| ctx.scalar_type(t)).collect()),
+            Type::Arrow(ps, _, _) => Some(ps.iter().map(|t| ctx.scalar_type(t)).collect()),
             _ => None,
         })
         .unwrap_or_else(|| vec![ScalarType::RcPtr; params.len()]);
@@ -1339,12 +1339,13 @@ pub(super) fn substitute_type_var(ty: &Type, var: TypeVar, replacement: &Type) -
                 .map(|a| substitute_type_var(a, var, replacement))
                 .collect(),
         ),
-        Type::Arrow(params, ret) => Type::Arrow(
+        Type::Arrow(params, ret, ls) => Type::Arrow(
             params
                 .iter()
                 .map(|p| substitute_type_var(p, var, replacement))
                 .collect(),
             Box::new(substitute_type_var(ret, var, replacement)),
+            ls.as_ref().map(|r| Box::new(substitute_type_var(r, var, replacement))),
         ),
         Type::Record { fields, rest } => Type::Record {
             fields: fields

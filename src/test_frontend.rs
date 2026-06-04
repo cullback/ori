@@ -478,7 +478,7 @@ fn render_scheme(ty: &crate::types::engine::Type) -> String {
             let arg_strs: Vec<String> = args.iter().map(render_scheme).collect();
             format!("{name}({})", arg_strs.join(", "))
         }
-        Type::Arrow(params, ret) => {
+        Type::Arrow(params, ret, _) => {
             let param_strs: Vec<String> = params.iter().map(render_scheme).collect();
             format!("{} -> {}", param_strs.join(", "), render_scheme(ret))
         }

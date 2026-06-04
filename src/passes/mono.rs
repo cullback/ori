@@ -436,7 +436,7 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                     let mut arg_types: Vec<Type> = vec![receiver.ty.clone()];
                     arg_types.extend(args.iter().map(|a| a.ty.clone()));
                     let concrete =
-                        Type::Arrow(arg_types, Box::new(expr.ty.clone()));
+                        Type::Arrow(arg_types, Box::new(expr.ty.clone()), None);
                     if let Some(new_name) =
                         self.specialize_by_name(&resolved_name, &concrete)
                     {
@@ -569,7 +569,7 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                     )
                 };
                 let concrete = match &expr.ty {
-                    Type::Arrow(call_params, ret) => {
+                    Type::Arrow(call_params, ret, _) => {
                         let mut full = Vec::with_capacity(captures.len() + call_params.len());
                         for c in captures.iter() {
                             full.push(unwrap(&c.ty));
@@ -577,7 +577,7 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                         for p in call_params {
                             full.push(unwrap(p));
                         }
-                        Type::Arrow(full, Box::new(unwrap(ret)))
+                        Type::Arrow(full, Box::new(unwrap(ret)), None)
                     }
                     other => unwrap(other),
                 };
@@ -739,7 +739,7 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
 /// and return type, as needed by the substitution extractor.
 fn call_signature(args: &[Expr<'_>], ret_ty: &Type) -> Type {
     let arg_types: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
-    Type::Arrow(arg_types, Box::new(ret_ty.clone()))
+    Type::Arrow(arg_types, Box::new(ret_ty.clone()), None)
 }
 
 /// Rewrite the parsed infer result to reflect specialized schemes.
@@ -807,7 +807,7 @@ fn extract_substitution_with(
                 extract_substitution_with(x, y, out, transparent);
             }
         }
-        (Type::Arrow(p1, r1), Type::Arrow(p2, r2)) if p1.len() == p2.len() => {
+        (Type::Arrow(p1, r1, _), Type::Arrow(p2, r2, _)) if p1.len() == p2.len() => {
             for (x, y) in p1.iter().zip(p2.iter()) {
                 extract_substitution_with(x, y, out, transparent);
             }
@@ -915,9 +915,10 @@ fn normalize_type(ty: &Type) -> Type {
             name.clone(),
             args.iter().map(normalize_type).collect(),
         ),
-        Type::Arrow(params, ret) => Type::Arrow(
+        Type::Arrow(params, ret, ls) => Type::Arrow(
             params.iter().map(normalize_type).collect(),
             Box::new(normalize_type(ret)),
+            ls.as_ref().map(|r| Box::new(normalize_type(r))),
         ),
         Type::Record { fields, .. } => {
             let mut norm_fields: Vec<(String, Type)> = fields
@@ -983,7 +984,7 @@ pub(crate) fn append_type_mangling(out: &mut String, ty: &Type) {
             }
             out.push(')');
         }
-        Type::Arrow(params, ret) => {
+        Type::Arrow(params, ret, _) => {
             out.push('(');
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {
@@ -1180,9 +1181,10 @@ fn apply_mapping(ty: &Type, mapping: &HashMap<TypeVar, Type>) -> Type {
             name.clone(),
             args.iter().map(|a| apply_mapping(a, mapping)).collect(),
         ),
-        Type::Arrow(params, ret) => Type::Arrow(
+        Type::Arrow(params, ret, ls) => Type::Arrow(
             params.iter().map(|p| apply_mapping(p, mapping)).collect(),
             Box::new(apply_mapping(ret, mapping)),
+            ls.as_ref().map(|r| Box::new(apply_mapping(r, mapping))),
         ),
         Type::Record { fields, rest } => {
             // First substitute through the named fields.

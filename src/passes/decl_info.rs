@@ -83,7 +83,7 @@ fn scheme_return_type(
     transparent: &HashMap<String, (Vec<TypeVar>, Type)>,
 ) -> ScalarType {
     let ret = match &scheme.ty {
-        Type::Arrow(_, ret) => ret.as_ref().clone(),
+        Type::Arrow(_, ret, _) => ret.as_ref().clone(),
         other => other.clone(),
     };
     let unwrapped = unwrap_transparent(&ret, transparent);
@@ -122,9 +122,10 @@ pub fn substitute_type_var(ty: &Type, var: TypeVar, replacement: &Type) -> Type 
             name.clone(),
             args.iter().map(|a| substitute_type_var(a, var, replacement)).collect(),
         ),
-        Type::Arrow(params, ret) => Type::Arrow(
+        Type::Arrow(params, ret, ls) => Type::Arrow(
             params.iter().map(|p| substitute_type_var(p, var, replacement)).collect(),
             Box::new(substitute_type_var(ret, var, replacement)),
+            ls.as_ref().map(|r| Box::new(substitute_type_var(r, var, replacement))),
         ),
         Type::Tuple(elems) => Type::Tuple(
             elems.iter().map(|e| substitute_type_var(e, var, replacement)).collect(),
@@ -322,7 +323,7 @@ fn register_tag_union(info: &mut DeclInfo, type_name: &str, tags: &[ast::TagDecl
         let field_types: Vec<ScalarType> = info.constructor_schemes.get(tag.name).map_or_else(
             || vec![ScalarType::RcPtr; tag.fields.len()],
             |scheme| match &scheme.ty {
-                Type::Arrow(params, _) => {
+                Type::Arrow(params, _, _) => {
                     params.iter().map(|t| resolve_scalar_type(t, fieldless)).collect()
                 }
                 _ => vec![ScalarType::RcPtr; tag.fields.len()],

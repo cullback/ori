@@ -1237,7 +1237,7 @@ fn lifted_func_capture_types(
     let Some(scheme) = func_schemes.get(target_func) else {
         return Vec::new();
     };
-    let Type::Arrow(params, _) = &scheme.ty else {
+    let Type::Arrow(params, _, _) = &scheme.ty else {
         return Vec::new();
     };
     if params.len() < n {
@@ -1251,7 +1251,7 @@ fn lifted_func_capture_types(
 /// the return type alone.
 fn retype_scheme_params(orig: &Scheme, info_by_pos: &HashMap<usize, NarrowedTag>) -> Scheme {
     let new_ty = match &orig.ty {
-        Type::Arrow(params, ret) => {
+        Type::Arrow(params, ret, ls) => {
             let new_params: Vec<Type> = params
                 .iter()
                 .enumerate()
@@ -1263,7 +1263,7 @@ fn retype_scheme_params(orig: &Scheme, info_by_pos: &HashMap<usize, NarrowedTag>
                     }
                 })
                 .collect();
-            Type::Arrow(new_params, ret.clone())
+            Type::Arrow(new_params, ret.clone(), ls.clone())
         }
         other => other.clone(),
     };

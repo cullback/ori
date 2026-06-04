@@ -183,7 +183,7 @@ fn rewrite_expr(
             &expr.kind,
             ExprKind::Name(_) | ExprKind::FieldAccess { .. }
         )
-        && matches!(&expr.ty, Type::Arrow(_, _))
+        && matches!(&expr.ty, Type::Arrow(_, _, _))
     {
         eta_expand(expr, info, symbols, synthesized, counter);
     }
@@ -246,7 +246,7 @@ fn eta_expand(
     synthesized: &mut Vec<(Decl<'static>, Scheme)>,
     counter: &mut usize,
 ) {
-    let Type::Arrow(param_types, ret_ty) = expr.ty.clone() else {
+    let Type::Arrow(param_types, ret_ty, _) = expr.ty.clone() else {
         unreachable!("caller checked expr.ty is Arrow");
     };
     let span = expr.span;
@@ -294,7 +294,7 @@ fn eta_expand(
     let lifted_name = format!("__lifted_eta_{id}");
     let lifted_sym = symbols.fresh(&lifted_name, span, SymbolKind::Func);
 
-    let scheme = Scheme::mono(Type::Arrow(param_types, ret_ty));
+    let scheme = Scheme::mono(Type::Arrow(param_types, ret_ty, None));
     let lifted_decl: Decl<'static> = Decl::FuncDef {
         span: synth_span(span),
         name: lifted_sym,

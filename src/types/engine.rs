@@ -8,12 +8,30 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeVar(pub usize);
 
+/// Lambda set: a row variable tracking which closure tags can flow
+/// through a function-typed position. Mirrors the `rest` field on
+/// `Record` and `TagUnion`:
+///
+/// - `None` = closed empty row (no closures, or post-mono — typically
+///   a top-level function called by name).
+/// - `Some(Var(tv))` = open row, will get unified at call sites.
+/// - `Some(TagUnion{tags: [...], rest: None})` = closed concrete set
+///   (post-inference — the lambda set is fully determined).
+///
+/// At Phase A this field exists but is ignored everywhere — every
+/// construction site passes `None` and every consumer ignores it via
+/// `_`. Phase B starts populating real values; Phase C makes unify
+/// merge them; Phase D specializes on them.
+///
+/// See `notes/lambda-set-rows-roadmap.md`.
+pub type LambdaSet = Option<Box<Type>>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Var(TypeVar),
     Con(String),
     App(String, Vec<Type>),
-    Arrow(Vec<Type>, Box<Type>),
+    Arrow(Vec<Type>, Box<Type>, LambdaSet),
     /// Record type with named fields and an optional rest (open row variable).
     /// `rest: None` means a closed record; `rest: Some(Var(tv))` means open (row polymorphic).
     Record {
@@ -99,9 +117,11 @@ impl Type {
         match self {
             Self::Var(_) | Self::Con(_) => self.clone(),
             Self::App(name, args) => Self::App(name.clone(), args.iter().map(&mut *f).collect()),
-            Self::Arrow(params, ret) => {
-                Self::Arrow(params.iter().map(&mut *f).collect(), Box::new(f(ret)))
-            }
+            Self::Arrow(params, ret, ls) => Self::Arrow(
+                params.iter().map(&mut *f).collect(),
+                Box::new(f(ret)),
+                ls.as_ref().map(|r| Box::new(f(r))),
+            ),
             Self::Record { fields, rest } => Self::Record {
                 fields: fields
                     .iter()
@@ -240,8 +260,10 @@ impl TypeEngine {
             Type::Var(v) => *v == tv,
             Type::Con(_) => false,
             Type::App(_, args) => args.iter().any(|a| self.occurs_in(tv, a)),
-            Type::Arrow(params, ret) => {
-                params.iter().any(|p| self.occurs_in(tv, p)) || self.occurs_in(tv, ret)
+            Type::Arrow(params, ret, ls) => {
+                params.iter().any(|p| self.occurs_in(tv, p))
+                    || self.occurs_in(tv, ret)
+                    || ls.as_ref().is_some_and(|r| self.occurs_in(tv, r))
             }
             Type::Record { fields, rest } => {
                 fields.iter().any(|(_, t)| self.occurs_in(tv, t))
@@ -274,7 +296,11 @@ impl TypeEngine {
             (_, Type::Var(_)) => self.unify(&rhs, &lhs),
             (Type::Con(a), Type::Con(b)) => self.unify_cons(a, b, &lhs, &rhs),
             (Type::App(n1, a1), Type::App(n2, a2)) => self.unify_apps(n1, a1, n2, a2),
-            (Type::Arrow(p1, r1), Type::Arrow(p2, r2)) => self.unify_arrows(p1, r1, p2, r2),
+            (Type::Arrow(p1, r1, _), Type::Arrow(p2, r2, _)) => {
+                // Phase A: ignore the lambda set on each side.
+                // Phase C will merge them via row unification.
+                self.unify_arrows(p1, r1, p2, r2)
+            }
             (Type::Tuple(a), Type::Tuple(b)) => self.unify_tuples(a, b),
             (
                 Type::Record {
@@ -633,11 +659,14 @@ impl TypeEngine {
                     self.collect_free_vars(a, fvs);
                 }
             }
-            Type::Arrow(params, ret) => {
+            Type::Arrow(params, ret, ls) => {
                 for p in params {
                     self.collect_free_vars(p, fvs);
                 }
                 self.collect_free_vars(ret, fvs);
+                if let Some(r) = ls {
+                    self.collect_free_vars(r, fvs);
+                }
             }
             Type::Record { fields, rest } => {
                 for (_, t) in fields {
@@ -773,7 +802,10 @@ impl TypeEngine {
                 let arg_strs: Vec<String> = args.iter().map(|a| self.display_type(a)).collect();
                 format!("{name}({})", arg_strs.join(", "))
             }
-            Type::Arrow(params, ret) => {
+            Type::Arrow(params, ret, _) => {
+                // Lambda set elided from display — user-facing types
+                // are unchanged. Phase B+ may add a debug-only render
+                // gated on an env var.
                 let param_strs: Vec<String> = params.iter().map(|p| self.display_type(p)).collect();
                 format!("{} -> {}", param_strs.join(", "), self.display_type(ret))
             }

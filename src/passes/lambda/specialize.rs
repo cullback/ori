@@ -98,7 +98,7 @@ fn specialize_module<'src>(
         let apply_ret_ty = func_schemes
             .get(&ls.apply_name)
             .and_then(|s| match &s.ty {
-                Type::Arrow(_, r) => Some(r.as_ref().clone()),
+                Type::Arrow(_, r, _) => Some(r.as_ref().clone()),
                 _ => None,
             });
         new_decls.push(build_apply_function(ls, &alloc, ls_idx, symbols, func_schemes, apply_ret_ty));
@@ -231,7 +231,7 @@ fn register_apply_scheme(
         let Some(lifted_scheme) = func_schemes.get(&lifted_name) else {
             return;
         };
-        let Type::Arrow(lifted_params, lifted_ret) = &lifted_scheme.ty else {
+        let Type::Arrow(lifted_params, lifted_ret, _) = &lifted_scheme.ty else {
             return;
         };
         let num_captures = entry.captures.len();
@@ -261,7 +261,7 @@ fn register_apply_scheme(
 
     func_schemes.insert(
         ls.apply_name.clone(),
-        Scheme::mono(Type::Arrow(params, Box::new(ret_ty))),
+        Scheme::mono(Type::Arrow(params, Box::new(ret_ty), None)),
     );
 }
 
@@ -804,7 +804,7 @@ fn apply_arg_types(
         let Some(scheme) = func_schemes.get(&name) else {
             continue;
         };
-        let Type::Arrow(params, _) = &scheme.ty else {
+        let Type::Arrow(params, _, _) = &scheme.ty else {
             continue;
         };
         let n = entry.captures.len();
@@ -839,7 +839,7 @@ fn lifted_func_capture_types(
     let Some(scheme) = func_schemes.get(&lifted_name) else {
         return Vec::new();
     };
-    let Type::Arrow(params, _) = &scheme.ty else {
+    let Type::Arrow(params, _, _) = &scheme.ty else {
         return Vec::new();
     };
     let n = entry.captures.len();

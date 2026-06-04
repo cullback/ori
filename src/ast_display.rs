@@ -662,7 +662,7 @@ fn write_ty(out: &mut String, ty: &Type) {
             }
             out.push(')');
         }
-        Type::Arrow(params, ret) => {
+        Type::Arrow(params, ret, _) => {
             out.push('(');
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {
