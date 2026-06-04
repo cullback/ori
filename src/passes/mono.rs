@@ -496,7 +496,9 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                     self.rewrite_calls_in_expr(&mut arm.body);
                 }
             }
-            ExprKind::Lambda { body, .. } => self.rewrite_calls_in_expr(body),
+            ExprKind::Lambda { .. } => {
+                unreachable!("lift_pre_infer removes all Lambda nodes before mono runs")
+            }
             ExprKind::Record { fields } => {
                 for (_, e) in fields.iter_mut() {
                     self.rewrite_calls_in_expr(e);
@@ -777,11 +779,10 @@ fn build_new_infer_result(
 // ---- Specialization key: type substitution extraction ----
 
 /// Walk `scheme_ty` alongside `concrete_ty` and record every
-/// `TypeVar → Type` mapping needed to make them match.
-fn extract_substitution(scheme_ty: &Type, concrete_ty: &Type, out: &mut HashMap<TypeVar, Type>) {
-    extract_substitution_with(scheme_ty, concrete_ty, out, None);
-}
-
+/// `TypeVar → Type` mapping needed to make them match. Pass
+/// `transparent: Some(&table)` to recover bindings across the
+/// transparent-newtype boundary (e.g. `App("Set", [V])` vs the
+/// underlying record).
 fn extract_substitution_with(
     scheme_ty: &Type,
     concrete_ty: &Type,
@@ -1107,7 +1108,9 @@ fn substitute_types_in_expr(expr: &mut Expr<'_>, mapping: &HashMap<TypeVar, Type
                 substitute_types_in_expr(&mut arm.body, mapping);
             }
         }
-        ExprKind::Lambda { body, .. } => substitute_types_in_expr(body, mapping),
+        ExprKind::Lambda { .. } => {
+            unreachable!("lift_pre_infer removes all Lambda nodes before mono runs")
+        }
         ExprKind::Record { fields } => {
             for (_, e) in fields.iter_mut() {
                 substitute_types_in_expr(e, mapping);

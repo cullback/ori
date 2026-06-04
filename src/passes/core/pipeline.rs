@@ -586,7 +586,9 @@ fn body_uses_sym(body: &AstExpr<'_>, target: SymbolId) -> bool {
             ExprKind::Block(stmts, last) => {
                 stmts.iter().any(|s| walk_stmt(s, t)) || walk_expr(last, t)
             }
-            ExprKind::Lambda { body, .. } => walk_expr(body, t),
+            ExprKind::Lambda { .. } => {
+                unreachable!("lift_pre_infer removes all Lambda nodes before Core lowering")
+            }
             ExprKind::Closure { captures, .. } => captures.iter().any(|c| walk_expr(c, t)),
         }
     }

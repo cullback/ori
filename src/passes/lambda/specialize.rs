@@ -700,7 +700,9 @@ impl<'src> Rewriter<'_> {
                     };
                 }
             }
-            ExprKind::Lambda { .. } => {}
+            ExprKind::Lambda { .. } => {
+                unreachable!("lift_pre_infer removes all Lambda nodes before infer")
+            }
             ExprKind::IntLit(_)
             | ExprKind::FloatLit(_)
             | ExprKind::StrLit(_)

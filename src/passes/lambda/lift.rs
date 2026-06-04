@@ -13,7 +13,7 @@
 //! Every former lambda is a named `FuncDef` with signature
 //! `(cap0, cap1, ..., param0, param1, ...) -> ret`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::ast::{self, Decl, Expr, ExprKind, Module, Span, Stmt};
 use crate::passes::resolve::Resolved;

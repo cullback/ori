@@ -149,7 +149,9 @@ fn expr_uses(e: &Expr<'_>, target: SymbolId) -> bool {
             expr_uses(expr, target)
                 || arms.iter().any(|a| a.guards.iter().any(|g| expr_uses(g, target)) || expr_uses(&a.body, target))
         }
-        ExprKind::Lambda { body, .. } => expr_uses(body, target),
+        ExprKind::Lambda { .. } => {
+            unreachable!("lift_pre_infer removes all Lambda nodes before lower runs")
+        }
         ExprKind::QualifiedCall { args, .. } => args.iter().any(|a| expr_uses(a, target)),
         ExprKind::Record { fields } => fields.iter().any(|(_, e)| expr_uses(e, target)),
         ExprKind::RecordUpdate { base, updates } => {
@@ -1029,7 +1031,7 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
             }
 
             ExprKind::Lambda { .. } => {
-                panic!("lambdas are only supported as direct arguments to function calls");
+                unreachable!("lift_pre_infer removes all Lambda nodes before lower runs")
             }
 
             ExprKind::RecordUpdate { base, updates } => {

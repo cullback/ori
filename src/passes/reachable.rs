@@ -275,7 +275,9 @@ fn collect_refs(expr: &Expr<'_>, refs: &mut Vec<String>, symbols: &SymbolTable) 
                 collect_refs(&arm.body, refs, symbols);
             }
         }
-        ExprKind::Lambda { body, .. } => collect_refs(body, refs, symbols),
+        ExprKind::Lambda { .. } => {
+            unreachable!("lift_pre_infer removes all Lambda nodes before reachable runs")
+        }
         ExprKind::Record { fields } => {
             for (_, e) in fields {
                 collect_refs(e, refs, symbols);

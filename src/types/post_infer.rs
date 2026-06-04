@@ -139,8 +139,8 @@ fn rewrite_expr(
                 rewrite_arm(arm, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
-        ExprKind::Lambda { body, .. } => {
-            rewrite_expr(body, expr_types, resolutions, eta, symbols, synthesized, counter);
+        ExprKind::Lambda { .. } => {
+            unreachable!("lift_pre_infer removes all Lambda nodes; eta-expansion now emits Closure")
         }
         ExprKind::Record { fields } => {
             for (_, e) in fields {

@@ -326,8 +326,8 @@ fn collect_sites<'src>(
                 collect_sites(c, sym_to_decl_idx, tag_names_in_targets, symbols, out);
             }
         }
-        ExprKind::Lambda { body, .. } => {
-            collect_sites(body, sym_to_decl_idx, tag_names_in_targets, symbols, out);
+        ExprKind::Lambda { .. } => {
+            unreachable!("lift_pre_infer removes all Lambda nodes before narrow runs")
         }
         ExprKind::IntLit(_)
         | ExprKind::FloatLit(_)
@@ -820,7 +820,9 @@ impl<'a, 'src> CloneBodyRewriter<'a> {
                     self.walk_expr(c);
                 }
             }
-            ExprKind::Lambda { body, .. } => self.walk_expr(body),
+            ExprKind::Lambda { .. } => {
+                unreachable!("lift_pre_infer removes all Lambda nodes before narrow runs")
+            }
             ExprKind::IntLit(_)
             | ExprKind::FloatLit(_)
             | ExprKind::StrLit(_)
@@ -964,7 +966,9 @@ impl CallSiteRewriter {
                     self.walk_expr(c);
                 }
             }
-            ExprKind::Lambda { body, .. } => self.walk_expr(body),
+            ExprKind::Lambda { .. } => {
+                unreachable!("lift_pre_infer removes all Lambda nodes before narrow runs")
+            }
             ExprKind::IntLit(_)
             | ExprKind::FloatLit(_)
             | ExprKind::StrLit(_)
@@ -1047,15 +1051,8 @@ impl<'a> AstCloner<'a> {
                 expr: Box::new(self.clone_expr(s)),
                 arms: arms.iter().map(|a| self.clone_arm(a)).collect(),
             },
-            ExprKind::Lambda { params, body } => {
-                let new_params: Vec<SymbolId> = params
-                    .iter()
-                    .map(|p| self.rename(*p, expr.span, SymbolKind::Local))
-                    .collect();
-                ExprKind::Lambda {
-                    params: new_params,
-                    body: Box::new(self.clone_expr(body)),
-                }
+            ExprKind::Lambda { .. } => {
+                unreachable!("lift_pre_infer removes all Lambda nodes before narrow runs")
             }
             ExprKind::QualifiedCall {
                 segments,

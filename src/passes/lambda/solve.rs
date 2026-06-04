@@ -394,7 +394,9 @@ fn scan_expr(ctx: &mut Ctx<'_>, expr: &Expr<'_>) {
                 scan_expr(ctx, cap_expr);
             }
         }
-        ExprKind::Lambda { body, .. } => scan_expr(ctx, body),
+        ExprKind::Lambda { .. } => {
+            unreachable!("lift_pre_infer removes all Lambda nodes before solve runs")
+        }
         ExprKind::Record { fields } => {
             for (_, e) in fields { scan_expr(ctx, e); }
         }
@@ -618,7 +620,9 @@ fn find_missing(ctx: &Ctx<'_>, expr: &Expr<'_>, out: &mut Vec<(SymbolId, Vec<Sym
         ExprKind::Closure { captures, .. } => {
             for c in captures { find_missing(ctx, c, out); }
         }
-        ExprKind::Lambda { body, .. } => find_missing(ctx, body, out),
+        ExprKind::Lambda { .. } => {
+            unreachable!("lift_pre_infer removes all Lambda nodes before solve runs")
+        }
         ExprKind::Record { fields } => { for (_, e) in fields { find_missing(ctx, e, out); } }
         ExprKind::RecordUpdate { base, updates } => {
             find_missing(ctx, base, out);

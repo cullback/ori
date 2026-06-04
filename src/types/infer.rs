@@ -11,16 +11,6 @@ fn method_key(type_name: &str, method: &str) -> String {
 }
 
 
-/// Value restriction: only generalize let bindings whose value is a
-/// syntactic function (lambda). Non-function bindings like records or
-/// tag values can carry open row variables — generalizing those would
-/// give each use site a fresh row, breaking structural field/tag
-/// propagation. This is a row-polymorphism concern, not a mutation
-/// concern (System T's lack of mutation doesn't help here).
-const fn is_syntactic_value(expr: &Expr<'_>) -> bool {
-    matches!(expr.kind, ExprKind::Lambda { .. })
-}
-
 /// Results of type inference, communicated to the lowerer.
 ///
 /// Post-Step-2c, `InferResult` only carries data that isn't naturally
@@ -528,50 +518,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             return self.check_con_as_function(*sym, expr.id, expr.span, expected);
         }
 
-        // Lambda against arrow: push expected param types into env
-        // BEFORE inferring the body so method calls on parameters
-        // see concrete types, not fresh vars.
-        if let ExprKind::Lambda { params, body } = &expr.kind {
-            let resolved_expected = self.engine.resolve(expected);
-            // Look through transparent types: if the expected type is
-            // an App that's transparent to an Arrow (e.g. Parser(a) ::
-            // (List(U8) -> Result(...))), resolve it so the lambda
-            // gets bidirectional checking.
-            let arrow_expected = match &resolved_expected {
-                Type::Arrow(..) => Some(resolved_expected.clone()),
-                Type::App(name, args) => {
-                    if let Some((param_vars, underlying)) =
-                        self.engine.transparent.get(name).cloned()
-                    {
-                        // Create fresh copies of param vars and substitute
-                        // them into the underlying type, then unify the
-                        // fresh vars with the concrete args. This avoids
-                        // polluting the stored param vars across uses.
-                        let fresh_map: Vec<(TypeVar, Type)> = param_vars
-                            .iter()
-                            .zip(args.iter())
-                            .map(|(old_var, arg)| (*old_var, arg.clone()))
-                            .collect();
-                        let substituted = self.engine.substitute_vars(&underlying, &fresh_map);
-                        let resolved_sub = self.engine.resolve(&substituted);
-                        matches!(resolved_sub, Type::Arrow(..)).then_some(resolved_sub)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(Type::Arrow(expected_params, expected_ret)) = &arrow_expected
-                && expected_params.len() == params.len()
-            {
-                let result =
-                    self.check_lambda(params, body, expected_params, expected_ret, expr.span)?;
-                // Also unify the lambda result with the original expected
-                // type so the opaque wrapper is properly linked.
-                self.unify_at(&result, expected, expr.span)?;
-                return Ok(result);
-            }
-        }
+        // Lambda bidirectional checking lived here, but
+        // `lift_pre_infer` removes every Lambda before infer runs.
+        // The synthesize-and-unify default path handles everything.
 
         // Default path: synthesize the expression's type and unify
         // with the expected type. On failure, the context (if any)
@@ -705,7 +654,9 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 self.infer_field_access(record, *field, expr.id, expr.span)
             }
 
-            ExprKind::Lambda { params, body } => self.infer_lambda(params, body),
+            ExprKind::Lambda { .. } => {
+                unreachable!("lift_pre_infer removes all Lambda nodes before infer runs")
+            }
 
             ExprKind::Tuple(elems) => {
                 let mut elem_types = Vec::new();
@@ -837,25 +788,21 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                                 &format!("let binding `{name_str}`"),
                             )?;
                         }
-                        let scheme = if is_syntactic_value(val) {
-                            ctx.engine.generalize(&val_ty, &ctx.env)
-                        } else {
-                            Scheme::mono(val_ty)
-                        };
-                        ctx.env.insert(name_str, scheme);
+                        // lift_pre_infer removes every Lambda before
+                        // infer runs, so let-bound values are never
+                        // syntactic functions and the value-restriction
+                        // path that would generalize them never fires.
+                        // All let bindings get monomorphic schemes;
+                        // top-level functions are generalized via
+                        // infer_func_body instead.
+                        ctx.env.insert(name_str, Scheme::mono(val_ty));
                     }
                     Stmt::Destructure { pattern, val } => {
                         let val_ty = ctx.infer_expr(val)?;
                         let bindings = ctx.infer_pattern(pattern, &val_ty, val.span, None)?;
-                        let is_value = is_syntactic_value(val);
                         for (sym, ty) in bindings {
                             let name = ctx.symbols.display(sym).to_owned();
-                            let scheme = if is_value {
-                                ctx.engine.generalize(&ty, &ctx.env)
-                            } else {
-                                Scheme::mono(ty)
-                            };
-                            ctx.env.insert(name, scheme);
+                            ctx.env.insert(name, Scheme::mono(ty));
                         }
                     }
                     Stmt::Guard {
@@ -1062,62 +1009,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         };
         self.unify_at(&record_ty, &expected, span)?;
         Ok(field_ty)
-    }
-
-    /// Bidirectional lambda check: infer the lambda body with
-    /// parameter types pushed from the expected arrow type. This
-    /// ensures method calls on parameters see concrete types during
-    /// inference, not fresh vars that only resolve after the body.
-    fn check_lambda(
-        &mut self,
-        params: &[SymbolId],
-        body: &Expr<'src>,
-        expected_params: &[Type],
-        expected_ret: &Type,
-        span: Span,
-    ) -> Result<Type, CompileError> {
-        self.scoped(|ctx| {
-            let param_types: Vec<Type> = params
-                .iter()
-                .zip(expected_params.iter())
-                .map(|(p, expected_ty)| {
-                    let name = ctx.symbols.display(*p).to_owned();
-                    ctx.env.insert(name, Scheme::mono(expected_ty.clone()));
-                    expected_ty.clone()
-                })
-                .collect();
-            let ret = ctx.engine.fresh();
-            ctx.ret_ty_stack.push(ret.clone());
-            let body_ty = ctx.infer_expr(body)?;
-            ctx.ret_ty_stack.pop();
-            ctx.unify_at(&ret, &body_ty, body.span)?;
-            ctx.unify_at(&ret, expected_ret, span)?;
-            Ok(Type::Arrow(param_types, Box::new(ret)))
-        })
-    }
-
-    fn infer_lambda(
-        &mut self,
-        params: &[SymbolId],
-        body: &Expr<'src>,
-    ) -> Result<Type, CompileError> {
-        self.scoped(|ctx| {
-            let param_types: Vec<Type> = params
-                .iter()
-                .map(|p| {
-                    let ty = ctx.engine.fresh();
-                    let name = ctx.symbols.display(*p).to_owned();
-                    ctx.env.insert(name, Scheme::mono(ty.clone()));
-                    ty
-                })
-                .collect();
-            let ret = ctx.engine.fresh();
-            ctx.ret_ty_stack.push(ret.clone());
-            let body_ty = ctx.infer_expr(body)?;
-            ctx.ret_ty_stack.pop();
-            ctx.unify_at(&ret, &body_ty, body.span)?;
-            Ok(Type::Arrow(param_types, Box::new(ret)))
-        })
     }
 
     // ---- Call inference ----
