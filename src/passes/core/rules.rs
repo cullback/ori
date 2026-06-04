@@ -70,7 +70,7 @@ fn recurse(expr: Expr) -> Expr {
                 .map(|a| MatchArm {
                     pattern: a.pattern,
                     guards: a.guards.into_iter().map(simplify).collect(),
-                    body: simplify(a.body),
+                    body: a.body.into_iter().map(simplify).collect(),
                     is_return: a.is_return,
                 })
                 .collect(),
@@ -84,9 +84,10 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
-        Expr::Con { tag, args, ty } => Expr::Con {
+        Expr::Con { tag, args, field_slot_counts, ty } => Expr::Con {
             tag,
             args: args.into_iter().map(simplify).collect(),
+            field_slot_counts,
             ty,
         },
 
@@ -96,15 +97,39 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
-        Expr::ProjSlot { source_slots, slot_idx, ty } => Expr::ProjSlot {
-            source_slots: source_slots.into_iter().map(simplify).collect(),
-            slot_idx,
-            ty,
-        },
-
         Expr::BufLoad { buf, idx, ty } => Expr::BufLoad {
             buf: Box::new(simplify(*buf)),
             idx: Box::new(simplify(*idx)),
+            ty,
+        },
+
+        Expr::ListRange { start, end, ty } => Expr::ListRange {
+            start: Box::new(simplify(*start)),
+            end: Box::new(simplify(*end)),
+            ty,
+        },
+
+        Expr::ListWalk { list_slots, init, target, captures, elem_ty, ty } => Expr::ListWalk {
+            list_slots: list_slots.into_iter().map(simplify).collect(),
+            init: init.into_iter().map(simplify).collect(),
+            target,
+            captures: captures.into_iter().map(simplify).collect(),
+            elem_ty,
+            ty,
+        },
+
+        Expr::ListAppend { list_slots, val_slots, elem_ty, ty } => Expr::ListAppend {
+            list_slots: list_slots.into_iter().map(simplify).collect(),
+            val_slots: val_slots.into_iter().map(simplify).collect(),
+            elem_ty,
+            ty,
+        },
+
+        Expr::ListSet { list_slots, idx, val_slots, elem_ty, ty } => Expr::ListSet {
+            list_slots: list_slots.into_iter().map(simplify).collect(),
+            idx: Box::new(simplify(*idx)),
+            val_slots: val_slots.into_iter().map(simplify).collect(),
+            elem_ty,
             ty,
         },
     }

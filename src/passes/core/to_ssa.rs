@@ -50,6 +50,16 @@ pub struct Ctx<'b> {
     /// decisions — those follow the existing-lower single-shell
     /// convention to keep call-result compatibility.
     pub payload_unions: std::collections::HashSet<String>,
+    /// Memo for shared-evaluation `Let`s. When `bind_multi_slot` or
+    /// `lower_block`'s wrap-with-Lets emits N `Let`s with the same
+    /// `binders` (because all N reference the same multi-slot value
+    /// at different slot indices), we lower `value` only on the
+    /// first encounter and reuse the resulting `Value`s thereafter.
+    /// Keyed by `binders[0]` — slot syms are minted fresh per
+    /// binding site, so the first binder uniquely identifies the
+    /// group. Empty for `Let`s introduced outside the fan-out
+    /// pattern (e.g. a regular block-level scalar let).
+    pub bind_cache: HashMap<SymbolId, Vec<Value>>,
 }
 
 /// Lower a Core expression as a multi-slot SSA result. Returns
@@ -64,9 +74,10 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // Payload-carrying Con: (tag, payload_ptr) two slots. We
         // allocate the payload, store each arg's slots at consecutive
         // offsets, return [tag, payload].
-        Expr::Con { tag, args, ty } => {
-            // Lower each arg's slots once — used by all three cases
-            // (fieldless, Phase E direct fanout, multi-variant shell).
+        Expr::Con { tag, args, field_slot_counts, ty } => {
+            // Lower each arg's slots — already flattened to one
+            // Core Expr per slot upstream (lower_call_args), so
+            // each arg contributes one Value at this layer.
             let mut all_slots: Vec<Value> = Vec::new();
             for arg in args {
                 all_slots.extend(lower_slots(ctx, arg)?);
@@ -96,16 +107,38 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
                 // path. all_slots should be empty for fieldless cons.
                 return Ok(vec![lower(ctx, expr)?]);
             }
-            // Multi-variant payload-carrying: alloc + stores + return
-            // (tag, payload).
+            // Multi-variant payload-carrying: payload holds one RcPtr
+            // per source-level field. Multi-slot source fields (Str,
+            // List, nested unions) get materialized into a 1-RcPtr
+            // shell containing their N slots, matching existing-lower's
+            // runtime contract. Re-group the per-slot Core args back
+            // into source fields via the constructor's field-type
+            // expansion.
             let tag_idx = if let Some(meta) = ctx.decls.constructors.get(tag) {
                 meta.tag_index
             } else {
                 structural_con_layout(ty, tag, &ctx.fieldless).0
             };
-            let alloc_size = all_slots.len() * 8;
-            let payload = ctx.builder.alloc(alloc_size);
-            for (i, v) in all_slots.iter().enumerate() {
+            let field_groups = group_args_by_field(
+                field_slot_counts,
+                &all_slots,
+            );
+            let arg_vals: Vec<Value> = field_groups
+                .iter()
+                .map(|slots| {
+                    if slots.len() == 1 {
+                        slots[0]
+                    } else {
+                        let wrapper = ctx.builder.alloc(slots.len() * 8);
+                        for (i, v) in slots.iter().enumerate() {
+                            ctx.builder.store(wrapper, i * 8, *v);
+                        }
+                        wrapper
+                    }
+                })
+                .collect();
+            let payload = ctx.builder.alloc(arg_vals.len() * 8);
+            for (i, v) in arg_vals.iter().enumerate() {
                 ctx.builder.store(payload, i * 8, *v);
             }
             let tag_v = ctx.builder.const_u64(tag_idx);
@@ -125,6 +158,15 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
                 arg_vals.extend(lower_slots(ctx, a)?);
             }
             Ok(ctx.builder.call_multi(target, arg_vals, &ret_slots))
+        }
+
+        // Match's natural multi-slot return — the merge block has
+        // one param per result slot, and each arm jumps with N values
+        // directly. Callers that need only one slot pick out of the
+        // returned Vec; callers that need all (multi-slot Result
+        // unbox) get them straight. No shell, no per-slot loads.
+        Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => {
+            lower_match(ctx, scrutinee_slots, scrutinee_ty, arms, ty)
         }
 
         // Cata lowers to the same SSA as the equivalent App — both
@@ -147,6 +189,387 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             } else {
                 Ok(ctx.builder.call_multi(fold_fn, arg_vals, &ret_slots))
             }
+        }
+
+        // Str literals fan out to (len, cap, data) directly — the
+        // canonical SROA shape, same as List(U8). Single-slot
+        // callers re-materialize via `lower` below.
+        Expr::Lit { value: Literal::Str(bytes), .. } => {
+            let len = bytes.len();
+            let data = ctx.builder.alloc(len * 8);
+            for (i, &b) in bytes.iter().enumerate() {
+                let v = ctx.builder.const_u8(b);
+                ctx.builder.store(data, i * 8, v);
+            }
+            let len_val = ctx.builder.const_u64(len as u64);
+            Ok(vec![len_val, len_val, data])
+        }
+
+        // List literals fan out to (len, cap, data) directly so
+        // App args, function returns, Con payloads receive the
+        // trio without an intermediate header alloc. The single-
+        // slot `lower` path wraps to a header when the caller
+        // needs one RcPtr (boundary cases only).
+        Expr::ListLit { elements, elem_ty, .. } => {
+            let slot_count = super::lower::expand_slots_with(
+                elem_ty,
+                &ctx.fieldless,
+                &ctx.transparent,
+                &ctx.payload_unions,
+            )
+            .len()
+            .max(1);
+            let total_slots = elements.len();
+            let n = total_slots / slot_count;
+            let data = ctx.builder.alloc(total_slots * 8);
+            for (i, elem) in elements.iter().enumerate() {
+                let v = lower(ctx, elem)?;
+                ctx.builder.store(data, i * 8, v);
+            }
+            let len_val = ctx.builder.const_u64(n as u64);
+            Ok(vec![len_val, len_val, data])
+        }
+
+        // List.walk: fold the list under a step function, threading
+        // the accumulator. Singleton-closure direct-dispatch only
+        // (Core lower only emits ListWalk when the closure's tag
+        // resolves to a known apply target). Mirrors
+        // existing-lower's `lower_list_walk` with the `until=false`
+        // path.
+        Expr::ListWalk { list_slots, init, target, captures, elem_ty, ty: walk_ty } => {
+            use crate::ssa::{BinaryOp, ScalarType};
+
+            let list_vals: Vec<Value> = {
+                let mut all = Vec::new();
+                for e in list_slots {
+                    all.extend(lower_slots(ctx, e)?);
+                }
+                all
+            };
+            if list_vals.len() != 3 {
+                return Err(format!(
+                    "core::to_ssa: ListWalk expects 3-slot list trio, got {} slots",
+                    list_vals.len()
+                ));
+            }
+            let len_val = list_vals[0];
+            let data_ptr = list_vals[2];
+
+            let acc_slots: Vec<ScalarType> = super::lower::expand_slots_with(
+                walk_ty,
+                &ctx.fieldless,
+                &ctx.transparent,
+                &ctx.payload_unions,
+            );
+            let init_vals: Vec<Value> = {
+                let mut all = Vec::new();
+                for e in init {
+                    all.extend(lower_slots(ctx, e)?);
+                }
+                all
+            };
+            if init_vals.len() != acc_slots.len() {
+                return Err(format!(
+                    "core::to_ssa: ListWalk init slot count {} != acc_slots {}",
+                    init_vals.len(),
+                    acc_slots.len()
+                ));
+            }
+
+            // Captures flow as parallel "step values" through the
+            // loop block params. Each capture expression is lowered
+            // to its slots; we collect both values and types.
+            let mut cap_vals: Vec<Value> = Vec::new();
+            let mut cap_tys: Vec<ScalarType> = Vec::new();
+            for c in captures {
+                let slots = lower_slots(ctx, c)?;
+                let ty_expanded = super::lower::expand_slots_with(
+                    c.ty(),
+                    &ctx.fieldless,
+                    &ctx.transparent,
+                    &ctx.payload_unions,
+                );
+                if slots.len() == ty_expanded.len() {
+                    cap_vals.extend(slots);
+                    cap_tys.extend(ty_expanded);
+                } else {
+                    // Mismatch — fall back to a single RcPtr per
+                    // capture (defensive; shouldn't happen for
+                    // well-typed Core).
+                    for v in slots {
+                        cap_vals.push(v);
+                        cap_tys.push(ScalarType::RcPtr);
+                    }
+                }
+            }
+
+            let elem_tys: Vec<ScalarType> = super::lower::expand_slots_with(
+                elem_ty,
+                &ctx.fieldless,
+                &ctx.transparent,
+                &ctx.payload_unions,
+            );
+
+            // Build header / body / done blocks. Header threads
+            // (i, acc..., len, data, caps...). Body adds element
+            // load + step call. Done receives the final acc.
+            let header = ctx.builder.create_block();
+            let i_param = ctx.builder.add_block_param(header, ScalarType::U64);
+            let acc_params: Vec<Value> = acc_slots
+                .iter()
+                .map(|&ty| ctx.builder.add_block_param(header, ty))
+                .collect();
+            let len_param = ctx.builder.add_block_param(header, ScalarType::U64);
+            let data_param = ctx.builder.add_block_param(header, ScalarType::RcPtr);
+            let cap_params: Vec<Value> = cap_tys
+                .iter()
+                .map(|&ty| ctx.builder.add_block_param(header, ty))
+                .collect();
+
+            let body_block = ctx.builder.create_block();
+            let body_i = ctx.builder.add_block_param(body_block, ScalarType::U64);
+            let body_acc: Vec<Value> = acc_slots
+                .iter()
+                .map(|&ty| ctx.builder.add_block_param(body_block, ty))
+                .collect();
+            let body_len = ctx.builder.add_block_param(body_block, ScalarType::U64);
+            let body_data = ctx.builder.add_block_param(body_block, ScalarType::RcPtr);
+            let body_cap_vals: Vec<Value> = cap_tys
+                .iter()
+                .map(|&ty| ctx.builder.add_block_param(body_block, ty))
+                .collect();
+
+            let done = ctx.builder.create_block();
+            let done_acc: Vec<Value> = acc_slots
+                .iter()
+                .map(|&ty| ctx.builder.add_block_param(done, ty))
+                .collect();
+            // Threaded so the buffer's rc-release lands here.
+            let _done_data = ctx.builder.add_block_param(done, ScalarType::RcPtr);
+            for &ty in &cap_tys {
+                ctx.builder.add_block_param(done, ty);
+            }
+
+            // Entry → header(0, init..., len, data, caps...).
+            let zero = ctx.builder.const_u64(0);
+            let mut entry_args = Vec::with_capacity(1 + init_vals.len() + 2 + cap_vals.len());
+            entry_args.push(zero);
+            entry_args.extend(init_vals);
+            entry_args.push(len_val);
+            entry_args.push(data_ptr);
+            entry_args.extend(cap_vals);
+            ctx.builder.jump(header, entry_args);
+
+            // Header: cmp i == len; done(acc, data, caps) :: body(i, acc, len, data, caps).
+            ctx.builder.switch_to(header);
+            let cmp = ctx.builder.binop(BinaryOp::Eq, i_param, len_param, ScalarType::U8);
+            let mut done_args: Vec<Value> = acc_params.clone();
+            done_args.push(data_param);
+            done_args.extend(cap_params.iter().copied());
+            let mut body_args: Vec<Value> = Vec::new();
+            body_args.push(i_param);
+            body_args.extend(acc_params.iter().copied());
+            body_args.push(len_param);
+            body_args.push(data_param);
+            body_args.extend(cap_params.iter().copied());
+            ctx.builder.branch(cmp, done, done_args, body_block, body_args);
+
+            // Body: load elem slot(s) from data buffer at body_i.
+            // Element stride is sum(elem_slot_count) * 8 bytes;
+            // for single-slot elements that's the simple `body_data[body_i]`
+            // load_dyn. For multi-slot (Str/List/aggregate) we'd need
+            // stride math — bail (return error) for those today.
+            ctx.builder.switch_to(body_block);
+            if elem_tys.len() != 1 {
+                return Err(format!(
+                    "core::to_ssa: ListWalk multi-slot elements ({} slots) not yet supported",
+                    elem_tys.len()
+                ));
+            }
+            let elem_v = ctx.builder.load_dyn(body_data, body_i, elem_tys[0]);
+
+            // Step call: target(caps, acc, elem) → acc_slots.
+            let mut call_args: Vec<Value> = Vec::new();
+            call_args.extend(body_cap_vals.iter().copied());
+            call_args.extend(body_acc.iter().copied());
+            call_args.push(elem_v);
+            let new_acc: Vec<Value> = if acc_slots.len() == 1 {
+                vec![ctx.builder.call(target, call_args, acc_slots[0])]
+            } else {
+                ctx.builder.call_multi(target, call_args, &acc_slots)
+            };
+
+            // i+1 → header.
+            let one = ctx.builder.const_u64(1);
+            let next_i = ctx.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+            let mut jump_args: Vec<Value> = Vec::with_capacity(1 + new_acc.len() + 2 + body_cap_vals.len());
+            jump_args.push(next_i);
+            jump_args.extend(new_acc);
+            jump_args.push(body_len);
+            jump_args.push(body_data);
+            jump_args.extend(body_cap_vals.iter().copied());
+            ctx.builder.jump(header, jump_args);
+
+            ctx.builder.switch_to(done);
+            Ok(done_acc)
+        }
+
+        // List.set: cow_store_dyn val into the data buffer at
+        // index `idx`. Multi-slot elements stride at
+        // `val_slots.len() * 8` bytes; each slot is a separate
+        // cow_store_dyn call (the first cow-preps the buffer; the
+        // result feeds the next call so the entire element lands
+        // in one cloned/unique buffer). Returns the new
+        // (len, cap, new_data) trio.
+        Expr::ListSet { list_slots, idx, val_slots, .. } => {
+            use crate::ssa::{BinaryOp, ScalarType};
+            let list_vals: Vec<Value> = {
+                let mut all = Vec::new();
+                for e in list_slots {
+                    all.extend(lower_slots(ctx, e)?);
+                }
+                all
+            };
+            if list_vals.len() != 3 {
+                return Err(format!(
+                    "core::to_ssa: ListSet expects 3-slot list trio, got {} slots",
+                    list_vals.len()
+                ));
+            }
+            let len = list_vals[0];
+            let cap = list_vals[1];
+            let data = list_vals[2];
+            let idx_v = lower(ctx, idx)?;
+            let val_vals: Vec<Value> = {
+                let mut all = Vec::new();
+                for e in val_slots {
+                    all.extend(lower_slots(ctx, e)?);
+                }
+                all
+            };
+            let stride_units = val_vals.len().max(1) as u64;
+            let stride_units_const = ctx.builder.const_u64(stride_units);
+            let elem_unit_base = ctx.builder.binop(BinaryOp::Mul, idx_v, stride_units_const, ScalarType::U64);
+
+            let mut current = data;
+            for (j, v) in val_vals.iter().enumerate() {
+                let target_idx = if j == 0 {
+                    elem_unit_base
+                } else {
+                    let j_const = ctx.builder.const_u64(j as u64);
+                    ctx.builder.binop(BinaryOp::Add, elem_unit_base, j_const, ScalarType::U64)
+                };
+                current = ctx.builder.cow_store_dyn(current, target_idx, *v);
+            }
+            Ok(vec![len, cap, current])
+        }
+
+        // List.append: cow_resize_dyn the data buffer to fit one
+        // more element, write val slots at index `len`, return the
+        // new (new_len, new_len, new_data) trio. Multi-slot
+        // elements (records, Str, nested lists) store N slots at
+        // consecutive 8-byte offsets within the element's stride
+        // bucket.
+        Expr::ListAppend { list_slots, val_slots, .. } => {
+            use crate::ssa::{BinaryOp, ScalarType};
+            let list_vals: Vec<Value> = {
+                let mut all = Vec::new();
+                for e in list_slots {
+                    all.extend(lower_slots(ctx, e)?);
+                }
+                all
+            };
+            if list_vals.len() != 3 {
+                return Err(format!(
+                    "core::to_ssa: ListAppend expects 3-slot list trio, got {} slots",
+                    list_vals.len()
+                ));
+            }
+            let len = list_vals[0];
+            let data = list_vals[2];
+
+            let val_vals: Vec<Value> = {
+                let mut all = Vec::new();
+                for e in val_slots {
+                    all.extend(lower_slots(ctx, e)?);
+                }
+                all
+            };
+            let stride_units = val_vals.len().max(1) as u64;
+            let stride_bytes = stride_units * 8;
+
+            let one = ctx.builder.const_u64(1);
+            let new_len = ctx.builder.binop(BinaryOp::Add, len, one, ScalarType::U64);
+            let stride_bytes_const = ctx.builder.const_u64(stride_bytes);
+            let new_byte_len = ctx.builder.binop(BinaryOp::Mul, new_len, stride_bytes_const, ScalarType::U64);
+            let new_data = ctx.builder.cow_resize_dyn(data, new_byte_len);
+
+            // Element-unit base: `len * stride_units` (in 8-byte
+            // index units, matching `store_dyn`'s convention).
+            let stride_units_const = ctx.builder.const_u64(stride_units);
+            let elem_unit_base = ctx.builder.binop(BinaryOp::Mul, len, stride_units_const, ScalarType::U64);
+            for (j, v) in val_vals.iter().enumerate() {
+                if j == 0 {
+                    ctx.builder.store_dyn(new_data, elem_unit_base, *v);
+                } else {
+                    let j_const = ctx.builder.const_u64(j as u64);
+                    let idx = ctx.builder.binop(BinaryOp::Add, elem_unit_base, j_const, ScalarType::U64);
+                    ctx.builder.store_dyn(new_data, idx, *v);
+                }
+            }
+            Ok(vec![new_len, new_len, new_data])
+        }
+
+        // List.range emits a counter-driven fill loop and returns
+        // the resulting (len, cap, data) trio. Empty range
+        // (`end <= start`) yields count=0 with a 0-byte data buffer.
+        Expr::ListRange { start, end, .. } => {
+            use crate::ssa::{BinaryOp, ScalarType};
+            let start_v = lower(ctx, start)?;
+            let end_v = lower(ctx, end)?;
+
+            let nonempty = ctx.builder.binop(BinaryOp::Gt, end_v, start_v, ScalarType::U8);
+            let then_block = ctx.builder.create_block();
+            let else_block = ctx.builder.create_block();
+            let count_merge = ctx.builder.create_block();
+            let count = ctx.builder.add_block_param(count_merge, ScalarType::U64);
+            ctx.builder.branch(nonempty, then_block, vec![], else_block, vec![]);
+
+            ctx.builder.switch_to(then_block);
+            let diff = ctx.builder.binop(BinaryOp::Sub, end_v, start_v, ScalarType::U64);
+            ctx.builder.jump(count_merge, vec![diff]);
+
+            ctx.builder.switch_to(else_block);
+            let zero = ctx.builder.const_u64(0);
+            ctx.builder.jump(count_merge, vec![zero]);
+
+            ctx.builder.switch_to(count_merge);
+            let eight = ctx.builder.const_u64(8);
+            let byte_len = ctx.builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
+            let data = ctx.builder.alloc_dyn(byte_len);
+
+            let header = ctx.builder.create_block();
+            let body = ctx.builder.create_block();
+            let exit = ctx.builder.create_block();
+            let header_i = ctx.builder.add_block_param(header, ScalarType::U64);
+            let body_i = ctx.builder.add_block_param(body, ScalarType::U64);
+
+            let zero2 = ctx.builder.const_u64(0);
+            ctx.builder.jump(header, vec![zero2]);
+
+            ctx.builder.switch_to(header);
+            let cond = ctx.builder.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
+            ctx.builder.branch(cond, body, vec![header_i], exit, vec![]);
+
+            ctx.builder.switch_to(body);
+            let val = ctx.builder.binop(BinaryOp::Add, start_v, body_i, ScalarType::U64);
+            ctx.builder.store_dyn(data, body_i, val);
+            let one = ctx.builder.const_u64(1);
+            let next_i = ctx.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+            ctx.builder.jump(header, vec![next_i]);
+
+            ctx.builder.switch_to(exit);
+            Ok(vec![count, count, data])
         }
 
         // All other variants are single-slot today; delegate.
@@ -203,10 +626,25 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         }
 
         Expr::Let { binders, value, body, .. } => {
-            // Lower body via lower_slots (so multi-slot results work)
-            // and materialize to single if needed — same convention
-            // as the function-return and match-arm boundaries.
-            let mut vals = lower_slots(ctx, value)?;
+            // Shared-Let memoization. When N `Let`s share the same
+            // `binders` (the `bind_multi_slot` pattern, or
+            // `lower_block`'s wrap-with-Lets across body slots),
+            // lower `value` exactly once and reuse the result for
+            // each subsequent Let. `binders[0]` keys the cache —
+            // slot syms are minted fresh per binding site, so a
+            // shared first binder uniquely identifies the group.
+            let cache_key = binders.first().copied();
+            let mut vals = if let Some(key) = cache_key {
+                if let Some(cached) = ctx.bind_cache.get(&key) {
+                    cached.clone()
+                } else {
+                    let computed = lower_slots(ctx, value)?;
+                    ctx.bind_cache.insert(key, computed.clone());
+                    computed
+                }
+            } else {
+                lower_slots(ctx, value)?
+            };
             // If value returned a single Value (heap shell from a Call
             // to a payload-union-returning function) but binders want
             // multiple slots, unbox by loading N values from the shell
@@ -227,6 +665,9 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
                         .enumerate()
                         .map(|(i, &ty)| ctx.builder.load(shell, i * 8, ty))
                         .collect();
+                    if let Some(key) = cache_key {
+                        ctx.bind_cache.insert(key, vals.clone());
+                    }
                 }
             }
             if vals.len() != binders.len() {
@@ -326,7 +767,24 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(header)
         }
 
-        Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => lower_match(ctx, scrutinee_slots, scrutinee_ty, arms, ty),
+        Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => {
+            // Single-value caller: Match naturally returns its full
+            // slot list. If the result type is single-slot, take the
+            // one value; if multi-slot, materialize a shell so this
+            // single-value callsite still gets one RcPtr. (Multi-slot
+            // callers go through `lower_slots`'s Match arm below,
+            // which avoids the shell entirely.)
+            let slots = lower_match(ctx, scrutinee_slots, scrutinee_ty, arms, ty)?;
+            if slots.len() == 1 {
+                Ok(slots[0])
+            } else {
+                let shell = ctx.builder.alloc(slots.len() * 8);
+                for (i, v) in slots.iter().enumerate() {
+                    ctx.builder.store(shell, i * 8, *v);
+                }
+                Ok(shell)
+            }
+        }
 
         // Unchecked indexed load from a buffer pointer. Lowers to
         // SSA `load_dyn(buf, idx, scalar_ty)` — one instruction.
@@ -339,34 +797,7 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(ctx.builder.load_dyn(buf_val, idx_val, scalar))
         }
 
-        // Pick a slot from `source_slots`. Two shapes show up:
-        // (a) the source is already decomposed (e.g. a Tuple
-        //     argument that came in as parallel SSA values) —
-        //     pick the `slot_idx`-th lowered value directly, no
-        //     SSA emitted. Detected by `source_slots.len() > 1`.
-        // (b) the source is a single RcPtr header pointing at a
-        //     (len, cap, data) or similar buffer — load
-        //     `slot_idx * 8` bytes in, typed as the projection's
-        //     scalar type. The common shape today since Core's
-        //     `expand_slots` treats `List(T)` as one RcPtr.
-        Expr::ProjSlot { source_slots, slot_idx, ty } => {
-            let mut all = Vec::new();
-            for e in source_slots {
-                all.extend(lower_slots(ctx, e)?);
-            }
-            if all.len() > 1 {
-                return all.into_iter().nth(*slot_idx).ok_or_else(|| format!(
-                    "core::to_ssa: ProjSlot index {slot_idx} out of range"
-                ));
-            }
-            if all.len() == 1 {
-                let scalar = resolve_scalar_type(ty, &ctx.fieldless);
-                return Ok(ctx.builder.load(all[0], slot_idx * 8, scalar));
-            }
-            Err("core::to_ssa: ProjSlot has empty source_slots".into())
-        }
-
-        Expr::Con { tag, args, ty } => {
+        Expr::Con { tag, args, field_slot_counts: _, ty } => {
             // Only fieldless unions handled in the single-slot path
             // today. Payload Cons that the caller actually wants as
             // a multi-slot result are lowered through lower_slots
@@ -405,6 +836,54 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
                 ))
         }
 
+        // Multi-slot primitives — single-slot caller asks for a
+        // header pointer; materialize the trio into a 24-byte shell.
+        Expr::ListRange { .. } => {
+            let slots = lower_slots(ctx, expr)?;
+            let shell = ctx.builder.alloc(slots.len() * 8);
+            for (i, v) in slots.iter().enumerate() {
+                ctx.builder.store(shell, i * 8, *v);
+            }
+            Ok(shell)
+        }
+
+        // ListSet single-slot caller: materialize the trio.
+        Expr::ListSet { .. } => {
+            let slots = lower_slots(ctx, expr)?;
+            let shell = ctx.builder.alloc(slots.len() * 8);
+            for (i, v) in slots.iter().enumerate() {
+                ctx.builder.store(shell, i * 8, *v);
+            }
+            Ok(shell)
+        }
+
+        // ListAppend single-slot caller: materialize the trio
+        // into a shell. Multi-slot callers go through `lower_slots`.
+        Expr::ListAppend { .. } => {
+            let slots = lower_slots(ctx, expr)?;
+            let shell = ctx.builder.alloc(slots.len() * 8);
+            for (i, v) in slots.iter().enumerate() {
+                ctx.builder.store(shell, i * 8, *v);
+            }
+            Ok(shell)
+        }
+
+        // ListWalk's result is the acc type, which can be either
+        // single-slot or multi-slot. Multi-slot callers go through
+        // `lower_slots` directly; single-slot callers get the
+        // acc value back.
+        Expr::ListWalk { .. } => {
+            let slots = lower_slots(ctx, expr)?;
+            if slots.len() == 1 {
+                Ok(slots[0])
+            } else {
+                let shell = ctx.builder.alloc(slots.len() * 8);
+                for (i, v) in slots.iter().enumerate() {
+                    ctx.builder.store(shell, i * 8, *v);
+                }
+                Ok(shell)
+            }
+        }
     }
 }
 
@@ -427,7 +906,7 @@ fn lower_match(
     scrutinee_ty: &Type,
     arms: &[MatchArm],
     ty: &Type,
-) -> Result<Value, String> {
+) -> Result<Vec<Value>, String> {
     // Match.scrutinee_slots is a parallel slot-expr list (length 1 for
     // single-slot scrutinees, length > 1 for multi-slot decompositions).
     // The source-level type comes from `scrutinee_ty` — per-slot exprs
@@ -506,14 +985,14 @@ fn lower_match(
     if arms.len() == 1 {
         let arm = &arms[0];
         match &arm.pattern {
-            Pattern::Wildcard => return lower(ctx, &arm.body),
+            Pattern::Wildcard => return lower_arm_body_slots(ctx, &arm.body),
             Pattern::Binding(sym) => {
                 // For multi-slot scrutinee, binding binds to the
                 // first slot (the discriminant). This is sufficient
                 // for simple uses; multi-slot Binding requires the
                 // multi-binder Let machinery.
                 let prev = ctx.locals.insert(*sym, tag_val);
-                let result = lower(ctx, &arm.body);
+                let result = lower_arm_body_slots(ctx, &arm.body);
                 match prev {
                     Some(p) => { ctx.locals.insert(*sym, p); }
                     None => { ctx.locals.remove(sym); }
@@ -549,7 +1028,7 @@ fn lower_match(
                         idx += 1;
                     }
                 }
-                let result = lower(ctx, &arm.body);
+                let result = lower_arm_body_slots(ctx, &arm.body);
                 for (sym, prev) in bound.into_iter().rev() {
                     match prev {
                         Some(p) => { ctx.locals.insert(sym, p); }
@@ -562,7 +1041,12 @@ fn lower_match(
         }
     }
 
-    let result_scalar = resolve_scalar_type(ty, &ctx.fieldless);
+    let result_slot_tys = super::lower::expand_slots_with(
+        ty,
+        &ctx.fieldless,
+        &ctx.transparent,
+        &ctx.payload_unions,
+    );
 
     let mut constructor_arms: Vec<(u64, &MatchArm, Vec<ScalarType>)> = Vec::new();
     let mut default_arm: Option<&MatchArm> = None;
@@ -616,7 +1100,13 @@ fn lower_match(
 
     let tag_block = ctx.builder.current_block.expect("expected current block");
     let merge = ctx.builder.create_block();
-    let merge_param = ctx.builder.add_block_param(merge, result_scalar);
+    // One merge param per result slot — Match returns its full slot
+    // list, no shell-and-unbox. Each arm jumps to merge with N values
+    // matching `result_slot_tys`.
+    let merge_params: Vec<Value> = result_slot_tys
+        .iter()
+        .map(|&ty| ctx.builder.add_block_param(merge, ty))
+        .collect();
 
     // Per-tag chain table: for each arm index, what's the next
     // arm with the *same* constructor tag? Guarded arms whose
@@ -666,15 +1156,31 @@ fn lower_match(
         // (no scheme recorded) we fall back to decl_info's per-binder
         // ScalarType — those constructors only carry scalar captures
         // by construction.
+        // Multi-variant payload binding: payload holds one RcPtr per
+        // source-level field. For multi-slot binder types
+        // (Str/List/Tree/nested unions), load the RcPtr shell from
+        // the payload then unwrap N values from the shell. Scalar
+        // and single-slot binders bind one Value directly from the
+        // payload slot.
         let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
         if let Pattern::Constructor { tag, binders } = &arm.pattern {
             if let Some(payload_param) = payload_block_param {
+                // Resolve the per-field types by substituting the
+                // constructor scheme's type vars against the
+                // monomorphic scrutinee_ty — without this, polymorphic
+                // constructors (`Ok : a -> Result(a, b)`) leave their
+                // field types as bare `Var(a)` whose `expand_slots`
+                // defaults to RcPtr, producing wrong-typed binder
+                // loads at the SSA layer.
                 let scheme_tys = ctx
                     .decls
                     .constructor_schemes
                     .get(tag)
                     .and_then(|s| match &s.ty {
-                        Type::Arrow(ps, _) => Some(ps.clone()),
+                        Type::Arrow(ps, r) => {
+                            let subst = collect_subst(r, &scrutinee_ty);
+                            Some(ps.iter().map(|p| apply_subst(p, &subst)).collect::<Vec<_>>())
+                        }
                         _ => None,
                     });
                 let scalar_fallback: Vec<ScalarType> = ctx
@@ -683,7 +1189,6 @@ fn lower_match(
                     .get(tag)
                     .map(|m| m.field_types.clone())
                     .unwrap_or_else(|| vec![ScalarType::RcPtr; binders.len()]);
-                let mut offset = 0usize;
                 for (i, binder_slots) in binders.iter().enumerate() {
                     let slot_tys: Vec<ScalarType> = if let Some(ref ps) = scheme_tys {
                         super::lower::expand_slots_with(
@@ -704,14 +1209,23 @@ fn lower_match(
                             slot_tys.len()
                         ));
                     }
-                    for (&sym, &slot_ty) in binder_slots.iter().zip(&slot_tys) {
+                    let payload_offset = i * 8;
+                    if binder_slots.len() == 1 {
+                        let sym = binder_slots[0];
                         if sym.0 == u32::MAX {
-                            offset += 8;
                             continue;
                         }
-                        let v = ctx.builder.load(payload_param, offset, slot_ty);
+                        let v = ctx.builder.load(payload_param, payload_offset, slot_tys[0]);
                         bound.push((sym, ctx.locals.insert(sym, v)));
-                        offset += 8;
+                    } else {
+                        let wrapper = ctx.builder.load(payload_param, payload_offset, ScalarType::RcPtr);
+                        for (slot_i, (&sym, &slot_ty)) in binder_slots.iter().zip(&slot_tys).enumerate() {
+                            if sym.0 == u32::MAX {
+                                continue;
+                            }
+                            let v = ctx.builder.load(wrapper, slot_i * 8, slot_ty);
+                            bound.push((sym, ctx.locals.insert(sym, v)));
+                        }
                     }
                 }
             }
@@ -759,13 +1273,13 @@ fn lower_match(
             ctx.builder.switch_to(body_block);
         }
 
-        // Lower the body via lower_slots so payload Con works. If
-        // the arm produces multiple slots but the Match result is
-        // single-slot (which happens when the Match's result type is
-        // a tag-union `:=` whose expand_slots returns 1), materialize
-        // the slots into a single heap shell — same convention as
-        // pipeline.rs uses for the function return boundary.
-        let arm_slots = lower_slots(ctx, &arm.body)?;
+        // Lower the body's slot list. Each arm produces N values
+        // matching `result_slot_tys.len()` (for merge arms) or the
+        // enclosing function's return arity (for return arms).
+        // Don't reconcile against `result_slot_tys` for return arms
+        // — those short-circuit to the function boundary, where the
+        // body's natural slot count is what matters.
+        let arm_slots = lower_arm_body_slots(ctx, &arm.body)?;
         if arm.is_return {
             // Return arm: short-circuit the enclosing function
             // rather than merging into the Match's result. Used by
@@ -777,16 +1291,16 @@ fn lower_match(
                 ctx.builder.ret_multi(arm_slots.clone());
             }
         } else {
-            let body_val = if arm_slots.len() == 1 {
-                arm_slots[0]
-            } else {
-                let shell = ctx.builder.alloc(arm_slots.len() * 8);
-                for (i, v) in arm_slots.iter().enumerate() {
-                    ctx.builder.store(shell, i * 8, *v);
-                }
-                shell
-            };
-            ctx.builder.jump(merge, vec![body_val]);
+            let arm_body_ty = arm.body.first().map(|e| e.ty()).unwrap_or(&Type::Con("__none".to_string())).clone();
+            let arm_slots = reconcile_arm_slots(ctx, arm_slots, &result_slot_tys, &arm_body_ty)?;
+            if arm_slots.len() != merge_params.len() {
+                return Err(format!(
+                    "core::to_ssa: Match arm body produced {} slots but merge expects {}",
+                    arm_slots.len(),
+                    merge_params.len()
+                ));
+            }
+            ctx.builder.jump(merge, arm_slots);
         }
 
         // Restore shadowed bindings.
@@ -807,17 +1321,17 @@ fn lower_match(
     let default_block = if let Some(arm) = default_arm {
         let b = default_block_id.expect("default_block_id pre-created when default_arm exists");
         ctx.builder.switch_to(b);
-        let arm_slots = lower_slots(ctx, &arm.body)?;
-        let body_val = if arm_slots.len() == 1 {
-            arm_slots[0]
-        } else {
-            let shell = ctx.builder.alloc(arm_slots.len() * 8);
-            for (i, v) in arm_slots.iter().enumerate() {
-                ctx.builder.store(shell, i * 8, *v);
-            }
-            shell
-        };
-        ctx.builder.jump(merge, vec![body_val]);
+        let arm_slots = lower_arm_body_slots(ctx, &arm.body)?;
+        let arm_body_ty = arm.body.first().map(|e| e.ty()).unwrap_or(&Type::Con("__none".to_string())).clone();
+        let arm_slots = reconcile_arm_slots(ctx, arm_slots, &result_slot_tys, &arm_body_ty)?;
+        if arm_slots.len() != merge_params.len() {
+            return Err(format!(
+                "core::to_ssa: Match default arm body produced {} slots but merge expects {}",
+                arm_slots.len(),
+                merge_params.len()
+            ));
+        }
+        ctx.builder.jump(merge, arm_slots);
         Some(b)
     } else {
         None
@@ -831,7 +1345,7 @@ fn lower_match(
     );
 
     ctx.builder.switch_to(merge);
-    Ok(merge_param)
+    Ok(merge_params)
 }
 
 /// True when `ty` resolves (via transparent unfolding) to a
@@ -840,9 +1354,146 @@ fn lower_match(
 /// tag and no payload heap object. Multi-variant and non-TagUnion
 /// types return false; the caller's coincidence check (slot counts
 /// match) alone isn't enough to distinguish them.
+/// Lower a Match arm body — a slot-list of Core `Expr`s — into a
+/// flat `Vec<Value>`. Each entry's `lower_slots` produces 1 or more
+/// values; the concatenation is what flows to the merge block.
+fn lower_arm_body_slots(
+    ctx: &mut Ctx<'_>,
+    body: &[Expr],
+) -> Result<Vec<Value>, String> {
+    let mut all = Vec::new();
+    for e in body {
+        all.extend(lower_slots(ctx, e)?);
+    }
+    Ok(all)
+}
+
+/// Reconcile a Match arm body's lowered slot count with the merge
+/// block's expected slot count. Two cases worth handling at the
+/// boundary:
+///
+/// - Body produced 1 value, merge expects N (because the body's
+///   `lower_slots` returned the heap-shell single-Value form):
+///   load N values from the shell at consecutive offsets.
+/// - Body produced N values, merge expects 1 (a multi-slot value
+///   flowing through a single-slot Match result — happens when the
+///   result type's `expand_slots` collapses to one RcPtr):
+///   materialize a heap shell holding the N values.
+///
+/// Identity case (N == N) passes through unchanged.
+fn reconcile_arm_slots(
+    ctx: &mut Ctx<'_>,
+    arm_slots: Vec<Value>,
+    result_slot_tys: &[crate::ssa::ScalarType],
+    body_ty: &Type,
+) -> Result<Vec<Value>, String> {
+    use crate::ssa::ScalarType;
+    if arm_slots.len() == result_slot_tys.len() {
+        return Ok(arm_slots);
+    }
+    if arm_slots.len() == 1 && result_slot_tys.len() > 1 {
+        // Body returned a single shell pointer; load N values from
+        // its consecutive 8-byte offsets. The shell layout is
+        // dictated by `expand_slots`'s ordering on `body_ty`.
+        let _ = body_ty;
+        let shell = arm_slots[0];
+        let unboxed: Vec<Value> = result_slot_tys
+            .iter()
+            .enumerate()
+            .map(|(i, &ty)| ctx.builder.load(shell, i * 8, ty))
+            .collect();
+        return Ok(unboxed);
+    }
+    if arm_slots.len() > 1 && result_slot_tys.len() == 1 {
+        // Body returned N values but the merge takes a single
+        // shell. Allocate a heap shell and store the N values into
+        // it; pass the shell pointer through.
+        let _ = body_ty;
+        let shell = ctx.builder.alloc(arm_slots.len() * 8);
+        for (i, v) in arm_slots.iter().enumerate() {
+            ctx.builder.store(shell, i * 8, *v);
+        }
+        return Ok(vec![shell]);
+    }
+    Err(format!(
+        "core::to_ssa: Match arm body slot count {} can't reconcile with merge's {} slots",
+        arm_slots.len(),
+        result_slot_tys.len()
+    ))
+}
+
 fn is_single_variant_union(ty: &Type, transparent: &super::lower::TransparentTable) -> bool {
     let unwrapped = super::lower::resolve_transparent(ty, transparent);
     matches!(unwrapped, Type::TagUnion { tags, .. } if tags.len() == 1)
+}
+
+/// Re-group flat per-slot Con args into source-field slot lists,
+/// driven by `field_slot_counts` computed at AST→Core time from the
+/// source AST args (before per-slot flattening). When the sum of
+/// counts doesn't match `all_slots.len()`, falls back to one slot per
+/// arg — the caller treats this as no-wrapping needed.
+/// Collect type-var substitutions by walking `scheme_ty` and
+/// `mono_ty` in parallel. Each `Var` in `scheme_ty` pairs with the
+/// concrete `Type` at the same position in `mono_ty`. Used by both
+/// the Con's `group_args_by_field` and Match-arm binder loading
+/// to instantiate polymorphic constructor schemes.
+fn collect_subst(
+    scheme_ty: &Type,
+    mono_ty: &Type,
+) -> Vec<(crate::types::engine::TypeVar, Type)> {
+    let mut out: Vec<(crate::types::engine::TypeVar, Type)> = Vec::new();
+    walk_for_subst(scheme_ty, mono_ty, &mut out);
+    out
+}
+
+fn walk_for_subst(
+    scheme: &Type,
+    mono: &Type,
+    out: &mut Vec<(crate::types::engine::TypeVar, Type)>,
+) {
+    match (scheme, mono) {
+        (Type::Var(v), _) => out.push((*v, mono.clone())),
+        (Type::App(_, a), Type::App(_, b)) | (Type::Tuple(a), Type::Tuple(b)) => {
+            for (sa, mb) in a.iter().zip(b.iter()) {
+                walk_for_subst(sa, mb, out);
+            }
+        }
+        (Type::Arrow(ap, ar), Type::Arrow(bp, br)) => {
+            for (sa, mb) in ap.iter().zip(bp.iter()) {
+                walk_for_subst(sa, mb, out);
+            }
+            walk_for_subst(ar, br, out);
+        }
+        _ => {}
+    }
+}
+
+fn apply_subst(
+    ty: &Type,
+    subst: &[(crate::types::engine::TypeVar, Type)],
+) -> Type {
+    let mut result = ty.clone();
+    for (v, t) in subst {
+        result = crate::passes::decl_info::substitute_type_var(&result, *v, t);
+    }
+    result
+}
+
+fn group_args_by_field(
+    field_slot_counts: &[usize],
+    all_slots: &[Value],
+) -> Vec<Vec<Value>> {
+    let total: usize = field_slot_counts.iter().sum();
+    if total != all_slots.len() {
+        return all_slots.iter().map(|v| vec![*v]).collect();
+    }
+    let mut out: Vec<Vec<Value>> = Vec::with_capacity(field_slot_counts.len());
+    let mut idx = 0usize;
+    for &n in field_slot_counts {
+        out.push(all_slots[idx..idx + n].to_vec());
+        idx += n;
+    }
+    out
 }
 
 /// Emit a constant of `disc` type holding `tag_idx`. Returns None if
@@ -931,6 +1582,7 @@ mod tests {
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
+            bind_cache: HashMap::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         // Finalize so we can introspect the function.
@@ -966,6 +1618,7 @@ mod tests {
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
+            bind_cache: HashMap::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -1014,6 +1667,7 @@ mod tests {
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
+            bind_cache: HashMap::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -1071,6 +1725,7 @@ mod tests {
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
+            bind_cache: HashMap::new(),
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -1142,6 +1797,7 @@ mod tests {
             fieldless,
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
+            bind_cache: HashMap::new(),
         };
 
         let core_with_var = Expr::Match {
@@ -1184,6 +1840,7 @@ mod tests {
             fieldless: HashMap::new(),
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
+            bind_cache: HashMap::new(),
         };
         let err = lower(&mut ctx, &core).unwrap_err();
         assert!(err.contains("#42"), "error should name the unbound symbol: {err}");

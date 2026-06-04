@@ -85,18 +85,21 @@ pub enum Pattern {
 pub struct MatchArm {
     pub pattern: Pattern,
     pub guards: Vec<Expr>,
-    pub body: Expr,
+    /// The arm's body as a slot list — one Core `Expr` per slot of
+    /// the Match's result type. Multi-slot results (Result, Maybe,
+    /// records, Str, List) get N entries; scalar results get 1.
+    /// At `to_ssa`, the entries lower to N parallel `Value`s
+    /// jumped to the merge block's N block params.
+    pub body: Vec<Expr>,
     pub is_return: bool,
 }
 
 impl MatchArm {
-    /// Bare-arm constructor: pattern + body, no guards, no return.
-    /// Most call sites synthesizing arms (And/Or desugar, Is sugar,
-    /// the multi-arm Match in If/Match) build this shape; the
-    /// guarded / return variants are added by `lower_match_arm`
-    /// when reading guards / is_return off the AST arm.
+    /// Bare-arm constructor: single-Expr body (the common case for
+    /// arms whose result is single-slot — booleans, scalars,
+    /// closure-tag fanouts). Wraps the body in a 1-entry slot list.
     pub fn plain(pattern: Pattern, body: Expr) -> Self {
-        Self { pattern, guards: vec![], body, is_return: false }
+        Self { pattern, guards: vec![], body: vec![body], is_return: false }
     }
 }
 
@@ -216,6 +219,14 @@ pub enum Expr {
     Con {
         tag: TagId,
         args: Vec<Expr>,
+        /// Per source-level field, the number of Core args (each
+        /// corresponding to one SSA slot) it occupies after the
+        /// `Name`-multi-slot flattening that `lower_expr_slots`
+        /// performs upstream. `field_slot_counts.iter().sum() ==
+        /// args.len()`. `to_ssa` uses this to re-group the flat
+        /// args list when materializing a wrapper per source field
+        /// in the Con's payload.
+        field_slot_counts: Vec<usize>,
         ty: Type,
     },
 
@@ -249,20 +260,6 @@ pub enum Expr {
         ty: Type,
     },
 
-    /// `ProjSlot(source_slots, slot_idx, ty)` — pick one slot out of
-    /// a multi-slot value's decomposition. The first leaf primitive
-    /// in the List-as-buffer family: `List.len(xs)` lowers to
-    /// `ProjSlot(xs.slots, 0, U64)` — the (len, cap, data) trio's
-    /// first element. Doesn't participate in algebraic rewrites
-    /// (no fusion law touches a header projection); lowers 1:1 to
-    /// the SSA `Value` already produced by `source_slots`'s
-    /// per-slot lowering.
-    ProjSlot {
-        source_slots: Vec<Expr>,
-        slot_idx: usize,
-        ty: Type,
-    },
-
     /// `BufLoad(buf, idx, ty)` — unchecked indexed load from a
     /// buffer pointer. The leaf primitive backing `List.get`'s
     /// success branch and the only memory-read op Core emits for
@@ -270,16 +267,95 @@ pub enum Expr {
     /// `List.get(xs, i)` desugars to:
     ///
     /// ```text
-    /// if i < ProjSlot(xs, 0)
-    ///   then Ok(BufLoad(ProjSlot(xs, 2), i, T))
+    /// if i < xs_slots[0]
+    ///   then Ok(BufLoad(xs_slots[2], i, T))
     ///   else Err(OutOfBounds)
     /// ```
     ///
-    /// Like `ProjSlot` it doesn't fuse — it lowers 1:1 to SSA
+    /// Slot picks on a list trio (e.g. `.len`, `.data`) are done by
+    /// direct slot-list indexing in `lower_expr_slots` — no Core
+    /// node needed since lists are 3-slot SROA'd everywhere internal
+    /// to the IR.
+    ///
+    /// `BufLoad` itself doesn't fuse — it lowers 1:1 to SSA
     /// `load_dyn`.
     BufLoad {
         buf: Box<Expr>,
         idx: Box<Expr>,
+        ty: Type,
+    },
+
+    /// `ListRange(start, end, ty)` — produces a `(len, cap, data)`
+    /// trio whose buffer holds `start, start+1, …, end-1` (or an
+    /// empty list when `end <= start`). The leaf primitive backing
+    /// `List.range(start, end)`. At `to_ssa` it expands into a
+    /// counter-driven fill loop; at the Core layer it stays opaque
+    /// so future Ana ∘ Cata → Hylo deforestation can recognize it
+    /// as an unfold.
+    ///
+    /// `ty` is the result `List(U64)` type.
+    ListRange {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        ty: Type,
+    },
+
+    /// `ListWalk(list_slots, init, target, captures, elem_ty, ty)`
+    /// — folds the list under a step function, threading the
+    /// accumulator. Currently restricted to the **singleton**
+    /// closure case: `target` is the lifted apply function name
+    /// resolved at AST→Core time via `mono.singletons` /
+    /// `mono.tag_targets`. Non-singleton closures still bail to
+    /// existing-lower.
+    ///
+    /// At `to_ssa` this expands to a counted loop with explicit
+    /// block params for the i-counter, accumulator slots, the
+    /// (len, data) header, and the captures.
+    ///
+    /// - `list_slots`: the source list's `(len, cap, data)` trio
+    ///   exprs.
+    /// - `init`: the initial accumulator value (multi-slot).
+    /// - `target`: the direct-call function name (e.g.
+    ///   `lifted_0`).
+    /// - `captures`: closure-environment values passed to
+    ///   `target` alongside `acc` and `elem`.
+    /// - `elem_ty`: element type of `list`.
+    /// - `ty`: result type (the accumulator's type after the
+    ///   fold).
+    ListWalk {
+        list_slots: Vec<Expr>,
+        init: Vec<Expr>,
+        target: String,
+        captures: Vec<Expr>,
+        elem_ty: Type,
+        ty: Type,
+    },
+
+    /// `ListAppend(list_slots, val_slots, elem_ty, ty)` — produces
+    /// a new `(len, cap, data)` trio with `val_slots` written at
+    /// index `len`. For multi-slot elements (records, Str, nested
+    /// List), the buffer stride is `val_slots.len() * 8` and each
+    /// slot lands at consecutive 8-byte offsets within the
+    /// element's stride bucket. Implemented via `cow_resize_dyn` +
+    /// per-slot stores; FBIP reuses the buffer in place when
+    /// refcount is 1.
+    ListAppend {
+        list_slots: Vec<Expr>,
+        val_slots: Vec<Expr>,
+        elem_ty: Type,
+        ty: Type,
+    },
+
+    /// `ListSet(list_slots, idx, val_slots, elem_ty, ty)` —
+    /// produces a new `(len, cap, data)` trio with `val_slots`
+    /// written at element index `idx`. Buffer is `cow_store_dyn`'d
+    /// in place when refcount is 1; otherwise it clones. Stride
+    /// handling matches `ListAppend`.
+    ListSet {
+        list_slots: Vec<Expr>,
+        idx: Box<Expr>,
+        val_slots: Vec<Expr>,
+        elem_ty: Type,
         ty: Type,
     },
 }
@@ -298,8 +374,11 @@ impl Expr {
             | Self::Con { ty, .. }
             | Self::BinOp { ty, .. }
             | Self::ListLit { ty, .. }
-            | Self::ProjSlot { ty, .. }
-            | Self::BufLoad { ty, .. } => ty,
+            | Self::BufLoad { ty, .. }
+            | Self::ListRange { ty, .. }
+            | Self::ListWalk { ty, .. }
+            | Self::ListAppend { ty, .. }
+            | Self::ListSet { ty, .. } => ty,
         }
     }
 }

@@ -213,3 +213,114 @@ main = |arg|
 No tag was stored. No heap object was allocated for any closure. Two direct calls — one to `__lifted_0`, one to `double` — both of which the inliner is free to inline further. The end result is plain arithmetic.
 
 That collapse is what the lambda set machinery exists to deliver. Every higher-order Ori program is compiled toward this shape; the only deviations are the truly heterogeneous cases, where the cost is one tag compare.
+
+## Migration: reorder lift before infer (TODO)
+
+The current pipeline runs lift AFTER mono+infer. That ordering forces lift to materialize types it doesn't strictly need (`func_schemes` for `__lifted_N`, `.ty` on Closure captures) and creates a two-source-of-truth problem downstream: schemes say one shape (Arrow for HO params), bodies expect another (closure-union for `__apply_K`). The mismatch surfaces in lowering as arity errors, type warnings, and the need for shell-wrap workarounds.
+
+The clean ordering is **lift before infer**, with the `ExprKind::Closure` node retired entirely:
+
+```
+parse → resolve → fold_lift → flatten_patterns → lift → topo → infer → mono → solve → specialize → narrow → ...
+```
+
+### What changes per pass
+
+1. **`lambda::lift`** (renamed `lift_pre_infer` or kept under same name):
+   - Takes `&mut Resolved`, not `&mut Monomorphized`. Does not touch `func_schemes`.
+   - For each `Lambda`: free-var analysis (lexical, no types needed) gives the captures. Mints a fresh `__lifted_N` `SymbolId` and a fresh `__Closure_N` tag-union name.
+   - Emits THREE Decls:
+     - `TypeAnno __Closure_N := [Tag_N(Var(c0), Var(c1), ...)]` — one type-var per capture.
+     - `FuncDef __lifted_N(c0_param, c1_param, ..., param0, param1, ...) -> body` — captures as leading params, body has captures substituted to the new params.
+     - (the original FuncDef the lambda was inside, with the Lambda replaced)
+   - Replaces the Lambda site with `Call(Tag_N_sym, [cap_exprs])` — a regular tag-constructor call. No `ExprKind::Closure` produced.
+
+2. **`types::infer`**:
+   - Delete the `ExprKind::Closure => panic!` arm. Closure nodes no longer exist.
+   - The new `TypeAnno __Closure_N` and `FuncDef __lifted_N` flow through inference as regular declarations. No special-casing.
+   - Constructor calls `Tag_N(captures)` type as the declared TagUnion; capture type-vars unify with each `cap_expr`'s inferred type. Standard HM.
+   - HO param positions (`apply`'s `f`) get unified with whatever closure-union flows in; result: `f` has type `__Closure_N` (or a tag-union of multiple `__Closure_*` types if multiple flow into one position — same lambda-set principle as today).
+
+3. **`mono`**:
+   - Specializes both user code and synthesized `__lifted_N` / `__Closure_N` declarations per the post-infer typing. Each `__Closure_N` gets monomorphized if its captures are polymorphic. No special handling needed — they're regular declarations.
+
+4. **`lambda::solve`**:
+   - Operates on typed AST as today, but instead of looking for `ExprKind::Closure`, looks for `Call(closure_tag_sym, captures)` where `closure_tag_sym` is a known closure-tag (i.e. its containing TypeAnno's name starts with `__Closure_`). Same 0-CFA flow analysis; smaller code because closure values are uniformly tag-constructor calls.
+
+5. **`lambda::specialize`**:
+   - No more `register_apply_scheme` post-hoc — `__apply_K`'s body is generated and inference (or a focused re-infer over just the synth helpers) types it naturally. Or: emit `__apply_K` as a regular FuncDef before mono, let mono pick it up. Either way: no scheme-rewriting machinery.
+   - HO call rewrites (`f(n)` → `__apply_K(f, n)`) remain as today, but the AST-mutation is the only work — no separate scheme update needed because types are already correct.
+
+6. **`lambda::narrow`**:
+   - Per-call-site cloning. The `retype_scheme_params` function disappears: clones get their schemes re-derived (or just structurally rewritten without type changes — the singleton-narrow case substitutes one closure-union for another, both already concrete). Shrinks from ~1300 lines to probably ~600.
+
+7. **`existing-lower`**:
+   - `to_slots`' Multi→Single materialization path stays for *non-closure* multi-slot args (records-as-args, etc.) but the HO-call branch goes away — closures are uniformly multi-slot, just like records.
+   - `lower_closure_step` simplifies — it's the closure-value lowering, and the value is already a Call to a constructor with the right shape.
+   - `walk.rs` emission: step_params come from the apply target's scheme directly; no special closure-shape derivation.
+   - The `mono.ho_param_closures` map (added during the failed incremental attempt) becomes unnecessary and can be removed.
+
+### Migration approach
+
+The cascade across passes is real — the user-facing test suite will break in batches during the migration. The honest path:
+
+1. Build the new `lift_pre_infer` in parallel with the old `lift`; pipeline initially uses the old one.
+2. Add a `ORI_LAMBDA_V2=1` flag that switches pipelines.
+3. Get the v2 pipeline passing tests by working through cascades pass-by-pass (infer → mono → solve → specialize → narrow → lower).
+4. Once v2 is at parity, delete v1 + the flag.
+
+Estimated effort: 2-3 focused days. Touches ~3-4k lines across `passes/lambda/*`, `types/infer.rs`, `lower/*.rs`. Net delta: probably -500 to -1500 lines once shell-wrap workarounds are removed.
+
+### Concrete audit: `ExprKind::Closure` references
+
+Run this audit before starting — it converts "vague refactor" into "fix exactly these sites":
+
+**Producers** (will be deleted):
+- `src/passes/lambda/lift.rs:205` and `:327` — the two places lift currently emits `Closure { func, captures }`. New `lift_pre_infer` emits `Call(closure_tag, captures)` + `TypeAnno __Closure_N := [...]` + `FuncDef __lifted_N` instead.
+
+**Structural consumers** (need rewrites to handle the new `Call`-shape):
+- `src/passes/lambda/solve.rs:371, 438, 501, 575` — 0-CFA flow analysis that matches `Closure { func, captures }` to extract func/capture names. Update to match `Call(closure_tag_sym, captures)` where `closure_tag_sym` is recognizable as a closure tag (registry from lift, or name-prefix check on `__Closure_*_tag`).
+- `src/passes/lambda/specialize.rs:684, 736` — does the `Closure → Call(tag, captures)` rewrite today. After lift produces this directly, **these blocks delete entirely** (~30 lines net deletion).
+
+**Traversal walkers** (just delete the `Closure` arm — variant no longer exists):
+- `src/passes/reachable.rs:318`
+- `src/ast_display.rs:304`
+- `src/passes/mono.rs:537, 1023`
+- `src/passes/validate_ast_types.rs:190`
+- `src/passes/core/pipeline.rs:590`
+- `src/passes/topo.rs:212`
+- `src/lower/mod.rs:166, 1109`
+- `src/types/post_infer.rs:161`
+- `src/passes/lambda/narrow.rs:324, 818, 962, 1107` — narrow walks Closure structurally for cloning; also needs Call-shape update (~50 lines)
+- `src/passes/flatten_patterns.rs:234`
+- `src/test_frontend.rs:3686`
+
+**Panic/error guards** (update or delete):
+- `src/passes/fold_lift.rs:202` and `:592` — "Closure should not exist before lambda_lift" — still valid after reorder if Closure variant is retained. If variant is deleted entirely, remove these guards.
+- `src/passes/lambda/solve.rs:544` — `"expected Name in Closure captures"` — invariant still holds for Call(closure_tag, [Name, Name, ...]) shape; reword.
+- `src/passes/lambda/specialize.rs:746` — `"Closure func must be in lambda set"` — delete entirely (specialize no longer touches Closure).
+- `src/types/infer.rs:745` — `"Closure should not exist during type inference"` — **delete this arm** (Closure never exists in infer's input under the new ordering, OR variant is retained but unreachable).
+
+### Where the new closure-tag declarations live
+
+Currently `specialize::build_closure_type` synthesizes the `TagDecl __Closure_N := [Tag_N(field_tys...)]` after solve has merged lambdas into lambda sets. In the new ordering, **lift creates one TagDecl per lambda** (single-variant): `__Closure_lambda_N := [Tag_lambda_N(Var(c0), Var(c1), ...)]`. Capture types are type-variables.
+
+Inference's row-polymorphism then handles the union case automatically: when two distinct lambdas flow into the same HO parameter, unification of their single-variant types yields a multi-variant tag union via existing row machinery. **`lambda_solve` no longer needs to compute set membership** — it just reads the post-infer types and enumerates the union's tags. Solve becomes a much smaller pass (~200 lines instead of 672).
+
+### What changes for `__apply_K`
+
+`specialize::build_apply_function` currently runs after the body rewriter. In the new world, it can run as part of specialize too (the body-rewriting half of specialize stays — it's where `f(n)` becomes `__apply_K(f, n)`). What changes: the closure-union types `__apply_K` consumes are now natively typed by inference, so `register_apply_scheme` simplifies — no need to derive the scheme from lifted-function param types after the fact; it falls out of normal inference if `__apply_K`'s body is emitted before the second inference pass.
+
+Actually simpler: `__apply_K` is just a regular function. Lift could emit it. Or specialize could emit it. Either way, normal inference covers it.
+
+### Why this is worth doing
+
+The current architecture leaks a "fix up types after the fact" pattern across multiple consumers (Core's `param_slot_types`, existing-lower's `to_slots`, `decl_info`'s helper maps, the abandoned `mono.ho_param_closures`). Every consumer that touches HO function signatures has to special-case Arrow-vs-closure-union. The lift-pre-infer reorder collapses all of that into "the type system says what the type is; consumers read it." One source of truth.
+
+The blocker today is just that the original lift-after-infer ordering was load-bearing for several passes' implementations; unwinding it touches enough surface that it's a focused-session task, not a quick patch.
+
+### Why this is worth doing
+
+The current architecture leaks a "fix up types after the fact" pattern across multiple consumers (Core's `param_slot_types`, existing-lower's `to_slots`, `decl_info`'s helper maps, the abandoned `mono.ho_param_closures`). Every consumer that touches HO function signatures has to special-case Arrow-vs-closure-union. The lift-pre-infer reorder collapses all of that into "the type system says what the type is; consumers read it." One source of truth.
+
+The blocker today is just that the original lift-after-infer ordering was load-bearing for several passes' implementations; unwinding it touches enough surface that it's a focused-session task, not a quick patch.

@@ -177,6 +177,17 @@ pub struct DeclInfo {
     /// payload fields), mapped to their discriminant SSA type.
     /// These are represented as a bare integer tag index at runtime.
     pub fieldless_tags: HashMap<String, ScalarType>,
+    /// Lambda-solve singleton resolution. Maps a synth `__apply_*`
+    /// name to the direct-call target function. Populated from
+    /// `mono.singletons`; consumed by walk lowering to take the
+    /// no-dispatch path when a closure's lambda set has exactly one
+    /// member.
+    pub singletons: HashMap<String, crate::passes::lambda::SingletonTarget>,
+    /// Same as `singletons` but keyed by the closure-tag constructor
+    /// name. Used to resolve a `Call(closure_tag, captures)` AST
+    /// expression to its lifted apply target without going through
+    /// the apply-name mangling.
+    pub tag_targets: HashMap<String, crate::passes::lambda::SingletonTarget>,
 }
 
 /// Build `DeclInfo` from the resolved module declarations.
@@ -208,6 +219,14 @@ pub fn build(mono: &Monomorphized<'_>) -> DeclInfo {
         constructors: HashMap::new(),
         constructor_schemes: infer_result.constructor_schemes.clone(),
         fieldless_tags,
+        singletons: mono.singletons.iter().map(|(k, v)| (k.clone(), crate::passes::lambda::SingletonTarget {
+            target_func: v.target_func.clone(),
+            num_captures: v.num_captures,
+        })).collect(),
+        tag_targets: mono.tag_targets.iter().map(|(k, v)| (k.clone(), crate::passes::lambda::SingletonTarget {
+            target_func: v.target_func.clone(),
+            num_captures: v.num_captures,
+        })).collect(),
     };
 
     // Register the num-to-str intrinsic method names as known

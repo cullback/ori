@@ -139,6 +139,19 @@ pub struct LowerCtx<'a> {
     /// (`r.x`, `r.b.c`, `t.0`). Read by the SSA display layer when
     /// printing Values for debug output / error messages.
     pub slot_paths: HashMap<SymbolId, String>,
+    /// Closure-tag → lifted-apply target. Populated from
+    /// `decl_info.tag_targets`. Walk lowering reads this to
+    /// resolve the direct-call function for a fresh-closure
+    /// `Call(closure_tag, captures)` at the walk call site.
+    pub tag_targets: HashMap<String, String>,
+    /// HO param closures: `(callee name, param index) → synth
+    /// closure-union type name`. Read at every Call/QualifiedCall/
+    /// MethodCall to override the arg's `Type::Arrow` shape when the
+    /// callee's param position is a higher-order parameter. Without
+    /// this override, `expand_slots(Arrow)` returns 1 slot and the
+    /// emitted Call doesn't match `__apply_K`'s 2-slot closure
+    /// parameter expectation.
+    pub ho_param_closures: HashMap<(String, usize), String>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -154,6 +167,8 @@ impl<'a> LowerCtx<'a> {
             payload_unions: HashSet::new(),
             locals: HashMap::new(),
             slot_paths: HashMap::new(),
+            tag_targets: HashMap::new(),
+            ho_param_closures: HashMap::new(),
         }
     }
 }
@@ -228,6 +243,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 return Ok(vec![Expr::Con {
                     tag: name,
                     args: vec![],
+                    field_slot_counts: vec![],
                     ty,
                 }]);
             }
@@ -252,6 +268,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     let body_false = Expr::Con {
                         tag: "False".to_string(),
                         args: vec![],
+                        field_slot_counts: vec![],
                         ty: ast.ty.clone(),
                     };
                     Ok(vec![Expr::Match {
@@ -277,6 +294,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     let body_true = Expr::Con {
                         tag: "True".to_string(),
                         args: vec![],
+                        field_slot_counts: vec![],
                         ty: ast.ty.clone(),
                     };
                     let body_false = lower_expr(ctx, rhs)?;
@@ -310,10 +328,11 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // Stdlib intrinsics (List.* / crash) get inlined by
             // existing-lower with direct knowledge of the
             // (len, cap, data) list decomposition. Core lowers
-            // the ones it understands into a small primitive set
-            // (`ProjSlot` for header reads, `BufLoad` /
-            // `BufCowStore` / `BufAlloc` for buffer ops); the
-            // remainder still bail so fallback handles them.
+            // the ones it understands via direct slot-list
+            // slicing for header reads + dedicated Core nodes
+            // (`BufLoad`, `ListRange`, `ListWalk`, `ListAppend`,
+            // `ListSet`) for buffer ops; the remainder bail so
+            // fallback handles them.
             if let Some(prim) = try_lower_stdlib_intrinsic(ctx, &name, args, &ast.ty)? {
                 return Ok(prim);
             }
@@ -322,7 +341,25 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     "core::lower_expr: stdlib intrinsic `{name}` needs existing-lower's expanded layout"
                 ));
             }
-            let arg_exprs = lower_call_args(ctx, args)?;
+            // Compute per-source-field slot counts from the AST args'
+            // inferred types BEFORE flattening into Core args, so the
+            // Con boundary (in to_ssa) can re-group the per-slot Core
+            // args back into source fields when materializing a wrapper
+            // per field.
+            let field_slot_counts: Vec<usize> = args
+                .iter()
+                .map(|a| {
+                    expand_slots_with(
+                        &a.ty,
+                        &ctx.fieldless,
+                        &ctx.transparent,
+                        &ctx.payload_unions,
+                    )
+                    .len()
+                    .max(1)
+                })
+                .collect();
+            let arg_exprs = lower_call_args(ctx, &name, args)?;
             if ctx.constructors.contains(&name) {
                 // Same caveat as the Name path: inference / lambda
                 // narrow can leave the Call's expression-level type
@@ -338,6 +375,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 Ok(vec![Expr::Con {
                     tag: name,
                     args: arg_exprs,
+                    field_slot_counts,
                     ty,
                 }])
             } else if name.starts_with("__fold_") && !args.is_empty() {
@@ -424,11 +462,25 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     "core::lower_expr: stdlib intrinsic `{name}` needs existing-lower's expanded layout"
                 ));
             }
-            let arg_exprs = lower_call_args(ctx, args)?;
+            let field_slot_counts: Vec<usize> = args
+                .iter()
+                .map(|a| {
+                    expand_slots_with(
+                        &a.ty,
+                        &ctx.fieldless,
+                        &ctx.transparent,
+                        &ctx.payload_unions,
+                    )
+                    .len()
+                    .max(1)
+                })
+                .collect();
+            let arg_exprs = lower_call_args(ctx, name, args)?;
             if ctx.constructors.contains(name) {
                 Ok(vec![Expr::Con {
                     tag: name.clone(),
                     args: arg_exprs,
+                    field_slot_counts,
                     ty: ast.ty.clone(),
                 }])
             } else {
@@ -502,10 +554,26 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
         ExprKind::Record { fields } => {
             // SROA: same as Tuple. Field order is the source order.
             // (Layout normalization can reorder for packing; that's
-            // a Core→SSA concern.)
+            // a Core→SSA concern.) For multi-slot fields whose
+            // expression yields a single Core node (e.g. an App,
+            // ListAppend, Cata returning multiple slots), mint a
+            // Let to bind slot syms one-per-slot so the resulting
+            // slot list has the right length and each slot is a
+            // simple Var reference — no duplicated evaluation.
             let mut slots = Vec::new();
             for (_fsym, e) in fields {
-                slots.extend(lower_expr_slots(ctx, e)?);
+                let lowered = lower_expr_slots(ctx, e)?;
+                let expected = expand_slots_with(
+                    &e.ty,
+                    &ctx.fieldless,
+                    &ctx.transparent,
+                    &ctx.payload_unions,
+                );
+                if lowered.len() == 1 && expected.len() > 1 {
+                    slots.extend(bind_multi_slot(ctx, lowered.into_iter().next().unwrap(), &expected, &e.ty));
+                } else {
+                    slots.extend(lowered);
+                }
             }
             Ok(slots)
         }
@@ -516,12 +584,15 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // field_slice gives (offset, count) into the base's slot
             // list — derived from the base's source type, which after
             // inference matches our `expand_slots`-shaped slot list.
-            let mut slots = lower_expr_slots(ctx, base)?;
+            // `_expanded` fans out a multi-slot value that lowered to
+            // a single Core Expr (App, ListLit, ...) so the splice
+            // length matches `count`.
+            let mut slots = lower_expr_slots_expanded(ctx, base)?;
             for (field, val) in updates {
                 let (offset, count) = field_slice(
                     &base.ty, *field, ctx.fields, &ctx.fieldless, &ctx.transparent,
                 );
-                let new_slots = lower_expr_slots(ctx, val)?;
+                let new_slots = lower_expr_slots_expanded(ctx, val)?;
                 if new_slots.len() != count {
                     return Err(format!(
                         "core::lower_expr: RecordUpdate field has {} slots, expected {}",
@@ -584,11 +655,13 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             let true_body = Expr::Con {
                 tag: "True".to_string(),
                 args: vec![],
+                field_slot_counts: vec![],
                 ty: bool_ty.clone(),
             };
             let false_body = Expr::Con {
                 tag: "False".to_string(),
                 args: vec![],
+                field_slot_counts: vec![],
                 ty: bool_ty.clone(),
             };
             Ok(vec![Expr::Match {
@@ -612,7 +685,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             let scrutinee_slots = lower_expr_slots(ctx, expr)?;
             let mut core_arms: Vec<MatchArm> = arms
                 .iter()
-                .map(|a| lower_match_arm(ctx, a))
+                .map(|a| lower_match_arm(ctx, a, &scrutinee_ty))
                 .collect::<Result<_, _>>()?;
             if let Some(else_expr) = else_body {
                 let body = lower_expr(ctx, else_expr)?;
@@ -666,9 +739,28 @@ fn sym_is_constructor(symbols: &SymbolTable, sym: SymbolId) -> bool {
 /// expansion, `Ok(None)` when the name isn't an intrinsic (caller
 /// falls through to App), and `Err` for malformed calls.
 ///
-/// The first port is `List.len(xs)` → `ProjSlot(xs, 0, U64)`.
-/// `List.get` and the COW writers land here next, lowered through
-/// `BufLoad` / `BufCowStore` primitives once those exist.
+/// Ported intrinsics today: `crash`, `List.len`, `List.get`,
+/// `List.range`, `List.walk`, `List.append`, `List.set`. Single-
+/// slot scalar element types only for `List.get`; multi-slot
+/// elements (Str inside `List(Str)`) bail.
+///
+/// If `closure_expr` is a `Call(closure_tag_sym, captures)` whose
+/// tag is registered in `tag_targets` (i.e. a fresh lambda at the
+/// call site whose lambda-set entry has a known lifted apply
+/// function), return the target function name. Otherwise return
+/// None — the caller bails to existing-lower for the non-direct
+/// dispatch case.
+fn resolve_closure_target_name(
+    ctx: &LowerCtx<'_>,
+    closure_expr: &AstExpr<'_>,
+) -> Option<String> {
+    let ExprKind::Call { target, .. } = &closure_expr.kind else {
+        return None;
+    };
+    let tag_name = ctx.symbols.display(*target).to_owned();
+    ctx.tag_targets.get(&tag_name).cloned()
+}
+
 fn try_lower_stdlib_intrinsic(
     ctx: &mut LowerCtx<'_>,
     name: &str,
@@ -688,10 +780,126 @@ fn try_lower_stdlib_intrinsic(
                     args.len()
                 ));
             }
-            let msg_slots = lower_expr_slots(ctx, &args[0])?;
+            let msg_slots = lower_expr_slots_expanded(ctx, &args[0])?;
             Ok(Some(vec![Expr::App {
                 target: "__crash".to_string(),
                 args: msg_slots,
+                ty: ret_ty.clone(),
+            }]))
+        }
+        "List.walk" => {
+            // Method form: args == [xs, init, closure_expr].
+            // Singleton-closure direct-call only — bail if the
+            // closure flows in as something other than a fresh
+            // `Call(closure_tag, captures)` whose tag we can resolve
+            // in `tag_targets`. Non-singleton dispatch (`__apply_K`)
+            // still uses existing-lower.
+            if args.len() != 3 {
+                return Err(format!(
+                    "core::lower_expr: List.walk expects 3 args, got {}",
+                    args.len()
+                ));
+            }
+            let xs = &args[0];
+            let init = &args[1];
+            let closure_expr = &args[2];
+            let Some(target_func) = resolve_closure_target_name(ctx, closure_expr) else {
+                return Ok(None); // bail to fallback
+            };
+            let xs_ty = resolve_transparent(&xs.ty, &ctx.transparent);
+            let elem_ty = match &xs_ty {
+                Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
+                _ => return Ok(None),
+            };
+            let list_slots = lower_expr_slots_expanded(ctx, xs)?;
+            let init_slots = lower_expr_slots(ctx, init)?;
+            // Captures: the closure_expr is Call(tag, captures);
+            // lower each capture's slots so the loop can thread
+            // them as parallel block params.
+            let captures = match &closure_expr.kind {
+                ExprKind::Call { args: cap_args, .. } => {
+                    let mut all = Vec::new();
+                    for a in cap_args {
+                        all.extend(lower_expr_slots(ctx, a)?);
+                    }
+                    all
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(vec![Expr::ListWalk {
+                list_slots,
+                init: init_slots,
+                target: target_func,
+                captures,
+                elem_ty,
+                ty: ret_ty.clone(),
+            }]))
+        }
+        "List.set" => {
+            // Method form: args == [xs, idx, val].
+            if args.len() != 3 {
+                return Err(format!(
+                    "core::lower_expr: List.set expects 3 args, got {}",
+                    args.len()
+                ));
+            }
+            let xs = &args[0];
+            let idx_expr = &args[1];
+            let val = &args[2];
+            let xs_ty = resolve_transparent(&xs.ty, &ctx.transparent);
+            let elem_ty = match &xs_ty {
+                Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
+                _ => return Ok(None),
+            };
+            let list_slots = lower_expr_slots_expanded(ctx, xs)?;
+            let idx_lowered = lower_expr(ctx, idx_expr)?;
+            let val_slots = lower_expr_slots(ctx, val)?;
+            Ok(Some(vec![Expr::ListSet {
+                list_slots,
+                idx: Box::new(idx_lowered),
+                val_slots,
+                elem_ty,
+                ty: ret_ty.clone(),
+            }]))
+        }
+        "List.append" => {
+            // Method form: args == [xs, val].
+            if args.len() != 2 {
+                return Err(format!(
+                    "core::lower_expr: List.append expects 2 args, got {}",
+                    args.len()
+                ));
+            }
+            let xs = &args[0];
+            let val = &args[1];
+            // Unwrap transparent aliases (e.g. `Str := List(U8)`)
+            // so the List-shape match below catches them.
+            let xs_ty = resolve_transparent(&xs.ty, &ctx.transparent);
+            let elem_ty = match &xs_ty {
+                Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
+                _ => return Ok(None),
+            };
+            let list_slots = lower_expr_slots_expanded(ctx, xs)?;
+            let val_slots = lower_expr_slots(ctx, val)?;
+            Ok(Some(vec![Expr::ListAppend {
+                list_slots,
+                val_slots,
+                elem_ty,
+                ty: ret_ty.clone(),
+            }]))
+        }
+        "List.range" => {
+            if args.len() != 2 {
+                return Err(format!(
+                    "core::lower_expr: List.range expects 2 args, got {}",
+                    args.len()
+                ));
+            }
+            let start = lower_expr(ctx, &args[0])?;
+            let end = lower_expr(ctx, &args[1])?;
+            Ok(Some(vec![Expr::ListRange {
+                start: Box::new(start),
+                end: Box::new(end),
                 ty: ret_ty.clone(),
             }]))
         }
@@ -702,12 +910,15 @@ fn try_lower_stdlib_intrinsic(
                     args.len()
                 ));
             }
-            let source_slots = lower_expr_slots(ctx, &args[0])?;
-            Ok(Some(vec![Expr::ProjSlot {
-                source_slots,
-                slot_idx: 0,
-                ty: ret_ty.clone(),
-            }]))
+            let source_slots = lower_expr_slots_expanded(ctx, &args[0])?;
+            // The list's slot list is `[len, cap, data]`; pick the
+            // first slot directly. Core lists are 3-slot SROA'd
+            // everywhere internal to the IR, so a header read is
+            // just a slot pick — no dedicated IR node.
+            if source_slots.is_empty() {
+                return Err("core::lower_expr: List.len received empty slot list".into());
+            }
+            Ok(Some(vec![source_slots.into_iter().next().unwrap()]))
         }
         "List.get" => {
             if args.len() != 2 {
@@ -717,50 +928,101 @@ fn try_lower_stdlib_intrinsic(
                 ));
             }
             // Desugar `List.get(xs, idx)` into a bounds-checked
-            // `Match` over `idx < ProjSlot(xs, 0)` whose arms build
-            // `Ok(BufLoad(ProjSlot(xs, 2), idx, T))` or
-            // `Err(OutOfBounds)`. The result of the Match is the
-            // single-shell Result; the two ProjSlot reads at the
-            // end unbox it into (tag, payload) so multi-slot
-            // callers (the typical `.unwrap()` chain) see the
-            // proper Result decomposition.
-            let xs_slots = lower_expr_slots(ctx, &args[0])?;
+            // `Match` over `idx < xs_slots[0]` whose arms build
+            // `Ok(BufLoad(xs_slots[2], idx, T))` or
+            // `Err(OutOfBounds)`. The Match returns the Result's
+            // (tag, payload) directly as parallel block params at
+            // its merge — `bind_multi_slot` binds them via a Let
+            // so the caller sees a proper 2-slot decomposition
+            // without a heap shell + load round-trip.
+            let xs_slots = lower_expr_slots_expanded(ctx, &args[0])?;
             let idx_expr = lower_expr(ctx, &args[1])?;
             let u64_ty = Type::Con("U64".to_string());
             let bool_ty = Type::TagUnion {
                 tags: vec![("True".to_string(), vec![]), ("False".to_string(), vec![])],
                 rest: None,
             };
-            let elem_ty = match &args[0].ty {
+            let xs_ty_resolved = resolve_transparent(&args[0].ty, &ctx.transparent);
+            let elem_ty = match &xs_ty_resolved {
                 Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
                 other => return Err(format!(
                     "core::lower_expr: List.get on non-List type {other:?}"
                 )),
             };
-            let len = Expr::ProjSlot {
-                source_slots: xs_slots.clone(),
-                slot_idx: 0,
-                ty: u64_ty.clone(),
-            };
-            let data = Expr::ProjSlot {
-                source_slots: xs_slots,
-                slot_idx: 2,
-                ty: Type::Con("__RcPtr".to_string()),
-            };
+            // Multi-slot inline elements (records, Str, nested List)
+            // are stored at stride `N * 8` per element in the data
+            // buffer, with slot j of element i at slot index
+            // `i * N + j`. Emit N `BufLoad`s per source field, with
+            // the slot list passed to `Ok`'s Con as `args` with
+            // `field_slot_counts = [N]`.
+            let elem_slots = expand_slots_with(
+                &elem_ty,
+                &ctx.fieldless,
+                &ctx.transparent,
+                &ctx.payload_unions,
+            );
+            // List trio is decomposed to 3 parallel slots in Core
+            // (len, cap, data). Pick slot 0 for the bounds check
+            // and slot 2 for the buffer; direct list indexing.
+            if xs_slots.len() < 3 {
+                return Err(format!(
+                    "core::lower_expr: List.get on xs lowered to {} slots, expected 3",
+                    xs_slots.len()
+                ));
+            }
+            let len = xs_slots[0].clone();
+            let data = xs_slots[2].clone();
             let bounds_check = Expr::BinOp {
                 op: crate::ssa::BinaryOp::Lt,
                 lhs: Box::new(idx_expr.clone()),
                 rhs: Box::new(len),
                 ty: bool_ty.clone(),
             };
-            let elem = Expr::BufLoad {
-                buf: Box::new(data),
-                idx: Box::new(idx_expr),
-                ty: elem_ty.clone(),
-            };
+            // Compute the per-slot indices: `idx * N + j` for j in
+            // 0..N. The N=1 single-slot case reduces to a plain
+            // `data[idx]` load (no multiplication).
+            let n = elem_slots.len();
+            let elem_args: Vec<Expr> = (0..n)
+                .map(|j| {
+                    let inner_idx = if n == 1 {
+                        idx_expr.clone()
+                    } else {
+                        let n_const = Expr::Lit {
+                            value: Literal::Int(n as i64),
+                            ty: u64_ty.clone(),
+                        };
+                        let base = Expr::BinOp {
+                            op: crate::ssa::BinaryOp::Mul,
+                            lhs: Box::new(idx_expr.clone()),
+                            rhs: Box::new(n_const),
+                            ty: u64_ty.clone(),
+                        };
+                        if j == 0 {
+                            base
+                        } else {
+                            let j_const = Expr::Lit {
+                                value: Literal::Int(j as i64),
+                                ty: u64_ty.clone(),
+                            };
+                            Expr::BinOp {
+                                op: crate::ssa::BinaryOp::Add,
+                                lhs: Box::new(base),
+                                rhs: Box::new(j_const),
+                                ty: u64_ty.clone(),
+                            }
+                        }
+                    };
+                    Expr::BufLoad {
+                        buf: Box::new(data.clone()),
+                        idx: Box::new(inner_idx),
+                        ty: type_for_scalar(elem_slots[j]),
+                    }
+                })
+                .collect();
             let ok_body = Expr::Con {
                 tag: "Ok".to_string(),
-                args: vec![elem],
+                args: elem_args,
+                field_slot_counts: vec![n],
                 ty: ret_ty.clone(),
             };
             let oob_union_ty = Type::TagUnion {
@@ -770,11 +1032,13 @@ fn try_lower_stdlib_intrinsic(
             let oob = Expr::Con {
                 tag: "OutOfBounds".to_string(),
                 args: vec![],
+                field_slot_counts: vec![],
                 ty: oob_union_ty,
             };
             let err_body = Expr::Con {
                 tag: "Err".to_string(),
                 args: vec![oob],
+                field_slot_counts: vec![1],
                 ty: ret_ty.clone(),
             };
             let match_result = Expr::Match {
@@ -792,21 +1056,19 @@ fn try_lower_stdlib_intrinsic(
                 ],
                 ty: ret_ty.clone(),
             };
-            // The Match's result is a single shell (RcPtr); unbox
-            // into Result's (tag, payload) slot pair so the
-            // multi-slot caller doesn't see a shell.
-            Ok(Some(vec![
-                Expr::ProjSlot {
-                    source_slots: vec![match_result.clone()],
-                    slot_idx: 0,
-                    ty: u64_ty,
-                },
-                Expr::ProjSlot {
-                    source_slots: vec![match_result],
-                    slot_idx: 1,
-                    ty: Type::Con("__RcPtr".to_string()),
-                },
-            ]))
+            // Match now returns its full slot list natively — the
+            // merge block has one param per Result slot (tag,
+            // payload). Bind the 2-slot Match value once via a Let
+            // and reference each slot via a fresh Var so the Match
+            // SSA is emitted exactly once (no duplicate bounds-check
+            // + arm allocation).
+            let result_slots = expand_slots_with(
+                &ret_ty,
+                &ctx.fieldless,
+                &ctx.transparent,
+                &ctx.payload_unions,
+            );
+            Ok(Some(bind_multi_slot(ctx, match_result, &result_slots, ret_ty)))
         }
         _ => Ok(None),
     }
@@ -819,11 +1081,15 @@ fn try_lower_stdlib_intrinsic(
 /// suffixes (`List.get__I64`).
 fn is_stdlib_intrinsic(name: &str) -> bool {
     let base = name.split("__").next().unwrap_or(name);
+    // True intrinsics: declared in `standard/list.ori` *without* a
+    // body (the lowering is inline at this layer, not via a normal
+    // SSA function call). `reverse` / `repeat` / `map` etc. have
+    // bodies in stdlib that use the true intrinsics — those flow
+    // through the regular App path.
     matches!(
         base,
         "List.len" | "List.get" | "List.append" | "List.set"
         | "List.range" | "List.walk" | "List.walk_until"
-        | "List.reverse" | "List.repeat" | "List.map"
         | "crash"
     )
 }
@@ -878,19 +1144,82 @@ fn ast_binop_to_ssa(op: crate::ast::BinOp) -> crate::ssa::BinaryOp {
     }
 }
 
-fn lower_call_args(ctx: &mut LowerCtx<'_>, args: &[AstExpr<'_>]) -> Result<Vec<Expr>, String> {
+fn lower_call_args(
+    ctx: &mut LowerCtx<'_>,
+    _callee: &str,
+    args: &[AstExpr<'_>],
+) -> Result<Vec<Expr>, String> {
     let mut out = Vec::new();
     for a in args {
-        out.extend(lower_expr_slots(ctx, a)?);
+        let lowered = lower_expr_slots(ctx, a)?;
+        let expected = expand_slots_with(
+            &a.ty,
+            &ctx.fieldless,
+            &ctx.transparent,
+            &ctx.payload_unions,
+        );
+        // Multi-slot single-Expr fan-out: when a multi-slot arg
+        // (closure value, Result, Maybe, record-typed arg) lowers
+        // to one Core Expr (e.g. a single Match or App), expand
+        // it into per-slot Var references so the call's positional
+        // arg list matches the callee's per-slot signature. See
+        // `bind_multi_slot` for the shared-Let convention.
+        if lowered.len() == 1 && expected.len() > 1 {
+            out.extend(bind_multi_slot(ctx, lowered.into_iter().next().unwrap(), &expected, &a.ty));
+        } else {
+            out.extend(lowered);
+        }
     }
     Ok(out)
 }
 
-fn lower_block(
+fn lower_block<'src>(
     ctx: &mut LowerCtx<'_>,
-    stmts: &[Stmt<'_>],
-    last: &AstExpr<'_>,
+    stmts: &[Stmt<'src>],
+    last: &AstExpr<'src>,
 ) -> Result<Vec<Expr>, String> {
+    // Desugar the first `Stmt::Guard` we hit into a 2-arm `If`:
+    // True arm returns the guard's value (`is_return: true` →
+    // short-circuit the enclosing function); False arm carries the
+    // remaining statements + `last` as its body. Recursing with
+    // the prefix-of-stmts + synthesized If as the new `last` lets
+    // the normal block lowering run unchanged.
+    if let Some(guard_idx) = stmts.iter().position(|s| matches!(s, Stmt::Guard { .. })) {
+        let Stmt::Guard { condition, return_val } = &stmts[guard_idx] else {
+            unreachable!("position matched Stmt::Guard");
+        };
+        let rest_stmts = stmts[guard_idx + 1..].to_vec();
+        let rest_block = AstExpr {
+            kind: ExprKind::Block(rest_stmts, Box::new(last.clone())),
+            span: last.span,
+            id: last.id,
+            ty: last.ty.clone(),
+        };
+        let true_arm = crate::ast::MatchArm {
+            pattern: crate::ast::Pattern::Constructor { name: "True", fields: vec![] },
+            guards: vec![],
+            body: return_val.clone(),
+            is_return: true,
+        };
+        let false_arm = crate::ast::MatchArm {
+            pattern: crate::ast::Pattern::Constructor { name: "False", fields: vec![] },
+            guards: vec![],
+            body: rest_block,
+            is_return: false,
+        };
+        let if_expr = AstExpr {
+            kind: ExprKind::If {
+                expr: Box::new(condition.clone()),
+                arms: vec![true_arm, false_arm],
+                else_body: None,
+            },
+            span: condition.span,
+            id: condition.id,
+            ty: last.ty.clone(),
+        };
+        return lower_block(ctx, &stmts[..guard_idx], &if_expr);
+    }
+
     // Lower stmts in source order so multi-slot bindings (records,
     // tuples, payload-union calls) register their slot syms in
     // `ctx.locals` before the body — or before subsequent stmts —
@@ -1047,6 +1376,118 @@ fn lower_destructure(
     Ok(())
 }
 
+/// Bind a single multi-slot Core expression to N fresh slot symbols
+/// via a `Let`, returning N `Var` references — one per slot. Each
+/// returned `Var` carries the same shared `Let` wrapper, so when
+/// `to_ssa::lower_slots` processes the slot list it lowers the
+/// value ONCE (the first Var's Let-value evaluation registers the
+/// slot syms in `ctx.locals`; subsequent Vars hit the registered
+/// syms). Used by `Record` / `Tuple` / call-arg sites that
+/// concatenate per-field slot lists when a field's expression is a
+/// multi-slot operation (App, ListAppend, Cata) producing a single
+/// Core node.
+/// Walk `scheme_ret` and the monomorphic `mono_ty` in parallel,
+/// pairing each `Type::Var` with the concrete `Type` at the same
+/// position. Used by pattern lowering to monomorphize per-field
+/// types from a polymorphic constructor scheme.
+fn collect_pattern_subst(
+    scheme_ret: &Type,
+    mono_ty: &Type,
+) -> Vec<(crate::types::engine::TypeVar, Type)> {
+    let mut out: Vec<(crate::types::engine::TypeVar, Type)> = Vec::new();
+    walk_pattern_subst(scheme_ret, mono_ty, &mut out);
+    out
+}
+
+fn walk_pattern_subst(
+    scheme: &Type,
+    mono: &Type,
+    out: &mut Vec<(crate::types::engine::TypeVar, Type)>,
+) {
+    match (scheme, mono) {
+        (Type::Var(v), _) => out.push((*v, mono.clone())),
+        (Type::App(_, a), Type::App(_, b)) | (Type::Tuple(a), Type::Tuple(b)) => {
+            for (sa, mb) in a.iter().zip(b.iter()) {
+                walk_pattern_subst(sa, mb, out);
+            }
+        }
+        (Type::Arrow(ap, ar), Type::Arrow(bp, br)) => {
+            for (sa, mb) in ap.iter().zip(bp.iter()) {
+                walk_pattern_subst(sa, mb, out);
+            }
+            walk_pattern_subst(ar, br, out);
+        }
+        _ => {}
+    }
+}
+
+fn apply_pattern_subst(
+    ty: &Type,
+    subst: &[(crate::types::engine::TypeVar, Type)],
+) -> Type {
+    let mut result = ty.clone();
+    for (v, t) in subst {
+        result = crate::passes::decl_info::substitute_type_var(&result, *v, t);
+    }
+    result
+}
+
+/// Lower an AST expression as a slot list, ensuring the result has
+/// `expand_slots(ast.ty)` entries. If the natural lowering produces
+/// a single Core Expr whose type is multi-slot (App, ListLit, Match,
+/// nested Con returning a payload union, etc.), fan it out into per-
+/// slot `Var` references via `bind_multi_slot` — one shared `Let`
+/// binds N slot syms to the value, each entry references one sym.
+/// `to_ssa`'s `bind_cache` ensures the value lowers exactly once.
+pub fn lower_expr_slots_expanded(
+    ctx: &mut LowerCtx<'_>,
+    ast: &AstExpr<'_>,
+) -> Result<Vec<Expr>, String> {
+    let lowered = lower_expr_slots(ctx, ast)?;
+    let expected = expand_slots_with(
+        &ast.ty,
+        &ctx.fieldless,
+        &ctx.transparent,
+        &ctx.payload_unions,
+    );
+    if lowered.len() == 1 && expected.len() > 1 {
+        Ok(bind_multi_slot(
+            ctx,
+            lowered.into_iter().next().unwrap(),
+            &expected,
+            &ast.ty,
+        ))
+    } else {
+        Ok(lowered)
+    }
+}
+
+fn bind_multi_slot(
+    ctx: &mut LowerCtx<'_>,
+    value: Expr,
+    slot_tys: &[ScalarType],
+    value_ty: &Type,
+) -> Vec<Expr> {
+    use crate::symbol::SymbolKind;
+    let span = crate::ast::Span { file: crate::source::FileId(0), start: 0, end: 0 };
+    let slot_syms: Vec<SymbolId> = (0..slot_tys.len())
+        .map(|i| ctx.symbols.fresh(format!("__rec_slot_{i}"), span, SymbolKind::Func))
+        .collect();
+    slot_syms
+        .iter()
+        .enumerate()
+        .map(|(i, &sym)| Expr::Let {
+            binders: slot_syms.clone(),
+            value: Box::new(value.clone()),
+            body: Box::new(Expr::Var {
+                sym,
+                ty: type_for_scalar(slot_tys[i]),
+            }),
+            ty: value_ty.clone(),
+        })
+        .collect()
+}
+
 fn mint_slot_syms(
     ctx: &mut LowerCtx<'_>,
     base: SymbolId,
@@ -1129,6 +1570,18 @@ pub fn expand_slots_with(
             return vec![ScalarType::U64, ScalarType::RcPtr];
         }
     }
+    // `List(T)` (and `Str = List(U8)` via the transparent table)
+    // decompose to (len: U64, cap: U64, data: RcPtr) at every
+    // layer — the canonical SROA shape. Functions take and return
+    // the slot trio; payload Cons store the trio inline; pattern
+    // binders bind three SSA values. The only place the trio
+    // collapses back into a single RcPtr header is the `__main`
+    // ABI boundary, where it's an explicit materialization.
+    if let Type::App(name, _) = &unwrapped {
+        if name == "List" {
+            return vec![ScalarType::U64, ScalarType::U64, ScalarType::RcPtr];
+        }
+    }
     match &unwrapped {
         Type::Record { fields, .. } => {
             let mut out = Vec::new();
@@ -1185,7 +1638,11 @@ fn type_for_scalar(s: ScalarType) -> Type {
     }
 }
 
-fn lower_match_arm(ctx: &mut LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<MatchArm, String> {
+fn lower_match_arm(
+    ctx: &mut LowerCtx<'_>,
+    arm: &AstMatchArm<'_>,
+    scrutinee_ty: &Type,
+) -> Result<MatchArm, String> {
     let mut pattern = lower_pattern(&arm.pattern)?;
 
     // For each constructor binder whose source type expands to
@@ -1193,23 +1650,44 @@ fn lower_match_arm(ctx: &mut LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<Matc
     // `ctx.locals` so `Name(binder)` in the arm body expands to the
     // per-slot Vars. Wildcards (sym = u32::MAX) skip the lookup.
     // Single-slot binders keep their AST sym — no minting needed.
+    //
+    // The scheme's `field_tys` may be polymorphic (e.g. `Err : b ->
+    // Result(a, b)`); we substitute against the scrutinee_ty so the
+    // monomorphic slot count is used. Without this, `Var(b)` falls
+    // back to 1 slot (the default RcPtr) and we miss the case
+    // where the Err payload is multi-slot like `Str` or `List(I64)`.
     let mut shadowed: Vec<(SymbolId, Option<Vec<SymbolId>>)> = Vec::new();
     if let Pattern::Constructor { tag, binders } = &mut pattern {
+        let scheme_subst: Vec<(crate::types::engine::TypeVar, Type)> = ctx
+            .constructor_return_types
+            .get(tag)
+            .map(|scheme_ret| collect_pattern_subst(scheme_ret, scrutinee_ty))
+            .unwrap_or_default();
         if let Some(field_tys) = ctx.constructor_field_types.get(tag).cloned() {
             for (i, binder_slots) in binders.iter_mut().enumerate() {
                 if i >= field_tys.len() {
                     break;
                 }
-                if binder_slots.len() != 1 || binder_slots[0].0 == u32::MAX {
+                if binder_slots.len() != 1 {
                     continue;
                 }
+                let field_ty = apply_pattern_subst(&field_tys[i], &scheme_subst);
                 let slot_tys = expand_slots_with(
-                    &field_tys[i],
+                    &field_ty,
                     &ctx.fieldless,
                     &ctx.transparent,
                     &ctx.payload_unions,
                 );
                 if slot_tys.len() <= 1 {
+                    continue;
+                }
+                if binder_slots[0].0 == u32::MAX {
+                    // Wildcard binder over a multi-slot field —
+                    // expand to N wildcard sentinels so the
+                    // pattern's binder count matches the field's
+                    // slot count (to_ssa's binder loader walks them
+                    // in parallel with `slot_tys`).
+                    *binder_slots = vec![SymbolId(u32::MAX); slot_tys.len()];
                     continue;
                 }
                 let ast_sym = binder_slots[0];
@@ -1229,7 +1707,7 @@ fn lower_match_arm(ctx: &mut LowerCtx<'_>, arm: &AstMatchArm<'_>) -> Result<Matc
         .iter()
         .map(|g| lower_expr(ctx, g))
         .collect::<Result<_, _>>()?;
-    let body = lower_expr(ctx, &arm.body)?;
+    let body = lower_expr_slots(ctx, &arm.body)?;
 
     // Restore the outer scope's `ctx.locals` so sibling arms don't
     // see this arm's slot syms. The Pattern still carries them so

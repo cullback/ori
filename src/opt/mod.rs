@@ -50,6 +50,9 @@ pub fn optimize(module: &mut Module) {
 /// after every pass to surface invariant violations at the boundary
 /// they were introduced.
 pub fn run_full_pipeline(module: &mut Module) {
+    if std::env::var("ORI_DUMP_LOWERED").is_ok() {
+        eprintln!("=== freshly lowered ===\n{module}");
+    }
     static_promote::promote(module);
     check(module, "static_promote");
     optimize(module);
@@ -57,6 +60,9 @@ pub fn run_full_pipeline(module: &mut Module) {
     // inline() re-runs ssa_form internally so it leaves the
     // explicit-block-params invariant intact.
     inline::inline(module);
+    if std::env::var("ORI_DUMP_POST_INLINE").is_ok() {
+        eprintln!("=== post-inline ===\n{module}");
+    }
     check(module, "inline");
     optimize(module);
     check(module, "optimize (post inline)");
@@ -75,4 +81,7 @@ pub fn run_full_pipeline(module: &mut Module) {
     check(module, "rc_fuse");
     optimize(module);
     check(module, "optimize (final)");
+    if std::env::var("ORI_DUMP_FINAL").is_ok() {
+        eprintln!("=== final SSA ===\n{module}");
+    }
 }

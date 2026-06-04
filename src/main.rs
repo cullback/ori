@@ -77,7 +77,19 @@ fn compile(
             eprintln!("[core] fallback: {e}");
         }
     }
-    let core_module = core_attempt.ok().filter(|m| {
+    // Run ssa_form + rc_emit + elim_dead_allocs before validating
+    // so Core's emission can use implicit cross-block refs (which
+    // ssa_form threads into explicit block params). Mirrors the
+    // tail of existing-lower's `lower::lower`.
+    let core_module = core_attempt.ok().map(|mut m| {
+        if std::env::var("ORI_DUMP_CORE_RAW").is_ok() {
+            eprintln!("=== raw Core SSA (pre ssa_form) ===\n{m}");
+        }
+        lower::ssa_form::run(&mut m);
+        lower::rc_emit::run(&mut m);
+        lower::elim_dead_allocs::run(&mut m);
+        m
+    }).filter(|m| {
         let r = ssa::validate::validate(m);
         let ok = r.is_clean() && r.warnings.is_empty();
         if !ok && std::env::var("ORI_TRACE_CORE").is_ok() {
@@ -90,7 +102,7 @@ fn compile(
         eprintln!("[core] used Core pipeline");
     }
 
-    let (mut ssa_module, input_vals) = if let Some(m) = core_module {
+    let (ssa_module, input_vals) = if let Some(m) = core_module {
         let main_params = m.functions.get("__main")
             .map(|f| f.params.clone())
             .unwrap_or_default();
@@ -98,6 +110,7 @@ fn compile(
     } else {
         lower::lower(&mono, &resolved.fields)?
     };
+    let mut ssa_module = ssa_module;
     run_ssa_pipeline(&mut ssa_module);
     Ok((ssa_module, input_vals))
 }

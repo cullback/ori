@@ -63,10 +63,17 @@ pub fn check(module: &Module, pass_name: &str) {
         );
     }
     if !r.warnings.is_empty() {
-        panic!(
-            "SSA soft-validation warnings after '{pass_name}':\n{}",
-            r.warnings.join("\n")
-        );
+        if std::env::var("ORI_VALIDATE_LOG_ONLY").is_ok() {
+            eprintln!(
+                "SSA soft-validation warnings after '{pass_name}' (logged, not panicking):\n{}",
+                r.warnings.join("\n")
+            );
+        } else {
+            panic!(
+                "SSA soft-validation warnings after '{pass_name}':\n{}",
+                r.warnings.join("\n")
+            );
+        }
     }
 }
 

@@ -214,19 +214,100 @@ pub fn lower_module(
         //   when an AST Name needs to expand to multi-slot Vars).
         let mut to_ssa_locals: HashMap<SymbolId, Value> = HashMap::new();
         let mut core_locals: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
-        for (param_sym, slot_tys) in params.iter().zip(&per_param_slots) {
-            add_function_param(
-                &mut builder,
-                mono,
-                *param_sym,
-                slot_tys,
-                &mut to_ssa_locals,
-                &mut core_locals,
-            );
+        // For __main's List params: the eval driver and CLI pass
+        // one RcPtr header per arg, so the SSA param stays a single
+        // RcPtr. Inside the body Core sees Lists as 3 slots, so we
+        // need to emit `Load`s at the header's (0, 8, 16) byte
+        // offsets in the entry block and bind the param sym to the
+        // 3 minted slot syms. Track which params need this
+        // boundary-unpacking; emit after entry is created.
+        struct UnpackedListParam {
+            param_sym: SymbolId,
+            header_val: Value,
+            slot_tys: Vec<ScalarType>,
+        }
+        let mut unpacked_lists: Vec<UnpackedListParam> = Vec::new();
+        if is_main {
+            // Look up each source param's declared type; if it's a
+            // List trio, override slot_tys to a single RcPtr and
+            // record the boundary unpack for later.
+            let scheme_param_tys: Vec<Type> = mono
+                .infer
+                .func_schemes
+                .get(&name_str)
+                .and_then(|s| match &s.ty {
+                    Type::Arrow(ps, _) => Some(ps.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            for (i, (param_sym, slot_tys)) in params.iter().zip(&per_param_slots).enumerate() {
+                let is_list_param = scheme_param_tys
+                    .get(i)
+                    .map(|t| is_list_trio(t, &transparent))
+                    .unwrap_or(false);
+                if is_list_param && slot_tys.len() == 3 {
+                    // ABI: take one RcPtr header. Body: 3 slot syms.
+                    let header_val = builder.add_func_param(ScalarType::RcPtr);
+                    unpacked_lists.push(UnpackedListParam {
+                        param_sym: *param_sym,
+                        header_val,
+                        slot_tys: slot_tys.clone(),
+                    });
+                } else {
+                    add_function_param(
+                        &mut builder,
+                        mono,
+                        *param_sym,
+                        slot_tys,
+                        &mut to_ssa_locals,
+                        &mut core_locals,
+                    );
+                }
+            }
+        } else {
+            for (param_sym, slot_tys) in params.iter().zip(&per_param_slots) {
+                add_function_param(
+                    &mut builder,
+                    mono,
+                    *param_sym,
+                    slot_tys,
+                    &mut to_ssa_locals,
+                    &mut core_locals,
+                );
+            }
         }
 
         let entry = builder.create_block();
         builder.switch_to(entry);
+
+        // Emit the header→trio unpacking for any __main List
+        // params we recorded above. Three loads per param at the
+        // canonical (0, 8, 16) byte offsets. Skip the unpack if
+        // the body doesn't reference the param — the loads would
+        // auto-rc the slots and force rc_dec balancing for values
+        // nothing uses, which existing-lower avoids by never
+        // emitting them in the first place. If we unpack, the
+        // body uses are the only justification for the extra RC
+        // traffic.
+        for up in &unpacked_lists {
+            if !body_uses_sym(&body, up.param_sym) {
+                // Param header binds as a single RcPtr — no slot
+                // unpacking. The body never references it; rc_emit
+                // releases the param at the function boundary.
+                to_ssa_locals.insert(up.param_sym, up.header_val);
+                continue;
+            }
+            let base_name = mono.symbols.display(up.param_sym).to_owned();
+            let span = mono.symbols.get(up.param_sym).span;
+            let slot_syms: Vec<SymbolId> = (0..up.slot_tys.len())
+                .map(|i| mono.symbols.fresh(format!("{base_name}.{i}"), span, SymbolKind::Func))
+                .collect();
+            for (i, (&sym, &ty)) in slot_syms.iter().zip(&up.slot_tys).enumerate() {
+                let v = builder.load(up.header_val, i * 8, ty);
+                to_ssa_locals.insert(sym, v);
+            }
+            core_locals.insert(up.param_sym, slot_syms);
+        }
 
         // AST → Core (mut borrows mono.symbols).
         let core_body = {
@@ -263,6 +344,12 @@ pub fn lower_module(
                     .or_insert_with(|| v.clone());
             }
             ctx.payload_unions = payload_unions.clone();
+            ctx.tag_targets = decls
+                .tag_targets
+                .iter()
+                .map(|(k, v)| (k.clone(), v.target_func.clone()))
+                .collect();
+            ctx.ho_param_closures = mono.ho_param_closures.clone();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {
                 format!("function `{name_str}`: AST→Core: {e}")
@@ -286,6 +373,7 @@ pub fn lower_module(
                 fieldless: decls.fieldless_tags.clone(),
                 transparent: transparent.clone(),
                 payload_unions: payload_unions.clone(),
+                bind_cache: std::collections::HashMap::new(),
             };
             let mut all = Vec::new();
             for e in &core_body {
@@ -306,7 +394,16 @@ pub fn lower_module(
         // by emitting alloc + sequential stores + return the shell
         // pointer — matches existing-lower's convention exactly.
         let ret_payload_unions = if is_main { std::collections::HashSet::new() } else { payload_unions.clone() };
-        let ret_slots = expand_slots_with(&body.ty, &decls.fieldless_tags, &transparent, &ret_payload_unions);
+        let ret_slots_natural = expand_slots_with(&body.ty, &decls.fieldless_tags, &transparent, &ret_payload_unions);
+        // __main's ABI: a List return collapses to a single RcPtr
+        // header. The body still produces (len, cap, data) — the
+        // shell-materialize reconciliation below packs the trio
+        // into an alloc'd header and returns one pointer.
+        let ret_slots = if is_main && is_list_trio(&body.ty, &transparent) {
+            vec![ScalarType::RcPtr]
+        } else {
+            ret_slots_natural
+        };
         let result_vals = if result_vals.len() == ret_slots.len() {
             result_vals
         } else if ret_slots.len() == 1 && result_vals.len() > 1 {
@@ -350,7 +447,34 @@ pub fn lower_module(
         }
     }
 
-    Ok(builder.build("__main"))
+    let module = builder.build("__main");
+
+    // Post-build sanity check: every `Call` must pass exactly as
+    // many args as the callee has params. Mismatches here surface
+    // higher-order lowering bugs (e.g. Core not expanding a
+    // closure-shaped param into its (tag, payload) slot pair)
+    // that downstream passes only catch post-inline. Bail
+    // explicitly so the fallback is taken at boundary time
+    // instead of panicking in `opt::inline`.
+    for (fname, func) in &module.functions {
+        let blocks: Vec<_> = func.blocks.values().collect();
+        for block in &blocks {
+            for inst in &block.insts {
+                if let crate::ssa::Inst::Call { target: callee, args, .. } = inst {
+                    if let Some(callee_func) = module.functions.get(callee) {
+                        if callee_func.params.len() != args.len() {
+                            return Err(format!(
+                                "function `{fname}`: call to `{callee}` has {} args but callee declares {} params",
+                                args.len(), callee_func.params.len()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(module)
 }
 
 /// Resolve a function's per-param slot type expansion. Reads
@@ -394,14 +518,95 @@ fn param_slot_types(
     transparent: &TransparentTable,
     payload_unions: &std::collections::HashSet<String>,
 ) -> Vec<Vec<ScalarType>> {
+    // NOTE: HO params still carry `Type::Arrow` in the scheme
+    // (`lambda_specialize` doesn't update the original function's
+    // scheme). `mono.ho_param_closures` projects the concrete
+    // closure-union shape, but using it here breaks consistency
+    // with existing-lower (which doesn't see the map) and with
+    // synthesized helpers (`__fold_N`, walk apply lifters) that
+    // derived their own signatures from the original Arrow-typed
+    // scheme. A complete fix would also re-flow the body's
+    // arg/return types through everything that reads schemes.
+    // Tracked as the HO closure-shape problem; for now Arrow →
+    // 1 RcPtr default keeps callee+caller consistent and existing-
+    // lower handles HO via shell-wrap materialization.
+    let _ = mono;
     mono.infer
         .func_schemes
         .get(name_str)
         .map(|s| match &s.ty {
-            Type::Arrow(ps, _) => ps.iter().map(|t| expand_slots_with(t, fieldless, transparent, payload_unions)).collect(),
+            Type::Arrow(ps, _) => ps
+                .iter()
+                .map(|t| expand_slots_with(t, fieldless, transparent, payload_unions))
+                .collect(),
             _ => vec![vec![ScalarType::RcPtr]; params.len()],
         })
         .unwrap_or_else(|| vec![vec![ScalarType::RcPtr]; params.len()])
+}
+
+/// True if `ty` resolves (via transparent unfolding) to a
+/// `List(T)`-shaped reference — used by `__main`'s ABI boundary
+/// to collapse the 3-slot (len, cap, data) trio back to a single
+/// RcPtr header for the eval driver / CLI's calling convention.
+/// Walk `body` looking for any `ExprKind::Name(target)` reference.
+/// Used by the __main ABI carve-out to decide whether unpacking a
+/// header into its slot trio is worth the loads — if the body
+/// doesn't touch the param, we'd just be emitting auto-rc'd loads
+/// that nothing reads and rc_dec'ing them at function end.
+fn body_uses_sym(body: &AstExpr<'_>, target: SymbolId) -> bool {
+    use crate::ast::{ExprKind, Pattern, Stmt};
+    fn walk_expr(e: &AstExpr<'_>, t: SymbolId) -> bool {
+        match &e.kind {
+            ExprKind::Name(s) => *s == t,
+            ExprKind::IntLit(_) | ExprKind::FloatLit(_) | ExprKind::StrLit(_) => false,
+            ExprKind::BinOp { lhs, rhs, .. } => walk_expr(lhs, t) || walk_expr(rhs, t),
+            ExprKind::Call { args, .. } => args.iter().any(|a| walk_expr(a, t)),
+            ExprKind::QualifiedCall { args, .. } => args.iter().any(|a| walk_expr(a, t)),
+            ExprKind::MethodCall { receiver, args, .. } => {
+                walk_expr(receiver, t) || args.iter().any(|a| walk_expr(a, t))
+            }
+            ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
+                elems.iter().any(|a| walk_expr(a, t))
+            }
+            ExprKind::Record { fields } => fields.iter().any(|(_, e)| walk_expr(e, t)),
+            ExprKind::RecordUpdate { base, updates } => {
+                walk_expr(base, t) || updates.iter().any(|(_, e)| walk_expr(e, t))
+            }
+            ExprKind::FieldAccess { record, .. } => walk_expr(record, t),
+            ExprKind::Is { expr, .. } => walk_expr(expr, t),
+            ExprKind::If { expr, arms, else_body } => {
+                walk_expr(expr, t)
+                    || arms.iter().any(|a| walk_expr(&a.body, t) || a.guards.iter().any(|g| walk_expr(g, t)))
+                    || else_body.as_ref().map(|b| walk_expr(b, t)).unwrap_or(false)
+            }
+            ExprKind::Fold { expr, arms } => {
+                walk_expr(expr, t)
+                    || arms.iter().any(|a| walk_expr(&a.body, t) || a.guards.iter().any(|g| walk_expr(g, t)))
+            }
+            ExprKind::Block(stmts, last) => {
+                stmts.iter().any(|s| walk_stmt(s, t)) || walk_expr(last, t)
+            }
+            ExprKind::Lambda { body, .. } => walk_expr(body, t),
+            ExprKind::Closure { captures, .. } => captures.iter().any(|c| walk_expr(c, t)),
+        }
+    }
+    fn walk_stmt(s: &Stmt<'_>, t: SymbolId) -> bool {
+        match s {
+            Stmt::Let { val, .. } => walk_expr(val, t),
+            Stmt::Destructure { val, .. } => walk_expr(val, t),
+            Stmt::Guard { condition, return_val } => {
+                walk_expr(condition, t) || walk_expr(return_val, t)
+            }
+            Stmt::TypeHint { .. } => false,
+        }
+    }
+    let _ = Pattern::Wildcard;
+    walk_expr(body, target)
+}
+
+fn is_list_trio(ty: &Type, transparent: &TransparentTable) -> bool {
+    use crate::passes::core::lower::resolve_transparent;
+    matches!(resolve_transparent(ty, transparent), Type::App(ref name, _) if name == "List")
 }
 
 /// Add SSA function parameter(s) for a single source-level param.

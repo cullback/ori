@@ -1,4 +1,2 @@
 main : List(Str), Str -> Result(Str, Str)
-main = |args, input| (
-    Ok("hi")
-)
+main = |a,i| Ok("hi")
