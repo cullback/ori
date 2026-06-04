@@ -1305,14 +1305,19 @@ fn rewrite_is_if_to_match<'src>(
     Some(rewritten)
 }
 
-/// Returns true if `ty` is a Record or Tuple whose `expand_slots`
-/// would produce more slots than existing-lower's `scalar_type`-per-
-/// field flattening. Used by Core's HOF lowerers to bail when the
-/// acc type's slot count would disagree with the lifted closure's
-/// SSA signature (compiled by existing-lower).
+/// Returns true if `ty` would expand to multiple slots under
+/// Core's recursive `expand_slots` in a way that disagrees with
+/// existing-lower's `scalar_type`-per-field collapse. Used by HOF
+/// lowerers to bail when the acc's slot count would mismatch the
+/// lifted closure's SSA signature (compiled by existing-lower):
+/// - `List(T)` and `Str` (transparently `List(U8)`) are 3 slots
+///   in Core, 1 RcPtr shell in nested contexts under existing-lower.
+/// - A Record/Tuple containing one of those fields amplifies the
+///   mismatch.
 fn has_nested_multi_slot_field(ty: &Type, transparent: &TransparentTable) -> bool {
     let unwrapped = resolve_transparent(ty, transparent);
     match &unwrapped {
+        Type::App(name, _) if name == "List" => true,
         Type::Record { fields, .. } => fields.iter().any(|(_, fty)| field_expands_beyond_scalar(fty, transparent)),
         Type::Tuple(tys) => tys.iter().any(|t| field_expands_beyond_scalar(t, transparent)),
         _ => false,
