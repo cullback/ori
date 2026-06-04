@@ -412,6 +412,18 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
         match lv {
             LoweredValue::Multi(vs) if vs.len() == expected_slots.len() => vs,
             LoweredValue::Multi(vs) if expected_slots.len() == 1 => {
+                // Shell-wrap. Still load-bearing in two cases:
+                //   * Records-as-arg where the callee's scheme says
+                //     a single-slot type (e.g. transparent newtype
+                //     opaque outside).
+                //   * Closure values where `lambda::specialize`
+                //     creates a multi-variant tag-union TYPE for the
+                //     closure VALUE but mono's per-set spec gives the
+                //     HOF param a singleton lambda-set on its Arrow
+                //     row. Shape mismatch → materialize a heap
+                //     pointer. Fixing requires specialize to emit
+                //     per-mono-spec TagDecls (same blocker as full
+                //     Phase E narrow delete).
                 let ptr = self.materialize_lv(LoweredValue::Multi(vs), src_ty);
                 vec![ptr]
             }

@@ -670,9 +670,14 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                             .map_or_else(default_type, |t| normalize_type(&t))
                     })
                     .collect();
-                // Foreign vars: ones that appeared in scheme.ty but
-                // are NOT in scheme.vars. Carry them in extra_mapping
-                // so process_request substitutes them in the body.
+                // Foreign vars: scheme.ty references vars NOT in
+                // scheme.vars (e.g. a transparent newtype's type
+                // params leaking through from an outer scheme).
+                // Carry them in extra_mapping so process_request
+                // substitutes them in the body. Lambda-set rows
+                // didn't subsume this case — it's specifically about
+                // type-args from enclosing scopes that appear in
+                // scheme.ty's structure.
                 let extra: HashMap<TypeVar, Type> = extracted
                     .into_iter()
                     .filter(|(tv, _)| !var_set.contains(tv))
@@ -1306,11 +1311,11 @@ fn apply_mapping(ty: &Type, mapping: &HashMap<TypeVar, Type>) -> Type {
             // from the call-site concrete type — dropping the rest
             // would lose those fields and produce a wrongly-shaped
             // record. (Surfaces for lifted closures whose body sees
-            // an open-row capture: scheme.ty has `{entries: V322,
-            // rest: V323}`, with V323 → `{len: U64}`. Without the
-            // merge, the lifted body's grown param decomposes to a
-            // single slot for `entries` instead of four for
-            // `{entries, len}`.)
+            // an open-row capture from a transparent newtype like
+            // Set, where scheme.ty has `{entries: V322, rest: V323}`
+            // with V323 → `{len: U64}`. Without the merge, grown
+            // decomposes to a single slot for `entries` instead of
+            // four for `{entries, len}`.)
             if let Some(rest_var_ty) = rest {
                 if let Type::Var(rv) = rest_var_ty.as_ref() {
                     if let Some(rest_resolved) = mapping.get(rv) {
