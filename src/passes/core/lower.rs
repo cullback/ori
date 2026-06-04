@@ -571,16 +571,20 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
         }
 
         ExprKind::Record { fields } => {
-            // SROA: same as Tuple. Field order is the source order.
-            // (Layout normalization can reorder for packing; that's
-            // a Core→SSA concern.) For multi-slot fields whose
-            // expression yields a single Core node (e.g. an App,
-            // ListAppend, Cata returning multiple slots), mint a
-            // Let to bind slot syms one-per-slot so the resulting
-            // slot list has the right length and each slot is a
-            // simple Var reference — no duplicated evaluation.
+            // SROA: concatenate each field's slot list in the
+            // canonical (alphabetical-by-name) field order. This is
+            // the order `expand_slots` produces and `field_slice`
+            // reads, so all three agree. For multi-slot fields whose
+            // expression yields a single Core node (e.g. an App
+            // returning multiple slots), bind via slot syms so each
+            // slot is a simple Var reference.
+            let mut sorted: Vec<(&str, &crate::ast::Expr<'_>)> = fields
+                .iter()
+                .map(|(fsym, e)| (ctx.fields.get(*fsym), e))
+                .collect();
+            sorted.sort_by_key(|(name, _)| *name);
             let mut slots = Vec::new();
-            for (_fsym, e) in fields {
+            for (_name, e) in sorted {
                 let lowered = lower_expr_slots(ctx, e)?;
                 let expected = expand_slots_with(
                     &e.ty,
@@ -856,9 +860,6 @@ fn try_lower_stdlib_intrinsic(
             let xs = &args[0];
             let init = &args[1];
             let closure_expr = &args[2];
-            if has_nested_multi_slot_field(&init.ty, &ctx.transparent) {
-                return Ok(None);
-            }
             let Some(target_func) = resolve_closure_target_name(ctx, closure_expr) else {
                 return Ok(None);
             };
@@ -1303,39 +1304,6 @@ fn rewrite_is_if_to_match<'src>(
     rewritten.id = id;
     rewritten.ty = ty.clone();
     Some(rewritten)
-}
-
-/// Returns true if `ty` would expand to multiple slots under
-/// Core's recursive `expand_slots` in a way that disagrees with
-/// existing-lower's `scalar_type`-per-field collapse. Used by HOF
-/// lowerers to bail when the acc's slot count would mismatch the
-/// lifted closure's SSA signature (compiled by existing-lower):
-/// - `List(T)` and `Str` (transparently `List(U8)`) are 3 slots
-///   in Core, 1 RcPtr shell in nested contexts under existing-lower.
-/// - A Record/Tuple containing one of those fields amplifies the
-///   mismatch.
-fn has_nested_multi_slot_field(ty: &Type, transparent: &TransparentTable) -> bool {
-    let unwrapped = resolve_transparent(ty, transparent);
-    match &unwrapped {
-        Type::App(name, _) if name == "List" => true,
-        Type::Record { fields, .. } => fields.iter().any(|(_, fty)| field_expands_beyond_scalar(fty, transparent)),
-        Type::Tuple(tys) => tys.iter().any(|t| field_expands_beyond_scalar(t, transparent)),
-        _ => false,
-    }
-}
-
-/// Helper for `has_nested_multi_slot_field`: a field expands to
-/// multiple slots if it's a List, a multi-field Record, or a nested
-/// Tuple — these are the cases where Core's recursive expand
-/// diverges from existing-lower's scalar_type-per-field collapse.
-fn field_expands_beyond_scalar(ty: &Type, transparent: &TransparentTable) -> bool {
-    let unwrapped = resolve_transparent(ty, transparent);
-    match &unwrapped {
-        Type::App(name, _) if name == "List" => true,
-        Type::Record { fields, .. } => !fields.is_empty(),
-        Type::Tuple(tys) => !tys.is_empty(),
-        _ => false,
-    }
 }
 
 fn is_stdlib_intrinsic(name: &str) -> bool {

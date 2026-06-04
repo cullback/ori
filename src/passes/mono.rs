@@ -1330,6 +1330,10 @@ fn apply_mapping(ty: &Type, mapping: &HashMap<TypeVar, Type>) -> Type {
                     }
                 }
             }
+            // Canonical record field order is alphabetical. Sort
+            // here so substituted records stay canonical without
+            // each caller having to remember to normalize_type.
+            new_fields.sort_by(|a, b| a.0.cmp(&b.0));
             Type::Record { fields: new_fields, rest: None }
         }
         Type::TagUnion { tags, rest } => {
