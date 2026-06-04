@@ -1212,6 +1212,19 @@ fn lower_match(
                     } else {
                         vec![scalar_fallback[i]]
                     };
+                    let payload_offset = i * 8;
+                    // Multi-slot field with single source binder:
+                    // bind the binder to the wrapper RcPtr at the
+                    // payload offset (the field's multi-slot data
+                    // lives in a sub-heap object referenced there).
+                    if binder_slots.len() == 1 && slot_tys.len() > 1 {
+                        let sym = binder_slots[0];
+                        if sym.0 != u32::MAX {
+                            let v = ctx.builder.load(payload_param, payload_offset, ScalarType::RcPtr);
+                            bound.push((sym, ctx.locals.insert(sym, v)));
+                        }
+                        continue;
+                    }
                     if binder_slots.len() != slot_tys.len() {
                         return Err(format!(
                             "core::to_ssa: Match arm binder for `{tag}` slot \
@@ -1221,7 +1234,6 @@ fn lower_match(
                             slot_tys.len()
                         ));
                     }
-                    let payload_offset = i * 8;
                     if binder_slots.len() == 1 {
                         let sym = binder_slots[0];
                         if sym.0 == u32::MAX {
