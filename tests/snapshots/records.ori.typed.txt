@@ -1,19 +1,23 @@
 module:
+  fn __lifted_19(x):
+    BinOp Mul : I64:
+      Name x : I64
+      IntLit 2 : I64
   type-alias Person:
     Record:
       name:
         Named I64
       age:
         Named I64
-  fn get_age(person):
-    FieldAccess .age : '_:
-      Name person : { age: '_ | '_ }
   type-alias main:
     Arrow:
       params:
         Named I64
       ret:
         Named I64
+  fn get_age(person):
+    FieldAccess .age : '_:
+      Name person : { age: '_ | '_ }
   fn main(arg):
     Block : I64:
       TypeHint alice:
@@ -45,10 +49,7 @@ module:
       Let doubled:
         QualifiedCall List.map : List(I64):
           Name ages : List(I64)
-          Lambda(x) : '_:
-            BinOp Mul : I64:
-              Name x : I64
-              IntLit 2 : I64
+          Closure(__lifted_19, []) : (I64) -> I64
       result:
         BinOp Add : I64:
           Name total_age : I64

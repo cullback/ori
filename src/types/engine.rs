@@ -142,14 +142,26 @@ pub struct Scheme {
     pub vars: Vec<TypeVar>,
     pub constraints: Vec<Constraint>,
     pub ty: Type,
+    /// Resolutions for scheme.vars that were bound to concrete types
+    /// after generalization (typically at a call site). Populated at
+    /// the end of `infer::check` for the schemes exposed to mono.
+    /// Empty in intermediate schemes during inference.
+    ///
+    /// Why: mono's `extract_substitution` only binds vars that appear
+    /// structurally in `scheme.ty`. A var generalized into `scheme.vars`
+    /// that was later bound to a concrete type would otherwise default
+    /// to I64 — wrong for lifted-lambda schemes whose method-constraint
+    /// ret var resolves at the closure use site.
+    pub var_concretes: HashMap<TypeVar, Type>,
 }
 
 impl Scheme {
-    pub const fn mono(ty: Type) -> Self {
+    pub fn mono(ty: Type) -> Self {
         Self {
             vars: vec![],
             constraints: vec![],
             ty,
+            var_concretes: HashMap::new(),
         }
     }
 }
@@ -685,13 +697,22 @@ impl TypeEngine {
             vars,
             constraints,
             ty: self.resolve(ty),
+            var_concretes: HashMap::new(),
         }
     }
 
     pub fn instantiate(&mut self, scheme: &Scheme) -> Type {
         let mapping: HashMap<TypeVar, Type> =
             scheme.vars.iter().map(|&v| (v, self.fresh())).collect();
-        // Re-add constraints with remapped type vars
+        // Re-add constraints with remapped type vars. Preserve the
+        // original `expr_id` so that when this instantiation resolves
+        // at a call site, `verify_constraints` writes the method
+        // resolution back onto the original method-call AST node.
+        // (Without this, polymorphic schemes whose body has a method-
+        // on-tvar call would never get `MethodCall.resolved` set —
+        // the only `expr_id` lives on the body-inference constraint
+        // whose tvar never binds because each call site instantiates
+        // to a fresh tvar.)
         for c in &scheme.constraints {
             let Type::Var(new_tv) = Self::apply_mapping(&Type::Var(c.type_var), &mapping) else {
                 continue;
@@ -700,8 +721,8 @@ impl TypeEngine {
                 type_var: new_tv,
                 method_name: c.method_name.clone(),
                 method_type: Self::apply_mapping(&c.method_type, &mapping),
-                span: None,
-                expr_id: None,
+                span: c.span,
+                expr_id: c.expr_id,
             });
         }
         Self::apply_mapping(&scheme.ty, &mapping)

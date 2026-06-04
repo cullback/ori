@@ -26,12 +26,15 @@ fn parse_and_resolve_named(path: &str, source: &str) -> (SourceArena, FileId, Re
     (arena, file_id, resolved)
 }
 
-/// Run pre-mono passes (fold_lift, flatten, topo) + type inference.
+/// Run pre-mono passes (fold_lift, flatten, lambda lift, topo) +
+/// type inference. Mirrors `main.rs::compile`'s prefix exactly so
+/// tests see the same module shape mono sees.
 fn through_infer(
     resolved: &mut Resolved<'_>,
 ) -> crate::types::infer::InferResult {
     crate::passes::fold_lift::lift(resolved);
     crate::passes::flatten_patterns::flatten(resolved).unwrap();
+    crate::passes::lambda::lift::lift_pre_infer(resolved);
     crate::passes::topo::compute(resolved).unwrap();
     crate::types::infer::check(resolved).unwrap()
 }
@@ -49,7 +52,6 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     let infer_result = through_infer(&mut resolved);
     let mut mono =
         crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
-    crate::passes::lambda::lift::lift(&mut mono);
     let lambda_solution = crate::passes::lambda::solve::solve(&mono);
     crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
     crate::passes::lambda::narrow::narrow(&mut mono);
@@ -3717,7 +3719,6 @@ fn compile_through_defunc(source: &str) -> (crate::ast::Module<'static>, crate::
     let infer_result = through_infer(&mut resolved);
     let mut mono =
         crate::passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
-    crate::passes::lambda::lift::lift(&mut mono);
     let lambda_solution = crate::passes::lambda::solve::solve(&mono);
     crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
     crate::passes::lambda::narrow::narrow(&mut mono);
@@ -4450,7 +4451,6 @@ main = |n| n + 1
         infer_result,
         resolved.symbols,
     );
-    crate::passes::lambda::lift::lift(&mut mono);
     let lambda_solution = crate::passes::lambda::solve::solve(&mono);
     crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
     crate::passes::lambda::narrow::narrow(&mut mono);
@@ -4529,7 +4529,6 @@ main = |n| if n == 0 : True then 1 : False then 0
         infer_result,
         resolved.symbols,
     );
-    crate::passes::lambda::lift::lift(&mut mono);
     let lambda_solution = crate::passes::lambda::solve::solve(&mono);
     crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
     crate::passes::lambda::narrow::narrow(&mut mono);
@@ -4612,7 +4611,6 @@ main = |n| helper(n) + 1
         infer_result,
         resolved.symbols,
     );
-    crate::passes::lambda::lift::lift(&mut mono);
     let lambda_solution = crate::passes::lambda::solve::solve(&mono);
     crate::passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
     crate::passes::lambda::narrow::narrow(&mut mono);

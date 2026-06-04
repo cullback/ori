@@ -361,6 +361,7 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                 vars: Vec::new(),
                 constraints: Vec::new(),
                 ty: specialized_ty,
+                var_concretes: HashMap::new(),
             },
         );
 
@@ -548,16 +549,29 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                 // function's scheme is Arrow(captures + remaining,
                 // ret), so mono needs the full arrow to extract type
                 // substitutions correctly. (See `infer_closure`.)
+                // Capture and param types may be transparent-newtype
+                // applications (e.g., `App("Set", [{x,y}])`) while the
+                // scheme.ty is the underlying record (since infer ran
+                // inside the method body with the transparent unwrap
+                // active). Unwrap before passing to mono so
+                // extract_substitution matches structurally.
+                let unwrap = |t: &Type| {
+                    crate::passes::core::lower::resolve_transparent(
+                        t, &self.infer.transparent,
+                    )
+                };
                 let concrete = match &expr.ty {
                     Type::Arrow(call_params, ret) => {
                         let mut full = Vec::with_capacity(captures.len() + call_params.len());
                         for c in captures.iter() {
-                            full.push(c.ty.clone());
+                            full.push(unwrap(&c.ty));
                         }
-                        full.extend_from_slice(call_params);
-                        Type::Arrow(full, ret.clone())
+                        for p in call_params {
+                            full.push(unwrap(p));
+                        }
+                        Type::Arrow(full, Box::new(unwrap(ret)))
                     }
-                    other => other.clone(),
+                    other => unwrap(other),
                 };
                 if let Some(new_sym) = self.specialize_target(*func, &concrete) {
                     *func = new_sym;
@@ -610,6 +624,16 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
 
         // Compute the type-arg substitution. Empty for monomorphic
         // functions; extracted and normalized for polymorphic ones.
+        // Resolution priority for each scheme var:
+        //   1. `extract_substitution` — call-site type binds the var
+        //      via its structural position in `scheme.ty`.
+        //   2. `scheme.var_concretes` — infer already bound the var
+        //      to a concrete type before the var was generalized out
+        //      of `scheme.ty` (e.g., method-constraint ret var
+        //      resolved late at the closure use site).
+        //   3. `default_type` — truly unconstrained (rare, defaults
+        //      to I64 to keep List.sum's `forall a [a.add]. List(a) -> a`
+        //      working when its body fixes `a` via `0` literal).
         let args: Vec<Type> = if stored.scheme.vars.is_empty() {
             Vec::new()
         } else {
@@ -622,6 +646,7 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                 .map(|tv| {
                     extracted
                         .get(tv)
+                        .or_else(|| stored.scheme.var_concretes.get(tv))
                         .cloned()
                         .map_or_else(default_type, |t| normalize_type(&t))
                 })

@@ -50,17 +50,14 @@ fn compile(
     passes::fold_lift::lift(&mut resolved);
     passes::flatten_patterns::flatten(&mut resolved)?;
     // Pre-infer lambda lift: every Lambda becomes a top-level
-    // FuncDef + closure TagDecl + Call(closure_tag, captures).
-    // No `ExprKind::Closure` nodes are produced — inference sees
-    // closure values as ordinary tag-union constructor calls.
-    // See notes/lambda-set-specialization.md "Migration" section.
+    // FuncDef + ExprKind::Closure { func, captures } at the lambda
+    // site. Inference types Closure as Arrow(remaining_params, ret)
+    // after dropping the leading N capture params from the lifted
+    // func's scheme.
     passes::lambda::lift::lift_pre_infer(&mut resolved);
     passes::topo::compute(&mut resolved)?;
     let infer_result = types::infer::check(&mut resolved)?;
     let mut mono = passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
-    // Old post-mono lift now sees no Lambdas — runs but no-ops.
-    // Will be deleted in a later phase once we confirm parity.
-    passes::lambda::lift::lift(&mut mono);
     let lambda_solution = passes::lambda::solve::solve(&mono);
     passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
     passes::lambda::narrow::narrow(&mut mono);

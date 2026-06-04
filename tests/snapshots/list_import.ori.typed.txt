@@ -1,4 +1,8 @@
 module:
+  fn __lifted_19(x):
+    BinOp Mul : I64:
+      Name x : I64
+      IntLit 2 : I64
   type-alias main:
     Arrow:
       params:
@@ -17,10 +21,7 @@ module:
       Let doubled:
         QualifiedCall List.map : List(I64):
           Name xs : List(I64)
-          Lambda(x) : '_:
-            BinOp Mul : I64:
-              Name x : I64
-              IntLit 2 : I64
+          Closure(__lifted_19, []) : (I64) -> I64
       result:
         QualifiedCall List.sum : I64:
           Name doubled : List(I64)

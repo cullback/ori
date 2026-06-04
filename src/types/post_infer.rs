@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{self, Decl, Expr, ExprId, ExprKind, Module, Stmt};
+use crate::ast::{self, Decl, Expr, ExprId, ExprKind, Module, Span, Stmt};
 use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
-use crate::types::engine::Type;
+use crate::types::engine::{Scheme, Type};
 
 /// A callable reference (constructor or method) that inference marked
 /// for eta-expansion into an explicit lambda.
@@ -30,16 +30,22 @@ pub enum EtaInfo {
 /// 2. Copies method resolutions from `resolutions` onto
 ///    `MethodCall.resolved` / `QualifiedCall.resolved`.
 /// 3. Rewrites constructor/method references marked in `eta` into
-///    explicit `Lambda` wrappers.
+///    `ExprKind::Closure { func: __lifted_eta_K, captures: [] }`,
+///    synthesizing the `__lifted_eta_K` FuncDef whose body is the
+///    underlying constructor/method call. New decls and their
+///    schemes are accumulated into `synthesized` for the caller to
+///    splice into the module + func_schemes after this walk.
 pub fn rewrite(
     module: &mut Module<'_>,
     expr_types: &HashMap<ExprId, Type>,
     resolutions: &HashMap<ExprId, String>,
     eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
+    synthesized: &mut Vec<(Decl<'static>, Scheme)>,
 ) {
+    let mut counter: usize = 0;
     for decl in &mut module.decls {
-        rewrite_decl(decl, expr_types, resolutions, eta, symbols);
+        rewrite_decl(decl, expr_types, resolutions, eta, symbols, synthesized, &mut counter);
     }
 }
 
@@ -49,12 +55,16 @@ fn rewrite_decl(
     resolutions: &HashMap<ExprId, String>,
     eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
+    synthesized: &mut Vec<(Decl<'static>, Scheme)>,
+    counter: &mut usize,
 ) {
     match decl {
-        Decl::FuncDef { body, .. } => rewrite_expr(body, expr_types, resolutions, eta, symbols),
+        Decl::FuncDef { body, .. } => {
+            rewrite_expr(body, expr_types, resolutions, eta, symbols, synthesized, counter);
+        }
         Decl::TypeAnno { methods, .. } => {
             for m in methods {
-                rewrite_decl(m, expr_types, resolutions, eta, symbols);
+                rewrite_decl(m, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
     }
@@ -66,6 +76,8 @@ fn rewrite_expr(
     resolutions: &HashMap<ExprId, String>,
     eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
+    synthesized: &mut Vec<(Decl<'static>, Scheme)>,
+    counter: &mut usize,
 ) {
     // Step 1: write resolved type onto this node.
     if let Some(ty) = expr_types.get(&expr.id) {
@@ -91,76 +103,76 @@ fn rewrite_expr(
         | ExprKind::StrLit(_)
         | ExprKind::Name(_) => {}
         ExprKind::BinOp { lhs, rhs, .. } => {
-            rewrite_expr(lhs, expr_types, resolutions, eta, symbols);
-            rewrite_expr(rhs, expr_types, resolutions, eta, symbols);
+            rewrite_expr(lhs, expr_types, resolutions, eta, symbols, synthesized, counter);
+            rewrite_expr(rhs, expr_types, resolutions, eta, symbols, synthesized, counter);
         }
         ExprKind::Call { args, .. } | ExprKind::QualifiedCall { args, .. } => {
             for a in args {
-                rewrite_expr(a, expr_types, resolutions, eta, symbols);
+                rewrite_expr(a, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
         ExprKind::Block(stmts, result) => {
             for stmt in stmts {
-                rewrite_stmt(stmt, expr_types, resolutions, eta, symbols);
+                rewrite_stmt(stmt, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
-            rewrite_expr(result, expr_types, resolutions, eta, symbols);
+            rewrite_expr(result, expr_types, resolutions, eta, symbols, synthesized, counter);
         }
         ExprKind::If {
             expr: scrutinee,
             arms,
             else_body,
         } => {
-            rewrite_expr(scrutinee, expr_types, resolutions, eta, symbols);
+            rewrite_expr(scrutinee, expr_types, resolutions, eta, symbols, synthesized, counter);
             for arm in arms {
-                rewrite_arm(arm, expr_types, resolutions, eta, symbols);
+                rewrite_arm(arm, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
             if let Some(eb) = else_body {
-                rewrite_expr(eb, expr_types, resolutions, eta, symbols);
+                rewrite_expr(eb, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
         ExprKind::Fold {
             expr: scrutinee,
             arms,
         } => {
-            rewrite_expr(scrutinee, expr_types, resolutions, eta, symbols);
+            rewrite_expr(scrutinee, expr_types, resolutions, eta, symbols, synthesized, counter);
             for arm in arms {
-                rewrite_arm(arm, expr_types, resolutions, eta, symbols);
+                rewrite_arm(arm, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
         ExprKind::Lambda { body, .. } => {
-            rewrite_expr(body, expr_types, resolutions, eta, symbols);
+            rewrite_expr(body, expr_types, resolutions, eta, symbols, synthesized, counter);
         }
         ExprKind::Record { fields } => {
             for (_, e) in fields {
-                rewrite_expr(e, expr_types, resolutions, eta, symbols);
+                rewrite_expr(e, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
         ExprKind::FieldAccess { record, .. } => {
-            rewrite_expr(record, expr_types, resolutions, eta, symbols);
+            rewrite_expr(record, expr_types, resolutions, eta, symbols, synthesized, counter);
         }
         ExprKind::Tuple(elems) | ExprKind::ListLit(elems) => {
             for e in elems {
-                rewrite_expr(e, expr_types, resolutions, eta, symbols);
+                rewrite_expr(e, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
         ExprKind::MethodCall { receiver, args, .. } => {
-            rewrite_expr(receiver, expr_types, resolutions, eta, symbols);
+            rewrite_expr(receiver, expr_types, resolutions, eta, symbols, synthesized, counter);
             for a in args {
-                rewrite_expr(a, expr_types, resolutions, eta, symbols);
+                rewrite_expr(a, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
         ExprKind::Is { expr: inner, .. } => {
-            rewrite_expr(inner, expr_types, resolutions, eta, symbols);
+            rewrite_expr(inner, expr_types, resolutions, eta, symbols, synthesized, counter);
         }
         ExprKind::RecordUpdate { base, updates } => {
-            rewrite_expr(base, expr_types, resolutions, eta, symbols);
+            rewrite_expr(base, expr_types, resolutions, eta, symbols, synthesized, counter);
             for (_, e) in updates {
-                rewrite_expr(e, expr_types, resolutions, eta, symbols);
+                rewrite_expr(e, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
         ExprKind::Closure { captures, .. } => {
             for c in captures {
-                rewrite_expr(c, expr_types, resolutions, eta, symbols);
+                rewrite_expr(c, expr_types, resolutions, eta, symbols, synthesized, counter);
             }
         }
     }
@@ -173,7 +185,7 @@ fn rewrite_expr(
         )
         && matches!(&expr.ty, Type::Arrow(_, _))
     {
-        eta_expand(expr, info, symbols);
+        eta_expand(expr, info, symbols, synthesized, counter);
     }
 }
 
@@ -183,11 +195,13 @@ fn rewrite_arm(
     resolutions: &HashMap<ExprId, String>,
     eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
+    synthesized: &mut Vec<(Decl<'static>, Scheme)>,
+    counter: &mut usize,
 ) {
     for g in &mut arm.guards {
-        rewrite_expr(g, expr_types, resolutions, eta, symbols);
+        rewrite_expr(g, expr_types, resolutions, eta, symbols, synthesized, counter);
     }
-    rewrite_expr(&mut arm.body, expr_types, resolutions, eta, symbols);
+    rewrite_expr(&mut arm.body, expr_types, resolutions, eta, symbols, synthesized, counter);
 }
 
 fn rewrite_stmt(
@@ -196,17 +210,19 @@ fn rewrite_stmt(
     resolutions: &HashMap<ExprId, String>,
     eta: &HashMap<ExprId, EtaInfo>,
     symbols: &mut SymbolTable,
+    synthesized: &mut Vec<(Decl<'static>, Scheme)>,
+    counter: &mut usize,
 ) {
     match stmt {
         Stmt::Let { val, .. } | Stmt::Destructure { val, .. } => {
-            rewrite_expr(val, expr_types, resolutions, eta, symbols);
+            rewrite_expr(val, expr_types, resolutions, eta, symbols, synthesized, counter);
         }
         Stmt::Guard {
             condition,
             return_val,
         } => {
-            rewrite_expr(condition, expr_types, resolutions, eta, symbols);
-            rewrite_expr(return_val, expr_types, resolutions, eta, symbols);
+            rewrite_expr(condition, expr_types, resolutions, eta, symbols, synthesized, counter);
+            rewrite_expr(return_val, expr_types, resolutions, eta, symbols, synthesized, counter);
         }
         Stmt::TypeHint { .. } => {}
     }
@@ -214,9 +230,22 @@ fn rewrite_stmt(
 
 // ---- Eta expansion ----
 
-/// Replace a marked callable reference with an explicit Lambda that
+/// Replace a marked callable reference with an `ExprKind::Closure`
+/// pointing at a freshly-synthesized `__lifted_eta_K` FuncDef that
 /// forwards its arguments to the underlying call.
-fn eta_expand(expr: &mut Expr<'_>, info: &EtaInfo, symbols: &mut SymbolTable) {
+///
+/// The eta'd lambda has no captures (its body only references its
+/// own params and the global constructor/method), so the resulting
+/// Closure has an empty `captures` vector. The lifted FuncDef and
+/// its monomorphic Scheme are pushed to `synthesized` for the
+/// caller to splice into the module + func_schemes after the walk.
+fn eta_expand(
+    expr: &mut Expr<'_>,
+    info: &EtaInfo,
+    symbols: &mut SymbolTable,
+    synthesized: &mut Vec<(Decl<'static>, Scheme)>,
+    counter: &mut usize,
+) {
     let Type::Arrow(param_types, ret_ty) = expr.ty.clone() else {
         unreachable!("caller checked expr.ty is Arrow");
     };
@@ -227,7 +256,7 @@ fn eta_expand(expr: &mut Expr<'_>, info: &EtaInfo, symbols: &mut SymbolTable) {
             symbols.fresh(name, span, SymbolKind::Local)
         })
         .collect();
-    let call_args: Vec<Expr<'_>> = param_syms
+    let call_args: Vec<Expr<'static>> = param_syms
         .iter()
         .zip(param_types.iter())
         .map(|(sym, ty)| {
@@ -257,13 +286,32 @@ fn eta_expand(expr: &mut Expr<'_>, info: &EtaInfo, symbols: &mut SymbolTable) {
             }
         }
     };
-    let mut inner_expr = Expr::new(inner_kind, span);
-    inner_expr.ty = *ret_ty;
+    let mut body_expr = Expr::new(inner_kind, span);
+    body_expr.ty = (*ret_ty).clone();
 
-    expr.kind = ExprKind::Lambda {
+    let id = *counter;
+    *counter += 1;
+    let lifted_name = format!("__lifted_eta_{id}");
+    let lifted_sym = symbols.fresh(&lifted_name, span, SymbolKind::Func);
+
+    let scheme = Scheme::mono(Type::Arrow(param_types, ret_ty));
+    let lifted_decl: Decl<'static> = Decl::FuncDef {
+        span: synth_span(span),
+        name: lifted_sym,
         params: param_syms,
-        body: Box::new(inner_expr),
+        body: body_expr,
+        doc: None,
     };
+    synthesized.push((lifted_decl, scheme));
+
+    expr.kind = ExprKind::Closure {
+        func: lifted_sym,
+        captures: Vec::new(),
+    };
+}
+
+fn synth_span(s: Span) -> Span {
+    s
 }
 
 /// True if `type_name.method` is a compiler-intrinsic numeric method.

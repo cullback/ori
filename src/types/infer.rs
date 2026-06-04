@@ -339,6 +339,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     vars: tvars.clone(),
                     constraints: vec![],
                     ty: con_type,
+                    var_concretes: HashMap::new(),
                 },
             );
         }
@@ -400,6 +401,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         vars: tvars,
                         constraints: vec![],
                         ty: anno_ty,
+                        var_concretes: HashMap::new(),
                     };
                     self.env.insert(mangled, scheme);
                 }
@@ -1937,12 +1939,14 @@ pub fn check(
             vars: vec![],
             constraints: vec![],
             ty: Type::Arrow(vec![param_ty.clone()], Box::new(Type::Con("Str".to_owned()))),
+            var_concretes: HashMap::new(),
         };
         ctx.env.insert(format!("{}.to_str", num.name()), to_str_scheme);
         let hash_scheme = Scheme {
             vars: vec![],
             constraints: vec![],
             ty: Type::Arrow(vec![param_ty], Box::new(Type::Con("U64".to_owned()))),
+            var_concretes: HashMap::new(),
         };
         ctx.env.insert(format!("{}.hash", num.name()), hash_scheme);
     }
@@ -1961,6 +1965,7 @@ pub fn check(
                 vec![Type::Con("Str".to_owned())],
                 Box::new(Type::Var(crash_tv)),
             ),
+            var_concretes: HashMap::new(),
         },
     );
 
@@ -2024,6 +2029,7 @@ pub fn check(
                         vars: tvars,
                         constraints: vec![],
                         ty: alias_ty,
+                        var_concretes: HashMap::new(),
                     };
                     if let Some(mod_name) = scope.qualified_types.get(name) {
                         let qual = format!("{mod_name}.{name}");
@@ -2166,7 +2172,7 @@ pub fn check(
         .collect();
 
     // Collect resolved function/method schemes for monomorphization.
-    let func_schemes: HashMap<String, Scheme> = ctx
+    let mut func_schemes: HashMap<String, Scheme> = ctx
         .env
         .iter()
         .map(|(name, scheme)| {
@@ -2183,12 +2189,26 @@ pub fn check(
                     }
                 })
                 .collect();
+            // For each scheme.var, record its post-infer resolution
+            // if it bound to a concrete type. Mono uses this to fill
+            // in substitutions that `extract_substitution` can't reach
+            // (vars not appearing in scheme.ty after late-resolved
+            // unification — surfaces for lifted-lambda schemes whose
+            // method-constraint ret var binds at the closure use site).
+            let mut var_concretes: HashMap<TypeVar, Type> = HashMap::new();
+            for (orig_tv, resolved_tv) in scheme.vars.iter().zip(resolved_vars.iter()) {
+                let resolved = ctx.engine.resolve(&Type::Var(*orig_tv));
+                if !matches!(resolved, Type::Var(_)) {
+                    var_concretes.insert(*resolved_tv, resolved);
+                }
+            }
             (
                 name.clone(),
                 Scheme {
                     vars: resolved_vars,
                     constraints: scheme.constraints.clone(),
                     ty: resolved_ty,
+                    var_concretes,
                 },
             )
         })
@@ -2206,6 +2226,7 @@ pub fn check(
                     vars: scheme.vars.clone(),
                     constraints: scheme.constraints.clone(),
                     ty: resolved_ty,
+                    var_concretes: HashMap::new(),
                 },
             )
         })
@@ -2218,14 +2239,25 @@ pub fn check(
 
     // Single combined post-inference walk: write resolved types onto
     // Expr::ty, write method resolutions onto MethodCall/QualifiedCall
-    // nodes, and eta-expand constructor/method references.
+    // nodes, and eta-expand constructor/method references into
+    // __lifted_eta_K FuncDefs + Closure values. The synthesized
+    // decls and their schemes are spliced in afterwards.
+    let mut eta_synthesized: Vec<(crate::ast::Decl<'static>, Scheme)> = Vec::new();
     super::post_infer::rewrite(
         module,
         &expr_types,
         &ctx.method_resolutions,
         &ctx.eta_expansions,
         symbols,
+        &mut eta_synthesized,
     );
+    for (decl, scheme) in eta_synthesized {
+        if let crate::ast::Decl::FuncDef { name, .. } = &decl {
+            let display = symbols.display(*name).to_owned();
+            func_schemes.insert(display, scheme);
+        }
+        module.decls.push(decl);
+    }
 
     Ok(InferResult {
         func_schemes,
