@@ -827,11 +827,19 @@ fn extract_substitution_with(
                 extract_substitution_with(x, y, out, transparent);
             }
         }
-        (Type::Arrow(p1, r1, _), Type::Arrow(p2, r2, _)) if p1.len() == p2.len() => {
+        (Type::Arrow(p1, r1, ls1), Type::Arrow(p2, r2, ls2)) if p1.len() == p2.len() => {
             for (x, y) in p1.iter().zip(p2.iter()) {
                 extract_substitution_with(x, y, out, transparent);
             }
             extract_substitution_with(r1, r2, out, transparent);
+            // Phase D: extract lambda-set var bindings. If scheme has
+            // `Some(Var(rv))` (open row) and concrete has any row
+            // content, bind rv → that content. process_request then
+            // substitutes the row into the body, preserving the
+            // call-site's closure-shape info.
+            if let (Some(s_ls), Some(c_ls)) = (ls1.as_deref(), ls2.as_deref()) {
+                extract_substitution_with(s_ls, c_ls, out, transparent);
+            }
         }
         (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
             for (x, y) in a.iter().zip(b.iter()) {
