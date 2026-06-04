@@ -130,6 +130,7 @@ pub fn specialize<'src>(
         ctx.worklist.push_back(SpecRequest {
             name: main_name,
             substitution: Vec::new(),
+            extra_mapping: HashMap::new(),
             spec_sym: main_sym,
         });
 
@@ -214,6 +215,15 @@ struct SpecRequest {
     /// The concrete types to substitute for the scheme's type vars.
     /// Empty for identity specializations of monomorphic functions.
     substitution: Vec<Type>,
+    /// Additional `TypeVar → Type` bindings for vars that appear in
+    /// `scheme.ty` but not in `scheme.vars` — extracted from the
+    /// call-site concrete via the transparent-aware
+    /// `extract_substitution_with`. Carries foreign vars whose
+    /// concrete value is determined at the use site (e.g. a row var
+    /// from the enclosing scope leaking into a lifted lambda's
+    /// scheme.ty). Without this, body substitution would default
+    /// such vars to I64 and mistype downstream method-call sites.
+    extra_mapping: HashMap<TypeVar, Type>,
     /// The `SymbolId` the resulting `FuncDef` should carry.
     spec_sym: SymbolId,
 }
@@ -344,11 +354,16 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
         let scheme_vars = stored.scheme.vars.clone();
         let doc = stored.doc.clone();
 
-        let mapping: HashMap<TypeVar, Type> = scheme_vars
+        let mut mapping: HashMap<TypeVar, Type> = scheme_vars
             .iter()
             .zip(req.substitution.iter())
             .map(|(v, t)| (*v, t.clone()))
             .collect();
+        // Layer in foreign-var bindings (vars that appear in
+        // scheme.ty but not scheme.vars). See SpecRequest.extra_mapping.
+        for (v, t) in &req.extra_mapping {
+            mapping.entry(*v).or_insert_with(|| t.clone());
+        }
 
         substitute_types_in_expr(&mut body, &mapping);
         self.rewrite_calls_in_expr(&mut body);
@@ -518,6 +533,7 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                             self.worklist.push_back(SpecRequest {
                                 name,
                                 substitution: Vec::new(),
+                                extra_mapping: HashMap::new(),
                                 spec_sym: orig_sym,
                             });
                         }
@@ -634,24 +650,41 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
         //   3. `default_type` — truly unconstrained (rare, defaults
         //      to I64 to keep List.sum's `forall a [a.add]. List(a) -> a`
         //      working when its body fixes `a` via `0` literal).
-        let args: Vec<Type> = if stored.scheme.vars.is_empty() {
-            Vec::new()
-        } else {
-            let mut extracted: HashMap<TypeVar, Type> = HashMap::new();
-            extract_substitution(&stored.scheme.ty, concrete, &mut extracted);
-            stored
-                .scheme
-                .vars
-                .iter()
-                .map(|tv| {
-                    extracted
-                        .get(tv)
-                        .or_else(|| stored.scheme.var_concretes.get(tv))
-                        .cloned()
-                        .map_or_else(default_type, |t| normalize_type(&t))
-                })
-                .collect()
-        };
+        let (args, extra_mapping): (Vec<Type>, HashMap<TypeVar, Type>) =
+            if stored.scheme.vars.is_empty() {
+                (Vec::new(), HashMap::new())
+            } else {
+                let mut extracted: HashMap<TypeVar, Type> = HashMap::new();
+                extract_substitution_with(
+                    &stored.scheme.ty,
+                    concrete,
+                    &mut extracted,
+                    Some(&self.infer.transparent),
+                );
+                let var_set: std::collections::HashSet<TypeVar> =
+                    stored.scheme.vars.iter().copied().collect();
+                let args: Vec<Type> = stored
+                    .scheme
+                    .vars
+                    .iter()
+                    .map(|tv| {
+                        extracted
+                            .get(tv)
+                            .or_else(|| stored.scheme.var_concretes.get(tv))
+                            .cloned()
+                            .map_or_else(default_type, |t| normalize_type(&t))
+                    })
+                    .collect();
+                // Foreign vars: ones that appeared in scheme.ty but
+                // are NOT in scheme.vars. Carry them in extra_mapping
+                // so process_request substitutes them in the body.
+                let extra: HashMap<TypeVar, Type> = extracted
+                    .into_iter()
+                    .filter(|(tv, _)| !var_set.contains(tv))
+                    .map(|(tv, t)| (tv, normalize_type(&t)))
+                    .collect();
+                (args, extra)
+            };
 
         // Two cases where we reuse the original sym with no rewrite:
         //   - Free function, monomorphic identity spec: the original
@@ -668,7 +701,7 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
 
         let spec_sym = if reuse_original {
             let orig_sym = self.original_syms[name];
-            self.enqueue(name, Vec::new(), orig_sym);
+            self.enqueue(name, Vec::new(), extra_mapping, orig_sym);
             return None;
         } else {
             let display = if args.is_empty() {
@@ -686,18 +719,25 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
             self.symbols.fresh(display, stored.span, kind)
         };
 
-        self.enqueue(name, args, spec_sym);
+        self.enqueue(name, args, extra_mapping, spec_sym);
         Some(spec_sym)
     }
 
     /// Record a `(name, args)` → `spec_sym` binding in `spec_map`
     /// and push a worklist entry to later process the body.
-    fn enqueue(&mut self, name: &str, args: Vec<Type>, spec_sym: SymbolId) {
+    fn enqueue(
+        &mut self,
+        name: &str,
+        args: Vec<Type>,
+        extra_mapping: HashMap<TypeVar, Type>,
+        spec_sym: SymbolId,
+    ) {
         let key = (name.to_owned(), args.clone());
         self.spec_map.insert(key, spec_sym);
         self.worklist.push_back(SpecRequest {
             name: name.to_owned(),
             substitution: args,
+            extra_mapping,
             spec_sym,
         });
     }
@@ -739,6 +779,32 @@ fn build_new_infer_result(
 /// Walk `scheme_ty` alongside `concrete_ty` and record every
 /// `TypeVar → Type` mapping needed to make them match.
 fn extract_substitution(scheme_ty: &Type, concrete_ty: &Type, out: &mut HashMap<TypeVar, Type>) {
+    extract_substitution_with(scheme_ty, concrete_ty, out, None);
+}
+
+fn extract_substitution_with(
+    scheme_ty: &Type,
+    concrete_ty: &Type,
+    out: &mut HashMap<TypeVar, Type>,
+    transparent: Option<&crate::passes::core::lower::TransparentTable>,
+) {
+    // If the two types have mismatching outer shapes but one (or
+    // both) is a transparent newtype, unwrap and retry. This lets
+    // mono extract substitutions across the transparent boundary —
+    // e.g. scheme.ty is `App("Set", [V])` while concrete is the
+    // underlying record (or vice versa), depending on whether the
+    // inferred type was captured pre- or post-unwrap. Without this
+    // the extract misses the bind and the var defaults to I64.
+    if let Some(tt) = transparent {
+        let scheme_is_transparent = matches!(scheme_ty, Type::App(n, _) | Type::Con(n) if tt.contains_key(n));
+        let concrete_is_transparent = matches!(concrete_ty, Type::App(n, _) | Type::Con(n) if tt.contains_key(n));
+        if scheme_is_transparent != concrete_is_transparent {
+            let s_unwrapped = crate::passes::core::lower::resolve_transparent(scheme_ty, tt);
+            let c_unwrapped = crate::passes::core::lower::resolve_transparent(concrete_ty, tt);
+            extract_substitution_with(&s_unwrapped, &c_unwrapped, out, transparent);
+            return;
+        }
+    }
     match (scheme_ty, concrete_ty) {
         (Type::Var(v), _) => {
             out.insert(*v, concrete_ty.clone());
@@ -747,18 +813,18 @@ fn extract_substitution(scheme_ty: &Type, concrete_ty: &Type, out: &mut HashMap<
         (Type::Con(a), Type::Con(b)) if a == b => {}
         (Type::App(n1, a1), Type::App(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
             for (x, y) in a1.iter().zip(a2.iter()) {
-                extract_substitution(x, y, out);
+                extract_substitution_with(x, y, out, transparent);
             }
         }
         (Type::Arrow(p1, r1), Type::Arrow(p2, r2)) if p1.len() == p2.len() => {
             for (x, y) in p1.iter().zip(p2.iter()) {
-                extract_substitution(x, y, out);
+                extract_substitution_with(x, y, out, transparent);
             }
-            extract_substitution(r1, r2, out);
+            extract_substitution_with(r1, r2, out, transparent);
         }
         (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
             for (x, y) in a.iter().zip(b.iter()) {
-                extract_substitution(x, y, out);
+                extract_substitution_with(x, y, out, transparent);
             }
         }
         (
@@ -773,7 +839,7 @@ fn extract_substitution(scheme_ty: &Type, concrete_ty: &Type, out: &mut HashMap<
         ) => {
             for (name, t1) in f1 {
                 if let Some((_, t2)) = f2.iter().find(|(n, _)| n == name) {
-                    extract_substitution(t1, t2, out);
+                    extract_substitution_with(t1, t2, out, transparent);
                 }
             }
             // Row polymorphism: if scheme has an open row and
@@ -810,7 +876,7 @@ fn extract_substitution(scheme_ty: &Type, concrete_ty: &Type, out: &mut HashMap<
             for (name, p1) in t1 {
                 if let Some((_, p2)) = t2.iter().find(|(n, _)| n == name) {
                     for (x, y) in p1.iter().zip(p2.iter()) {
-                        extract_substitution(x, y, out);
+                        extract_substitution_with(x, y, out, transparent);
                     }
                 }
             }
