@@ -358,6 +358,19 @@ pub enum Expr {
         elem_ty: Type,
         ty: Type,
     },
+
+    /// `Cast { src, dest_ty, bitcast, ty }` — a scalar conversion
+    /// (e.g. `U8 → U32` zero-extend, `F64 → U64` bitcast). Lowers
+    /// directly to SSA's `Cast` or `BitCast` instruction. `bitcast =
+    /// true` preserves the bit pattern (used for `to_bits` /
+    /// `from_bits`); `false` does a typed cast (zero/sign-extend,
+    /// truncate).
+    Cast {
+        src: Box<Expr>,
+        dest_ty: crate::ssa::ScalarType,
+        bitcast: bool,
+        ty: Type,
+    },
 }
 
 impl Expr {
@@ -378,7 +391,8 @@ impl Expr {
             | Self::ListRange { ty, .. }
             | Self::ListWalk { ty, .. }
             | Self::ListAppend { ty, .. }
-            | Self::ListSet { ty, .. } => ty,
+            | Self::ListSet { ty, .. }
+            | Self::Cast { ty, .. } => ty,
         }
     }
 }

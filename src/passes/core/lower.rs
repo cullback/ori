@@ -441,6 +441,14 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 }]);
             }
             if name.starts_with("__builtin.") {
+                // Unary numeric conversions (`__builtin.to_u8`,
+                // `__builtin.from_u8`, `__builtin.to_bits`, etc.)
+                // dispatch on `segments[0]` (the receiver type) for
+                // the destination scalar. Mirrors existing-lower's
+                // call.rs handling.
+                if let Some(prim) = try_lower_unary_builtin(ctx, name, segments, args, &ast.ty)? {
+                    return Ok(prim);
+                }
                 return Err(format!(
                     "core::lower_expr: QualifiedCall to intrinsic `{name}` not yet handled"
                 ));
@@ -502,6 +510,14 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 }]);
             }
             if name.starts_with("__builtin.") {
+                // Unary numeric conversions on a method receiver.
+                // We pass the receiver as the single "arg" — the
+                // helper inspects ast.ty (the call's result) to
+                // determine the destination scalar.
+                let combined = vec![(**receiver).clone()];
+                if let Some(prim) = try_lower_unary_builtin(ctx, name, &[], &combined, &ast.ty)? {
+                    return Ok(prim);
+                }
                 return Err(format!(
                     "core::lower_expr: MethodCall to intrinsic `{name}` not yet handled"
                 ));
@@ -1083,6 +1099,104 @@ fn is_stdlib_intrinsic(name: &str) -> bool {
         | "List.range" | "List.walk" | "List.walk_until"
         | "crash"
     )
+}
+
+/// Lower unary numeric conversion builtins (`__builtin.to_u8`,
+/// `__builtin.from_u8`, `__builtin.to_u64`, `__builtin.to_i64`,
+/// `__builtin.to_bits`, `__builtin.from_bits`) to a Core `Cast`
+/// expression.
+///
+/// `segments` is the QualifiedCall's segments (e.g. `["U32",
+/// "from_u8"]` — the receiver type lives in `segments[0]`). For
+/// MethodCall form, `segments` is empty and the receiver type is
+/// inferred from the receiver expression's type instead.
+///
+/// `result_ty` is the call expression's result type — for `to_u8`,
+/// `to_u64`, `to_i64`, and `from_bits`, the destination scalar is
+/// determined by it. For `from_u8` the destination is read from
+/// `segments[0]` (QualifiedCall) or from `result_ty` (either form).
+/// For `to_bits` the destination is the matching unsigned width of
+/// the source signed type (or `U64` for `F64`).
+fn try_lower_unary_builtin(
+    ctx: &mut LowerCtx<'_>,
+    name: &str,
+    segments: &[&str],
+    args: &[crate::ast::Expr<'_>],
+    result_ty: &Type,
+) -> Result<Option<Vec<Expr>>, String> {
+    use crate::ssa::ScalarType;
+    let Some(op_name) = name.strip_prefix("__builtin.") else {
+        return Ok(None);
+    };
+    if args.len() != 1 {
+        return Ok(None);
+    }
+    let src = lower_expr(ctx, &args[0])?;
+    // Pick the destination scalar based on the builtin's name +
+    // available type info.
+    let result_scalar = scalar_type_of(result_ty);
+    let (dest_ty, bitcast) = match op_name {
+        "to_u8" => (ScalarType::U8, false),
+        "to_u64" => (ScalarType::U64, false),
+        "to_i64" => (ScalarType::I64, false),
+        "from_u8" => {
+            // U32.from_u8 vs U64.from_u8 — destination determined by
+            // result type (or by segments[0] if available).
+            let dest = if let Some(t) = segments.first().and_then(|s| scalar_from_type_name(s)) {
+                t
+            } else {
+                result_scalar.unwrap_or(ScalarType::U64)
+            };
+            (dest, false)
+        }
+        "to_bits" => {
+            // Map signed → unsigned of same width; F64 → U64.
+            let recv_name = segments.first().copied().unwrap_or("");
+            let dest = match recv_name {
+                "I8" => ScalarType::U8,
+                "I16" => ScalarType::U16,
+                "I32" => ScalarType::U32,
+                "I64" | "F64" => ScalarType::U64,
+                _ => result_scalar.unwrap_or(ScalarType::U64),
+            };
+            (dest, true)
+        }
+        "from_bits" => (ScalarType::F64, true),
+        _ => return Ok(None),
+    };
+    Ok(Some(vec![Expr::Cast {
+        src: Box::new(src),
+        dest_ty,
+        bitcast,
+        ty: result_ty.clone(),
+    }]))
+}
+
+/// Scalar from a type-name string (e.g. `"U32"` → `ScalarType::U32`).
+/// Returns `None` for non-numeric type names.
+fn scalar_from_type_name(name: &str) -> Option<crate::ssa::ScalarType> {
+    use crate::ssa::ScalarType;
+    Some(match name {
+        "I8" => ScalarType::I8,
+        "U8" => ScalarType::U8,
+        "I16" => ScalarType::I16,
+        "U16" => ScalarType::U16,
+        "I32" => ScalarType::I32,
+        "U32" => ScalarType::U32,
+        "I64" => ScalarType::I64,
+        "U64" => ScalarType::U64,
+        "F64" => ScalarType::F64,
+        _ => return None,
+    })
+}
+
+/// Scalar from a `Type::Con(name)`. Returns `None` for non-Con or
+/// non-numeric types.
+fn scalar_type_of(ty: &Type) -> Option<crate::ssa::ScalarType> {
+    match ty {
+        Type::Con(name) => scalar_from_type_name(name),
+        _ => None,
+    }
 }
 
 /// Map a `__builtin.<op>` intrinsic name to its Core `BinOp` if it

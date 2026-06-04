@@ -132,6 +132,13 @@ fn recurse(expr: Expr) -> Expr {
             elem_ty,
             ty,
         },
+
+        Expr::Cast { src, dest_ty, bitcast, ty } => Expr::Cast {
+            src: Box::new(simplify(*src)),
+            dest_ty,
+            bitcast,
+            ty,
+        },
     }
 }
 

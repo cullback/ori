@@ -710,6 +710,18 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(ctx.builder.binop(*op, l, r, result_ty))
         }
 
+        Expr::Cast { src, dest_ty, bitcast, .. } => {
+            // Numeric conversion. `bitcast` preserves the bit
+            // pattern (to_bits / from_bits); regular cast does
+            // zero/sign-extend or truncate as the SSA op dictates.
+            let v = lower(ctx, src)?;
+            Ok(if *bitcast {
+                ctx.builder.bitcast(v, *dest_ty)
+            } else {
+                ctx.builder.cast(v, *dest_ty)
+            })
+        }
+
         Expr::App { target, args, ty } => {
             // Use lower_slots for args so multi-slot args (records,
             // payload Cons, multi-result Calls) spread into multiple
