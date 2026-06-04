@@ -118,6 +118,15 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
+        Expr::ListWalkUntil { list_slots, init, target, captures, elem_ty, ty } => Expr::ListWalkUntil {
+            list_slots: list_slots.into_iter().map(simplify).collect(),
+            init: init.into_iter().map(simplify).collect(),
+            target,
+            captures: captures.into_iter().map(simplify).collect(),
+            elem_ty,
+            ty,
+        },
+
         Expr::ListAppend { list_slots, val_slots, elem_ty, ty } => Expr::ListAppend {
             list_slots: list_slots.into_iter().map(simplify).collect(),
             val_slots: val_slots.into_iter().map(simplify).collect(),

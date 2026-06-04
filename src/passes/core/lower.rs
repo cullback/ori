@@ -837,6 +837,57 @@ fn try_lower_stdlib_intrinsic(
                 ty: ret_ty.clone(),
             }]))
         }
+        "List.walk_until" => {
+            // Method form: args == [xs, init, closure_expr]. Same
+            // shape as List.walk but the closure returns Step(b).
+            // Bails when the acc type has a nested multi-slot field
+            // (List, nested record): Core's recursive `expand_slots`
+            // would fan those out into multiple SSA params, but
+            // existing-lower (which compiles the lifted closure)
+            // collapses each record field to a single ScalarType.
+            // The arity mismatch shows up as wrong-typed Eq at
+            // runtime. Simple I64/scalar acc walks work fine.
+            if args.len() != 3 {
+                return Err(format!(
+                    "core::lower_expr: List.walk_until expects 3 args, got {}",
+                    args.len()
+                ));
+            }
+            let xs = &args[0];
+            let init = &args[1];
+            let closure_expr = &args[2];
+            if has_nested_multi_slot_field(&init.ty, &ctx.transparent) {
+                return Ok(None);
+            }
+            let Some(target_func) = resolve_closure_target_name(ctx, closure_expr) else {
+                return Ok(None);
+            };
+            let xs_ty = resolve_transparent(&xs.ty, &ctx.transparent);
+            let elem_ty = match &xs_ty {
+                Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
+                _ => return Ok(None),
+            };
+            let list_slots = lower_expr_slots_expanded(ctx, xs)?;
+            let init_slots = lower_expr_slots(ctx, init)?;
+            let captures = match &closure_expr.kind {
+                ExprKind::Call { args: cap_args, .. } => {
+                    let mut all = Vec::new();
+                    for a in cap_args {
+                        all.extend(lower_expr_slots(ctx, a)?);
+                    }
+                    all
+                }
+                _ => return Ok(None),
+            };
+            return Ok(Some(vec![Expr::ListWalkUntil {
+                list_slots,
+                init: init_slots,
+                target: target_func,
+                captures,
+                elem_ty,
+                ty: ret_ty.clone(),
+            }]));
+        }
         "List.walk" => {
             // Method form: args == [xs, init, closure_expr].
             // Singleton-closure direct-call only — bail if the
@@ -1252,6 +1303,34 @@ fn rewrite_is_if_to_match<'src>(
     rewritten.id = id;
     rewritten.ty = ty.clone();
     Some(rewritten)
+}
+
+/// Returns true if `ty` is a Record or Tuple whose `expand_slots`
+/// would produce more slots than existing-lower's `scalar_type`-per-
+/// field flattening. Used by Core's HOF lowerers to bail when the
+/// acc type's slot count would disagree with the lifted closure's
+/// SSA signature (compiled by existing-lower).
+fn has_nested_multi_slot_field(ty: &Type, transparent: &TransparentTable) -> bool {
+    let unwrapped = resolve_transparent(ty, transparent);
+    match &unwrapped {
+        Type::Record { fields, .. } => fields.iter().any(|(_, fty)| field_expands_beyond_scalar(fty, transparent)),
+        Type::Tuple(tys) => tys.iter().any(|t| field_expands_beyond_scalar(t, transparent)),
+        _ => false,
+    }
+}
+
+/// Helper for `has_nested_multi_slot_field`: a field expands to
+/// multiple slots if it's a List, a multi-field Record, or a nested
+/// Tuple — these are the cases where Core's recursive expand
+/// diverges from existing-lower's scalar_type-per-field collapse.
+fn field_expands_beyond_scalar(ty: &Type, transparent: &TransparentTable) -> bool {
+    let unwrapped = resolve_transparent(ty, transparent);
+    match &unwrapped {
+        Type::App(name, _) if name == "List" => true,
+        Type::Record { fields, .. } => !fields.is_empty(),
+        Type::Tuple(tys) => !tys.is_empty(),
+        _ => false,
+    }
 }
 
 fn is_stdlib_intrinsic(name: &str) -> bool {

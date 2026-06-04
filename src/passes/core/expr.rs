@@ -331,6 +331,20 @@ pub enum Expr {
         ty: Type,
     },
 
+    /// Same as `ListWalk`, except `target`'s return is a `Step(b)`
+    /// tag union (`[Continue(b), Break(b)]`). After each step call,
+    /// the loop dispatches on the tag: `Continue` → next iteration
+    /// with payload as new acc; `Break` → jump to `done` with
+    /// payload as result.
+    ListWalkUntil {
+        list_slots: Vec<Expr>,
+        init: Vec<Expr>,
+        target: String,
+        captures: Vec<Expr>,
+        elem_ty: Type,
+        ty: Type,
+    },
+
     /// `ListAppend(list_slots, val_slots, elem_ty, ty)` — produces
     /// a new `(len, cap, data)` trio with `val_slots` written at
     /// index `len`. For multi-slot elements (records, Str, nested
@@ -390,6 +404,7 @@ impl Expr {
             | Self::BufLoad { ty, .. }
             | Self::ListRange { ty, .. }
             | Self::ListWalk { ty, .. }
+            | Self::ListWalkUntil { ty, .. }
             | Self::ListAppend { ty, .. }
             | Self::ListSet { ty, .. }
             | Self::Cast { ty, .. } => ty,
