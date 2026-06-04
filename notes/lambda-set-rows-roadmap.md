@@ -100,9 +100,29 @@ The row-polymorphism template already exists in `Type::Record` and
     `Expr::App`. Closes Pos/Neg/Wrapped/Wrap-style patterns.
   - **M, N, O**: not started.
 
-**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5% → 93.9%**
-(+17 tests through Core in this session push). All 308 tests pass
+**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5% → 93.9% → 94.3%**
+(+18 tests through Core in this session push). All 308 tests pass
 throughout.
+
+### Phase H++ (93.9% → 94.3%, +1 test, but deletes the convention smell)
+
+The "two `expand_slots` conventions" framing turned out to be wrong.
+Tracing showed Core and existing-lower already shared the
+alphabetical-field convention — the divergence was that
+`apply_mapping` (in mono's specialization) and Core's
+`ExprKind::Record` construction both iterated fields in their input
+order instead of sorting. When mono substituted type vars into a
+record-typed scheme, the substituted result had fields in pre-
+substitution order, which could be source order. Downstream
+consumers (`expand_slots`, `field_slice`, lower's per-param SSA
+fanout) all assumed canonical alphabetical order.
+
+Two-line fix: sort in `apply_mapping`'s Record branch, sort in
+Core's `Record` construction. Removed `has_nested_multi_slot_field`
++ `field_expands_beyond_scalar` (45 lines deleted). The walk_until
+guard is gone — `List.walk_until` now handles record-with-List accs
+in Core without falling back. 5 walk_until fallback variants closed
+structurally.
 
 ### Phase H+ (92.5% → 93.9%, +3 tests)
 
