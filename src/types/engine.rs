@@ -220,6 +220,20 @@ impl TypeEngine {
         Type::Var(tv)
     }
 
+    /// Build an `Arrow` with a fresh open lambda-set row. Use this
+    /// instead of `Type::Arrow(p, Box::new(r), None)` at construction
+    /// sites that produce function types during inference — the open
+    /// row lets call-site unification merge in whichever closures
+    /// flow through, so the row survives into the resolved scheme
+    /// (the var gets bound to the merged set).
+    ///
+    /// Closure values use a singleton closed row directly, not this
+    /// helper (see infer's `ExprKind::Closure` arm).
+    pub fn fresh_arrow(&mut self, params: Vec<Type>, ret: Type) -> Type {
+        let row = self.fresh();
+        Type::Arrow(params, Box::new(ret), Some(Box::new(row)))
+    }
+
     // ---- Substitution ----
 
     pub fn resolve(&self, ty: &Type) -> Type {

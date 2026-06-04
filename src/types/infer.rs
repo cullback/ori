@@ -233,11 +233,8 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 for p in params {
                     param_types.push(self.type_expr_to_type(p, tvar_env)?);
                 }
-                Ok(Type::Arrow(
-                    param_types,
-                    Box::new(self.type_expr_to_type(ret, tvar_env)?),
-                    None,
-                ))
+                let ret_ty = self.type_expr_to_type(ret, tvar_env)?;
+                Ok(self.engine.fresh_arrow(param_types, ret_ty))
             }
             TypeExpr::TagUnion(tags, open) => {
                 // Inline tag union in a type annotation becomes a
@@ -322,7 +319,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 for f in &tag.fields {
                     field_types.push(self.type_expr_to_type(f, &mut tvar_env)?);
                 }
-                Type::Arrow(field_types, Box::new(return_type.clone()), None)
+                self.engine.fresh_arrow(field_types, return_type.clone())
             };
             self.constructors.insert(
                 tag.name.to_owned(),
@@ -363,7 +360,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         let param_types: Vec<Type> =
                             params.iter().map(|_| self.engine.fresh()).collect();
                         let ret = self.engine.fresh();
-                        let func_ty = Type::Arrow(param_types.clone(), Box::new(ret.clone()), None);
+                        let func_ty = self.engine.fresh_arrow(param_types.clone(), ret.clone());
                         // Collect the fresh vars used in the pre-scheme
                         // and quantify the scheme over them. Otherwise
                         // these vars stay free in env, so when another
@@ -577,7 +574,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 tags: vec![(name, expected_params.clone())],
                 rest: Some(Box::new(rest)),
             };
-            Type::Arrow(expected_params, Box::new(ret_ty), None)
+            self.engine.fresh_arrow(expected_params, ret_ty)
         };
 
         self.unify_at(&con_arrow, expected, span)?;
@@ -1062,7 +1059,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             if arg_types.is_empty() && self.constructors.contains_key(func) {
                 return Ok(func_ty);
             }
-            let expected = Type::Arrow(arg_types, Box::new(ret.clone()), None);
+            let expected = self.engine.fresh_arrow(arg_types, ret.clone());
             self.unify_at(&func_ty, &expected, span)?;
             self.maybe_mark_numeric_builtin(func, expr_id, span);
             return Ok(ret);
@@ -1164,7 +1161,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             } else {
                 Type::Var(tv)
             };
-            let method_type = Type::Arrow(vec![Type::Var(tv), Type::Var(tv)], Box::new(ret_ty), None);
+            let method_type = self.engine.fresh_arrow(vec![Type::Var(tv), Type::Var(tv)], ret_ty);
             self.push_constraint(
                 Constraint {
                     type_var: tv,
@@ -1237,7 +1234,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                 let func_ty = self.engine.instantiate(&scheme);
                 let mut full_args = vec![recv_ty];
                 full_args.extend(arg_types);
-                let expected = Type::Arrow(full_args, Box::new(ret.clone()), None);
+                let expected = self.engine.fresh_arrow(full_args, ret.clone());
                 self.unify_at(&func_ty, &expected, span)?;
                 let resolution = if super::post_infer::is_numeric_builtin(name, method) {
                     format!("__builtin.{method}")
@@ -1312,7 +1309,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         if let Type::Var(tv) = resolved {
             let mut param_types = vec![Type::Var(tv)];
             param_types.extend(arg_types);
-            let method_type = Type::Arrow(param_types, Box::new(ret.clone()), None);
+            let method_type = self.engine.fresh_arrow(param_types, ret.clone());
             self.push_constraint(
                 Constraint {
                     type_var: tv,
@@ -1394,7 +1391,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
         let field_types: Vec<Type> =
             fields.iter().map(|_| self.engine.fresh()).collect();
         let con_ret = self.engine.fresh();
-        let arrow = Type::Arrow(field_types.clone(), Box::new(con_ret.clone()), None);
+        let arrow = self.engine.fresh_arrow(field_types.clone(), con_ret.clone());
         self.unify_at(&con_ty, &arrow, span)?;
         self.unify_at(&con_ret, expected, span)?;
 
@@ -1626,7 +1623,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
             } else {
                 let param_types: Vec<Type> = params.iter().map(|_| ctx.engine.fresh()).collect();
                 let ret = ctx.engine.fresh();
-                let func_ty = Type::Arrow(param_types, Box::new(ret), None);
+                let func_ty = ctx.engine.fresh_arrow(param_types, ret);
                 ctx.env
                     .insert(name.to_owned(), Scheme::mono(func_ty.clone()));
                 func_ty
@@ -1634,7 +1631,7 @@ impl<'a, 'src> InferCtx<'a, 'src> {
 
             let param_types: Vec<Type> = params.iter().map(|_| ctx.engine.fresh()).collect();
             let ret = ctx.engine.fresh();
-            let expected = Type::Arrow(param_types.clone(), Box::new(ret.clone()), None);
+            let expected = ctx.engine.fresh_arrow(param_types.clone(), ret.clone());
             ctx.unify_at(&func_ty, &expected, body.span)?;
 
             for (p, ty) in params.iter().zip(param_types.iter()) {
@@ -1872,14 +1869,14 @@ pub fn check(
         let to_str_scheme = Scheme {
             vars: vec![],
             constraints: vec![],
-            ty: Type::Arrow(vec![param_ty.clone()], Box::new(Type::Con("Str".to_owned())), None),
+            ty: ctx.engine.fresh_arrow(vec![param_ty.clone()], Type::Con("Str".to_owned())),
             var_concretes: HashMap::new(),
         };
         ctx.env.insert(format!("{}.to_str", num.name()), to_str_scheme);
         let hash_scheme = Scheme {
             vars: vec![],
             constraints: vec![],
-            ty: Type::Arrow(vec![param_ty], Box::new(Type::Con("U64".to_owned())), None),
+            ty: ctx.engine.fresh_arrow(vec![param_ty], Type::Con("U64".to_owned())),
             var_concretes: HashMap::new(),
         };
         ctx.env.insert(format!("{}.hash", num.name()), hash_scheme);
@@ -1895,10 +1892,9 @@ pub fn check(
         Scheme {
             vars: vec![crash_tv],
             constraints: vec![],
-            ty: Type::Arrow(
+            ty: ctx.engine.fresh_arrow(
                 vec![Type::Con("Str".to_owned())],
-                Box::new(Type::Var(crash_tv)),
-                None,
+                Type::Var(crash_tv),
             ),
             var_concretes: HashMap::new(),
         },

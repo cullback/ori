@@ -642,6 +642,15 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
         //   3. `default_type` — truly unconstrained (rare, defaults
         //      to I64 to keep List.sum's `forall a [a.add]. List(a) -> a`
         //      working when its body fixes `a` via `0` literal).
+        // Identify lambda-set vars structurally. They get substituted
+        // through the body like any var (so process_request's mapping
+        // is complete) but are filtered from the mangled name to keep
+        // it stable. Phase D will use them as a specialization sub-
+        // key separate from the mangled type-arg list.
+        let mut ls_vars: std::collections::HashSet<TypeVar> =
+            std::collections::HashSet::new();
+        collect_lambda_set_vars(&stored.scheme.ty, &mut ls_vars);
+
         let (args, extra_mapping): (Vec<Type>, HashMap<TypeVar, Type>) =
             if stored.scheme.vars.is_empty() {
                 (Vec::new(), HashMap::new())
@@ -696,12 +705,23 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
             self.enqueue(name, Vec::new(), extra_mapping, orig_sym);
             return None;
         } else {
-            let display = if args.is_empty() {
+            // Mangle from the type-arg list with lambda-set vars
+            // stripped — they contribute to per-call-site behavior
+            // (Phase D) but shouldn't appear in the mangled name.
+            let mangle_args: Vec<Type> = stored
+                .scheme
+                .vars
+                .iter()
+                .zip(args.iter())
+                .filter(|(tv, _)| !ls_vars.contains(tv))
+                .map(|(_, t)| t.clone())
+                .collect();
+            let display = if mangle_args.is_empty() {
                 // Mono method identity spec: display is the full
                 // mangled name like `"Bool.not"`.
                 name.to_owned()
             } else {
-                mangle(name, &args)
+                mangle(name, &mangle_args)
             };
             let kind = if stored.is_method {
                 SymbolKind::Method
@@ -948,6 +968,92 @@ fn normalize_type(ty: &Type) -> Type {
             }
         }
         Type::Tuple(elems) => Type::Tuple(elems.iter().map(normalize_type).collect()),
+    }
+}
+
+/// Walk `ty` and collect every TypeVar that appears in a lambda-set
+/// position (the third field of `Type::Arrow`). Used by mono to
+/// distinguish ordinary type-arg vars (which contribute to mangled
+/// names) from row vars (which don't, but still need substitution
+/// through the body).
+fn collect_lambda_set_vars(ty: &Type, out: &mut std::collections::HashSet<TypeVar>) {
+    match ty {
+        Type::Var(_) | Type::Con(_) => {}
+        Type::App(_, args) => {
+            for a in args {
+                collect_lambda_set_vars(a, out);
+            }
+        }
+        Type::Arrow(params, ret, ls) => {
+            for p in params {
+                collect_lambda_set_vars(p, out);
+            }
+            collect_lambda_set_vars(ret, out);
+            if let Some(ls_ty) = ls {
+                // Every var reachable through the lambda-set is a
+                // row-position var. (TagUnion fields can have type
+                // params of their own, but in lambda-set rows the
+                // payload types are capture types — which we DO want
+                // in mangling. So we only mark the row-var-shaped
+                // ones: a bare `Var(_)` directly under LambdaSet, or
+                // a TagUnion's `rest` row variable.)
+                collect_ls_row_vars(ls_ty, out);
+            }
+        }
+        Type::Record { fields, rest } => {
+            for (_, t) in fields {
+                collect_lambda_set_vars(t, out);
+            }
+            if let Some(r) = rest {
+                collect_lambda_set_vars(r, out);
+            }
+        }
+        Type::TagUnion { tags, rest } => {
+            for (_, payloads) in tags {
+                for p in payloads {
+                    collect_lambda_set_vars(p, out);
+                }
+            }
+            if let Some(r) = rest {
+                collect_lambda_set_vars(r, out);
+            }
+        }
+        Type::Tuple(elems) => {
+            for e in elems {
+                collect_lambda_set_vars(e, out);
+            }
+        }
+    }
+}
+
+/// Visit only the lambda-set row variable positions: the bare
+/// `Type::Var(_)` directly under a LambdaSet (an open row), and the
+/// `rest` row var of a TagUnion lambda set. Payload types inside
+/// lambda-set tags are *not* row vars — they're capture types and
+/// continue to contribute to mangling.
+fn collect_ls_row_vars(ls_ty: &Type, out: &mut std::collections::HashSet<TypeVar>) {
+    match ls_ty {
+        Type::Var(tv) => {
+            out.insert(*tv);
+        }
+        Type::TagUnion { tags, rest } => {
+            // Recurse into payloads via collect_lambda_set_vars (they
+            // are normal type positions — only their lambda-set
+            // sub-positions count as row vars).
+            for (_, payloads) in tags {
+                for p in payloads {
+                    collect_lambda_set_vars(p, out);
+                }
+            }
+            if let Some(r) = rest {
+                if let Type::Var(tv) = r.as_ref() {
+                    out.insert(*tv);
+                } else {
+                    collect_ls_row_vars(r, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
