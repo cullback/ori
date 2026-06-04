@@ -624,14 +624,83 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 Some(r) => r,
                 None => {
                     owned = resolve_method_late(ctx, method, &receiver.ty);
-                    if !ctx.funcs.contains(&owned) && !owned.starts_with("__builtin.") {
-                        return Err(format!(
-                            "core::lower_expr: MethodCall resolved to `{owned}` but no such SSA function (would need lazy helper synthesis)"
-                        ));
-                    }
                     &owned
                 }
             };
+            // `__record_equals` / `__tuple_equals` (inference's
+            // placeholder for `==` on records/tuples) routes through
+            // the structural BinOp::Eq path: lower both sides as
+            // multi-slot, pairwise Eq, AND together. Works for any
+            // record/tuple whose every slot is a scalar (no
+            // recursive helpers needed). Heap-bearing slots bail.
+            if name == "__record_equals" || name == "__tuple_equals" {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "core::lower_expr: {name} expects 1 arg, got {}",
+                        args.len()
+                    ));
+                }
+                let lhs_slots = lower_expr_slots(ctx, receiver)?;
+                let rhs_slots = lower_expr_slots(ctx, &args[0])?;
+                if lhs_slots.len() != rhs_slots.len() {
+                    return Err(format!(
+                        "core::lower_expr: {name} slot mismatch — lhs={}, rhs={}",
+                        lhs_slots.len(),
+                        rhs_slots.len()
+                    ));
+                }
+                let recv_ty_unwrapped = resolve_transparent(&receiver.ty, &ctx.transparent);
+                let slot_tys = expand_slots_with(
+                    &recv_ty_unwrapped,
+                    &ctx.fieldless,
+                    &ctx.transparent,
+                    &ctx.payload_unions,
+                );
+                if slot_tys.iter().any(|t| t.is_heap_ptr()) {
+                    return Err(format!(
+                        "core::lower_expr: {name} on heap-bearing fields needs recursive helper synthesis"
+                    ));
+                }
+                let bool_ty = ast.ty.clone();
+                if lhs_slots.is_empty() {
+                    // Empty record/tuple: always equal.
+                    return Ok(vec![Expr::Lit {
+                        value: Literal::Int(1),
+                        ty: bool_ty,
+                    }]);
+                }
+                let mut iter = lhs_slots.into_iter().zip(rhs_slots);
+                let (l0, r0) = iter.next().unwrap();
+                let mut acc = Expr::BinOp {
+                    op: crate::ssa::BinaryOp::Eq,
+                    lhs: Box::new(l0),
+                    rhs: Box::new(r0),
+                    ty: bool_ty.clone(),
+                };
+                for (l, r) in iter {
+                    let slot_eq = Expr::BinOp {
+                        op: crate::ssa::BinaryOp::Eq,
+                        lhs: Box::new(l),
+                        rhs: Box::new(r),
+                        ty: bool_ty.clone(),
+                    };
+                    acc = Expr::BinOp {
+                        op: crate::ssa::BinaryOp::And,
+                        lhs: Box::new(acc),
+                        rhs: Box::new(slot_eq),
+                        ty: bool_ty.clone(),
+                    };
+                }
+                return Ok(vec![acc]);
+            }
+            if !ctx.funcs.contains(name) && !name.starts_with("__builtin.")
+                && !is_stdlib_intrinsic(name)
+                && !builtin_to_binop(name).is_some()
+            {
+                return Err(format!(
+                    "core::lower_expr: MethodCall resolved to `{name}` but no such SSA function (would need lazy helper synthesis)"
+                ));
+            }
             if let Some(op) = builtin_to_binop(name) {
                 if args.len() != 1 {
                     return Err(format!(
