@@ -695,6 +695,32 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
         }
 
         ExprKind::If { expr, arms, else_body } => {
+            // `if (A is X(b)) and (b is Y(c)) then ... else ...`:
+            // the bool-and path lowers each Is as a Bool-returning
+            // Match, so binders from the first Is don't propagate
+            // to the second. Rewrite to nested If:
+            //   if A is X(b) then (if b is Y(c) then ... else f) else f
+            // The inner if sits inside the outer if's True arm where
+            // the outer Is's binders are in scope. Only fires when
+            // arms are the canonical True/False boolean shape (i.e.
+            // not a user pattern Match like `if x : Foo(a) then ...`).
+            if let ExprKind::BinOp { op: crate::ast::BinOp::And, lhs, rhs } = &expr.kind {
+                if let Some(rewritten) = rewrite_and_if_to_nested(
+                    lhs, rhs, arms, else_body.as_deref(), ast.span, ast.id, &ast.ty,
+                ) {
+                    return lower_expr_slots(ctx, &rewritten);
+                }
+            }
+            // `if (A is X(b)) then T else F`: rewrite to a pattern
+            // Match on A so b's binding flows naturally to T. The
+            // bool path would lose the binding.
+            if let ExprKind::Is { expr: scrutinee, pattern } = &expr.kind {
+                if let Some(rewritten) = rewrite_is_if_to_match(
+                    scrutinee, pattern, arms, ast.span, ast.id, &ast.ty,
+                ) {
+                    return lower_expr_slots(ctx, &rewritten);
+                }
+            }
             // The scrutinee may be multi-slot (e.g., matching on a
             // Maybe parameter whose params decomposed to (tag,
             // payload)). lower_expr_slots returns the parallel slot
@@ -1098,6 +1124,131 @@ fn try_lower_stdlib_intrinsic(
 /// list shape) rather than via a registered SSA function.
 /// Catches both bare names (`List.get`) and monomorphized
 /// suffixes (`List.get__I64`).
+/// Rewrite `if (lhs and rhs) then T else F` to
+/// `if lhs then (if rhs then T else F) else F`. Only fires when the
+/// arms are the canonical True/False boolean shape (not a typed
+/// pattern Match) — otherwise we'd transform a user-written Match.
+/// Returns None if the shape doesn't match.
+fn rewrite_and_if_to_nested<'src>(
+    lhs: &AstExpr<'src>,
+    rhs: &AstExpr<'src>,
+    arms: &[crate::ast::MatchArm<'src>],
+    else_body: Option<&AstExpr<'src>>,
+    span: crate::ast::Span,
+    id: crate::ast::ExprId,
+    ty: &Type,
+) -> Option<AstExpr<'src>> {
+    use crate::ast::{ExprKind as AstK, MatchArm, Pattern as AstPat};
+    if arms.len() != 2 {
+        return None;
+    }
+    let true_arm = arms.iter().find(|a| matches!(&a.pattern, AstPat::Constructor { name: "True", .. }))?;
+    let false_arm = arms.iter().find(|a| matches!(&a.pattern, AstPat::Constructor { name: "False", .. }))?;
+    if else_body.is_some() {
+        return None;
+    }
+    let body_t = true_arm.body.clone();
+    let body_f = false_arm.body.clone();
+    let inner_if = {
+        let mut e = AstExpr::new(
+            AstK::If {
+                expr: Box::new(rhs.clone()),
+                arms: vec![
+                    MatchArm {
+                        pattern: AstPat::Constructor { name: "True", fields: vec![] },
+                        guards: vec![],
+                        body: body_t,
+                        is_return: false,
+                    },
+                    MatchArm {
+                        pattern: AstPat::Constructor { name: "False", fields: vec![] },
+                        guards: vec![],
+                        body: body_f.clone(),
+                        is_return: false,
+                    },
+                ],
+                else_body: None,
+            },
+            span,
+        );
+        e.id = id;
+        e.ty = ty.clone();
+        e
+    };
+    let outer_if = {
+        let mut e = AstExpr::new(
+            AstK::If {
+                expr: Box::new(lhs.clone()),
+                arms: vec![
+                    MatchArm {
+                        pattern: AstPat::Constructor { name: "True", fields: vec![] },
+                        guards: vec![],
+                        body: inner_if,
+                        is_return: false,
+                    },
+                    MatchArm {
+                        pattern: AstPat::Constructor { name: "False", fields: vec![] },
+                        guards: vec![],
+                        body: body_f,
+                        is_return: false,
+                    },
+                ],
+                else_body: None,
+            },
+            span,
+        );
+        e.id = id;
+        e.ty = ty.clone();
+        e
+    };
+    Some(outer_if)
+}
+
+/// Rewrite `if (scrutinee is pattern) then T else F` to a pattern
+/// Match on the scrutinee with pattern → T, _ → F. Binders in the
+/// pattern flow naturally into the True arm's body.
+fn rewrite_is_if_to_match<'src>(
+    scrutinee: &AstExpr<'src>,
+    pattern: &crate::ast::Pattern<'src>,
+    arms: &[crate::ast::MatchArm<'src>],
+    span: crate::ast::Span,
+    id: crate::ast::ExprId,
+    ty: &Type,
+) -> Option<AstExpr<'src>> {
+    use crate::ast::{ExprKind as AstK, MatchArm, Pattern as AstPat};
+    if arms.len() != 2 {
+        return None;
+    }
+    let true_arm = arms.iter().find(|a| matches!(&a.pattern, AstPat::Constructor { name: "True", .. }))?;
+    let false_arm = arms.iter().find(|a| matches!(&a.pattern, AstPat::Constructor { name: "False", .. }))?;
+    let body_t = true_arm.body.clone();
+    let body_f = false_arm.body.clone();
+    let mut rewritten = AstExpr::new(
+        AstK::If {
+            expr: Box::new(scrutinee.clone()),
+            arms: vec![
+                MatchArm {
+                    pattern: pattern.clone(),
+                    guards: vec![],
+                    body: body_t,
+                    is_return: false,
+                },
+                MatchArm {
+                    pattern: AstPat::Wildcard,
+                    guards: vec![],
+                    body: body_f,
+                    is_return: false,
+                },
+            ],
+            else_body: None,
+        },
+        span,
+    );
+    rewritten.id = id;
+    rewritten.ty = ty.clone();
+    Some(rewritten)
+}
+
 fn is_stdlib_intrinsic(name: &str) -> bool {
     let base = name.split("__").next().unwrap_or(name);
     // True intrinsics: declared in `standard/list.ori` *without* a
