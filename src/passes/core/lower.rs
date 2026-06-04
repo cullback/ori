@@ -328,6 +328,90 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                         ty: ast.ty.clone(),
                     }])
                 }
+                BinOp::Eq | BinOp::Neq => {
+                    // Multi-slot operands (records/tuples of scalars)
+                    // need slot-wise equality + AND. Single-slot
+                    // operands take the scalar fast path. The
+                    // negation for Neq is one final Xor 1.
+                    let lhs_slots = lower_expr_slots(ctx, lhs)?;
+                    let rhs_slots = lower_expr_slots(ctx, rhs)?;
+                    if lhs_slots.len() == 1 && rhs_slots.len() == 1 {
+                        let result = Expr::BinOp {
+                            op: crate::ssa::BinaryOp::Eq,
+                            lhs: Box::new(lhs_slots.into_iter().next().unwrap()),
+                            rhs: Box::new(rhs_slots.into_iter().next().unwrap()),
+                            ty: ast.ty.clone(),
+                        };
+                        if matches!(op, BinOp::Neq) {
+                            let one = Expr::Lit { value: Literal::Int(1), ty: ast.ty.clone() };
+                            return Ok(vec![Expr::BinOp {
+                                op: crate::ssa::BinaryOp::Xor,
+                                lhs: Box::new(result),
+                                rhs: Box::new(one),
+                                ty: ast.ty.clone(),
+                            }]);
+                        }
+                        return Ok(vec![result]);
+                    }
+                    if lhs_slots.len() != rhs_slots.len() {
+                        return Err(format!(
+                            "core::lower_expr: Eq slot mismatch — lhs={}, rhs={}",
+                            lhs_slots.len(),
+                            rhs_slots.len()
+                        ));
+                    }
+                    // Multi-slot: only safe when every slot is a
+                    // scalar (records/tuples with scalar fields).
+                    // Heap-bearing slots (RcPtr for nested lists or
+                    // records) would need recursive structural eq
+                    // we don't synthesize yet — bail to fallback.
+                    let lhs_ty_unwrapped = resolve_transparent(&lhs.ty, &ctx.transparent);
+                    let slot_tys = expand_slots_with(
+                        &lhs_ty_unwrapped,
+                        &ctx.fieldless,
+                        &ctx.transparent,
+                        &ctx.payload_unions,
+                    );
+                    if slot_tys.iter().any(|t| t.is_heap_ptr()) {
+                        return Err(format!(
+                            "core::lower_expr: Eq on multi-slot type with heap-bearing fields not supported"
+                        ));
+                    }
+                    // Pairwise Eq, ANDed together.
+                    let bool_ty = ast.ty.clone();
+                    let mut iter = lhs_slots.into_iter().zip(rhs_slots);
+                    let (l0, r0) = iter.next().unwrap();
+                    let mut acc = Expr::BinOp {
+                        op: crate::ssa::BinaryOp::Eq,
+                        lhs: Box::new(l0),
+                        rhs: Box::new(r0),
+                        ty: bool_ty.clone(),
+                    };
+                    for (l, r) in iter {
+                        let slot_eq = Expr::BinOp {
+                            op: crate::ssa::BinaryOp::Eq,
+                            lhs: Box::new(l),
+                            rhs: Box::new(r),
+                            ty: bool_ty.clone(),
+                        };
+                        acc = Expr::BinOp {
+                            op: crate::ssa::BinaryOp::And,
+                            lhs: Box::new(acc),
+                            rhs: Box::new(slot_eq),
+                            ty: bool_ty.clone(),
+                        };
+                    }
+                    if matches!(op, BinOp::Neq) {
+                        let one = Expr::Lit { value: Literal::Int(1), ty: bool_ty.clone() };
+                        acc = Expr::BinOp {
+                            op: crate::ssa::BinaryOp::Xor,
+                            lhs: Box::new(acc),
+                            rhs: Box::new(one),
+                            ty: bool_ty,
+                        };
+                    }
+                    Ok(vec![acc])
+                }
                 _ => Ok(vec![Expr::BinOp {
                     op: ast_binop_to_ssa(*op),
                     lhs: Box::new(lower_expr(ctx, lhs)?),
