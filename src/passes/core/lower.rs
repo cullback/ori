@@ -243,6 +243,24 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     ty,
                 }]);
             }
+            // Top-level value declarations (`k_table = [...]`,
+            // `s_table = [...]`) are zero-arity functions in
+            // post-mono. A Name reference to one is a call with no
+            // args. Without this branch, the Name falls through to
+            // `Expr::Var` and to_ssa errors with "unbound Var".
+            // `try_get` rather than `display` so unit tests with
+            // placeholder syms don't panic; production paths have
+            // every sym registered.
+            if let Some(info) = ctx.symbols.try_get(*sym) {
+                let display = info.display.clone();
+                if ctx.funcs.contains(&display) {
+                    return Ok(vec![Expr::App {
+                        target: display,
+                        args: vec![],
+                        ty: ast.ty.clone(),
+                    }]);
+                }
+            }
             Ok(vec![Expr::Var { sym: *sym, ty: ast.ty.clone() }])
         }
 
