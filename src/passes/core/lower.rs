@@ -614,12 +614,21 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // When inference left `resolved` empty (polymorphic body,
             // transparent newtype receiver), recover by mangling
             // `TypeName.method` from the receiver's type. Mirrors
-            // existing-lower's `resolve_method_at_lower_time`.
+            // existing-lower's `resolve_method_at_lower_time`. If the
+            // recovered name doesn't correspond to a real SSA
+            // function in this module (the `__record_*` /
+            // `__tuple_*` fallback names that existing-lower would
+            // synthesize lazily), bail so the program falls back.
             let owned;
             let name = match resolved.as_ref() {
                 Some(r) => r,
                 None => {
                     owned = resolve_method_late(ctx, method, &receiver.ty);
+                    if !ctx.funcs.contains(&owned) && !owned.starts_with("__builtin.") {
+                        return Err(format!(
+                            "core::lower_expr: MethodCall resolved to `{owned}` but no such SSA function (would need lazy helper synthesis)"
+                        ));
+                    }
                     &owned
                 }
             };
@@ -2061,8 +2070,15 @@ fn field_slice(
         );
     };
     let target_name = fields.get(field);
+    // Sort by field name to match `expand_slots`'s canonical slot
+    // order. Without this, a transparent newtype's underlying record
+    // (registered in source order) would give a different slot
+    // offset here than expand_slots computes.
+    let mut sorted: Vec<(&str, &Type)> =
+        record_fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    sorted.sort_by_key(|(n, _)| *n);
     let mut offset = 0;
-    for (fname, fty) in record_fields {
+    for (fname, fty) in sorted {
         let count = expand_slots(fty, fieldless, transparent).len();
         if fname == target_name {
             return (offset, count);
@@ -2122,8 +2138,15 @@ pub fn expand_slots_with(
     }
     match &unwrapped {
         Type::Record { fields, .. } => {
+            // Sort fields by name so slot order is canonical even if
+            // the input type wasn't normalized (e.g. transparent
+            // newtypes register their underlying record verbatim
+            // from source).
+            let mut sorted: Vec<(&str, &Type)> =
+                fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            sorted.sort_by_key(|(n, _)| *n);
             let mut out = Vec::new();
-            for (_, fty) in fields {
+            for (_, fty) in sorted {
                 out.extend(expand_slots(fty, fieldless, transparent));
             }
             out
