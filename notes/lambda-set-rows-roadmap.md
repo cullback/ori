@@ -100,8 +100,75 @@ The row-polymorphism template already exists in `Type::Record` and
     `Expr::App`. Closes Pos/Neg/Wrapped/Wrap-style patterns.
   - **M, N, O**: not started.
 
-**Test coverage on Core: 82.9% → 85.1%** (5 more tests through
+**Test coverage on Core: 82.9% → 86.4%** (9 more tests through
 Core, no regressions). All 308 tests pass throughout.
+
+### Phase L's sub-fixes that shipped
+
+  - Structural constructors (uppercase Call targets with no
+    declared TypeAnno) emit `Expr::Con` instead of `Expr::App`.
+    Closes Pos/Neg/Wrapped/Wrap-style patterns. (+4 tests)
+  - `lower_destructure` handles Record patterns by reordering
+    fields to the canonical sorted-by-name slot order, then
+    delegating to the existing Tuple-shaped binding logic. (+3 tests)
+  - Match arm binder for multi-slot field bound by a single source
+    name loads the wrapper RcPtr at the payload offset (multi-slot
+    field data lives in a sub-heap object). Removes the "slot count
+    mismatch" error class for Ok/Boxed/etc. but downstream tests
+    still bail at "unbound Var" — see below.
+  - Phase-E scrutinee dispatch handles N≥3 slots (single-variant
+    union with N fields fanned out). Closes 2 of 4 "Match scrutinee
+    produced 3 slots" fallbacks.
+
+### Remaining cluster (architectural blockers)
+
+After this session, the residual ~31 fallbacks cluster into:
+
+  - **Multi-slot locals in Core's to_ssa** (~9 tests): nested
+    patterns (`Boxed(Ok(x))`), Let bindings whose value produces 2
+    slots for 1 binder. `flatten_patterns` introduces sub-pattern
+    binders that the multi-slot field wrapper RcPtr doesn't satisfy.
+    Fix: extend `to_ssa.ctx.locals` from `HashMap<SymbolId, Value>`
+    to `HashMap<SymbolId, Vec<Value>>` (mirror `lower.ctx.locals`),
+    OR materialize multi-slot binders into a heap shell that
+    downstream code can deref.
+
+  - **`List.walk_until` Core port** (~5 tests): substantial new
+    SSA loop with Break/Continue tag inspection. Attempted in this
+    session but reverted — the Eq-on-tag in the new loop seemed to
+    break unrelated string-interpolation tests in a way that needs
+    more investigation. The variant + lower arm + ~100 lines of SSA
+    emission would fit in a focused 1–2 day session.
+
+  - **specialize per-set TagDecl refactor** (~5 tests for ListWalk
+    multi-slot + apply arity mismatches): the same blocker that
+    prevented full Phase E delete + Phase F shell-wrap removal.
+    `lambda::specialize` emits ONE TagDecl per lambda-set across
+    all mono specs of an HOF; the closure VALUE then carries the
+    merged tag-union TYPE and lower's value-side construction takes
+    the multi-variant D2 shape regardless of the singleton row.
+
+  - **Validation warning cluster** (~7 tests): "RcPtr vs I64 return
+    type", "branch arg type mismatch I64 vs RcPtr". Subtle scheme/
+    type misalignment in the HOF path. Likely also relates to the
+    specialize per-set blocker.
+
+  - **Long tail of 1-off issues**: `Wrap` fieldless scrutinee with
+    binders, "expected single slot for ExprKind Tuple", a couple of
+    transparent-newtype destructure cases.
+
+### Suggested next session
+
+1. **Multi-slot `to_ssa.locals`** (1–2 days) → unblocks ~9 tests
+   in the nested-pattern cluster. Lowest-architecture-investment
+   single change that touches the most tests.
+2. **specialize per-set TagDecls** (2–3 days) → unblocks ~5 tests
+   AND completes Phases E+F. Higher leverage but deeper change.
+3. **List.walk_until port** (1–2 days) → +5 tests. Independent
+   of the other two.
+
+These three alone would close ~19 of the residual 31 fallbacks,
+bringing Core coverage to ~94%.
 
 ## What lambda-set rows actually delivered
 
