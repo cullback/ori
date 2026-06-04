@@ -369,6 +369,18 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     field_slot_counts,
                     ty,
                 }])
+            } else if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                // Structural constructor (uppercase, no declared
+                // TypeAnno). Inference produced a TagUnion type for
+                // the call site (see infer.rs's `infer_call`
+                // structural fallback); emit as Con so SSA sees a
+                // tag-union value, not a phantom function call.
+                Ok(vec![Expr::Con {
+                    tag: name,
+                    args: arg_exprs,
+                    field_slot_counts,
+                    ty: ast.ty.clone(),
+                }])
             } else if name.starts_with("__fold_") && !args.is_empty() {
                 // Recognize calls to fold_lift's synth helpers as
                 // `Cata`. The first source-level arg is the
