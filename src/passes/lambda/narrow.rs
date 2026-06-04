@@ -41,6 +41,20 @@ use crate::symbol::{FieldSym, SymbolId, SymbolKind, SymbolTable};
 use crate::types::engine::{Scheme, Type};
 
 pub fn narrow(mono: &mut Monomorphized<'_>) {
+    // Phase E goal was to delete this pass entirely. Phase D's mono
+    // per-lambda-set specialization does subsume narrow's per-call-
+    // site cloning, AND `lower::expand_slots` now reads closure
+    // shape directly from the Arrow's lambda-set row (so
+    // retype_scheme_params is redundant for that consumer). BUT:
+    // lambda::specialize creates ONE shared TagDecl per lambda-set
+    // across all mono specs of the HOF — so closure values flowing
+    // into a mono spec still have the merged tag-union TYPE, and
+    // lower's value-side lowering takes the multi-variant D2 shape.
+    //
+    // To truly delete narrow, lambda::specialize needs to be aware
+    // of mono per-set specs and emit per-spec TagDecls — or mono
+    // needs to splice closure-tag rewrites into the body alongside
+    // the type substitution. Deferred to a follow-up.
     let module = std::mem::take(&mut mono.module);
     let (new_module, new_tag_targets, new_singletons) = narrow_module(
         module,

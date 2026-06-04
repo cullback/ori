@@ -305,6 +305,28 @@ impl<'a, 'src> LowerCtx<'a, 'src> {
                     vec![ScalarType::U64, ScalarType::RcPtr]
                 }
             }
+            // Arrow with a lambda set carries the same shape
+            // information a tag-union-typed HO param would carry —
+            // post-Phase D, narrow's retype_scheme_params is
+            // redundant if we just consult the set directly.
+            Type::Arrow(_, _, Some(ls)) => {
+                // Resolve the lambda set; if it concretizes to a
+                // TagUnion, use the same per-variant slot logic the
+                // TagUnion branch above uses.
+                if let Type::TagUnion { tags, .. } = ls.as_ref() {
+                    if tags.iter().all(|(_, fields)| fields.is_empty()) {
+                        // No captures across the set — single tag
+                        // scalar suffices.
+                        vec![ScalarType::U64]
+                    } else if tags.len() == 1 {
+                        tags[0].1.iter().map(|t| self.scalar_type(t)).collect()
+                    } else {
+                        vec![ScalarType::U64, ScalarType::RcPtr]
+                    }
+                } else {
+                    vec![ScalarType::RcPtr]
+                }
+            }
             _ => vec![self.scalar_type(&unwrapped)],
         }
     }
