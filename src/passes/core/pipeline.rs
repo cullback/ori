@@ -494,6 +494,7 @@ fn type_expr_to_type(t: &crate::ast::TypeExpr<'_>) -> Type {
         TypeExpr::App(name, args) => {
             Type::App((*name).to_owned(), args.iter().map(type_expr_to_type).collect())
         }
+        TypeExpr::Tuple(elems) => Type::Tuple(elems.iter().map(type_expr_to_type).collect()),
         _ => Type::Con("__unknown".to_owned()),
     }
 }

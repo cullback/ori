@@ -700,6 +700,32 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
                     }
                 }
             }
+            // Value returned multiple slots but the binder is a
+            // single source name (e.g. `w = MkWrap(...)` where MkWrap
+            // is single-variant and its tuple field fans out to 2
+            // slots). Bind the source name to the full slot list as
+            // a multi-slot local.
+            if vals.len() > 1 && binders.len() == 1 {
+                let binder = binders[0];
+                let prev = vec![(binder, ctx.locals.insert(binder, vals))];
+                let result_slots = lower_slots(ctx, body);
+                for (binder, p) in prev.into_iter().rev() {
+                    match p {
+                        Some(prev_val) => { ctx.locals.insert(binder, prev_val); }
+                        None => { ctx.locals.remove(&binder); }
+                    }
+                }
+                let result_slots = result_slots?;
+                if result_slots.len() == 1 {
+                    return Ok(result_slots[0]);
+                } else {
+                    let shell = ctx.builder.alloc(result_slots.len() * 8);
+                    for (i, v) in result_slots.iter().enumerate() {
+                        ctx.builder.store(shell, i * 8, *v);
+                    }
+                    return Ok(shell);
+                }
+            }
             if vals.len() != binders.len() {
                 return Err(format!(
                     "core::to_ssa: Let value produced {} slots but binders.len()={}",
