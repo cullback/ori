@@ -1015,6 +1015,11 @@ fn lower_match(
         // wildcard / binding arm). Pattern-matching a single-
         // variant union has exactly one tag, so any tag-equivalent
         // arm matches every value.
+        let any_guarded = arms.iter().any(|a| !a.guards.is_empty());
+        if any_guarded {
+            return lower_phase_e_guarded(ctx, &scrutinee_slots, arms, ty);
+        }
+        {
         for arm in arms {
             let binders_opt: Option<&Vec<Vec<SymbolId>>> = match &arm.pattern {
                 Pattern::Constructor { binders, .. } => Some(binders),
@@ -1055,6 +1060,7 @@ fn lower_match(
             return result;
         }
         // No matching arm — fall through to error.
+        }
     }
     let (tag_val, payload_val) = match scrutinee_slots.as_slice() {
         [v] => {
@@ -1382,8 +1388,11 @@ fn lower_match(
                 // to BIND those binders in the surrounding scope —
                 // not just check the bool — so the arm body can
                 // reference `x`.
-                if let Some((scrutinee, pat)) = extract_is_guard(guard) {
-                    let scrutinee_vals = lower_slots(ctx, scrutinee)?;
+                if let Some((scrutinee_slots, pat)) = extract_is_guard(guard) {
+                    let mut scrutinee_vals: Vec<Value> = Vec::new();
+                    for slot in scrutinee_slots {
+                        scrutinee_vals.extend(lower_slots(ctx, slot)?);
+                    }
                     let next_check = ctx.builder.create_block();
                     emit_is_guard(
                         ctx,
@@ -1487,6 +1496,201 @@ fn lower_match(
     Ok(merge_params)
 }
 
+fn zero_value(ctx: &mut Ctx<'_>, ty: crate::ssa::ScalarType) -> Value {
+    use crate::ssa::ScalarType;
+    match ty {
+        ScalarType::I8 => ctx.builder.const_i8(0),
+        ScalarType::U8 => ctx.builder.const_u8(0),
+        ScalarType::I16 => ctx.builder.const_i16(0),
+        ScalarType::U16 => ctx.builder.const_u16(0),
+        ScalarType::I32 => ctx.builder.const_i32(0),
+        ScalarType::U32 => ctx.builder.const_u32(0),
+        ScalarType::I64 => ctx.builder.const_i64(0),
+        ScalarType::U64 => ctx.builder.const_u64(0),
+        ScalarType::F64 => ctx.builder.const_f64(0.0),
+        ScalarType::Ptr | ScalarType::RcPtr => ctx.builder.alloc(0),
+    }
+}
+
+/// Lower a Phase-E (single-variant, fanned-out) Match where at
+/// least one arm has guards. Without guards, the no-tag fast path
+/// at the top of `lower_match` binds binders directly and lowers
+/// the body. With guards, each arm needs a block so a failing
+/// guard can fall through to the next arm — same Pair tag means
+/// every arm matches every value, the guards disambiguate.
+fn lower_phase_e_guarded(
+    ctx: &mut Ctx<'_>,
+    scrutinee_slots: &[Value],
+    arms: &[MatchArm],
+    ty: &Type,
+) -> Result<Vec<Value>, String> {
+    let result_slot_tys = super::lower::expand_slots_with(
+        ty,
+        &ctx.fieldless,
+        &ctx.transparent,
+        &ctx.payload_unions,
+    );
+    let merge = ctx.builder.create_block();
+    let merge_params: Vec<Value> = result_slot_tys
+        .iter()
+        .map(|&t| ctx.builder.add_block_param(merge, t))
+        .collect();
+    let mut con_arms: Vec<&MatchArm> = Vec::new();
+    let mut default_arm: Option<&MatchArm> = None;
+    for arm in arms {
+        match &arm.pattern {
+            Pattern::Constructor { .. } | Pattern::Binding(_) => con_arms.push(arm),
+            Pattern::Wildcard => default_arm = Some(arm),
+            _ => return Err(format!(
+                "core::to_ssa: Phase-E guarded Match unsupported arm pattern: {:?}",
+                arm.pattern
+            )),
+        }
+    }
+    let arm_block_ids: Vec<crate::ssa::BlockId> = (0..con_arms.len())
+        .map(|_| ctx.builder.create_block())
+        .collect();
+    let default_block_id = default_arm.map(|_| ctx.builder.create_block());
+    let first_target = arm_block_ids.first().copied().or(default_block_id).ok_or_else(|| {
+        "core::to_ssa: Phase-E guarded Match has no arms".to_string()
+    })?;
+    ctx.builder.jump(first_target, vec![]);
+
+    for (arm_i, arm) in con_arms.iter().enumerate() {
+        let b = arm_block_ids[arm_i];
+        ctx.builder.switch_to(b);
+        let mut bound: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
+        match &arm.pattern {
+            Pattern::Constructor { binders, .. } => {
+                let mut slot_idx = 0;
+                for binder_slots in binders {
+                    for &sym in binder_slots {
+                        if slot_idx >= scrutinee_slots.len() {
+                            break;
+                        }
+                        let v = scrutinee_slots[slot_idx];
+                        if sym.0 != u32::MAX {
+                            bound.push((sym, ctx.locals.insert(sym, vec![v])));
+                        }
+                        slot_idx += 1;
+                    }
+                }
+            }
+            Pattern::Binding(sym) => {
+                bound.push((*sym, ctx.locals.insert(*sym, scrutinee_slots.to_vec())));
+            }
+            _ => unreachable!(),
+        }
+        let fallthrough_explicit = arm_block_ids.get(arm_i + 1).copied().or(default_block_id);
+        let mut guard_bindings: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
+        if !arm.guards.is_empty() {
+            // Last guarded arm with no default: exhaustive Match
+            // semantics say the guard must succeed at runtime. Emit
+            // a sink block that returns zero values matching the
+            // function's return signature — never executed at
+            // runtime, but gives the block a valid terminator.
+            let fail_block = match fallthrough_explicit {
+                Some(b) => b,
+                None => {
+                    let sink = ctx.builder.create_block();
+                    let prev = ctx.builder.current_block;
+                    ctx.builder.switch_to(sink);
+                    let ret_tys: Vec<crate::ssa::ScalarType> = ctx
+                        .builder
+                        .func
+                        .return_type
+                        .clone()
+                        .unwrap_or_else(|| vec![crate::ssa::ScalarType::I64]);
+                    let zeros: Vec<Value> = ret_tys
+                        .iter()
+                        .map(|&t| zero_value(ctx, t))
+                        .collect();
+                    if zeros.len() == 1 {
+                        ctx.builder.ret(zeros[0]);
+                    } else {
+                        ctx.builder.ret_multi(zeros);
+                    }
+                    if let Some(p) = prev {
+                        ctx.builder.switch_to(p);
+                    }
+                    sink
+                }
+            };
+            let fail_args: Vec<Value> = vec![];
+            let body_block = ctx.builder.create_block();
+            for guard in &arm.guards {
+                if let Some((scrutinee_slots_g, pat)) = extract_is_guard(guard) {
+                    let mut svals: Vec<Value> = Vec::new();
+                    for slot in scrutinee_slots_g {
+                        svals.extend(lower_slots(ctx, slot)?);
+                    }
+                    let next_check = ctx.builder.create_block();
+                    emit_is_guard(
+                        ctx, &svals, pat, next_check,
+                        fail_block, &fail_args, &mut guard_bindings,
+                    )?;
+                    ctx.builder.switch_to(next_check);
+                } else {
+                    let g_val = lower(ctx, guard)?;
+                    let next_check = ctx.builder.create_block();
+                    ctx.builder.branch(g_val, next_check, vec![], fail_block, fail_args.clone());
+                    ctx.builder.switch_to(next_check);
+                }
+            }
+            ctx.builder.jump(body_block, vec![]);
+            ctx.builder.switch_to(body_block);
+        }
+        bound.extend(guard_bindings);
+
+        let arm_slots = lower_arm_body_slots(ctx, &arm.body)?;
+        if arm.is_return {
+            if arm_slots.len() == 1 {
+                ctx.builder.ret(arm_slots[0]);
+            } else {
+                ctx.builder.ret_multi(arm_slots.clone());
+            }
+        } else {
+            let arm_body_ty = arm.body.first().map(|e| e.ty())
+                .unwrap_or(&Type::Con("__none".to_string())).clone();
+            let arm_slots = reconcile_arm_slots(ctx, arm_slots, &result_slot_tys, &arm_body_ty)?;
+            if arm_slots.len() != merge_params.len() {
+                return Err(format!(
+                    "core::to_ssa: Phase-E arm body produced {} slots but merge expects {}",
+                    arm_slots.len(),
+                    merge_params.len()
+                ));
+            }
+            ctx.builder.jump(merge, arm_slots);
+        }
+        for (binder, prev) in bound.into_iter().rev() {
+            match prev {
+                Some(p) => { ctx.locals.insert(binder, p); }
+                None => { ctx.locals.remove(&binder); }
+            }
+        }
+    }
+
+    if let Some(arm) = default_arm {
+        let b = default_block_id.expect("default_block_id pre-created");
+        ctx.builder.switch_to(b);
+        let arm_slots = lower_arm_body_slots(ctx, &arm.body)?;
+        let arm_body_ty = arm.body.first().map(|e| e.ty())
+            .unwrap_or(&Type::Con("__none".to_string())).clone();
+        let arm_slots = reconcile_arm_slots(ctx, arm_slots, &result_slot_tys, &arm_body_ty)?;
+        if arm_slots.len() != merge_params.len() {
+            return Err(format!(
+                "core::to_ssa: Phase-E Match default produced {} slots but merge expects {}",
+                arm_slots.len(),
+                merge_params.len()
+            ));
+        }
+        ctx.builder.jump(merge, arm_slots);
+    }
+
+    ctx.builder.switch_to(merge);
+    Ok(merge_params)
+}
+
 /// True when `ty` resolves (via transparent unfolding) to a
 /// single-variant tag union — the Phase-E direct-fanout case where
 /// a Con of this type produces only the variant's fields with no
@@ -1500,13 +1704,10 @@ fn lower_match(
 /// Detecting that shape lets us bind the constructor's binders in
 /// the surrounding scope when the guard succeeds, rather than
 /// throwing the bindings away as the standard bool-evaluation would.
-fn extract_is_guard<'g>(guard: &'g Expr) -> Option<(&'g Expr, &'g Pattern)> {
+fn extract_is_guard<'g>(guard: &'g Expr) -> Option<(&'g [Expr], &'g Pattern)> {
     let Expr::Match { scrutinee_slots, arms, .. } = guard else {
         return None;
     };
-    if scrutinee_slots.len() != 1 {
-        return None;
-    }
     if arms.len() != 2 {
         return None;
     }
@@ -1535,7 +1736,7 @@ fn extract_is_guard<'g>(guard: &'g Expr) -> Option<(&'g Expr, &'g Pattern)> {
     if !is_bool_con(&false_arm.body, "False") {
         return None;
     }
-    Some((&scrutinee_slots[0], con_pat))
+    Some((scrutinee_slots.as_slice(), con_pat))
 }
 
 /// Lower an Is-guard: dispatch on the scrutinee, bind the
