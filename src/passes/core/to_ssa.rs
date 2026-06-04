@@ -1010,7 +1010,7 @@ fn lower_match(
     // dispatch on. There's at most one matching arm (the
     // constructor pattern); bind its binders to the slots directly
     // and lower the body.
-    if is_phase_e_scrutinee && scrutinee_slots.len() >= 2 {
+    if is_phase_e_scrutinee && !scrutinee_slots.is_empty() {
         // Find the single Constructor arm (or fall through to a
         // wildcard / binding arm). Pattern-matching a single-
         // variant union has exactly one tag, so any tag-equivalent
