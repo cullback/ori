@@ -1,4 +1,4 @@
-# Lambda set rows: implementation roadmap
+# Roadmap: lambda-set-rows + Core completion
 
 Extend `Type::Arrow(args, ret)` to `Type::Arrow(args, ret, lambda_set)`
 where `lambda_set` is a row variable tracking which closure tags can
@@ -238,34 +238,198 @@ Independent work, not in scope of this roadmap:
    actually lower closures (not just bail) — this is part of what
    the rows enable.
 
-### Order to tackle the residual
+**See Phases H–O below** for the detailed residual plan that closes
+each of these categories.
 
-If "Core is complete with zero fallbacks" is the ultimate goal, here's
-the suggested follow-on after lambda-set-rows:
+## Phases H–N: residual to zero Core fallbacks
 
-| After this roadmap | Estimated effort | Why it matters |
+After A–G, the structural project is done. The remaining work is a
+series of focused passes per fallback category. Each gets the same
+"green at every phase" treatment.
+
+Before starting H, instrument the fallback counter:
+
+- Run `cargo test --quiet -- --ignored zzz_core_coverage_summary 2>&1`
+  to see current fallback reasons + counts. The output enumerates the
+  exact categories below with empirical weights — use it to prioritize
+  if the estimates here are wrong.
+- Add similar instrumentation for the AOC / stdlib test programs so
+  we see real-world fallback rates, not just unit-test rates.
+
+### Phase H — stdlib HOFs in Core (1 week)
+
+The biggest residual category. Core knows `List.walk`, `List.set`,
+`List.append`, `List.range`, `List.len`, `List.get`. Most HOF-rich
+real-world code uses the others, which all fall back.
+
+After Phase F, multi-slot closures work in Core, so this is now
+unblocked.
+
+Add a Core arm per stdlib HOF:
+
+- `List.map` — fuses to a single Build with element-wise lambda apply.
+- `List.filter` — fuses to a Build with predicate-gated push.
+- `List.fold` / `List.foldr` — same shape as `List.walk` but with
+  different argument order; mostly mechanical.
+- `List.concat` / `List.concat_map` — Build with nested push.
+- `List.zip` / `List.unzip` — parallel iteration over two trios.
+- `List.take` / `List.drop` — bounded Build.
+- `List.any` / `List.all` — short-circuiting fold.
+- `Set.from_list`, `Set.walk`, `Map.from_list`, `Map.walk` — same
+  story for Set/Map. Plus their internals (insert, lookup) once
+  Core handles the iteration.
+
+Split per-function. Each adds one Core arm + one test. Order by
+empirical fallback frequency from the coverage summary.
+
+**Sub-phases H1–HN.** Estimated 1–2 days per HOF; ~10 HOFs.
+
+### Phase I — `Stmt::Guard` in Core (2 days)
+
+`let x = ... if cond` (a guard statement). Currently `passes/core/lower.rs:1272`
+bails. Thread guard evaluation through Core's match lowering:
+
+- A guard inside a match arm becomes an extra branch on the inferred
+  condition's Bool — collapse to a Match with two arms (the guarded
+  body, and fall-through to the next pattern).
+- A top-level guard in a block becomes a one-arm if.
+
+The shape is already present in existing-lower; mostly transcription.
+
+### Phase J — local-receiver method calls in Core (2–3 days)
+
+`x.method(...)` where `x` is a local value (not a type prefix like
+`I64.add`). Currently `passes/core/lower.rs:420` bails. Resolve
+through the same mechanism existing-lower uses: look up the method
+on the receiver's resolved type, emit a direct call to the mangled
+method name.
+
+Most of the dispatch logic already exists in mono's `MethodCall`
+handler — Core just needs to read the `resolved` field set by infer's
+`post_infer` and emit a plain Call.
+
+### Phase K — `__builtin.*` intrinsics in Core (2 days)
+
+Numeric builtins (`I64.add`, `U32.shl`, `F64.sqrt`, etc.) currently
+route through existing-lower's intrinsic path. Add a Core arm that
+emits the corresponding SSA primitive directly.
+
+Most of these are 1-instruction lowerings; mechanical. The
+`crate::numeric` module enumerates them — table-drive the Core arm
+from that.
+
+### Phase L — deep pattern destructuring in Core (2–3 days)
+
+Nested patterns like `: Cons(Cons(x, _), _) then ...` and record
+patterns with subpatterns currently bail at `passes/core/lower.rs:1728`,
+`:1746`. Extend Core's `Match` lowering to handle:
+
+- Nested Con patterns (recursive destructuring).
+- Record patterns with non-trivial field subpatterns.
+- List patterns with rest-bindings and nested element patterns.
+
+Same shape as existing-lower's pattern matcher; transcription.
+
+### Phase M — stdlib annotation system (1 week, optional)
+
+A scalable alternative to Phase H's per-function arms. Add
+`@cata`/`@build` annotations to stdlib functions, with a Core arm
+that interprets them generically:
+
+- `@cata` means "this function is a fold over the first argument" —
+  Core fuses it with upstream Builds.
+- `@build` means "this function constructs a list" — Core fuses it
+  with downstream catas.
+- Together they implement deforestation generically.
+
+This is the right long-term shape — adding a new stdlib HOF then
+only requires the annotation, not a Core arm. But it's optional: if
+Phase H gets us to "everything important works," skip M.
+
+Discussion in `notes/core-ir.md` line 305+ on the annotation design
+and the empirical gate ("measure fusion benefit on a real program")
+that this would unlock.
+
+### Phase N — retire existing-lower (3–5 days)
+
+The payoff. With Core handling everything, the AST→SSA fallback
+path can go.
+
+- Delete `src/lower/` entirely. ~3000 lines.
+- Delete the fallback in `main.rs::compile` — Core is the only path.
+- Delete `compile_until_lower` and any test-only paths that exist
+  because of the fallback.
+- Delete `mono.singletons`, `mono.tag_targets` (these exist mostly
+  for existing-lower's walk emission; Core uses its own resolution).
+- Delete `ssa::validate`'s warning-vs-error distinction — Core never
+  emits warnings.
+
+Run full suite. Run AOC programs. Run any benchmarks. If anything
+regresses on output (correctness) or performance, file a follow-up;
+don't restore existing-lower.
+
+This is the moment the project is "done."
+
+### Phase O — final cleanup + docs (1 day)
+
+- Update `CLAUDE.md` to reflect the single-pipeline architecture.
+- Update `notes/core-ir.md` with the empirical fusion results.
+- Update `src/lower/README.md` → delete or point at `src/passes/core/`.
+- Squash if desired.
+
+## Full project: total estimate
+
+| Block | Phases | Days |
 |---|---|---|
-| Closure as param/return/aggregate field | (lands with lambda-set-rows) | huge swath of HO programs |
-| Stdlib `List.map` / `List.filter` / `List.fold` in Core | 1 week | covers most HOF use cases |
-| Guard expressions | 2 days | unblocks pattern-heavy code |
-| Local-receiver method calls (`x.method()`) | 2–3 days | common syntactic pattern |
-| Stdlib intrinsic annotation system (`@cata`/`@build`) | 1 week | scalable, unblocks future stdlib |
-| Deep pattern destructuring in Core | 2–3 days | edge cases |
+| Structural: lambda-set-rows | A–G | 12–19 |
+| Residual: stdlib HOFs | H1–HN | 10–20 |
+| Residual: guards | I | 2 |
+| Residual: local-receiver methods | J | 2–3 |
+| Residual: __builtin intrinsics | K | 2 |
+| Residual: deep patterns | L | 2–3 |
+| Optional: annotation system | M | 5–7 |
+| Retire existing-lower | N | 3–5 |
+| Final cleanup | O | 1 |
+| **TOTAL (without M)** | | **34–55 days** |
+| **TOTAL (with M)** | | **39–62 days** |
 
-**Total residual scope after lambda-set-rows: ~3–4 weeks of focused
-work to fully retire the AST→SSA fallback path.**
+One person, focused. Call it **7–12 weeks** wall-clock if it gets
+priority, or 3–6 months if it's part-time alongside other work.
 
-## Sequencing decision
+## Sequencing rationale
 
-Lambda-set-rows is the right next step because:
+Lambda-set-rows (A–G) is the right first block because:
 
 1. It closes the **largest single category** of Core fallbacks (HO
    closures across every shape).
 2. It deletes the most ad-hoc surface (~1500–3000 lines of
    workarounds and side-channels).
-3. The remaining residual is straightforward grinding (per-intrinsic
-   Core lowering, pattern surface) — no further type-system work
-   needed.
+3. It's the **only structural piece** left — once truthful schemes
+   exist, H–O are grinding work with no architectural decisions
+   blocking them.
 
-After this lands, "drive Core fallbacks to zero" becomes a series of
-small focused passes rather than a structural project.
+H–O are sequenced by empirical impact:
+
+- **H first** because stdlib HOFs are the dominant fallback category
+  in real programs. Use the coverage summary to validate ordering.
+- **I, J, K, L** are independent — work them in parallel if you
+  have multiple people, or by empirical weight if solo.
+- **M is optional** — only do it if Phase H feels too verbose, or
+  if you want the deforestation benefits.
+- **N** is the destination. Don't start until H–L are solid and
+  the coverage summary shows zero fallbacks across the test suite.
+
+## What "done" looks like
+
+After Phase N:
+
+- One pipeline. `lower::lower` deleted. `main.rs::compile` has no
+  fallback branch.
+- Every test passes through Core.
+- `ssa::validate` is the only correctness gate post-lowering — and
+  it passes on every program.
+- The compiler is meaningfully smaller (~5000 lines deleted
+  total across A–N).
+- Core IR's optimization opportunities (deforestation, fold fusion)
+  become tractable to add — the SSA after Core is in a more uniform
+  shape than the SSA after existing-lower.
