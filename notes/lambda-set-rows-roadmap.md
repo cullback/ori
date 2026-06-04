@@ -103,6 +103,23 @@ The row-polymorphism template already exists in `Type::Record` and
 **Test coverage on Core: 82.9% → 86.4%** (9 more tests through
 Core, no regressions). All 308 tests pass throughout.
 
+### Phase L+ multi-slot to_ssa.locals refactor (foundation, neutral on coverage)
+
+  - Extended `to_ssa::Ctx::locals` from `HashMap<SymbolId, Value>`
+    to `HashMap<SymbolId, Vec<Value>>`, mirroring `lower::Ctx::locals`.
+  - Multi-slot Match binders now load all slot values from the
+    wrapper and bind them as a Vec (no more wrapper-RcPtr shim).
+  - Phase-E Binding patterns on multi-slot scrutinees bind to all
+    slots.
+  - 25+ insertion sites updated.
+
+This is foundation work — coverage didn't move because the
+remaining unbound-Var fallbacks are about intermediate syms that
+`flatten_patterns` introduces for nested pattern destructure. Those
+syms aren't reaching the multi-slot binder path yet. Future work:
+trace flatten_patterns' sym minting and ensure each nested level
+hands off the multi-slot binding correctly.
+
 ### Phase L's sub-fixes that shipped
 
   - Structural constructors (uppercase Call targets with no
