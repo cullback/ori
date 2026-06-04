@@ -366,7 +366,6 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                 vars: Vec::new(),
                 constraints: Vec::new(),
                 ty: specialized_ty,
-                var_concretes: HashMap::new(),
             },
         );
 
@@ -633,20 +632,16 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
         // Compute the type-arg substitution. Empty for monomorphic
         // functions; extracted and normalized for polymorphic ones.
         // Resolution priority for each scheme var:
-        //   1. `extract_substitution` — call-site type binds the var
-        //      via its structural position in `scheme.ty`.
-        //   2. `scheme.var_concretes` — infer already bound the var
-        //      to a concrete type before the var was generalized out
-        //      of `scheme.ty` (e.g., method-constraint ret var
-        //      resolved late at the closure use site).
-        //   3. `default_type` — truly unconstrained (rare, defaults
-        //      to I64 to keep List.sum's `forall a [a.add]. List(a) -> a`
+        //   1. `extract_substitution_with` — call-site type binds the
+        //      var via its structural position in `scheme.ty`.
+        //   2. `default_type` — truly unconstrained (defaults to I64
+        //      to keep List.sum's `forall a [a.add]. List(a) -> a`
         //      working when its body fixes `a` via `0` literal).
         // Identify lambda-set vars structurally. They get substituted
         // through the body like any var (so process_request's mapping
         // is complete) but are filtered from the mangled name to keep
-        // it stable. Phase D will use them as a specialization sub-
-        // key separate from the mangled type-arg list.
+        // it stable (Phase D uses the row content as a spec sub-key
+        // via `args`, not via the display).
         let mut ls_vars: std::collections::HashSet<TypeVar> =
             std::collections::HashSet::new();
         collect_lambda_set_vars(&stored.scheme.ty, &mut ls_vars);
@@ -671,7 +666,6 @@ impl<'a, 'src> MonoCtx<'a, 'src> {
                     .map(|tv| {
                         extracted
                             .get(tv)
-                            .or_else(|| stored.scheme.var_concretes.get(tv))
                             .cloned()
                             .map_or_else(default_type, |t| normalize_type(&t))
                     })

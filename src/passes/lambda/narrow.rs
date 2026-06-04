@@ -1285,7 +1285,6 @@ fn retype_scheme_params(orig: &Scheme, info_by_pos: &HashMap<usize, NarrowedTag>
         vars: orig.vars.clone(),
         constraints: orig.constraints.clone(),
         ty: new_ty,
-        var_concretes: orig.var_concretes.clone(),
     }
 }
 

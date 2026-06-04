@@ -327,7 +327,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                     vars: tvars.clone(),
                     constraints: vec![],
                     ty: con_type,
-                    var_concretes: HashMap::new(),
                 },
             );
         }
@@ -386,7 +385,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                                 vars,
                                 constraints: vec![],
                                 ty: func_ty,
-                                var_concretes: HashMap::new(),
                             },
                         );
                     }
@@ -416,7 +414,6 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         vars: tvars,
                         constraints: vec![],
                         ty: anno_ty,
-                        var_concretes: HashMap::new(),
                     };
                     self.env.insert(mangled, scheme);
                 }
@@ -1870,14 +1867,12 @@ pub fn check(
             vars: vec![],
             constraints: vec![],
             ty: ctx.engine.fresh_arrow(vec![param_ty.clone()], Type::Con("Str".to_owned())),
-            var_concretes: HashMap::new(),
         };
         ctx.env.insert(format!("{}.to_str", num.name()), to_str_scheme);
         let hash_scheme = Scheme {
             vars: vec![],
             constraints: vec![],
             ty: ctx.engine.fresh_arrow(vec![param_ty], Type::Con("U64".to_owned())),
-            var_concretes: HashMap::new(),
         };
         ctx.env.insert(format!("{}.hash", num.name()), hash_scheme);
     }
@@ -1896,7 +1891,6 @@ pub fn check(
                 vec![Type::Con("Str".to_owned())],
                 Type::Var(crash_tv),
             ),
-            var_concretes: HashMap::new(),
         },
     );
 
@@ -1960,7 +1954,6 @@ pub fn check(
                         vars: tvars,
                         constraints: vec![],
                         ty: alias_ty,
-                        var_concretes: HashMap::new(),
                     };
                     if let Some(mod_name) = scope.qualified_types.get(name) {
                         let qual = format!("{mod_name}.{name}");
@@ -2120,34 +2113,12 @@ pub fn check(
                     }
                 })
                 .collect();
-            // For each scheme.var, record its post-infer resolution
-            // if it bound to a concrete type. Mono uses this to fill
-            // in substitutions that `extract_substitution` can't reach
-            // (vars not appearing in scheme.ty after late-resolved
-            // unification — surfaces for lifted-lambda schemes whose
-            // method-constraint ret var binds at the closure use site).
-            // Capture post-infer resolutions for scheme.vars that
-            // bound to a fully concrete (no free vars) type. The
-            // "fully concrete" filter is critical: a var may resolve
-            // to a type whose own free vars belong to *another*
-            // scheme (e.g. `V_344` from __lifted_21 resolving to
-            // `App("Set", [Var(V_1391)])` where V_1391 is the outer
-            // Set.from_list scheme's var). Substituting that into the
-            // lifted body would carry the foreign var through mono.
-            let mut var_concretes: HashMap<TypeVar, Type> = HashMap::new();
-            for (orig_tv, resolved_tv) in scheme.vars.iter().zip(resolved_vars.iter()) {
-                let resolved = ctx.engine.resolve(&Type::Var(*orig_tv));
-                if !matches!(resolved, Type::Var(_)) && ctx.engine.free_vars(&resolved).is_empty() {
-                    var_concretes.insert(*resolved_tv, resolved);
-                }
-            }
             (
                 name.clone(),
                 Scheme {
                     vars: resolved_vars,
                     constraints: scheme.constraints.clone(),
                     ty: resolved_ty,
-                    var_concretes,
                 },
             )
         })
@@ -2165,7 +2136,6 @@ pub fn check(
                     vars: scheme.vars.clone(),
                     constraints: scheme.constraints.clone(),
                     ty: resolved_ty,
-                    var_concretes: HashMap::new(),
                 },
             )
         })

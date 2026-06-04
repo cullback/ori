@@ -162,26 +162,14 @@ pub struct Scheme {
     pub vars: Vec<TypeVar>,
     pub constraints: Vec<Constraint>,
     pub ty: Type,
-    /// Resolutions for scheme.vars that were bound to concrete types
-    /// after generalization (typically at a call site). Populated at
-    /// the end of `infer::check` for the schemes exposed to mono.
-    /// Empty in intermediate schemes during inference.
-    ///
-    /// Why: mono's `extract_substitution` only binds vars that appear
-    /// structurally in `scheme.ty`. A var generalized into `scheme.vars`
-    /// that was later bound to a concrete type would otherwise default
-    /// to I64 — wrong for lifted-lambda schemes whose method-constraint
-    /// ret var resolves at the closure use site.
-    pub var_concretes: HashMap<TypeVar, Type>,
 }
 
 impl Scheme {
-    pub fn mono(ty: Type) -> Self {
+    pub const fn mono(ty: Type) -> Self {
         Self {
             vars: vec![],
             constraints: vec![],
             ty,
-            var_concretes: HashMap::new(),
         }
     }
 }
@@ -864,7 +852,6 @@ impl TypeEngine {
             vars,
             constraints,
             ty: self.resolve(ty),
-            var_concretes: HashMap::new(),
         }
     }
 
