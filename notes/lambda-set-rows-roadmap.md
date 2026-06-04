@@ -100,8 +100,35 @@ The row-polymorphism template already exists in `Type::Record` and
     `Expr::App`. Closes Pos/Neg/Wrapped/Wrap-style patterns.
   - **M, N, O**: not started.
 
-**Test coverage on Core: 82.9% → 86.4%** (9 more tests through
-Core, no regressions). All 308 tests pass throughout.
+**Test coverage on Core: 82.9% → 86.4% → 91.2%** (20 more tests
+through Core total; +11 in the most recent push). All 308 tests
+pass throughout.
+
+### Phase L++ session (86.4% → 91.2%, +11 tests)
+
+Five focused commits addressing the nested-pattern fallback cluster:
+
+  - **Phase-E guarded Match dispatch**: when the scrutinee is a
+    single-variant fan-out value and at least one arm has guards,
+    chain arms via fail-block fall-through. Unreachable
+    exhaustivity-violation path is a sink block that returns zeros.
+  - **Multi-slot Is-guard scrutinee**: `extract_is_guard` /
+    `emit_is_guard` accept any-arity scrutinee_slots; the caller
+    flattens via `lower_slots` so multi-slot `__pat_0` bindings flow
+    through.
+  - **Phase-E threshold lowered to ≥ 1 slot**: `Inner : [Val(I64)]`
+    (1 slot) and `Boxed(Result)` (2 slots) now route through the
+    fan-out path instead of the [v]/[t,p] standard paths that
+    misread the lone-slot/tag-payload shape.
+  - **AST→Core if-and-Is + if-Is rewrites**: flatten_patterns
+    produces chained `is`-via-`and` for nested patterns; the bool
+    evaluation path lost binders. Rewrite at AST→Core lower time to
+    nested if and pattern Match so binders flow naturally.
+  - **Scheme substitution in emit_is_guard**: polymorphic constructor
+    schemes (`Ok : a -> Result(a, b)`) had `Var(a)` defaulting to a
+    single RcPtr slot — wrong for nested patterns. Pass
+    `scrutinee_ty` and substitute, matching what lower_match arm
+    binding already does. Triple-nested `Box(Ok(Ok(x)))` now works.
 
 ### Phase L+ multi-slot to_ssa.locals refactor (foundation, neutral on coverage)
 
