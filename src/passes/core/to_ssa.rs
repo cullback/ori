@@ -381,24 +381,36 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             ctx.builder.branch(cmp, done, done_args, body_block, body_args);
 
             // Body: load elem slot(s) from data buffer at body_i.
-            // Element stride is sum(elem_slot_count) * 8 bytes;
-            // for single-slot elements that's the simple `body_data[body_i]`
-            // load_dyn. For multi-slot (Str/List/aggregate) we'd need
-            // stride math — bail (return error) for those today.
+            // The buffer is laid out with `stride = elem_tys.len()`
+            // slots per element. For single-slot elements the base
+            // is just `body_i`; for multi-slot, base = body_i * stride
+            // and slot k loads at base + k.
             ctx.builder.switch_to(body_block);
-            if elem_tys.len() != 1 {
-                return Err(format!(
-                    "core::to_ssa: ListWalk multi-slot elements ({} slots) not yet supported",
-                    elem_tys.len()
-                ));
-            }
-            let elem_v = ctx.builder.load_dyn(body_data, body_i, elem_tys[0]);
+            let elem_vals: Vec<Value> = if elem_tys.len() == 1 {
+                vec![ctx.builder.load_dyn(body_data, body_i, elem_tys[0])]
+            } else {
+                let stride = ctx.builder.const_u64(elem_tys.len() as u64);
+                let base = ctx.builder.binop(BinaryOp::Mul, body_i, stride, ScalarType::U64);
+                elem_tys
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &t)| {
+                        if k == 0 {
+                            ctx.builder.load_dyn(body_data, base, t)
+                        } else {
+                            let k_const = ctx.builder.const_u64(k as u64);
+                            let off = ctx.builder.binop(BinaryOp::Add, base, k_const, ScalarType::U64);
+                            ctx.builder.load_dyn(body_data, off, t)
+                        }
+                    })
+                    .collect()
+            };
 
-            // Step call: target(caps, acc, elem) → acc_slots.
+            // Step call: target(caps, acc, elem...) → acc_slots.
             let mut call_args: Vec<Value> = Vec::new();
             call_args.extend(body_cap_vals.iter().copied());
             call_args.extend(body_acc.iter().copied());
-            call_args.push(elem_v);
+            call_args.extend(elem_vals);
             let new_acc: Vec<Value> = if acc_slots.len() == 1 {
                 vec![ctx.builder.call(target, call_args, acc_slots[0])]
             } else {
