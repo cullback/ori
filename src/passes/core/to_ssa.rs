@@ -1388,7 +1388,7 @@ fn lower_match(
                 // to BIND those binders in the surrounding scope —
                 // not just check the bool — so the arm body can
                 // reference `x`.
-                if let Some((scrutinee_slots, pat)) = extract_is_guard(guard) {
+                if let Some((scrutinee_slots, scr_ty, pat)) = extract_is_guard(guard) {
                     let mut scrutinee_vals: Vec<Value> = Vec::new();
                     for slot in scrutinee_slots {
                         scrutinee_vals.extend(lower_slots(ctx, slot)?);
@@ -1397,6 +1397,7 @@ fn lower_match(
                     emit_is_guard(
                         ctx,
                         &scrutinee_vals,
+                        scr_ty,
                         pat,
                         next_check,
                         fail_block,
@@ -1618,15 +1619,15 @@ fn lower_phase_e_guarded(
             };
             let fail_args: Vec<Value> = vec![];
             let body_block = ctx.builder.create_block();
-            for guard in &arm.guards {
-                if let Some((scrutinee_slots_g, pat)) = extract_is_guard(guard) {
+            for guard in arm.guards.iter() {
+                if let Some((scrutinee_slots_g, scr_ty, pat)) = extract_is_guard(guard) {
                     let mut svals: Vec<Value> = Vec::new();
                     for slot in scrutinee_slots_g {
                         svals.extend(lower_slots(ctx, slot)?);
                     }
                     let next_check = ctx.builder.create_block();
                     emit_is_guard(
-                        ctx, &svals, pat, next_check,
+                        ctx, &svals, scr_ty, pat, next_check,
                         fail_block, &fail_args, &mut guard_bindings,
                     )?;
                     ctx.builder.switch_to(next_check);
@@ -1704,8 +1705,8 @@ fn lower_phase_e_guarded(
 /// Detecting that shape lets us bind the constructor's binders in
 /// the surrounding scope when the guard succeeds, rather than
 /// throwing the bindings away as the standard bool-evaluation would.
-fn extract_is_guard<'g>(guard: &'g Expr) -> Option<(&'g [Expr], &'g Pattern)> {
-    let Expr::Match { scrutinee_slots, arms, .. } = guard else {
+fn extract_is_guard<'g>(guard: &'g Expr) -> Option<(&'g [Expr], &'g Type, &'g Pattern)> {
+    let Expr::Match { scrutinee_slots, scrutinee_ty, arms, .. } = guard else {
         return None;
     };
     if arms.len() != 2 {
@@ -1736,7 +1737,7 @@ fn extract_is_guard<'g>(guard: &'g Expr) -> Option<(&'g [Expr], &'g Pattern)> {
     if !is_bool_con(&false_arm.body, "False") {
         return None;
     }
-    Some((scrutinee_slots.as_slice(), con_pat))
+    Some((scrutinee_slots.as_slice(), scrutinee_ty, con_pat))
 }
 
 /// Lower an Is-guard: dispatch on the scrutinee, bind the
@@ -1748,6 +1749,7 @@ fn extract_is_guard<'g>(guard: &'g Expr) -> Option<(&'g [Expr], &'g Pattern)> {
 fn emit_is_guard(
     ctx: &mut Ctx<'_>,
     scrutinee_vals: &[Value],
+    scrutinee_ty: &Type,
     pattern: &Pattern,
     next_check: crate::ssa::BlockId,
     fail_block: crate::ssa::BlockId,
@@ -1804,7 +1806,10 @@ fn emit_is_guard(
             .constructor_schemes
             .get(tag)
             .and_then(|s| match &s.ty {
-                Type::Arrow(ps, _, _) => Some(ps.clone()),
+                Type::Arrow(ps, r, _) => {
+                    let subst = collect_subst(r, scrutinee_ty);
+                    Some(ps.iter().map(|p| apply_subst(p, &subst)).collect::<Vec<_>>())
+                }
                 _ => None,
             });
         let scalar_fallback: Vec<ScalarType> = ctx
