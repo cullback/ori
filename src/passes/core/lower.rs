@@ -1640,27 +1640,34 @@ fn lower_destructure(
             "core::lower_destructure: unsupported pattern shape: {other:?}"
         )),
     };
-    // Each sub-pattern must be a Binding or Wildcard at the top
-    // level. Wildcards get a sentinel SymbolId (`u32::MAX`) so the
-    // shared Let-emission code uses one branch for both; the
-    // SSA pipeline drops Lets whose binder is unused, so the
-    // wildcard's value just doesn't get bound. Nested sub-patterns
-    // need pre-flattening (the AST already does this for nested
-    // ctor patterns inside Match arms).
-    let binders: Vec<SymbolId> = sub_pats
-        .iter()
-        .map(|p| match p {
-            AstPattern::Binding(sym) => Ok(*sym),
-            AstPattern::Wildcard => Ok(SymbolId(u32::MAX)),
+    // Each sub-pattern must resolve to Binding or Wildcard at every
+    // leaf. Wildcards get a sentinel SymbolId (`u32::MAX`). Nested
+    // Tuple sub-patterns (e.g. `((a, b), (c, d)) = t`) flatten
+    // recursively into a single binder list — the value's slot list
+    // is already flat (SROA), so this mirrors that shape.
+    fn flatten_sub_pats(pat: &AstPattern<'_>, out: &mut Vec<SymbolId>) -> Result<(), String> {
+        match pat {
+            AstPattern::Binding(sym) => { out.push(*sym); Ok(()) }
+            AstPattern::Wildcard => { out.push(SymbolId(u32::MAX)); Ok(()) }
+            AstPattern::Tuple(ps) => {
+                for p in ps {
+                    flatten_sub_pats(p, out)?;
+                }
+                Ok(())
+            }
             other => Err(format!(
                 "core::lower_destructure: only top-level Binding/Wildcard sub-patterns supported, got {other:?}"
             )),
-        })
-        .collect::<Result<_, _>>()?;
-    if sub_pats.len() != expected_slot_count {
+        }
+    }
+    let mut binders: Vec<SymbolId> = Vec::new();
+    for p in sub_pats {
+        flatten_sub_pats(p, &mut binders)?;
+    }
+    if binders.len() != expected_slot_count {
         return Err(format!(
-            "core::lower_destructure: Tuple pattern has {} elements but value type expands to {} slots",
-            sub_pats.len(),
+            "core::lower_destructure: Tuple pattern flattens to {} binders but value type expands to {} slots",
+            binders.len(),
             expected_slot_count
         ));
     }
