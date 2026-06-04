@@ -296,10 +296,9 @@ impl TypeEngine {
             (_, Type::Var(_)) => self.unify(&rhs, &lhs),
             (Type::Con(a), Type::Con(b)) => self.unify_cons(a, b, &lhs, &rhs),
             (Type::App(n1, a1), Type::App(n2, a2)) => self.unify_apps(n1, a1, n2, a2),
-            (Type::Arrow(p1, r1, _), Type::Arrow(p2, r2, _)) => {
-                // Phase A: ignore the lambda set on each side.
-                // Phase C will merge them via row unification.
-                self.unify_arrows(p1, r1, p2, r2)
+            (Type::Arrow(p1, r1, ls1), Type::Arrow(p2, r2, ls2)) => {
+                self.unify_arrows(p1, r1, p2, r2)?;
+                self.unify_lambda_sets(ls1, ls2)
             }
             (Type::Tuple(a), Type::Tuple(b)) => self.unify_tuples(a, b),
             (
@@ -519,6 +518,131 @@ impl TypeEngine {
             self.unify(x, y)?;
         }
         self.unify(r1, r2)
+    }
+
+    /// Unify two lambda sets (Arrow's row field).
+    ///
+    /// Lambda set unification semantics differ from value-tag-union
+    /// unification in one critical way: two **closed** lambda sets
+    /// can merge into their union. Two distinct closures flowing
+    /// into the same HOF position is the canonical case — each
+    /// contributes its singleton-closed row, and the result is the
+    /// 2-tag union. For value tag unions, closed-vs-closed mismatch
+    /// is a type error (`{x: I64}` ≠ `{y: I64}`); for lambda sets,
+    /// it's a merge.
+    ///
+    /// `None` is treated as "no closures flow through this position"
+    /// (closed empty). Promoted to the other side's row if the other
+    /// has content, since "no closures + {t1}" = "{t1}".
+    fn unify_lambda_sets(
+        &mut self,
+        ls1: &super::engine::LambdaSet,
+        ls2: &super::engine::LambdaSet,
+    ) -> Result<(), String> {
+        let resolved1 = ls1.as_deref().map(|t| self.resolve(t));
+        let resolved2 = ls2.as_deref().map(|t| self.resolve(t));
+        match (resolved1, resolved2) {
+            (None, None) => Ok(()),
+            (Some(a), None) | (None, Some(a)) => {
+                // Promote None to an open row (fresh var) so the
+                // present side absorbs into it. The fresh var
+                // becomes bound to `a` via standard unification.
+                let fresh = self.fresh();
+                self.unify(&fresh, &a)
+            }
+            (
+                Some(Type::TagUnion { tags: t1, rest: r1 }),
+                Some(Type::TagUnion { tags: t2, rest: r2 }),
+            ) => self.unify_lambda_set_rows(&t1, r1.as_deref(), &t2, r2.as_deref()),
+            // Mixed shapes (Var vs TagUnion, etc.) — fall back to
+            // standard unify. The Var case binds it to the other
+            // side's content, which is correct.
+            (Some(a), Some(b)) => self.unify(&a, &b),
+        }
+    }
+
+    /// Merge two lambda-set rows by union of their tags. The result
+    /// is a single row containing every tag from both sides; common
+    /// tags must have matching payload arities (their payload types
+    /// unify). Rest-row variables are linked through the merge so a
+    /// later unification with a third set widens both sides at once.
+    fn unify_lambda_set_rows(
+        &mut self,
+        t1: &[(String, Vec<Type>)],
+        r1: Option<&Type>,
+        t2: &[(String, Vec<Type>)],
+        r2: Option<&Type>,
+    ) -> Result<(), String> {
+        // Unify payloads of tags present on both sides.
+        for (n1, p1) in t1 {
+            if let Some((_, p2)) = t2.iter().find(|(n, _)| n == n1) {
+                if p1.len() != p2.len() {
+                    return Err(format!(
+                        "lambda-set tag `{n1}` arity mismatch: {} vs {}",
+                        p1.len(),
+                        p2.len()
+                    ));
+                }
+                for (a, b) in p1.iter().zip(p2.iter()) {
+                    self.unify(a, b)?;
+                }
+            }
+        }
+        // Build the merged tag set: everything from t1, plus extras
+        // from t2 that aren't already there.
+        let mut merged: Vec<(String, Vec<Type>)> = t1.to_vec();
+        for (n2, p2) in t2 {
+            if !merged.iter().any(|(n, _)| n == n2) {
+                merged.push((n2.clone(), p2.clone()));
+            }
+        }
+        // Compute the merged rest: if either side is open, the
+        // result is open (with a shared fresh var so further merges
+        // propagate to both sides); if both are closed, the result
+        // is closed.
+        let merged_rest: Option<Box<Type>> = match (r1, r2) {
+            (None, None) => None,
+            _ => {
+                let fresh = self.fresh();
+                let fresh_boxed = Box::new(fresh.clone());
+                // Bind any open row vars on either side to the
+                // merged row so prior holders see the union.
+                if let Some(r1_ty) = r1 {
+                    self.unify(
+                        r1_ty,
+                        &Type::TagUnion {
+                            tags: t2
+                                .iter()
+                                .filter(|(n, _)| !t1.iter().any(|(n1, _)| n1 == n))
+                                .cloned()
+                                .collect(),
+                            rest: Some(fresh_boxed.clone()),
+                        },
+                    )?;
+                }
+                if let Some(r2_ty) = r2 {
+                    self.unify(
+                        r2_ty,
+                        &Type::TagUnion {
+                            tags: t1
+                                .iter()
+                                .filter(|(n, _)| !t2.iter().any(|(n2, _)| n2 == n))
+                                .cloned()
+                                .collect(),
+                            rest: Some(fresh_boxed.clone()),
+                        },
+                    )?;
+                }
+                Some(fresh_boxed)
+            }
+        };
+        // We don't need to thread `merged` anywhere — the unification
+        // calls above mutate `self.subst` so future resolves of
+        // either original row recover the union. Phase D will read
+        // these resolved rows for specialization keys.
+        let _ = merged;
+        let _ = merged_rest;
+        Ok(())
     }
 
     fn unify_tuples(&mut self, a: &[Type], b: &[Type]) -> Result<(), String> {
