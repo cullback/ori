@@ -62,19 +62,82 @@ The row-polymorphism template already exists in `Type::Record` and
     into `args` (the spec_map key). Two call sites with different
     closure sets now naturally produce different mono specializations.
   - **E (partial)**: `lower::expand_slots` reads closure shape from
-    the Arrow's row (singleton → decompose, multi → D2). Full narrow
-    delete blocked: `lambda::specialize` still creates ONE shared
-    TagDecl per lambda-set across all mono specs of the HOF, so the
-    closure VALUE flowing into a mono spec carries the merged tag-
-    union TYPE. Lower's value-side construction then takes the
+    the Arrow's row (singleton → decompose, multi → D2). **Full
+    narrow delete blocked**: `lambda::specialize` still creates ONE
+    shared TagDecl per lambda-set across all mono specs of the HOF,
+    so the closure VALUE flowing into a mono spec carries the merged
+    tag-union TYPE. Lower's value-side construction then takes the
     multi-variant D2 shape regardless of the Arrow row's singleton
     content. Fixing this needs either per-mono-spec TagDecls from
     specialize, or mono to splice closure-tag rewrites into the body
-    alongside type substitution. **`narrow.rs` stays for now**.
-  - **F–G**: not started.
+    alongside type substitution. `narrow.rs` stays for now.
+  - **F (partial)**: empirically removed each workaround in turn.
+    `Scheme::var_concretes` deleted — fully subsumed by row tracking.
+    The others (extra_mapping, transparent-aware extract,
+    apply_mapping Record-merge-rest, lower shell-wrap) are
+    **load-bearing for transparent newtypes** like `Set` —
+    independent of lambda-set rows, would need their own dedicated
+    cleanup. Shell-wrap specifically also blocked by the same
+    specialize-shared-TagDecl issue as full E.
+  - **G**: shipped (this update).
   - **H–O**: not started.
 
 All 308 tests pass throughout.
+
+## What lambda-set rows actually delivered
+
+Quantifiable wins from this project (Phases A–G):
+
+  - **Truthful schemes**: every Arrow position in `func_schemes`
+    carries the closure set that can flow through it.
+  - **Per-call-site specialization**: mono naturally produces
+    distinct apply specs for distinct closure sets, without narrow's
+    cloning machinery doing the work upstream of mono. (narrow's
+    clone path is now algorithmically redundant — it stays only
+    because of the specialize-shared-TagDecl coupling.)
+  - **`Scheme::var_concretes` deleted**: ~50 lines + a side-channel
+    that existed only because the previous architecture couldn't
+    track late-resolved type-arg bindings structurally.
+  - **`lower::expand_slots`** reads closure shape directly from the
+    Arrow row — no longer dependent on narrow's `retype_scheme_params`
+    for the slot-count answer.
+
+What this project did **not** deliver (because of the
+specialize-shared-TagDecl coupling and the transparent-newtype
+foreign-var cluster):
+
+  - Full deletion of `lambda::narrow` (~1300 lines).
+  - Removal of `lower::to_slots` shell-wrap.
+  - Removal of `SpecRequest::extra_mapping`, transparent-aware
+    extract, `apply_mapping` Record-merge-rest hack.
+
+The path to those is the **lambda::specialize per-set TagDecl
+refactor** (a focused 1–2 day project that emits one TagDecl per
+mono-spec instead of one shared TagDecl across mono-specs of the
+same HOF).
+
+## Suggested follow-up before tackling H+
+
+The biggest remaining structural blocker is `lambda::specialize`'s
+shared-TagDecl model. A focused follow-up:
+
+  1. Walk the mono'd module per `__lifted_N` function name.
+  2. For each mono spec of an HOF, find the closure tags actually
+     reachable (by walking the spec body for `Closure {func, ...}`
+     constructors, or reading the spec's HO param Arrow row).
+  3. Emit one TagDecl per `(hof_spec, ho_param_position)` pair.
+  4. Update the call sites in that spec's body to use the spec's
+     TagDecl tag.
+  5. Update `__apply_K`'s synthesized body to dispatch over the
+     spec's tags.
+
+After that lands: Phase E's full narrow delete, F's shell-wrap
+removal, and a much smaller narrow.rs (maybe 200 lines vs 1300).
+Estimated 1–3 days.
+
+If that work is deferred, Phases H–O can still proceed
+independently — they're about Core IR completion, not the
+lambda-set machinery.
 
 ## Phases
 
