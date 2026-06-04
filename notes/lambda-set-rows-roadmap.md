@@ -104,6 +104,21 @@ The row-polymorphism template already exists in `Type::Record` and
 (+21 tests through Core in this session push). All 308 tests pass
 throughout.
 
+### Phase H+++++ session-end posture
+
+**Structural cleanups (deletions and invariant-strengthening):**
+
+* `mono::apply_mapping` Record branch sorts fields → `has_nested_multi_slot_field` workaround deleted (45 lines).
+* `expand_slots[_with]` and `field_slice` sort defensively → divergent slot orderings now caught at the canonical-form boundary regardless of where the type was constructed.
+* `resolve_method_late` gates `__record_*` / `__tuple_*` placeholders on `ctx.funcs` membership → fallback message is now "MethodCall resolved to X but no such SSA function" instead of "undefined SSA function" at eval time.
+
+**Remaining 10 fallbacks (3 architectural buckets):**
+
+* **Lazy `__eq__{record}` / `__hash__{record}` synthesis** (3 tests, Set cluster): Core needs to emit these helpers on demand the way existing-lower's `ensure_eq_func` does. Without them, methods on bare records can't dispatch.
+* **`lambda::specialize` per-mono-spec TagDecls** (4 tests + 3 validation warnings = 7 tests, apply cluster): the long-standing E/F blocker called out in narrow.rs's own doc. Closure values flowing into a mono spec carry the merged-tag-union TYPE; lower's value-side construction takes the multi-variant D2 shape regardless of the singleton row. Until specialize emits per-spec TagDecls, the call site and callee disagree on closure shape.
+
+Both are real implementation chunks — not workarounds. Resolving either takes its own focused session.
+
 ### Phase H++++ (95.2% → 95.6%, +1 test)
 
 * **Zero-arg top-level functions via App**: `ExprKind::Name(sym)`
