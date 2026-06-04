@@ -100,9 +100,19 @@ The row-polymorphism template already exists in `Type::Record` and
     `Expr::App`. Closes Pos/Neg/Wrapped/Wrap-style patterns.
   - **M, N, O**: not started.
 
-**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5% → 93.9% → 94.3% → 95.2%**
-(+20 tests through Core in this session push). All 308 tests pass
+**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5% → 93.9% → 94.3% → 95.2% → 95.6%**
+(+21 tests through Core in this session push). All 308 tests pass
 throughout.
+
+### Phase H++++ (95.2% → 95.6%, +1 test)
+
+* **Zero-arg top-level functions via App**: `ExprKind::Name(sym)`
+  where the sym's display is in `decls.funcs` (a top-level value
+  declaration like `k_table = [...]`) lowers to `Expr::App { target,
+  args: [] }` rather than `Expr::Var`. Without this, to_ssa hit
+  "unbound Var" because the sym isn't a local binding. The md5
+  test (which captures `k_table` in a lifted closure) now goes
+  through Core.
 
 ### Phase H+++ (94.3% → 95.2%, +2 tests, more structural fixes)
 
