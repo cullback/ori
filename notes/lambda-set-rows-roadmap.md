@@ -46,6 +46,36 @@ From the codebase survey:
 The row-polymorphism template already exists in `Type::Record` and
 `Type::TagUnion`'s `rest: Option<Box<Type>>` field. We mirror it.
 
+## Status (as of 2026-06-04)
+
+  - **A**: shipped. `Type::Arrow` extended; all engine.rs internals
+    handle the new field; 67 sites mechanically updated.
+  - **B**: shipped. `ExprKind::Closure` produces an Arrow with a
+    closed-singleton row. Eta-expanded closures populate the same way.
+  - **C**: shipped. `unify_lambda_sets` merges closed singletons by
+    union (lambda-set semantics, unlike value tag unions). Every
+    Arrow construction site now uses `engine.fresh_arrow` for an
+    open row. `mono::collect_lambda_set_vars` excludes row vars from
+    mangled names.
+  - **D**: shipped. `extract_substitution_with` recurses through the
+    Arrow's lambda set, so the per-call-site closure-set value flows
+    into `args` (the spec_map key). Two call sites with different
+    closure sets now naturally produce different mono specializations.
+  - **E (partial)**: `lower::expand_slots` reads closure shape from
+    the Arrow's row (singleton → decompose, multi → D2). Full narrow
+    delete blocked: `lambda::specialize` still creates ONE shared
+    TagDecl per lambda-set across all mono specs of the HOF, so the
+    closure VALUE flowing into a mono spec carries the merged tag-
+    union TYPE. Lower's value-side construction then takes the
+    multi-variant D2 shape regardless of the Arrow row's singleton
+    content. Fixing this needs either per-mono-spec TagDecls from
+    specialize, or mono to splice closure-tag rewrites into the body
+    alongside type substitution. **`narrow.rs` stays for now**.
+  - **F–G**: not started.
+  - **H–O**: not started.
+
+All 308 tests pass throughout.
+
 ## Phases
 
 Each phase ends with **all 308 tests green** so bisection works.
