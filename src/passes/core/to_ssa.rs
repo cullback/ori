@@ -1292,6 +1292,16 @@ fn lower_match(
         // No matching arm — fall through to error.
         }
     }
+    // Str-literal Match: scrutinee is a Str (3 slots: len, cap,
+    // data), arms are `StrLit` patterns with a Wildcard default.
+    // Emit a chain of (length-eq && bytewise-eq) checks; on match,
+    // jump to the arm's body; otherwise fall through to the next
+    // arm; final fall-through goes to the default.
+    if scrutinee_slots.len() == 3
+        && arms.iter().any(|a| matches!(a.pattern, Pattern::StrLit(_)))
+    {
+        return lower_strlit_match(ctx, &scrutinee_slots, arms, ty);
+    }
     let (tag_val, payload_val) = match scrutinee_slots.as_slice() {
         [v] => {
             if is_payload_carrying_union {
@@ -1722,6 +1732,163 @@ fn lower_match(
         arm_blocks,
         default_block.map(|b| (b, vec![])),
     );
+
+    ctx.builder.switch_to(merge);
+    Ok(merge_params)
+}
+
+/// Lower a Match whose scrutinee is a `Str` (3-slot len/cap/data
+/// trio) and whose arms are `StrLit` patterns. Emit each arm as
+/// (length-equality && bytewise-loop equality) gated by a branch
+/// to the arm body or fallthrough to the next arm. The final
+/// fallthrough goes to the `Wildcard` default arm.
+fn lower_strlit_match(
+    ctx: &mut Ctx<'_>,
+    scrutinee_slots: &[Value],
+    arms: &[MatchArm],
+    ty: &Type,
+) -> Result<Vec<Value>, String> {
+    use crate::ssa::{BinaryOp, ScalarType};
+    debug_assert_eq!(scrutinee_slots.len(), 3, "Str scrutinee has 3 slots");
+    let s_len = scrutinee_slots[0];
+    let s_data = scrutinee_slots[2];
+
+    let result_slot_tys = super::lower::expand_slots_with(
+        ty,
+        &ctx.fieldless,
+        &ctx.transparent,
+        &ctx.payload_unions,
+    );
+    let merge = ctx.builder.create_block();
+    let merge_params: Vec<Value> = result_slot_tys
+        .iter()
+        .map(|&t| ctx.builder.add_block_param(merge, t))
+        .collect();
+
+    // Split into StrLit arms (ordered) and at most one default.
+    let mut lit_arms: Vec<(&Vec<u8>, &MatchArm)> = Vec::new();
+    let mut default_arm: Option<&MatchArm> = None;
+    for arm in arms {
+        match &arm.pattern {
+            Pattern::StrLit(bytes) => lit_arms.push((bytes, arm)),
+            Pattern::Wildcard => {
+                if default_arm.is_some() {
+                    return Err("core::to_ssa: Str Match has multiple Wildcard arms".into());
+                }
+                default_arm = Some(arm);
+            }
+            other => {
+                return Err(format!(
+                    "core::to_ssa: Str Match pattern not supported: {other:?}"
+                ));
+            }
+        }
+    }
+
+    let lower_arm_to_merge = |ctx: &mut Ctx<'_>, arm: &MatchArm| -> Result<(), String> {
+        let arm_slots = lower_arm_body_slots(ctx, &arm.body)?;
+        if arm.is_return {
+            if arm_slots.len() == 1 {
+                ctx.builder.ret(arm_slots[0]);
+            } else {
+                ctx.builder.ret_multi(arm_slots);
+            }
+            return Ok(());
+        }
+        let arm_body_ty = arm.body.first().map(|e| e.ty())
+            .unwrap_or(&Type::Con("__none".to_string())).clone();
+        let arm_slots = reconcile_arm_slots(ctx, arm_slots, &result_slot_tys, &arm_body_ty)?;
+        if arm_slots.len() != merge_params.len() {
+            return Err(format!(
+                "core::to_ssa: Str Match arm body produced {} slots but merge expects {}",
+                arm_slots.len(),
+                merge_params.len()
+            ));
+        }
+        ctx.builder.jump(merge, arm_slots);
+        Ok(())
+    };
+
+    // Default block (or self-looping sink if no default).
+    let default_block = if let Some(arm) = default_arm {
+        let b = ctx.builder.create_block();
+        let prev = ctx.builder.current_block;
+        ctx.builder.switch_to(b);
+        lower_arm_to_merge(ctx, arm)?;
+        if let Some(p) = prev { ctx.builder.switch_to(p); }
+        b
+    } else {
+        let sink = ctx.builder.create_block();
+        let prev = ctx.builder.current_block;
+        ctx.builder.switch_to(sink);
+        let ret_tys: Vec<ScalarType> = ctx
+            .builder
+            .func
+            .return_type
+            .clone()
+            .unwrap_or_else(|| vec![ScalarType::I64]);
+        let zeros: Vec<Value> = ret_tys.iter().map(|&t| zero_value(ctx, t)).collect();
+        if zeros.len() == 1 {
+            ctx.builder.ret(zeros[0]);
+        } else {
+            ctx.builder.ret_multi(zeros);
+        }
+        if let Some(p) = prev { ctx.builder.switch_to(p); }
+        sink
+    };
+
+    // Chain each StrLit arm: (s.len == lit.len) && bytewise_eq.
+    // On success, jump to the arm's body block; on failure, fall
+    // through to the next arm's length check (or the default).
+    for (i, (lit_bytes, arm)) in lit_arms.iter().enumerate() {
+        let body_block = ctx.builder.create_block();
+        let next_block = if i + 1 < lit_arms.len() {
+            ctx.builder.create_block()
+        } else {
+            default_block
+        };
+        // Length check.
+        let lit_len = ctx.builder.const_u64(lit_bytes.len() as u64);
+        let len_eq = ctx.builder.binop(BinaryOp::Eq, s_len, lit_len, ScalarType::U8);
+        let bytewise_block = ctx.builder.create_block();
+        ctx.builder.branch(len_eq, bytewise_block, vec![], next_block, vec![]);
+
+        // Bytewise loop: iterate i from 0 to lit_len; on first mismatch
+        // jump to next_block; on completion jump to body_block.
+        ctx.builder.switch_to(bytewise_block);
+        if lit_bytes.is_empty() {
+            // Empty string — length match alone is enough.
+            ctx.builder.jump(body_block, vec![]);
+        } else {
+            // Inline the byte compares (typical literal-Match arms are
+            // short — emit one compare per byte for clarity and speed).
+            let mut cur_block = bytewise_block;
+            for (idx, &b) in lit_bytes.iter().enumerate() {
+                ctx.builder.switch_to(cur_block);
+                let idx_val = ctx.builder.const_u64(idx as u64);
+                let s_byte = ctx.builder.load_dyn(s_data, idx_val, ScalarType::U8);
+                let lit_byte = ctx.builder.const_u8(b);
+                let byte_eq = ctx.builder.binop(BinaryOp::Eq, s_byte, lit_byte, ScalarType::U8);
+                let next_byte_block = if idx + 1 < lit_bytes.len() {
+                    ctx.builder.create_block()
+                } else {
+                    body_block
+                };
+                ctx.builder.branch(byte_eq, next_byte_block, vec![], next_block, vec![]);
+                cur_block = next_byte_block;
+            }
+        }
+
+        // Body block: lower the arm.
+        ctx.builder.switch_to(body_block);
+        lower_arm_to_merge(ctx, arm)?;
+
+        // Switch to next_block for the next arm's length check (only
+        // if there is a next arm — otherwise we're done).
+        if i + 1 < lit_arms.len() {
+            ctx.builder.switch_to(next_block);
+        }
+    }
 
     ctx.builder.switch_to(merge);
     Ok(merge_params)
