@@ -733,8 +733,13 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 .map(|a| lower_match_arm(ctx, a, &scrutinee_ty))
                 .collect::<Result<_, _>>()?;
             if let Some(else_expr) = else_body {
-                let body = lower_expr(ctx, else_expr)?;
-                core_arms.push(MatchArm::plain(Pattern::Wildcard, body));
+                let body = lower_expr_slots(ctx, else_expr)?;
+                core_arms.push(MatchArm {
+                    pattern: Pattern::Wildcard,
+                    guards: vec![],
+                    body,
+                    is_return: false,
+                });
             }
             Ok(vec![Expr::Match {
                 scrutinee_slots,
