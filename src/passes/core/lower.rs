@@ -1444,8 +1444,42 @@ fn lower_destructure(
 ) -> Result<(), String> {
     let value_slots = lower_expr_slots(ctx, val)?;
     let expected_slot_count = expand_slots_with(&val.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions).len();
+    // For Record patterns, reorder sub-patterns to match the
+    // record's sorted-by-field-name slot order (expand_slots'
+    // canonical order). Each pattern field's sub-pattern is the
+    // binder for that slot.
+    let owned_sub_pats: Vec<AstPattern<'_>>;
     let sub_pats: &[AstPattern<'_>] = match pattern {
         AstPattern::Tuple(ps) => ps,
+        AstPattern::Record { fields, .. } => {
+            // Resolve val's record type to get the canonical field
+            // order (sorted alphabetically per expand_slots).
+            let resolved = resolve_transparent(&val.ty, &ctx.transparent);
+            let record_fields = match &resolved {
+                Type::Record { fields: rf, .. } => rf.clone(),
+                _ => {
+                    return Err(format!(
+                        "core::lower_destructure: Record pattern but val type isn't Record: {:?}",
+                        val.ty
+                    ));
+                }
+            };
+            let mut sorted_fields: Vec<&str> = record_fields.iter().map(|(n, _)| n.as_str()).collect();
+            sorted_fields.sort();
+            // For each slot (in sorted order), find the pattern's
+            // entry for that field, or insert Wildcard if absent.
+            let mut ordered: Vec<AstPattern<'_>> = Vec::with_capacity(sorted_fields.len());
+            for &slot_name in &sorted_fields {
+                let entry = fields
+                    .iter()
+                    .find(|(fsym, _)| ctx.fields.get(*fsym) == slot_name)
+                    .map(|(_, p)| p.clone())
+                    .unwrap_or(AstPattern::Wildcard);
+                ordered.push(entry);
+            }
+            owned_sub_pats = ordered;
+            &owned_sub_pats
+        }
         other => return Err(format!(
             "core::lower_destructure: unsupported pattern shape: {other:?}"
         )),
