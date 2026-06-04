@@ -212,7 +212,7 @@ pub fn lower_module(
         // - to_ssa_locals: SymbolId → SSA Value (used by Core→SSA).
         // - core_locals: SymbolId → slot SymbolIds (used by AST→Core
         //   when an AST Name needs to expand to multi-slot Vars).
-        let mut to_ssa_locals: HashMap<SymbolId, Value> = HashMap::new();
+        let mut to_ssa_locals: HashMap<SymbolId, Vec<Value>> = HashMap::new();
         let mut core_locals: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
         // For __main's List params: the eval driver and CLI pass
         // one RcPtr header per arg, so the SSA param stays a single
@@ -294,7 +294,7 @@ pub fn lower_module(
                 // Param header binds as a single RcPtr — no slot
                 // unpacking. The body never references it; rc_emit
                 // releases the param at the function boundary.
-                to_ssa_locals.insert(up.param_sym, up.header_val);
+                to_ssa_locals.insert(up.param_sym, vec![up.header_val]);
                 continue;
             }
             let base_name = mono.symbols.display(up.param_sym).to_owned();
@@ -304,7 +304,7 @@ pub fn lower_module(
                 .collect();
             for (i, (&sym, &ty)) in slot_syms.iter().zip(&up.slot_tys).enumerate() {
                 let v = builder.load(up.header_val, i * 8, ty);
-                to_ssa_locals.insert(sym, v);
+                to_ssa_locals.insert(sym, vec![v]);
             }
             core_locals.insert(up.param_sym, slot_syms);
         }
@@ -613,12 +613,12 @@ fn add_function_param(
     mono: &mut Monomorphized<'_>,
     param_sym: SymbolId,
     slot_tys: &[ScalarType],
-    to_ssa_locals: &mut HashMap<SymbolId, Value>,
+    to_ssa_locals: &mut HashMap<SymbolId, Vec<Value>>,
     core_locals: &mut HashMap<SymbolId, Vec<SymbolId>>,
 ) {
     if slot_tys.len() == 1 {
         let v = builder.add_func_param(slot_tys[0]);
-        to_ssa_locals.insert(param_sym, v);
+        to_ssa_locals.insert(param_sym, vec![v]);
     } else {
         let base_name = mono.symbols.display(param_sym).to_owned();
         let span = mono.symbols.get(param_sym).span;
@@ -627,7 +627,7 @@ fn add_function_param(
             .collect();
         for (sym, &ty) in slot_syms.iter().zip(slot_tys) {
             let v = builder.add_func_param(ty);
-            to_ssa_locals.insert(*sym, v);
+            to_ssa_locals.insert(*sym, vec![v]);
         }
         core_locals.insert(param_sym, slot_syms);
     }

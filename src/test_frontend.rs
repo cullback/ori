@@ -4485,7 +4485,7 @@ main = |n| n + 1
     let _entry = b.create_block();
     b.switch_to(crate::ssa::BlockId(0));
     let mut locals = std::collections::HashMap::new();
-    locals.insert(n_sym, n_val);
+    locals.insert(n_sym, vec![n_val]);
     let decls = crate::passes::decl_info::DeclInfo::default();
     let mut ctx = crate::passes::core::to_ssa::Ctx {
         builder: &mut b,
@@ -4560,7 +4560,7 @@ main = |n| if n == 0 : True then 1 : False then 0
     let _entry = b.create_block();
     b.switch_to(crate::ssa::BlockId(0));
     let mut locals = std::collections::HashMap::new();
-    locals.insert(n_sym, n_val);
+    locals.insert(n_sym, vec![n_val]);
     let mut core_ctx = crate::passes::core::to_ssa::Ctx {
         builder: &mut b,
         symbols: &mono.symbols,

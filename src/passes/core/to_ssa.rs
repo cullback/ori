@@ -42,7 +42,13 @@ pub struct Ctx<'b> {
     pub builder: &'b mut Builder,
     pub symbols: &'b SymbolTable,
     pub decls: &'b DeclInfo,
-    pub locals: HashMap<SymbolId, Value>,
+    /// Local binding → its SSA value(s). Single-slot bindings have
+    /// a 1-element Vec; multi-slot bindings (records, tuples,
+    /// payload-union destructures bound by a single source name)
+    /// have an N-element Vec carrying every slot. `lower` (single-
+    /// slot lookup) requires the Vec to be exactly 1 element;
+    /// `lower_slots` (multi-slot lookup) returns the full Vec.
+    pub locals: HashMap<SymbolId, Vec<Value>>,
     pub fieldless: HashMap<String, ScalarType>,
     pub transparent: super::lower::TransparentTable,
     /// Used by `lower(Let)` to unbox a single-shell value into N slots
@@ -572,6 +578,21 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             Ok(vec![count, count, data])
         }
 
+        // Var with multi-slot binding: return all slot values
+        // directly. `lower` errors on multi-slot Vars; this is the
+        // multi-slot read path. Single-slot Vars also flow through
+        // here because the fallback `_ =>` would call `lower` which
+        // returns a 1-element Vec from a 1-element locals entry.
+        Expr::Var { sym, .. } => {
+            ctx.locals.get(sym).cloned().ok_or_else(|| {
+                let name = ctx
+                    .symbols
+                    .try_get(*sym)
+                    .map(|info| info.display.as_str())
+                    .unwrap_or("?");
+                format!("core::to_ssa: unbound Var #{} ({name})", sym.0)
+            })
+        }
         // All other variants are single-slot today; delegate.
         _ => Ok(vec![lower(ctx, expr)?]),
     }
@@ -582,18 +603,27 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
 /// this slice.
 pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
     match expr {
-        Expr::Var { sym, .. } => ctx
-            .locals
-            .get(sym)
-            .copied()
-            .ok_or_else(|| {
-                let name = ctx
-                    .symbols
-                    .try_get(*sym)
-                    .map(|info| info.display.as_str())
-                    .unwrap_or("?");
-                format!("core::to_ssa: unbound Var #{} ({name})", sym.0)
-            }),
+        Expr::Var { sym, .. } => {
+            let vals = ctx
+                .locals
+                .get(sym)
+                .cloned()
+                .ok_or_else(|| {
+                    let name = ctx
+                        .symbols
+                        .try_get(*sym)
+                        .map(|info| info.display.as_str())
+                        .unwrap_or("?");
+                    format!("core::to_ssa: unbound Var #{} ({name})", sym.0)
+                })?;
+            if vals.len() != 1 {
+                return Err(format!(
+                    "core::to_ssa: multi-slot Var #{} accessed via single-slot lower (use lower_slots)",
+                    sym.0
+                ));
+            }
+            Ok(vals[0])
+        }
 
         Expr::Lit { value: Literal::Int(n), ty } => {
             // Type-directed const emission. Programs with U64, U8, I32,
@@ -679,7 +709,7 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             }
             let mut prev = Vec::with_capacity(binders.len());
             for (binder, val) in binders.iter().zip(vals) {
-                prev.push((*binder, ctx.locals.insert(*binder, val)));
+                prev.push((*binder, ctx.locals.insert(*binder, vec![val])));
             }
             let result_slots = lower_slots(ctx, body);
             for (binder, p) in prev.into_iter().rev() {
@@ -994,7 +1024,7 @@ fn lower_match(
             // Bind each slot to the corresponding binder sym. For a
             // Constructor pattern, `binders` is per-field; for
             // Wildcard / Binding, just bind the whole thing.
-            let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
+            let mut bound: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
             if let Some(binders) = binders_opt {
                 let mut slot_idx = 0;
                 for binder_slots in binders {
@@ -1004,13 +1034,15 @@ fn lower_match(
                         }
                         let v = scrutinee_slots[slot_idx];
                         if sym.0 != u32::MAX {
-                            bound.push((sym, ctx.locals.insert(sym, v)));
+                            bound.push((sym, ctx.locals.insert(sym, vec![v])));
                         }
                         slot_idx += 1;
                     }
                 }
             } else if let Pattern::Binding(sym) = &arm.pattern {
-                bound.push((*sym, ctx.locals.insert(*sym, scrutinee_slots[0])));
+                // Bind the whole multi-slot scrutinee to the source
+                // name (multi-slot locals carry all slots).
+                bound.push((*sym, ctx.locals.insert(*sym, scrutinee_slots.clone())));
             }
             let result = lower_arm_body_slots(ctx, &arm.body);
             // Restore locals.
@@ -1048,11 +1080,7 @@ fn lower_match(
         match &arm.pattern {
             Pattern::Wildcard => return lower_arm_body_slots(ctx, &arm.body),
             Pattern::Binding(sym) => {
-                // For multi-slot scrutinee, binding binds to the
-                // first slot (the discriminant). This is sufficient
-                // for simple uses; multi-slot Binding requires the
-                // multi-binder Let machinery.
-                let prev = ctx.locals.insert(*sym, tag_val);
+                let prev = ctx.locals.insert(*sym, vec![tag_val]);
                 let result = lower_arm_body_slots(ctx, &arm.body);
                 match prev {
                     Some(p) => { ctx.locals.insert(*sym, p); }
@@ -1077,7 +1105,7 @@ fn lower_match(
                     && !binders.is_empty()
                     && binders.iter().map(|b| b.len()).sum::<usize>() == scrutinee_slots.len() =>
             {
-                let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
+                let mut bound: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
                 let mut idx = 0;
                 for binder_slots in binders {
                     for &sym in binder_slots {
@@ -1085,7 +1113,7 @@ fn lower_match(
                             idx += 1;
                             continue;
                         }
-                        bound.push((sym, ctx.locals.insert(sym, scrutinee_slots[idx])));
+                        bound.push((sym, ctx.locals.insert(sym, vec![scrutinee_slots[idx]])));
                         idx += 1;
                     }
                 }
@@ -1223,7 +1251,7 @@ fn lower_match(
         // the payload then unwrap N values from the shell. Scalar
         // and single-slot binders bind one Value directly from the
         // payload slot.
-        let mut bound: Vec<(SymbolId, Option<Value>)> = Vec::new();
+        let mut bound: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
         if let Pattern::Constructor { tag, binders } = &arm.pattern {
             if let Some(payload_param) = payload_block_param {
                 // Resolve the per-field types by substituting the
@@ -1267,10 +1295,20 @@ fn lower_match(
                     // payload offset (the field's multi-slot data
                     // lives in a sub-heap object referenced there).
                     if binder_slots.len() == 1 && slot_tys.len() > 1 {
+                        // Multi-slot field bound by a single source
+                        // name. Load every slot from the wrapper
+                        // heap object referenced at payload_offset
+                        // and bind the source name to the full slot
+                        // list (multi-slot locals).
                         let sym = binder_slots[0];
                         if sym.0 != u32::MAX {
-                            let v = ctx.builder.load(payload_param, payload_offset, ScalarType::RcPtr);
-                            bound.push((sym, ctx.locals.insert(sym, v)));
+                            let wrapper = ctx.builder.load(payload_param, payload_offset, ScalarType::RcPtr);
+                            let slot_vals: Vec<Value> = slot_tys
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &t)| ctx.builder.load(wrapper, i * 8, t))
+                                .collect();
+                            bound.push((sym, ctx.locals.insert(sym, slot_vals)));
                         }
                         continue;
                     }
@@ -1289,7 +1327,7 @@ fn lower_match(
                             continue;
                         }
                         let v = ctx.builder.load(payload_param, payload_offset, slot_tys[0]);
-                        bound.push((sym, ctx.locals.insert(sym, v)));
+                        bound.push((sym, ctx.locals.insert(sym, vec![v])));
                     } else {
                         let wrapper = ctx.builder.load(payload_param, payload_offset, ScalarType::RcPtr);
                         for (slot_i, (&sym, &slot_ty)) in binder_slots.iter().zip(&slot_tys).enumerate() {
@@ -1297,7 +1335,7 @@ fn lower_match(
                                 continue;
                             }
                             let v = ctx.builder.load(wrapper, slot_i * 8, slot_ty);
-                            bound.push((sym, ctx.locals.insert(sym, v)));
+                            bound.push((sym, ctx.locals.insert(sym, vec![v])));
                         }
                     }
                 }
@@ -1860,7 +1898,7 @@ mod tests {
         let mut fieldless = HashMap::new();
         fieldless.insert("Bool".to_string(), ScalarType::U8);
         let mut locals = HashMap::new();
-        locals.insert(sentinel, one_u8);
+        locals.insert(sentinel, vec![one_u8]);
         let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
