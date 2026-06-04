@@ -100,9 +100,24 @@ The row-polymorphism template already exists in `Type::Record` and
     `Expr::App`. Closes Pos/Neg/Wrapped/Wrap-style patterns.
   - **M, N, O**: not started.
 
-**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5% → 93.9% → 94.3%**
-(+18 tests through Core in this session push). All 308 tests pass
+**Test coverage on Core: 82.9% → 86.4% → 91.2% → 92.5% → 93.9% → 94.3% → 95.2%**
+(+20 tests through Core in this session push). All 308 tests pass
 throughout.
+
+### Phase H+++ (94.3% → 95.2%, +2 tests, more structural fixes)
+
+* **Str-literal Match**: dedicated `lower_strlit_match` chains
+  per-arm length+bytewise equality checks. No external helper
+  needed — bytes are inlined since literal-Match arms are short.
+  Closes both `classify` fallbacks. +2 tests.
+* **ListWalk + ListWalkUntil handle multi-slot elements** via
+  `body_i * stride` math. The 3 ListWalk multi-slot fallbacks
+  closed structurally; the Set tests progress further (now blocked
+  on a different downstream issue inside Set.insert's lifted body).
+* **Late method resolution** for MethodCall when inference leaves
+  `resolved` empty (transparent newtype receiver): port
+  existing-lower's `resolve_method_at_lower_time`. Adds `funcs`
+  field to LowerCtx, populated from decl_info.
 
 ### Phase H++ (93.9% → 94.3%, +1 test, but deletes the convention smell)
 
