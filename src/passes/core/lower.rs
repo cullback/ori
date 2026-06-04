@@ -144,6 +144,10 @@ pub struct LowerCtx<'a> {
     /// resolve the direct-call function for a fresh-closure
     /// `Call(closure_tag, captures)` at the walk call site.
     pub tag_targets: HashMap<String, String>,
+    /// All known function names in the module. `resolve_method_late`
+    /// scans this for `TypeName.method` matches when inference
+    /// left a MethodCall unresolved.
+    pub funcs: HashSet<String>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -160,6 +164,7 @@ impl<'a> LowerCtx<'a> {
             locals: HashMap::new(),
             slot_paths: HashMap::new(),
             tag_targets: HashMap::new(),
+            funcs: HashSet::new(),
         }
     }
 }
@@ -503,10 +508,19 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             }
         }
 
-        ExprKind::MethodCall { receiver, args, resolved, .. } => {
-            let name = resolved
-                .as_ref()
-                .ok_or_else(|| "core::lower_expr: MethodCall unresolved".to_string())?;
+        ExprKind::MethodCall { receiver, args, resolved, method, .. } => {
+            // When inference left `resolved` empty (polymorphic body,
+            // transparent newtype receiver), recover by mangling
+            // `TypeName.method` from the receiver's type. Mirrors
+            // existing-lower's `resolve_method_at_lower_time`.
+            let owned;
+            let name = match resolved.as_ref() {
+                Some(r) => r,
+                None => {
+                    owned = resolve_method_late(ctx, method, &receiver.ty);
+                    &owned
+                }
+            };
             if let Some(op) = builtin_to_binop(name) {
                 if args.len() != 1 {
                     return Err(format!(
@@ -1304,6 +1318,62 @@ fn rewrite_is_if_to_match<'src>(
     rewritten.id = id;
     rewritten.ty = ty.clone();
     Some(rewritten)
+}
+
+/// Resolve `receiver.method(...)` when inference left
+/// `resolved` empty. Returns a mangled name to use as the
+/// call target. Mirrors existing-lower's
+/// `resolve_method_at_lower_time`: if the receiver is named
+/// (Con/App), use that name; otherwise look up by transparent
+/// unfold or by searching known funcs for a `TypeName.method`
+/// match.
+fn resolve_method_late(
+    ctx: &LowerCtx<'_>,
+    method: &str,
+    recv_ty: &Type,
+) -> String {
+    let named_lookup = |name: &str| -> Option<String> {
+        if let Some(nt) = crate::numeric::NumericType::from_name(name) {
+            if nt.has_builtin_method(method) {
+                return Some(format!("__builtin.{method}"));
+            }
+        }
+        Some(format!("{name}.{method}"))
+    };
+    if let Type::Con(name) | Type::App(name, _) = recv_ty {
+        if let Some(r) = named_lookup(name) {
+            return r;
+        }
+    }
+    let resolved = resolve_transparent(recv_ty, &ctx.transparent);
+    match &resolved {
+        Type::Record { .. } => {
+            // Search known funcs for `TypeName.method[__suffix]`.
+            // Set, for example, is a transparent alias for its
+            // underlying record; method names resolve via the
+            // alias's namespace.
+            let needle = format!(".{method}");
+            for func_name in &ctx.funcs {
+                if let Some(pos) = func_name.find(&needle) {
+                    let after = &func_name[pos + needle.len()..];
+                    if after.is_empty() || after.starts_with("__") {
+                        return func_name.clone();
+                    }
+                }
+            }
+            format!("__record_{method}")
+        }
+        Type::Tuple(_) => format!("__tuple_{method}"),
+        Type::TagUnion { .. } => format!("__tag_{method}"),
+        Type::Con(name) | Type::App(name, _) => {
+            if let Some(r) = named_lookup(name) {
+                r
+            } else {
+                format!("{name}.{method}")
+            }
+        }
+        _ => format!("__unknown_{method}"),
+    }
 }
 
 fn is_stdlib_intrinsic(name: &str) -> bool {

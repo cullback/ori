@@ -563,18 +563,33 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             ctx.builder.branch(cmp, done, done_args, body_block, body_args);
 
             ctx.builder.switch_to(body_block);
-            if elem_tys.len() != 1 {
-                return Err(format!(
-                    "core::to_ssa: ListWalkUntil multi-slot elements ({} slots) not yet supported",
-                    elem_tys.len()
-                ));
-            }
-            let elem_v = ctx.builder.load_dyn(body_data, body_i, elem_tys[0]);
+            // Element stride: for multi-slot elements, the buffer
+            // stores `elem_tys.len()` slots per element. base =
+            // body_i * stride; slot k loads at base + k.
+            let elem_vals: Vec<Value> = if elem_tys.len() == 1 {
+                vec![ctx.builder.load_dyn(body_data, body_i, elem_tys[0])]
+            } else {
+                let stride = ctx.builder.const_u64(elem_tys.len() as u64);
+                let base = ctx.builder.binop(BinaryOp::Mul, body_i, stride, ScalarType::U64);
+                elem_tys
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &t)| {
+                        if k == 0 {
+                            ctx.builder.load_dyn(body_data, base, t)
+                        } else {
+                            let k_const = ctx.builder.const_u64(k as u64);
+                            let off = ctx.builder.binop(BinaryOp::Add, base, k_const, ScalarType::U64);
+                            ctx.builder.load_dyn(body_data, off, t)
+                        }
+                    })
+                    .collect()
+            };
 
             let mut call_args: Vec<Value> = Vec::new();
             call_args.extend(body_cap_vals.iter().copied());
             call_args.extend(body_acc.iter().copied());
-            call_args.push(elem_v);
+            call_args.extend(elem_vals);
             let step_ret_tys = vec![ScalarType::U64, ScalarType::RcPtr];
             let step_result = ctx.builder.call_multi(target, call_args, &step_ret_tys);
             let tag_v = step_result[0];

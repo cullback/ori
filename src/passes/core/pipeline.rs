@@ -349,6 +349,7 @@ pub fn lower_module(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.target_func.clone()))
                 .collect();
+            ctx.funcs = decls.funcs.clone();
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {
                 format!("function `{name_str}`: AST→Core: {e}")
