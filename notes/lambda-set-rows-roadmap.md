@@ -79,10 +79,29 @@ The row-polymorphism template already exists in `Type::Record` and
     independent of lambda-set rows, would need their own dedicated
     cleanup. Shell-wrap specifically also blocked by the same
     specialize-shared-TagDecl issue as full E.
-  - **G**: shipped (this update).
-  - **H–O**: not started.
+  - **G**: shipped (roadmap kept current).
+  - **H (partial)**: List.walk_until + other stdlib HOFs not yet
+    ported. Significant new SSA-loop work (~50 lines) — deferred.
+  - **I**: shipped trivially — `Stmt::Guard` was already desugared
+    in `lower_block`'s early-out. Confirmed no current test hits the
+    "not yet supported" arm.
+  - **J**: not started. Local-receiver method calls still bail at
+    `lower.rs:420`.
+  - **K**: shipped. Added `Expr::Cast` variant; unary numeric
+    conversions (`to_u8`, `from_u8`, `to_u64`, `to_i64`, `to_bits`,
+    `from_bits`) now lower through Core.
+  - **L (blocked)**: tried `binder_slots.len()==1 && slot_tys.len()>1`
+    → bind to wrapper RcPtr. Removed the original error but pushed
+    the failure downstream (nested patterns need multi-slot locals
+    or materialization). Full fix needs `flatten_patterns` and/or
+    Core `Ctx::locals` to support multi-slot binders. Deferred.
+  - **L+**: structural constructors (uppercase Call targets not in
+    declared TypeAnnos) now emit `Expr::Con` in Core instead of
+    `Expr::App`. Closes Pos/Neg/Wrapped/Wrap-style patterns.
+  - **M, N, O**: not started.
 
-All 308 tests pass throughout.
+**Test coverage on Core: 82.9% → 85.1%** (5 more tests through
+Core, no regressions). All 308 tests pass throughout.
 
 ## What lambda-set rows actually delivered
 
