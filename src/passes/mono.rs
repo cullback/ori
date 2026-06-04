@@ -1125,13 +1125,39 @@ fn apply_mapping(ty: &Type, mapping: &HashMap<TypeVar, Type>) -> Type {
             params.iter().map(|p| apply_mapping(p, mapping)).collect(),
             Box::new(apply_mapping(ret, mapping)),
         ),
-        Type::Record { fields, .. } => Type::Record {
-            fields: fields
+        Type::Record { fields, rest } => {
+            // First substitute through the named fields.
+            let mut new_fields: Vec<(String, Type)> = fields
                 .iter()
                 .map(|(n, t)| (n.clone(), apply_mapping(t, mapping)))
-                .collect(),
-            rest: None,
-        },
+                .collect();
+            // If there's an open row variable, look it up in the
+            // mapping and merge its fields in. Mono receives row vars
+            // bound to a closed Record carrying the "extras" extracted
+            // from the call-site concrete type — dropping the rest
+            // would lose those fields and produce a wrongly-shaped
+            // record. (Surfaces for lifted closures whose body sees
+            // an open-row capture: scheme.ty has `{entries: V322,
+            // rest: V323}`, with V323 → `{len: U64}`. Without the
+            // merge, the lifted body's grown param decomposes to a
+            // single slot for `entries` instead of four for
+            // `{entries, len}`.)
+            if let Some(rest_var_ty) = rest {
+                if let Type::Var(rv) = rest_var_ty.as_ref() {
+                    if let Some(rest_resolved) = mapping.get(rv) {
+                        let rest_norm = normalize_type(rest_resolved);
+                        if let Type::Record { fields: extra, .. } = rest_norm {
+                            for (n, t) in extra {
+                                if !new_fields.iter().any(|(en, _)| en == &n) {
+                                    new_fields.push((n, t));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Type::Record { fields: new_fields, rest: None }
+        }
         Type::TagUnion { tags, rest } => {
             // Substitute through both the tag payloads and the
             // row-variable rest. Row vars are handled specially:

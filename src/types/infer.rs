@@ -372,8 +372,35 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         let param_types: Vec<Type> =
                             params.iter().map(|_| self.engine.fresh()).collect();
                         let ret = self.engine.fresh();
-                        let func_ty = Type::Arrow(param_types, Box::new(ret));
-                        self.env.insert(mangled.clone(), Scheme::mono(func_ty));
+                        let func_ty = Type::Arrow(param_types.clone(), Box::new(ret.clone()));
+                        // Collect the fresh vars used in the pre-scheme
+                        // and quantify the scheme over them. Otherwise
+                        // these vars stay free in env, so when another
+                        // function (e.g. a lifted lambda inferred in
+                        // Pass 2b) calls the method during Pass 2b/2c,
+                        // it unifies with the *same* vars — leaving
+                        // those vars free across schemes and breaking
+                        // mono substitution (the caller's scheme.ty
+                        // references vars that aren't in scheme.vars
+                        // and default to I64).
+                        let mut vars: Vec<TypeVar> = Vec::new();
+                        for p in &param_types {
+                            if let Type::Var(v) = p {
+                                vars.push(*v);
+                            }
+                        }
+                        if let Type::Var(v) = ret {
+                            vars.push(v);
+                        }
+                        self.env.insert(
+                            mangled.clone(),
+                            Scheme {
+                                vars,
+                                constraints: vec![],
+                                ty: func_ty,
+                                var_concretes: HashMap::new(),
+                            },
+                        );
                     }
                     if let Some(mod_name) = scope.qualified_types.get(type_name) {
                         let qual = format!("{mod_name}.{mangled}");
@@ -2195,10 +2222,18 @@ pub fn check(
             // (vars not appearing in scheme.ty after late-resolved
             // unification — surfaces for lifted-lambda schemes whose
             // method-constraint ret var binds at the closure use site).
+            // Capture post-infer resolutions for scheme.vars that
+            // bound to a fully concrete (no free vars) type. The
+            // "fully concrete" filter is critical: a var may resolve
+            // to a type whose own free vars belong to *another*
+            // scheme (e.g. `V_344` from __lifted_21 resolving to
+            // `App("Set", [Var(V_1391)])` where V_1391 is the outer
+            // Set.from_list scheme's var). Substituting that into the
+            // lifted body would carry the foreign var through mono.
             let mut var_concretes: HashMap<TypeVar, Type> = HashMap::new();
             for (orig_tv, resolved_tv) in scheme.vars.iter().zip(resolved_vars.iter()) {
                 let resolved = ctx.engine.resolve(&Type::Var(*orig_tv));
-                if !matches!(resolved, Type::Var(_)) {
+                if !matches!(resolved, Type::Var(_)) && ctx.engine.free_vars(&resolved).is_empty() {
                     var_concretes.insert(*resolved_tv, resolved);
                 }
             }
