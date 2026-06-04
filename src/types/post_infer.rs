@@ -294,7 +294,7 @@ fn eta_expand(
     let lifted_name = format!("__lifted_eta_{id}");
     let lifted_sym = symbols.fresh(&lifted_name, span, SymbolKind::Func);
 
-    let scheme = Scheme::mono(Type::Arrow(param_types, ret_ty, None));
+    let scheme = Scheme::mono(Type::Arrow(param_types.clone(), ret_ty.clone(), None));
     let lifted_decl: Decl<'static> = Decl::FuncDef {
         span: synth_span(span),
         name: lifted_sym,
@@ -308,6 +308,17 @@ fn eta_expand(
         func: lifted_sym,
         captures: Vec::new(),
     };
+    // Phase B: stamp the singleton lambda set onto expr.ty so the
+    // closure value carries its identity through downstream typing.
+    // Eta closures have no captures, so the tag's payload is empty.
+    expr.ty = Type::Arrow(
+        param_types,
+        ret_ty,
+        Some(Box::new(Type::TagUnion {
+            tags: vec![(lifted_name, vec![])],
+            rest: None,
+        })),
+    );
 }
 
 fn synth_span(s: Span) -> Span {

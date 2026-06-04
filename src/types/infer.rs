@@ -724,10 +724,16 @@ impl<'a, 'src> InferCtx<'a, 'src> {
 
             ExprKind::Closure { func, captures } => {
                 // Pre-infer lift emits these in place of every Lambda.
-                // Type = Arrow(remaining_params, ret), where remaining =
-                // lifted func's params minus the leading N captures.
-                // Each capture expr's type must match the corresponding
-                // capture-param type from the lifted function.
+                // Type = Arrow(remaining_params, ret, lambda_set), where
+                // remaining = lifted func's params minus the leading N
+                // captures. Each capture expr's type must match the
+                // corresponding capture-param type from the lifted
+                // function.
+                //
+                // Phase B: the lambda set is a singleton row carrying
+                // this closure's identity (lifted func name + capture
+                // types). Phase C's unification will merge sets when
+                // multiple lambdas flow into the same HOF position.
                 let name = self.symbols.display(*func).to_owned();
                 let scheme = self.lookup(&name).cloned().ok_or_else(|| {
                     Self::type_error(
@@ -752,13 +758,22 @@ impl<'a, 'src> InferCtx<'a, 'src> {
                         ),
                     ));
                 }
-                let cap_param_tys = &all_params[..n_caps];
+                let cap_param_tys: Vec<Type> = all_params[..n_caps].to_vec();
                 let remaining: Vec<Type> = all_params[n_caps..].to_vec();
-                for (cap_expr, cap_param_ty) in captures.iter().zip(cap_param_tys) {
+                for (cap_expr, cap_param_ty) in captures.iter().zip(cap_param_tys.iter()) {
                     let cap_ty = self.infer_expr(cap_expr)?;
                     self.unify_at(&cap_ty, cap_param_ty, cap_expr.span)?;
                 }
-                Ok(Type::Arrow(remaining, ret, None))
+                // Build the singleton lambda set: one tag named after
+                // the lifted function, with capture types as payload.
+                // The row's `rest: None` makes it a closed singleton —
+                // unification will widen it if another closure flows
+                // through the same position.
+                let lambda_set = Some(Box::new(Type::TagUnion {
+                    tags: vec![(name.clone(), cap_param_tys)],
+                    rest: None,
+                }));
+                Ok(Type::Arrow(remaining, ret, lambda_set))
             }
         }
     }
