@@ -56,6 +56,7 @@ fn compile(
     passes::lambda::lift::lift_pre_infer(&mut resolved);
     passes::topo::compute(&mut resolved)?;
     let infer_result = types::infer::check(&mut resolved)?;
+    let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut resolved.symbols);
     let mut mono = passes::mono::specialize(resolved.module, infer_result, resolved.symbols);
     let lambda_solution = passes::lambda::solve::solve(&mono);
     passes::lambda::specialize::specialize(&mut mono, &lambda_solution);
@@ -68,7 +69,7 @@ fn compile(
     // Perceus traffic; elim_dead_allocs cleans up.
     let decls = passes::decl_info::build(&mono);
     let mut ssa_module = passes::core::pipeline::lower_module(
-        &mut mono, &resolved.fields, &decls,
+        &mut mono, &resolved.fields, &decls, &builtins,
     ).map_err(|e| CompileError { message: e, span: None })?;
     if std::env::var("ORI_DUMP_CORE_RAW").is_ok() {
         eprintln!("=== raw Core SSA (pre ssa_form) ===\n{ssa_module}");

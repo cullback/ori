@@ -217,3 +217,122 @@ impl SymbolTable {
         &self.get(id).display
     }
 }
+
+/// Stable `SymbolId`s for compiler-internal primitive operations
+/// (arithmetic, comparison, bitwise, casts, list anamorphism). The
+/// Core IR represents every primitive as `Expr::App { target: <one
+/// of these>, args, ty }` so the "no special variants for primitive
+/// ops" property holds: primitives are bodyless `App`s, recognized
+/// at Core→SSA via this registry, and dispatched to the right
+/// `Inst` (Binary / Cast / inline counter-loop / ...).
+///
+/// Bootstrap once at the top of the compilation pipeline via
+/// [`BuiltinRegistry::bootstrap`]; the resulting `SymbolId`s are
+/// then threaded into `LowerCtx` (so AST→Core can stamp them on
+/// constructions) and the `to_ssa` `Ctx` (so the dispatch knows
+/// which `App` is which builtin).
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinRegistry {
+    pub add: SymbolId,
+    pub sub: SymbolId,
+    pub mul: SymbolId,
+    pub div: SymbolId,
+    pub rem: SymbolId,
+    pub eq: SymbolId,
+    pub neq: SymbolId,
+    pub lt: SymbolId,
+    pub gt: SymbolId,
+    pub le: SymbolId,
+    pub ge: SymbolId,
+    pub bit_and: SymbolId,
+    pub bit_or: SymbolId,
+    pub bit_xor: SymbolId,
+    pub shl: SymbolId,
+    pub shr: SymbolId,
+    /// Regular numeric cast (zero/sign extend or truncate).
+    pub cast: SymbolId,
+    /// `to_bits` / `from_bits` — same bit pattern, different type.
+    pub bitcast: SymbolId,
+    /// `List.range(start, end)` — anamorphism producing `[start,
+    /// start+1, ..., end-1]`. Element type comes from the `App.ty`
+    /// at lower time.
+    pub range: SymbolId,
+}
+
+impl BuiltinRegistry {
+    /// Allocate `SymbolId`s for every primitive. Display names follow
+    /// the existing `__builtin.*` convention (so `SymbolTable::display`
+    /// renders something sensible in dumps and error messages); the
+    /// `SymbolKind::Func` carries the "this names a callable" semantics
+    /// even though there's no SSA function with the name — the
+    /// `to_ssa` dispatch intercepts before the `Inst::Call` would
+    /// otherwise refer to it.
+    pub fn bootstrap(symbols: &mut SymbolTable) -> Self {
+        let span = Span::default();
+        let mut mk = |display: &str| symbols.intern(display, span, SymbolKind::Func);
+        Self {
+            add: mk("__builtin.add"),
+            sub: mk("__builtin.sub"),
+            mul: mk("__builtin.mul"),
+            div: mk("__builtin.div"),
+            rem: mk("__builtin.rem"),
+            eq: mk("__builtin.eq"),
+            neq: mk("__builtin.neq"),
+            lt: mk("__builtin.lt"),
+            gt: mk("__builtin.gt"),
+            le: mk("__builtin.le"),
+            ge: mk("__builtin.ge"),
+            bit_and: mk("__builtin.bit_and"),
+            bit_or: mk("__builtin.bit_or"),
+            bit_xor: mk("__builtin.bit_xor"),
+            shl: mk("__builtin.shl"),
+            shr: mk("__builtin.shr"),
+            cast: mk("__builtin.cast"),
+            bitcast: mk("__builtin.bitcast"),
+            range: mk("__builtin.list.range"),
+        }
+    }
+
+    /// Map a `SymbolId` to the builtin it represents, if any. Used
+    /// by `to_ssa`'s `App` handler to decide whether to dispatch
+    /// (inline op emission) or call (regular function).
+    pub fn classify(&self, sym: SymbolId) -> Option<BuiltinKind> {
+        use crate::ssa::BinaryOp;
+        if sym == self.add { return Some(BuiltinKind::Binary(BinaryOp::Add)); }
+        if sym == self.sub { return Some(BuiltinKind::Binary(BinaryOp::Sub)); }
+        if sym == self.mul { return Some(BuiltinKind::Binary(BinaryOp::Mul)); }
+        if sym == self.div { return Some(BuiltinKind::Binary(BinaryOp::Div)); }
+        if sym == self.rem { return Some(BuiltinKind::Binary(BinaryOp::Rem)); }
+        if sym == self.eq { return Some(BuiltinKind::Binary(BinaryOp::Eq)); }
+        if sym == self.neq { return Some(BuiltinKind::Binary(BinaryOp::Neq)); }
+        if sym == self.lt { return Some(BuiltinKind::Binary(BinaryOp::Lt)); }
+        if sym == self.gt { return Some(BuiltinKind::Binary(BinaryOp::Gt)); }
+        if sym == self.le { return Some(BuiltinKind::Binary(BinaryOp::Le)); }
+        if sym == self.ge { return Some(BuiltinKind::Binary(BinaryOp::Ge)); }
+        if sym == self.bit_and { return Some(BuiltinKind::Binary(BinaryOp::And)); }
+        if sym == self.bit_or { return Some(BuiltinKind::Binary(BinaryOp::Or)); }
+        if sym == self.bit_xor { return Some(BuiltinKind::Binary(BinaryOp::Xor)); }
+        if sym == self.shl { return Some(BuiltinKind::Binary(BinaryOp::Shl)); }
+        if sym == self.shr { return Some(BuiltinKind::Binary(BinaryOp::Shr)); }
+        if sym == self.cast { return Some(BuiltinKind::Cast); }
+        if sym == self.bitcast { return Some(BuiltinKind::Bitcast); }
+        if sym == self.range { return Some(BuiltinKind::Range); }
+        None
+    }
+}
+
+/// What a builtin `SymbolId` represents at to_ssa dispatch time.
+#[derive(Debug, Clone, Copy)]
+pub enum BuiltinKind {
+    /// Two-argument scalar op: `Inst::Binary(op, ...)`.
+    Binary(crate::ssa::BinaryOp),
+    /// One-argument numeric conversion, zero/sign-extend or truncate.
+    /// Destination scalar type is read from `App.ty`.
+    Cast,
+    /// One-argument bit-pattern reinterpretation. Destination scalar
+    /// type from `App.ty`.
+    Bitcast,
+    /// `range(start, end)` → buffer trio. Element scalar type from
+    /// `App.ty` (which is `List(T)`).
+    Range,
+}

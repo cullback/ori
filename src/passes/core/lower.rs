@@ -163,10 +163,19 @@ pub struct LowerCtx<'a> {
     /// `lower_call_args` to expand caller-side args to the multi-
     /// slot shape the callee expects.
     pub callee_ho_arg: HashMap<(String, usize), Type>,
+    /// Bootstrapped builtin op SymbolIds. AST→Core constructs
+    /// `Expr::App { target: builtins.<op>, ... }` for every
+    /// primitive arithmetic / comparison / cast / range so the IR
+    /// stays free of dedicated `BinOp` / `Cast` / `Range` variants.
+    pub builtins: crate::symbol::BuiltinRegistry,
 }
 
 impl<'a> LowerCtx<'a> {
-    pub fn new(fields: &'a FieldInterner, symbols: &'a mut SymbolTable) -> Self {
+    pub fn new(
+        fields: &'a FieldInterner,
+        symbols: &'a mut SymbolTable,
+        builtins: crate::symbol::BuiltinRegistry,
+    ) -> Self {
         Self {
             fields,
             symbols,
@@ -182,6 +191,7 @@ impl<'a> LowerCtx<'a> {
             funcs: HashSet::new(),
             ho_param_override: HashMap::new(),
             callee_ho_arg: HashMap::new(),
+            builtins,
         }
     }
 }
@@ -2715,7 +2725,8 @@ mod tests {
         fields: &'a FieldInterner,
         symbols: &'a mut SymbolTable,
     ) -> LowerCtx<'a> {
-        LowerCtx::new(fields, symbols)
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(symbols);
+        LowerCtx::new(fields, symbols, builtins)
     }
 
     #[test]

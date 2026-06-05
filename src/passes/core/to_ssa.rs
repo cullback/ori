@@ -56,6 +56,10 @@ pub struct Ctx<'b> {
     /// decisions — those follow the existing-lower single-shell
     /// convention to keep call-result compatibility.
     pub payload_unions: std::collections::HashSet<String>,
+    /// Builtin op SymbolIds. App's whose `target` matches one of
+    /// these dispatch to inline ops (`Inst::BinOp`, `Inst::Cast`,
+    /// inline range loop) instead of regular function calls.
+    pub builtins: crate::symbol::BuiltinRegistry,
     /// Memo for shared-evaluation `Let`s. When `bind_multi_slot` or
     /// `lower_block`'s wrap-with-Lets emits N `Let`s with the same
     /// `binders` (because all N reference the same multi-slot value
@@ -2352,7 +2356,8 @@ mod tests {
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
-        let symbols = SymbolTable::new();
+        let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
@@ -2363,6 +2368,7 @@ mod tests {
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
             bind_cache: HashMap::new(),
+            builtins,
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         // Finalize so we can introspect the function.
@@ -2388,7 +2394,8 @@ mod tests {
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
-        let symbols = SymbolTable::new();
+        let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
@@ -2399,6 +2406,7 @@ mod tests {
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
             bind_cache: HashMap::new(),
+            builtins,
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -2422,6 +2430,7 @@ mod tests {
         use crate::source::FileId;
         use crate::symbol::SymbolKind;
         let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let f = symbols.fresh(
             "myfunc",
             Span { file: FileId(0), start: 0, end: 0 },
@@ -2448,6 +2457,7 @@ mod tests {
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
             bind_cache: HashMap::new(),
+            builtins,
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -2492,7 +2502,8 @@ mod tests {
             ty: i64_ty(),
         };
 
-        let symbols = SymbolTable::new();
+        let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
@@ -2506,6 +2517,7 @@ mod tests {
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
             bind_cache: HashMap::new(),
+            builtins,
         };
         let result = lower(&mut ctx, &core).expect("lowering should succeed");
         builder.ret(result);
@@ -2553,7 +2565,8 @@ mod tests {
             ty: i64_ty(),
         };
 
-        let symbols = SymbolTable::new();
+        let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
@@ -2578,6 +2591,7 @@ mod tests {
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
             bind_cache: HashMap::new(),
+            builtins,
         };
 
         let core_with_var = Expr::Match {
@@ -2610,7 +2624,8 @@ mod tests {
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
-        let symbols = SymbolTable::new();
+        let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
@@ -2621,6 +2636,7 @@ mod tests {
             transparent: HashMap::new(),
             payload_unions: std::collections::HashSet::new(),
             bind_cache: HashMap::new(),
+            builtins,
         };
         let err = lower(&mut ctx, &core).unwrap_err();
         assert!(err.contains("#42"), "error should name the unbound symbol: {err}");

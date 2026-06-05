@@ -57,8 +57,9 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     // elim_dead_allocs run after Core's emission to finalize SSA
     // for validation.
     let decls = crate::passes::decl_info::build(&mono);
+    let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut mono.symbols);
     let mut ssa_module = crate::passes::core::pipeline::lower_module(
-        &mut mono, &resolved.fields, &decls,
+        &mut mono, &resolved.fields, &decls, &builtins,
     ).unwrap();
     crate::ssa::ssa_form::run(&mut ssa_module);
     crate::ssa::rc_emit::run(&mut ssa_module);
@@ -4412,11 +4413,13 @@ main = |n| n + 1
         (params[0], body.clone())
     };
 
+    let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut mono.symbols);
     // Lower the body AST → Core via slot-list API.
     let core_body = {
         let mut ctx = crate::passes::core::lower::LowerCtx::new(
             &resolved.fields,
             &mut mono.symbols,
+            builtins,
         );
         crate::passes::core::lower::lower_expr(&mut ctx, &body_clone)
             .expect("Core lowering should succeed for n + 1")
@@ -4440,6 +4443,7 @@ main = |n| n + 1
         transparent: std::collections::HashMap::new(),
         payload_unions: std::collections::HashSet::new(),
         bind_cache: std::collections::HashMap::new(),
+        builtins,
     };
     let result = crate::passes::core::to_ssa::lower(&mut ctx, &core_body)
         .expect("Core→SSA should succeed");
@@ -4489,10 +4493,12 @@ main = |n| if n == 0 : True then 1 : False then 0
         (params[0], body.clone())
     };
 
+    let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut mono.symbols);
     let core_body = {
         let mut ctx = crate::passes::core::lower::LowerCtx::new(
             &resolved.fields,
             &mut mono.symbols,
+            builtins,
         );
         ctx.fieldless = decls.fieldless_tags.clone();
         crate::passes::core::lower::lower_expr(&mut ctx, &body_clone)
@@ -4514,6 +4520,7 @@ main = |n| if n == 0 : True then 1 : False then 0
         transparent: std::collections::HashMap::new(),
         payload_unions: std::collections::HashSet::new(),
         bind_cache: std::collections::HashMap::new(),
+        builtins,
     };
     let result = crate::passes::core::to_ssa::lower(&mut core_ctx, &core_body)
         .expect("Core→SSA should succeed");
@@ -4560,10 +4567,12 @@ main = |n| helper(n) + 1
     crate::passes::lambda::narrow::narrow(&mut mono);
     let decls = crate::passes::decl_info::build(&mono);
 
+    let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut mono.symbols);
     let module = crate::passes::core::pipeline::lower_module(
         &mut mono,
         &resolved.fields,
         &decls,
+        &builtins,
     ).expect("whole-module Core lowering should succeed");
     crate::ssa::validate::check(&module, "core pipeline e2e");
 

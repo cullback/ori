@@ -40,6 +40,7 @@ pub fn lower_module(
     mono: &mut Monomorphized<'_>,
     fields: &FieldInterner,
     decls: &DeclInfo,
+    builtins: &crate::symbol::BuiltinRegistry,
 ) -> Result<Module, String> {
     // Snapshot the function decls (name, params, body) so we don't
     // hold `mono.module` immutably while we borrow `mono.symbols`
@@ -311,7 +312,7 @@ pub fn lower_module(
 
         // AST → Core (mut borrows mono.symbols).
         let core_body = {
-            let mut ctx = LowerCtx::new(fields, &mut mono.symbols);
+            let mut ctx = LowerCtx::new(fields, &mut mono.symbols, *builtins);
             ctx.fieldless = decls.fieldless_tags.clone();
             ctx.transparent = transparent.clone();
             ctx.constructors = decls.constructors.keys().cloned().collect();
@@ -447,6 +448,7 @@ pub fn lower_module(
                 transparent: transparent.clone(),
                 payload_unions: payload_unions.clone(),
                 bind_cache: std::collections::HashMap::new(),
+                builtins: *builtins,
             };
             let mut all = Vec::new();
             for e in &core_body {
