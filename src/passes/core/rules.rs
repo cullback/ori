@@ -96,7 +96,7 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
-        Expr::ListLit { elements, elem_ty, ty } => Expr::ListLit {
+        Expr::BufLit { elements, elem_ty, ty } => Expr::BufLit {
             elements: elements.into_iter().map(simplify).collect(),
             elem_ty,
             ty,
@@ -108,21 +108,21 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
-        Expr::ListRange { start, end, ty } => Expr::ListRange {
+        Expr::Range { start, end, ty } => Expr::Range {
             start: Box::new(simplify(*start)),
             end: Box::new(simplify(*end)),
             ty,
         },
 
-        Expr::ListAppend { list_slots, val_slots, elem_ty, ty } => Expr::ListAppend {
-            list_slots: list_slots.into_iter().map(simplify).collect(),
+        Expr::BufAppend { buf_slots, val_slots, elem_ty, ty } => Expr::BufAppend {
+            buf_slots: buf_slots.into_iter().map(simplify).collect(),
             val_slots: val_slots.into_iter().map(simplify).collect(),
             elem_ty,
             ty,
         },
 
-        Expr::ListSet { list_slots, idx, val_slots, elem_ty, ty } => Expr::ListSet {
-            list_slots: list_slots.into_iter().map(simplify).collect(),
+        Expr::BufSet { buf_slots, idx, val_slots, elem_ty, ty } => Expr::BufSet {
+            buf_slots: buf_slots.into_iter().map(simplify).collect(),
             idx: Box::new(simplify(*idx)),
             val_slots: val_slots.into_iter().map(simplify).collect(),
             elem_ty,
@@ -204,15 +204,15 @@ fn body_uses(expr: &Expr, target: SymbolId) -> bool {
                 || captures.iter().any(|e| body_uses(e, target))
         }
         Expr::Con { args, .. } => args.iter().any(|a| body_uses(a, target)),
-        Expr::ListLit { elements, .. } => elements.iter().any(|e| body_uses(e, target)),
+        Expr::BufLit { elements, .. } => elements.iter().any(|e| body_uses(e, target)),
         Expr::BufLoad { buf, idx, .. } => body_uses(buf, target) || body_uses(idx, target),
-        Expr::ListRange { start, end, .. } => body_uses(start, target) || body_uses(end, target),
-        Expr::ListAppend { list_slots, val_slots, .. } => {
-            list_slots.iter().any(|e| body_uses(e, target))
+        Expr::Range { start, end, .. } => body_uses(start, target) || body_uses(end, target),
+        Expr::BufAppend { buf_slots, val_slots, .. } => {
+            buf_slots.iter().any(|e| body_uses(e, target))
                 || val_slots.iter().any(|e| body_uses(e, target))
         }
-        Expr::ListSet { list_slots, idx, val_slots, .. } => {
-            list_slots.iter().any(|e| body_uses(e, target))
+        Expr::BufSet { buf_slots, idx, val_slots, .. } => {
+            buf_slots.iter().any(|e| body_uses(e, target))
                 || body_uses(idx, target)
                 || val_slots.iter().any(|e| body_uses(e, target))
         }

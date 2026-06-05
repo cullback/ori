@@ -456,8 +456,8 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // (len, cap, data) list decomposition. Core lowers
             // the ones it understands via direct slot-list
             // slicing for header reads + dedicated Core nodes
-            // (`BufLoad`, `ListRange`, `ListWalk`, `ListAppend`,
-            // `ListSet`) for buffer ops; the remainder bail so
+            // (`BufLoad`, `Range`, `ListWalk`, `BufAppend`,
+            // `BufSet`) for buffer ops; the remainder bail so
             // fallback handles them.
             if let Some(prim) = try_lower_stdlib_intrinsic(ctx, &name, args, &ast.ty)? {
                 return Ok(prim);
@@ -870,7 +870,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // list — derived from the base's source type, which after
             // inference matches our `expand_slots`-shaped slot list.
             // `_expanded` fans out a multi-slot value that lowered to
-            // a single Core Expr (App, ListLit, ...) so the splice
+            // a single Core Expr (App, BufLit, ...) so the splice
             // length matches `count`.
             let mut slots = lower_expr_slots_expanded(ctx, base)?;
             for (field, val) in updates {
@@ -923,7 +923,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             for e in elems {
                 elements.extend(lower_expr_slots(ctx, e)?);
             }
-            Ok(vec![Expr::ListLit {
+            Ok(vec![Expr::BufLit {
                 elements,
                 elem_ty,
                 ty: ast.ty.clone(),
@@ -1141,7 +1141,7 @@ fn try_lower_stdlib_intrinsic(
                 Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
                 _ => return Ok(None),
             };
-            let list_slots = lower_expr_slots_expanded(ctx, xs)?;
+            let buf_slots = lower_expr_slots_expanded(ctx, xs)?;
             let init_slots = lower_expr_slots(ctx, init)?;
             let captures = match &closure_expr.kind {
                 ExprKind::Call { args: cap_args, .. } => {
@@ -1155,7 +1155,7 @@ fn try_lower_stdlib_intrinsic(
             };
             return Ok(Some(vec![Expr::Cata {
                 fold_fn: target_func,
-                target_slots: list_slots,
+                target_slots: buf_slots,
                 target_ty: xs_ty,
                 init: init_slots,
                 captures,
@@ -1188,7 +1188,7 @@ fn try_lower_stdlib_intrinsic(
                 Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
                 _ => return Ok(None),
             };
-            let list_slots = lower_expr_slots_expanded(ctx, xs)?;
+            let buf_slots = lower_expr_slots_expanded(ctx, xs)?;
             let init_slots = lower_expr_slots(ctx, init)?;
             // Captures: the closure_expr is Call(tag, captures);
             // lower each capture's slots so the loop can thread
@@ -1205,7 +1205,7 @@ fn try_lower_stdlib_intrinsic(
             };
             Ok(Some(vec![Expr::Cata {
                 fold_fn: target_func,
-                target_slots: list_slots,
+                target_slots: buf_slots,
                 target_ty: xs_ty,
                 init: init_slots,
                 captures,
@@ -1230,11 +1230,11 @@ fn try_lower_stdlib_intrinsic(
                 Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
                 _ => return Ok(None),
             };
-            let list_slots = lower_expr_slots_expanded(ctx, xs)?;
+            let buf_slots = lower_expr_slots_expanded(ctx, xs)?;
             let idx_lowered = lower_expr(ctx, idx_expr)?;
             let val_slots = lower_expr_slots(ctx, val)?;
-            Ok(Some(vec![Expr::ListSet {
-                list_slots,
+            Ok(Some(vec![Expr::BufSet {
+                buf_slots,
                 idx: Box::new(idx_lowered),
                 val_slots,
                 elem_ty,
@@ -1258,10 +1258,10 @@ fn try_lower_stdlib_intrinsic(
                 Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
                 _ => return Ok(None),
             };
-            let list_slots = lower_expr_slots_expanded(ctx, xs)?;
+            let buf_slots = lower_expr_slots_expanded(ctx, xs)?;
             let val_slots = lower_expr_slots(ctx, val)?;
-            Ok(Some(vec![Expr::ListAppend {
-                list_slots,
+            Ok(Some(vec![Expr::BufAppend {
+                buf_slots,
                 val_slots,
                 elem_ty,
                 ty: ret_ty.clone(),
@@ -1276,7 +1276,7 @@ fn try_lower_stdlib_intrinsic(
             }
             let start = lower_expr(ctx, &args[0])?;
             let end = lower_expr(ctx, &args[1])?;
-            Ok(Some(vec![Expr::ListRange {
+            Ok(Some(vec![Expr::Range {
                 start: Box::new(start),
                 end: Box::new(end),
                 ty: ret_ty.clone(),
@@ -2183,7 +2183,7 @@ fn lower_destructure(
 /// slot syms in `ctx.locals`; subsequent Vars hit the registered
 /// syms). Used by `Record` / `Tuple` / call-arg sites that
 /// concatenate per-field slot lists when a field's expression is a
-/// multi-slot operation (App, ListAppend, Cata) producing a single
+/// multi-slot operation (App, BufAppend, Cata) producing a single
 /// Core node.
 /// Walk `scheme_ret` and the monomorphic `mono_ty` in parallel,
 /// pairing each `Type::Var` with the concrete `Type` at the same
@@ -2233,7 +2233,7 @@ fn apply_pattern_subst(
 
 /// Lower an AST expression as a slot list, ensuring the result has
 /// `expand_slots(ast.ty)` entries. If the natural lowering produces
-/// a single Core Expr whose type is multi-slot (App, ListLit, Match,
+/// a single Core Expr whose type is multi-slot (App, BufLit, Match,
 /// nested Con returning a payload union, etc.), fan it out into per-
 /// slot `Var` references via `bind_multi_slot` — one shared `Let`
 /// binds N slot syms to the value, each entry references one sym.

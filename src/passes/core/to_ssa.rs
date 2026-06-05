@@ -227,7 +227,7 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // trio without an intermediate header alloc. The single-
         // slot `lower` path wraps to a header when the caller
         // needs one RcPtr (boundary cases only).
-        Expr::ListLit { elements, elem_ty, .. } => {
+        Expr::BufLit { elements, elem_ty, .. } => {
             let slot_count = super::lower::expand_slots_with(
                 elem_ty,
                 &ctx.fieldless,
@@ -255,11 +255,11 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // result feeds the next call so the entire element lands
         // in one cloned/unique buffer). Returns the new
         // (len, cap, new_data) trio.
-        Expr::ListSet { list_slots, idx, val_slots, .. } => {
+        Expr::BufSet { buf_slots, idx, val_slots, .. } => {
             use crate::ssa::{BinaryOp, ScalarType};
             let list_vals: Vec<Value> = {
                 let mut all = Vec::new();
-                for e in list_slots {
+                for e in buf_slots {
                     all.extend(lower_slots(ctx, e)?);
                 }
                 all
@@ -304,11 +304,11 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // elements (records, Str, nested lists) store N slots at
         // consecutive 8-byte offsets within the element's stride
         // bucket.
-        Expr::ListAppend { list_slots, val_slots, .. } => {
+        Expr::BufAppend { buf_slots, val_slots, .. } => {
             use crate::ssa::{BinaryOp, ScalarType};
             let list_vals: Vec<Value> = {
                 let mut all = Vec::new();
-                for e in list_slots {
+                for e in buf_slots {
                     all.extend(lower_slots(ctx, e)?);
                 }
                 all
@@ -357,7 +357,7 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // List.range emits a counter-driven fill loop and returns
         // the resulting (len, cap, data) trio. Empty range
         // (`end <= start`) yields count=0 with a 0-byte data buffer.
-        Expr::ListRange { start, end, .. } => {
+        Expr::Range { start, end, .. } => {
             use crate::ssa::{BinaryOp, ScalarType};
             let start_v = lower(ctx, start)?;
             let end_v = lower(ctx, end)?;
@@ -648,7 +648,7 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             }
         }
 
-        Expr::ListLit { elements, elem_ty, .. } => {
+        Expr::BufLit { elements, elem_ty, .. } => {
             // Element layout: each source-level element occupies
             // `slot_count` consecutive 8-byte slots in the data
             // buffer. `elements` is already flat (AST→Core
@@ -749,7 +749,7 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 
         // Multi-slot primitives — single-slot caller asks for a
         // header pointer; materialize the trio into a 24-byte shell.
-        Expr::ListRange { .. } => {
+        Expr::Range { .. } => {
             let slots = lower_slots(ctx, expr)?;
             let shell = ctx.builder.alloc(slots.len() * 8);
             for (i, v) in slots.iter().enumerate() {
@@ -759,7 +759,7 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         }
 
         // ListSet single-slot caller: materialize the trio.
-        Expr::ListSet { .. } => {
+        Expr::BufSet { .. } => {
             let slots = lower_slots(ctx, expr)?;
             let shell = ctx.builder.alloc(slots.len() * 8);
             for (i, v) in slots.iter().enumerate() {
@@ -770,7 +770,7 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 
         // ListAppend single-slot caller: materialize the trio
         // into a shell. Multi-slot callers go through `lower_slots`.
-        Expr::ListAppend { .. } => {
+        Expr::BufAppend { .. } => {
             let slots = lower_slots(ctx, expr)?;
             let shell = ctx.builder.alloc(slots.len() * 8);
             for (i, v) in slots.iter().enumerate() {

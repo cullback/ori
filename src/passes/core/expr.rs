@@ -276,7 +276,7 @@ pub enum Expr {
     /// at function-boundary use, which Core handles via expand_slots).
     /// Each element must be single-slot for now; multi-slot elements
     /// (List of records, etc.) need inlined-element layout support.
-    ListLit {
+    BufLit {
         elements: Vec<Expr>,
         elem_ty: Type,
         ty: Type,
@@ -316,13 +316,13 @@ pub enum Expr {
     /// as an unfold.
     ///
     /// `ty` is the result `List(U64)` type.
-    ListRange {
+    Range {
         start: Box<Expr>,
         end: Box<Expr>,
         ty: Type,
     },
 
-    /// `ListAppend(list_slots, val_slots, elem_ty, ty)` — produces
+    /// `ListAppend(buf_slots, val_slots, elem_ty, ty)` — produces
     /// a new `(len, cap, data)` trio with `val_slots` written at
     /// index `len`. For multi-slot elements (records, Str, nested
     /// List), the buffer stride is `val_slots.len() * 8` and each
@@ -330,20 +330,20 @@ pub enum Expr {
     /// element's stride bucket. Implemented via `cow_resize_dyn` +
     /// per-slot stores; FBIP reuses the buffer in place when
     /// refcount is 1.
-    ListAppend {
-        list_slots: Vec<Expr>,
+    BufAppend {
+        buf_slots: Vec<Expr>,
         val_slots: Vec<Expr>,
         elem_ty: Type,
         ty: Type,
     },
 
-    /// `ListSet(list_slots, idx, val_slots, elem_ty, ty)` —
+    /// `ListSet(buf_slots, idx, val_slots, elem_ty, ty)` —
     /// produces a new `(len, cap, data)` trio with `val_slots`
     /// written at element index `idx`. Buffer is `cow_store_dyn`'d
     /// in place when refcount is 1; otherwise it clones. Stride
     /// handling matches `ListAppend`.
-    ListSet {
-        list_slots: Vec<Expr>,
+    BufSet {
+        buf_slots: Vec<Expr>,
         idx: Box<Expr>,
         val_slots: Vec<Expr>,
         elem_ty: Type,
@@ -377,11 +377,11 @@ impl Expr {
             | Self::Cata { ty, .. }
             | Self::Con { ty, .. }
             | Self::BinOp { ty, .. }
-            | Self::ListLit { ty, .. }
+            | Self::BufLit { ty, .. }
             | Self::BufLoad { ty, .. }
-            | Self::ListRange { ty, .. }
-            | Self::ListAppend { ty, .. }
-            | Self::ListSet { ty, .. }
+            | Self::Range { ty, .. }
+            | Self::BufAppend { ty, .. }
+            | Self::BufSet { ty, .. }
             | Self::Cast { ty, .. } => ty,
         }
     }
@@ -401,11 +401,11 @@ impl Expr {
             | Self::Cata { ty, .. }
             | Self::Con { ty, .. }
             | Self::BinOp { ty, .. }
-            | Self::ListLit { ty, .. }
+            | Self::BufLit { ty, .. }
             | Self::BufLoad { ty, .. }
-            | Self::ListRange { ty, .. }
-            | Self::ListAppend { ty, .. }
-            | Self::ListSet { ty, .. }
+            | Self::Range { ty, .. }
+            | Self::BufAppend { ty, .. }
+            | Self::BufSet { ty, .. }
             | Self::Cast { ty, .. } => *ty = new_ty,
         }
     }
