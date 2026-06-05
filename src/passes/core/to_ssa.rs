@@ -175,18 +175,29 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             lower_match(ctx, scrutinee_slots, scrutinee_ty, arms, ty)
         }
 
-        // Cata lowers to the same SSA as the equivalent App — both
-        // call the same `__fold_N` helper. Cata's value is purely at
-        // the rewrite layer (rules.rs); to_ssa treats it as a labeled
-        // App so the resulting SSA matches what existing-lower
-        // produces from `fold_lift`'s output verbatim.
-        Expr::Cata { fold_fn, target_slots, extra_args, ty } => {
+        // Cata dispatches on target's source type:
+        //   - target_ty unwraps to `List(T)` → emit a counter loop
+        //     (`lower_list_cata`). `early_exit=true` adds
+        //     Continue/Break dispatch on each step return.
+        //   - Otherwise → emit a recursive helper Call. The
+        //     fold-helper's body (from `fold_lift`) holds the
+        //     structural recursion.
+        Expr::Cata { fold_fn, target_slots, target_ty, init, captures, elem_ty, early_exit, ty } => {
+            let unwrapped = super::lower::resolve_transparent(target_ty, &ctx.transparent);
+            let is_list = matches!(&unwrapped, Type::App(n, ts) if n == "List" && ts.len() == 1);
+            if is_list {
+                return lower_list_cata(ctx, target_slots, init, captures, elem_ty, *early_exit, fold_fn, ty);
+            }
+            // Helper-call path: Call(fold_fn, target_slots ++ init ++ captures).
             let ret_slots = super::lower::expand_slots_with(ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
             let mut arg_vals: Vec<Value> = Vec::new();
             for s in target_slots {
                 arg_vals.extend(lower_slots(ctx, s)?);
             }
-            for a in extra_args {
+            for a in init {
+                arg_vals.extend(lower_slots(ctx, a)?);
+            }
+            for a in captures {
                 arg_vals.extend(lower_slots(ctx, a)?);
             }
             if ret_slots.len() == 1 {
@@ -236,407 +247,6 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             Ok(vec![len_val, len_val, data])
         }
 
-        // List.walk: fold the list under a step function, threading
-        // the accumulator. Singleton-closure direct-dispatch only
-        // (Core lower only emits ListWalk when the closure's tag
-        // resolves to a known apply target). Mirrors
-        // existing-lower's `lower_list_walk` with the `until=false`
-        // path.
-        Expr::ListWalk { list_slots, init, target, captures, elem_ty, ty: walk_ty } => {
-            use crate::ssa::{BinaryOp, ScalarType};
-
-            let list_vals: Vec<Value> = {
-                let mut all = Vec::new();
-                for e in list_slots {
-                    all.extend(lower_slots(ctx, e)?);
-                }
-                all
-            };
-            if list_vals.len() != 3 {
-                return Err(format!(
-                    "core::to_ssa: ListWalk expects 3-slot list trio, got {} slots",
-                    list_vals.len()
-                ));
-            }
-            let len_val = list_vals[0];
-            let data_ptr = list_vals[2];
-
-            let acc_slots: Vec<ScalarType> = super::lower::expand_slots_with(
-                walk_ty,
-                &ctx.fieldless,
-                &ctx.transparent,
-                &ctx.payload_unions,
-            );
-            let init_vals: Vec<Value> = {
-                let mut all = Vec::new();
-                for e in init {
-                    all.extend(lower_slots(ctx, e)?);
-                }
-                all
-            };
-            if init_vals.len() != acc_slots.len() {
-                return Err(format!(
-                    "core::to_ssa: ListWalk init slot count {} != acc_slots {}",
-                    init_vals.len(),
-                    acc_slots.len()
-                ));
-            }
-
-            // Captures flow as parallel "step values" through the
-            // loop block params. Each capture expression is lowered
-            // to its slots; we collect both values and types.
-            let mut cap_vals: Vec<Value> = Vec::new();
-            let mut cap_tys: Vec<ScalarType> = Vec::new();
-            for c in captures {
-                let slots = lower_slots(ctx, c)?;
-                let ty_expanded = super::lower::expand_slots_with(
-                    c.ty(),
-                    &ctx.fieldless,
-                    &ctx.transparent,
-                    &ctx.payload_unions,
-                );
-                if slots.len() == ty_expanded.len() {
-                    cap_vals.extend(slots);
-                    cap_tys.extend(ty_expanded);
-                } else {
-                    // Mismatch — fall back to a single RcPtr per
-                    // capture (defensive; shouldn't happen for
-                    // well-typed Core).
-                    for v in slots {
-                        cap_vals.push(v);
-                        cap_tys.push(ScalarType::RcPtr);
-                    }
-                }
-            }
-
-            let elem_tys: Vec<ScalarType> = super::lower::expand_slots_with(
-                elem_ty,
-                &ctx.fieldless,
-                &ctx.transparent,
-                &ctx.payload_unions,
-            );
-
-            // Build header / body / done blocks. Header threads
-            // (i, acc..., len, data, caps...). Body adds element
-            // load + step call. Done receives the final acc.
-            let header = ctx.builder.create_block();
-            let i_param = ctx.builder.add_block_param(header, ScalarType::U64);
-            let acc_params: Vec<Value> = acc_slots
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(header, ty))
-                .collect();
-            let len_param = ctx.builder.add_block_param(header, ScalarType::U64);
-            let data_param = ctx.builder.add_block_param(header, ScalarType::RcPtr);
-            let cap_params: Vec<Value> = cap_tys
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(header, ty))
-                .collect();
-
-            let body_block = ctx.builder.create_block();
-            let body_i = ctx.builder.add_block_param(body_block, ScalarType::U64);
-            let body_acc: Vec<Value> = acc_slots
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(body_block, ty))
-                .collect();
-            let body_len = ctx.builder.add_block_param(body_block, ScalarType::U64);
-            let body_data = ctx.builder.add_block_param(body_block, ScalarType::RcPtr);
-            let body_cap_vals: Vec<Value> = cap_tys
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(body_block, ty))
-                .collect();
-
-            let done = ctx.builder.create_block();
-            let done_acc: Vec<Value> = acc_slots
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(done, ty))
-                .collect();
-            // Threaded so the buffer's rc-release lands here.
-            let _done_data = ctx.builder.add_block_param(done, ScalarType::RcPtr);
-            for &ty in &cap_tys {
-                ctx.builder.add_block_param(done, ty);
-            }
-
-            // Entry → header(0, init..., len, data, caps...).
-            let zero = ctx.builder.const_u64(0);
-            let mut entry_args = Vec::with_capacity(1 + init_vals.len() + 2 + cap_vals.len());
-            entry_args.push(zero);
-            entry_args.extend(init_vals);
-            entry_args.push(len_val);
-            entry_args.push(data_ptr);
-            entry_args.extend(cap_vals);
-            ctx.builder.jump(header, entry_args);
-
-            // Header: cmp i == len; done(acc, data, caps) :: body(i, acc, len, data, caps).
-            ctx.builder.switch_to(header);
-            let cmp = ctx.builder.binop(BinaryOp::Eq, i_param, len_param, ScalarType::U8);
-            let mut done_args: Vec<Value> = acc_params.clone();
-            done_args.push(data_param);
-            done_args.extend(cap_params.iter().copied());
-            let mut body_args: Vec<Value> = Vec::new();
-            body_args.push(i_param);
-            body_args.extend(acc_params.iter().copied());
-            body_args.push(len_param);
-            body_args.push(data_param);
-            body_args.extend(cap_params.iter().copied());
-            ctx.builder.branch(cmp, done, done_args, body_block, body_args);
-
-            // Body: load elem slot(s) from data buffer at body_i.
-            // The buffer is laid out with `stride = elem_tys.len()`
-            // slots per element. For single-slot elements the base
-            // is just `body_i`; for multi-slot, base = body_i * stride
-            // and slot k loads at base + k.
-            ctx.builder.switch_to(body_block);
-            let elem_vals: Vec<Value> = if elem_tys.len() == 1 {
-                vec![ctx.builder.load_dyn(body_data, body_i, elem_tys[0])]
-            } else {
-                let stride = ctx.builder.const_u64(elem_tys.len() as u64);
-                let base = ctx.builder.binop(BinaryOp::Mul, body_i, stride, ScalarType::U64);
-                elem_tys
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &t)| {
-                        if k == 0 {
-                            ctx.builder.load_dyn(body_data, base, t)
-                        } else {
-                            let k_const = ctx.builder.const_u64(k as u64);
-                            let off = ctx.builder.binop(BinaryOp::Add, base, k_const, ScalarType::U64);
-                            ctx.builder.load_dyn(body_data, off, t)
-                        }
-                    })
-                    .collect()
-            };
-
-            // Step call: target(caps, acc, elem...) → acc_slots.
-            let mut call_args: Vec<Value> = Vec::new();
-            call_args.extend(body_cap_vals.iter().copied());
-            call_args.extend(body_acc.iter().copied());
-            call_args.extend(elem_vals);
-            let new_acc: Vec<Value> = if acc_slots.len() == 1 {
-                vec![ctx.builder.call(target, call_args, acc_slots[0])]
-            } else {
-                ctx.builder.call_multi(target, call_args, &acc_slots)
-            };
-
-            // i+1 → header.
-            let one = ctx.builder.const_u64(1);
-            let next_i = ctx.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
-            let mut jump_args: Vec<Value> = Vec::with_capacity(1 + new_acc.len() + 2 + body_cap_vals.len());
-            jump_args.push(next_i);
-            jump_args.extend(new_acc);
-            jump_args.push(body_len);
-            jump_args.push(body_data);
-            jump_args.extend(body_cap_vals.iter().copied());
-            ctx.builder.jump(header, jump_args);
-
-            ctx.builder.switch_to(done);
-            Ok(done_acc)
-        }
-
-        // List.walk_until: same loop shape as ListWalk, but the
-        // step call returns Step(b) = (tag, payload_ptr). After
-        // each call: tag-dispatch — Continue → header(i+1, new acc,
-        // ...); Break → done(new acc, ...).
-        Expr::ListWalkUntil { list_slots, init, target, captures, elem_ty, ty: walk_ty } => {
-            use crate::ssa::{BinaryOp, ScalarType};
-
-            let list_vals: Vec<Value> = {
-                let mut all = Vec::new();
-                for e in list_slots {
-                    all.extend(lower_slots(ctx, e)?);
-                }
-                all
-            };
-            if list_vals.len() != 3 {
-                return Err(format!(
-                    "core::to_ssa: ListWalkUntil expects 3-slot list trio, got {} slots",
-                    list_vals.len()
-                ));
-            }
-            let len_val = list_vals[0];
-            let data_ptr = list_vals[2];
-
-            let acc_slots: Vec<ScalarType> = super::lower::expand_slots_with(
-                walk_ty,
-                &ctx.fieldless,
-                &ctx.transparent,
-                &ctx.payload_unions,
-            );
-            let init_vals: Vec<Value> = {
-                let mut all = Vec::new();
-                for e in init {
-                    all.extend(lower_slots(ctx, e)?);
-                }
-                all
-            };
-            if init_vals.len() != acc_slots.len() {
-                return Err(format!(
-                    "core::to_ssa: ListWalkUntil init slot count {} != acc_slots {}",
-                    init_vals.len(),
-                    acc_slots.len()
-                ));
-            }
-
-            let mut cap_vals: Vec<Value> = Vec::new();
-            let mut cap_tys: Vec<ScalarType> = Vec::new();
-            for c in captures {
-                let slots = lower_slots(ctx, c)?;
-                let ty_expanded = super::lower::expand_slots_with(
-                    c.ty(),
-                    &ctx.fieldless,
-                    &ctx.transparent,
-                    &ctx.payload_unions,
-                );
-                if slots.len() == ty_expanded.len() {
-                    cap_vals.extend(slots);
-                    cap_tys.extend(ty_expanded);
-                } else {
-                    for v in slots {
-                        cap_vals.push(v);
-                        cap_tys.push(ScalarType::RcPtr);
-                    }
-                }
-            }
-
-            let elem_tys: Vec<ScalarType> = super::lower::expand_slots_with(
-                elem_ty,
-                &ctx.fieldless,
-                &ctx.transparent,
-                &ctx.payload_unions,
-            );
-
-            let header = ctx.builder.create_block();
-            let i_param = ctx.builder.add_block_param(header, ScalarType::U64);
-            let acc_params: Vec<Value> = acc_slots
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(header, ty))
-                .collect();
-            let len_param = ctx.builder.add_block_param(header, ScalarType::U64);
-            let data_param = ctx.builder.add_block_param(header, ScalarType::RcPtr);
-            let cap_params: Vec<Value> = cap_tys
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(header, ty))
-                .collect();
-
-            let body_block = ctx.builder.create_block();
-            let body_i = ctx.builder.add_block_param(body_block, ScalarType::U64);
-            let body_acc: Vec<Value> = acc_slots
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(body_block, ty))
-                .collect();
-            let body_len = ctx.builder.add_block_param(body_block, ScalarType::U64);
-            let body_data = ctx.builder.add_block_param(body_block, ScalarType::RcPtr);
-            let body_cap_vals: Vec<Value> = cap_tys
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(body_block, ty))
-                .collect();
-
-            let done = ctx.builder.create_block();
-            let done_acc: Vec<Value> = acc_slots
-                .iter()
-                .map(|&ty| ctx.builder.add_block_param(done, ty))
-                .collect();
-            let _done_data = ctx.builder.add_block_param(done, ScalarType::RcPtr);
-            for &ty in &cap_tys {
-                ctx.builder.add_block_param(done, ty);
-            }
-
-            let zero = ctx.builder.const_u64(0);
-            let mut entry_args = Vec::with_capacity(1 + init_vals.len() + 2 + cap_vals.len());
-            entry_args.push(zero);
-            entry_args.extend(init_vals);
-            entry_args.push(len_val);
-            entry_args.push(data_ptr);
-            entry_args.extend(cap_vals);
-            ctx.builder.jump(header, entry_args);
-
-            ctx.builder.switch_to(header);
-            let cmp = ctx.builder.binop(BinaryOp::Eq, i_param, len_param, ScalarType::U8);
-            let mut done_args: Vec<Value> = acc_params.clone();
-            done_args.push(data_param);
-            done_args.extend(cap_params.iter().copied());
-            let mut body_args: Vec<Value> = Vec::new();
-            body_args.push(i_param);
-            body_args.extend(acc_params.iter().copied());
-            body_args.push(len_param);
-            body_args.push(data_param);
-            body_args.extend(cap_params.iter().copied());
-            ctx.builder.branch(cmp, done, done_args, body_block, body_args);
-
-            ctx.builder.switch_to(body_block);
-            // Element stride: for multi-slot elements, the buffer
-            // stores `elem_tys.len()` slots per element. base =
-            // body_i * stride; slot k loads at base + k.
-            let elem_vals: Vec<Value> = if elem_tys.len() == 1 {
-                vec![ctx.builder.load_dyn(body_data, body_i, elem_tys[0])]
-            } else {
-                let stride = ctx.builder.const_u64(elem_tys.len() as u64);
-                let base = ctx.builder.binop(BinaryOp::Mul, body_i, stride, ScalarType::U64);
-                elem_tys
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &t)| {
-                        if k == 0 {
-                            ctx.builder.load_dyn(body_data, base, t)
-                        } else {
-                            let k_const = ctx.builder.const_u64(k as u64);
-                            let off = ctx.builder.binop(BinaryOp::Add, base, k_const, ScalarType::U64);
-                            ctx.builder.load_dyn(body_data, off, t)
-                        }
-                    })
-                    .collect()
-            };
-
-            let mut call_args: Vec<Value> = Vec::new();
-            call_args.extend(body_cap_vals.iter().copied());
-            call_args.extend(body_acc.iter().copied());
-            call_args.extend(elem_vals);
-            let step_ret_tys = vec![ScalarType::U64, ScalarType::RcPtr];
-            let step_result = ctx.builder.call_multi(target, call_args, &step_ret_tys);
-            let tag_v = step_result[0];
-            let payload_ptr = step_result[1];
-
-            // Load acc slots from the Step payload. The payload's
-            // first field is the acc value; for multi-slot accs,
-            // that field is a wrapper RcPtr that we load the slots
-            // out of. For single-slot accs, the slot lives directly
-            // at payload[0]. Mirrors existing-lower's
-            // load_walk_acc_payload.
-            let new_acc: Vec<Value> = if acc_slots.len() == 1 {
-                vec![ctx.builder.load(payload_ptr, 0, acc_slots[0])]
-            } else {
-                let wrapper = ctx.builder.load(payload_ptr, 0, ScalarType::RcPtr);
-                acc_slots
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &ty)| ctx.builder.load(wrapper, i * 8, ty))
-                    .collect()
-            };
-
-            let break_tag_idx = ctx
-                .decls
-                .constructors
-                .get("Break")
-                .map(|m| m.tag_index)
-                .ok_or_else(|| "core::to_ssa: ListWalkUntil needs `Break` constructor in decl_info".to_string())?;
-            let break_val = ctx.builder.const_u64(break_tag_idx);
-            let is_break = ctx.builder.binop(BinaryOp::Eq, tag_v, break_val, ScalarType::U8);
-
-            let one = ctx.builder.const_u64(1);
-            let next_i = ctx.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
-            let mut break_done_args: Vec<Value> = new_acc.clone();
-            break_done_args.push(body_data);
-            break_done_args.extend(body_cap_vals.iter().copied());
-            let mut continue_header_args: Vec<Value> = Vec::with_capacity(1 + new_acc.len() + 2 + body_cap_vals.len());
-            continue_header_args.push(next_i);
-            continue_header_args.extend(new_acc.iter().copied());
-            continue_header_args.push(body_len);
-            continue_header_args.push(body_data);
-            continue_header_args.extend(body_cap_vals.iter().copied());
-            ctx.builder.branch(is_break, done, break_done_args, header, continue_header_args);
-
-            ctx.builder.switch_to(done);
-            Ok(done_acc)
-        }
 
         // List.set: cow_store_dyn val into the data buffer at
         // index `idx`. Multi-slot elements stride at
@@ -1019,23 +629,23 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(ctx.builder.call(target, arg_vals, ret_ty))
         }
 
-        // Single-slot Cata path: identical SSA shape to App, since
-        // Cata is just a labeled fold-shaped call at the IR level.
-        Expr::Cata { fold_fn, target_slots, extra_args, ty } => {
-            let mut arg_vals: Vec<Value> = Vec::new();
-            for s in target_slots {
-                arg_vals.extend(lower_slots(ctx, s)?);
-            }
-            for a in extra_args {
-                arg_vals.extend(lower_slots(ctx, a)?);
-            }
-            let ret_slots = super::lower::expand_slots_with(ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
-            let ret_ty = if ret_slots.len() == 1 {
-                ret_slots[0]
+        // Single-slot Cata path: defer to the multi-slot lowering
+        // and materialize the result. List-shaped Catas emit a
+        // counter loop; recursive-helper Catas emit a Call. Either
+        // way `lower_slots` returns the slot list; we shell-wrap
+        // multi-slot results so the single-slot caller sees one
+        // RcPtr.
+        Expr::Cata { .. } => {
+            let slots = lower_slots(ctx, expr)?;
+            if slots.len() == 1 {
+                Ok(slots[0])
             } else {
-                resolve_scalar_type(ty, &ctx.fieldless)
-            };
-            Ok(ctx.builder.call(fold_fn, arg_vals, ret_ty))
+                let shell = ctx.builder.alloc(slots.len() * 8);
+                for (i, v) in slots.iter().enumerate() {
+                    ctx.builder.store(shell, i * 8, *v);
+                }
+                Ok(shell)
+            }
         }
 
         Expr::ListLit { elements, elem_ty, .. } => {
@@ -1169,35 +779,6 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             Ok(shell)
         }
 
-        // ListWalk's result is the acc type, which can be either
-        // single-slot or multi-slot. Multi-slot callers go through
-        // `lower_slots` directly; single-slot callers get the
-        // acc value back.
-        Expr::ListWalk { .. } => {
-            let slots = lower_slots(ctx, expr)?;
-            if slots.len() == 1 {
-                Ok(slots[0])
-            } else {
-                let shell = ctx.builder.alloc(slots.len() * 8);
-                for (i, v) in slots.iter().enumerate() {
-                    ctx.builder.store(shell, i * 8, *v);
-                }
-                Ok(shell)
-            }
-        }
-
-        Expr::ListWalkUntil { .. } => {
-            let slots = lower_slots(ctx, expr)?;
-            if slots.len() == 1 {
-                Ok(slots[0])
-            } else {
-                let shell = ctx.builder.alloc(slots.len() * 8);
-                for (i, v) in slots.iter().enumerate() {
-                    ctx.builder.store(shell, i * 8, *v);
-                }
-                Ok(shell)
-            }
-        }
     }
 }
 
@@ -1209,6 +790,249 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 ///    its own block; results merge into a block-param of the result
 ///    type.
 ///
+/// Lower a List-shaped Cata to a counter loop. Shared by both the
+/// plain walk (`early_exit=false`) and walk-until (`early_exit=
+/// true`) paths — the only structural difference is whether the
+/// step's result needs Continue/Break tag-dispatch before being
+/// fed back as the next accumulator.
+///
+/// SSA shape:
+/// ```text
+///   entry → header(0, init..., len, data, caps...)
+///   header: i == len ? done(acc..., data, caps...) : body(...)
+///   body: load elem at i (multi-slot stride); step(caps, acc, elem)
+///         early_exit=false: jump header(i+1, new_acc, ...)
+///         early_exit=true:  branch on Step tag — Continue → header(...);
+///                                                Break    → done(new_acc, ...)
+///   done(acc..., _data, _caps): yield acc
+/// ```
+fn lower_list_cata(
+    ctx: &mut Ctx<'_>,
+    target_slots: &[Expr],
+    init: &[Expr],
+    captures: &[Expr],
+    elem_ty: &Type,
+    early_exit: bool,
+    fold_fn: &str,
+    walk_ty: &Type,
+) -> Result<Vec<Value>, String> {
+    use crate::ssa::{BinaryOp, ScalarType};
+
+    let list_vals: Vec<Value> = {
+        let mut all = Vec::new();
+        for e in target_slots {
+            all.extend(lower_slots(ctx, e)?);
+        }
+        all
+    };
+    if list_vals.len() != 3 {
+        return Err(format!(
+            "core::to_ssa: List-Cata expects 3-slot list trio, got {} slots",
+            list_vals.len()
+        ));
+    }
+    let len_val = list_vals[0];
+    let data_ptr = list_vals[2];
+
+    let acc_slots: Vec<ScalarType> = super::lower::expand_slots_with(
+        walk_ty,
+        &ctx.fieldless,
+        &ctx.transparent,
+        &ctx.payload_unions,
+    );
+    let init_vals: Vec<Value> = {
+        let mut all = Vec::new();
+        for e in init {
+            all.extend(lower_slots(ctx, e)?);
+        }
+        all
+    };
+    if init_vals.len() != acc_slots.len() {
+        return Err(format!(
+            "core::to_ssa: List-Cata init slot count {} != acc_slots {}",
+            init_vals.len(),
+            acc_slots.len()
+        ));
+    }
+
+    // Captures flow as parallel "step values" through the loop
+    // block params.
+    let mut cap_vals: Vec<Value> = Vec::new();
+    let mut cap_tys: Vec<ScalarType> = Vec::new();
+    for c in captures {
+        let slots = lower_slots(ctx, c)?;
+        let ty_expanded = super::lower::expand_slots_with(
+            c.ty(),
+            &ctx.fieldless,
+            &ctx.transparent,
+            &ctx.payload_unions,
+        );
+        if slots.len() == ty_expanded.len() {
+            cap_vals.extend(slots);
+            cap_tys.extend(ty_expanded);
+        } else {
+            for v in slots {
+                cap_vals.push(v);
+                cap_tys.push(ScalarType::RcPtr);
+            }
+        }
+    }
+
+    let elem_tys: Vec<ScalarType> = super::lower::expand_slots_with(
+        elem_ty,
+        &ctx.fieldless,
+        &ctx.transparent,
+        &ctx.payload_unions,
+    );
+
+    let header = ctx.builder.create_block();
+    let i_param = ctx.builder.add_block_param(header, ScalarType::U64);
+    let acc_params: Vec<Value> = acc_slots
+        .iter()
+        .map(|&ty| ctx.builder.add_block_param(header, ty))
+        .collect();
+    let len_param = ctx.builder.add_block_param(header, ScalarType::U64);
+    let data_param = ctx.builder.add_block_param(header, ScalarType::RcPtr);
+    let cap_params: Vec<Value> = cap_tys
+        .iter()
+        .map(|&ty| ctx.builder.add_block_param(header, ty))
+        .collect();
+
+    let body_block = ctx.builder.create_block();
+    let body_i = ctx.builder.add_block_param(body_block, ScalarType::U64);
+    let body_acc: Vec<Value> = acc_slots
+        .iter()
+        .map(|&ty| ctx.builder.add_block_param(body_block, ty))
+        .collect();
+    let body_len = ctx.builder.add_block_param(body_block, ScalarType::U64);
+    let body_data = ctx.builder.add_block_param(body_block, ScalarType::RcPtr);
+    let body_cap_vals: Vec<Value> = cap_tys
+        .iter()
+        .map(|&ty| ctx.builder.add_block_param(body_block, ty))
+        .collect();
+
+    let done = ctx.builder.create_block();
+    let done_acc: Vec<Value> = acc_slots
+        .iter()
+        .map(|&ty| ctx.builder.add_block_param(done, ty))
+        .collect();
+    let _done_data = ctx.builder.add_block_param(done, ScalarType::RcPtr);
+    for &ty in &cap_tys {
+        ctx.builder.add_block_param(done, ty);
+    }
+
+    // Entry → header(0, init..., len, data, caps...).
+    let zero = ctx.builder.const_u64(0);
+    let mut entry_args = Vec::with_capacity(1 + init_vals.len() + 2 + cap_vals.len());
+    entry_args.push(zero);
+    entry_args.extend(init_vals);
+    entry_args.push(len_val);
+    entry_args.push(data_ptr);
+    entry_args.extend(cap_vals);
+    ctx.builder.jump(header, entry_args);
+
+    // Header: i == len ? done(acc, data, caps) : body(i, acc, len, data, caps).
+    ctx.builder.switch_to(header);
+    let cmp = ctx.builder.binop(BinaryOp::Eq, i_param, len_param, ScalarType::U8);
+    let mut done_args: Vec<Value> = acc_params.clone();
+    done_args.push(data_param);
+    done_args.extend(cap_params.iter().copied());
+    let mut body_args: Vec<Value> = Vec::new();
+    body_args.push(i_param);
+    body_args.extend(acc_params.iter().copied());
+    body_args.push(len_param);
+    body_args.push(data_param);
+    body_args.extend(cap_params.iter().copied());
+    ctx.builder.branch(cmp, done, done_args, body_block, body_args);
+
+    // Body: load elem slot(s) from data buffer; call step.
+    ctx.builder.switch_to(body_block);
+    let elem_vals: Vec<Value> = if elem_tys.len() == 1 {
+        vec![ctx.builder.load_dyn(body_data, body_i, elem_tys[0])]
+    } else {
+        let stride = ctx.builder.const_u64(elem_tys.len() as u64);
+        let base = ctx.builder.binop(BinaryOp::Mul, body_i, stride, ScalarType::U64);
+        elem_tys
+            .iter()
+            .enumerate()
+            .map(|(k, &t)| {
+                if k == 0 {
+                    ctx.builder.load_dyn(body_data, base, t)
+                } else {
+                    let k_const = ctx.builder.const_u64(k as u64);
+                    let off = ctx.builder.binop(BinaryOp::Add, base, k_const, ScalarType::U64);
+                    ctx.builder.load_dyn(body_data, off, t)
+                }
+            })
+            .collect()
+    };
+
+    let mut call_args: Vec<Value> = Vec::new();
+    call_args.extend(body_cap_vals.iter().copied());
+    call_args.extend(body_acc.iter().copied());
+    call_args.extend(elem_vals);
+
+    let one = ctx.builder.const_u64(1);
+    let next_i = ctx.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+
+    if !early_exit {
+        // Plain walk: step returns acc directly. Jump back to header.
+        let new_acc: Vec<Value> = if acc_slots.len() == 1 {
+            vec![ctx.builder.call(fold_fn, call_args, acc_slots[0])]
+        } else {
+            ctx.builder.call_multi(fold_fn, call_args, &acc_slots)
+        };
+        let mut jump_args: Vec<Value> = Vec::with_capacity(1 + new_acc.len() + 2 + body_cap_vals.len());
+        jump_args.push(next_i);
+        jump_args.extend(new_acc);
+        jump_args.push(body_len);
+        jump_args.push(body_data);
+        jump_args.extend(body_cap_vals.iter().copied());
+        ctx.builder.jump(header, jump_args);
+    } else {
+        // Walk-until: step returns Step(b) = (tag, payload). Dispatch
+        // on the tag — Continue → header(i+1, ...), Break → done(...).
+        let step_ret_tys = vec![ScalarType::U64, ScalarType::RcPtr];
+        let step_result = ctx.builder.call_multi(fold_fn, call_args, &step_ret_tys);
+        let tag_v = step_result[0];
+        let payload_ptr = step_result[1];
+
+        let new_acc: Vec<Value> = if acc_slots.len() == 1 {
+            vec![ctx.builder.load(payload_ptr, 0, acc_slots[0])]
+        } else {
+            let wrapper = ctx.builder.load(payload_ptr, 0, ScalarType::RcPtr);
+            acc_slots
+                .iter()
+                .enumerate()
+                .map(|(i, &ty)| ctx.builder.load(wrapper, i * 8, ty))
+                .collect()
+        };
+
+        let break_tag_idx = ctx
+            .decls
+            .constructors
+            .get("Break")
+            .map(|m| m.tag_index)
+            .ok_or_else(|| "core::to_ssa: walk_until needs `Break` constructor in decl_info".to_string())?;
+        let break_val = ctx.builder.const_u64(break_tag_idx);
+        let is_break = ctx.builder.binop(BinaryOp::Eq, tag_v, break_val, ScalarType::U8);
+
+        let mut break_done_args: Vec<Value> = new_acc.clone();
+        break_done_args.push(body_data);
+        break_done_args.extend(body_cap_vals.iter().copied());
+        let mut continue_header_args: Vec<Value> = Vec::with_capacity(1 + new_acc.len() + 2 + body_cap_vals.len());
+        continue_header_args.push(next_i);
+        continue_header_args.extend(new_acc.iter().copied());
+        continue_header_args.push(body_len);
+        continue_header_args.push(body_data);
+        continue_header_args.extend(body_cap_vals.iter().copied());
+        ctx.builder.branch(is_break, done, break_done_args, header, continue_header_args);
+    }
+
+    ctx.builder.switch_to(done);
+    Ok(done_acc)
+}
+
 /// Still unsupported in this slice:
 /// - Non-fieldless unions (need to decompose into `(tag, payload)` and
 ///   bind field values from the payload).

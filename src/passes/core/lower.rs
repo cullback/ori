@@ -534,7 +534,11 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 Ok(vec![Expr::Cata {
                     fold_fn: name,
                     target_slots,
-                    extra_args: extras,
+                    target_ty: args[0].ty.clone(),
+                    init: Vec::new(),
+                    captures: extras,
+                    elem_ty: Type::Var(crate::types::engine::TypeVar(0)),
+                    early_exit: false,
                     ty: ast.ty.clone(),
                 }])
             } else {
@@ -1149,12 +1153,14 @@ fn try_lower_stdlib_intrinsic(
                 }
                 _ => return Ok(None),
             };
-            return Ok(Some(vec![Expr::ListWalkUntil {
-                list_slots,
+            return Ok(Some(vec![Expr::Cata {
+                fold_fn: target_func,
+                target_slots: list_slots,
+                target_ty: xs_ty,
                 init: init_slots,
-                target: target_func,
                 captures,
                 elem_ty,
+                early_exit: true,
                 ty: ret_ty.clone(),
             }]));
         }
@@ -1197,12 +1203,14 @@ fn try_lower_stdlib_intrinsic(
                 }
                 _ => return Ok(None),
             };
-            Ok(Some(vec![Expr::ListWalk {
-                list_slots,
+            Ok(Some(vec![Expr::Cata {
+                fold_fn: target_func,
+                target_slots: list_slots,
+                target_ty: xs_ty,
                 init: init_slots,
-                target: target_func,
                 captures,
                 elem_ty,
+                early_exit: false,
                 ty: ret_ty.clone(),
             }]))
         }

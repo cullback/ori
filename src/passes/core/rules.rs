@@ -78,10 +78,14 @@ fn recurse(expr: Expr) -> Expr {
             ty,
         },
 
-        Expr::Cata { fold_fn, target_slots, extra_args, ty } => Expr::Cata {
+        Expr::Cata { fold_fn, target_slots, target_ty, init, captures, elem_ty, early_exit, ty } => Expr::Cata {
             fold_fn,
             target_slots: target_slots.into_iter().map(simplify).collect(),
-            extra_args: extra_args.into_iter().map(simplify).collect(),
+            target_ty,
+            init: init.into_iter().map(simplify).collect(),
+            captures: captures.into_iter().map(simplify).collect(),
+            elem_ty,
+            early_exit,
             ty,
         },
 
@@ -107,24 +111,6 @@ fn recurse(expr: Expr) -> Expr {
         Expr::ListRange { start, end, ty } => Expr::ListRange {
             start: Box::new(simplify(*start)),
             end: Box::new(simplify(*end)),
-            ty,
-        },
-
-        Expr::ListWalk { list_slots, init, target, captures, elem_ty, ty } => Expr::ListWalk {
-            list_slots: list_slots.into_iter().map(simplify).collect(),
-            init: init.into_iter().map(simplify).collect(),
-            target,
-            captures: captures.into_iter().map(simplify).collect(),
-            elem_ty,
-            ty,
-        },
-
-        Expr::ListWalkUntil { list_slots, init, target, captures, elem_ty, ty } => Expr::ListWalkUntil {
-            list_slots: list_slots.into_iter().map(simplify).collect(),
-            init: init.into_iter().map(simplify).collect(),
-            target,
-            captures: captures.into_iter().map(simplify).collect(),
-            elem_ty,
             ty,
         },
 
@@ -212,20 +198,15 @@ fn body_uses(expr: &Expr, target: SymbolId) -> bool {
                         || a.body.iter().any(|b| body_uses(b, target))
                 })
         }
-        Expr::Cata { target_slots, extra_args, .. } => {
+        Expr::Cata { target_slots, init, captures, .. } => {
             target_slots.iter().any(|e| body_uses(e, target))
-                || extra_args.iter().any(|e| body_uses(e, target))
+                || init.iter().any(|e| body_uses(e, target))
+                || captures.iter().any(|e| body_uses(e, target))
         }
         Expr::Con { args, .. } => args.iter().any(|a| body_uses(a, target)),
         Expr::ListLit { elements, .. } => elements.iter().any(|e| body_uses(e, target)),
         Expr::BufLoad { buf, idx, .. } => body_uses(buf, target) || body_uses(idx, target),
         Expr::ListRange { start, end, .. } => body_uses(start, target) || body_uses(end, target),
-        Expr::ListWalk { list_slots, init, captures, .. }
-        | Expr::ListWalkUntil { list_slots, init, captures, .. } => {
-            list_slots.iter().any(|e| body_uses(e, target))
-                || init.iter().any(|e| body_uses(e, target))
-                || captures.iter().any(|e| body_uses(e, target))
-        }
         Expr::ListAppend { list_slots, val_slots, .. } => {
             list_slots.iter().any(|e| body_uses(e, target))
                 || val_slots.iter().any(|e| body_uses(e, target))

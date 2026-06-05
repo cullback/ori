@@ -196,15 +196,37 @@ pub enum Expr {
     /// rewrites instead of SCEV-style reconstruction.
     Cata {
         fold_fn: String,
-        /// Parallel slot list for the inductive value. Multi-slot
-        /// inductives (Lnk, Tree, Nat — multi-variant payload
-        /// unions) decompose to (tag, payload) at the SSA layer
-        /// and arrive here as a 2-element vec; single-slot
-        /// inductives (Phase E singleton closures with one
-        /// capture, or `:=` aliases that scalar_type collapses)
-        /// use a 1-element vec.
+        /// Parallel slot list for the inductive value. For
+        /// recursive inductives (Lnk, Tree, Nat — multi-variant
+        /// payload unions), this is the (tag, payload) pair. For
+        /// `List(T)`, this is the 3-slot (len, cap, data) trio
+        /// and `to_ssa` lowers it as a counter loop instead of a
+        /// recursive helper call.
         target_slots: Vec<Expr>,
-        extra_args: Vec<Expr>,
+        /// **Source-level** type of the inductive value. Slot
+        /// exprs in `target_slots` carry per-slot scalar types
+        /// (`Con("U64")`, etc.), so the original `List(I64)` /
+        /// `Nat` / `Tree(_)` shape is preserved here for
+        /// `to_ssa`'s dispatch on what kind of fold to emit.
+        target_ty: Type,
+        /// Initial accumulator slots. Empty for `__fold_N`
+        /// recursive helpers (recursion accumulates internally).
+        /// Non-empty for `List.walk(init, f)` — the loop seeds
+        /// its header block-param with these slots.
+        init: Vec<Expr>,
+        /// Closure-environment slots passed to `fold_fn`
+        /// alongside acc + elem at each step.
+        captures: Vec<Expr>,
+        /// Element type for List targets — used by `to_ssa` to
+        /// compute the per-element byte stride when emitting the
+        /// counter loop. For non-List Catas, this is a dummy
+        /// (`Type::Var(_)`) — the helper-call path doesn't use
+        /// it.
+        elem_ty: Type,
+        /// `true` when `fold_fn` returns `Step(b)` (the
+        /// `List.walk_until` shape) — each iteration dispatches
+        /// on Continue/Break. `false` for plain folds.
+        early_exit: bool,
         ty: Type,
     },
 
@@ -300,51 +322,6 @@ pub enum Expr {
         ty: Type,
     },
 
-    /// `ListWalk(list_slots, init, target, captures, elem_ty, ty)`
-    /// — folds the list under a step function, threading the
-    /// accumulator. Currently restricted to the **singleton**
-    /// closure case: `target` is the lifted apply function name
-    /// resolved at AST→Core time via `mono.singletons` /
-    /// `mono.tag_targets`. Non-singleton closures still bail to
-    /// existing-lower.
-    ///
-    /// At `to_ssa` this expands to a counted loop with explicit
-    /// block params for the i-counter, accumulator slots, the
-    /// (len, data) header, and the captures.
-    ///
-    /// - `list_slots`: the source list's `(len, cap, data)` trio
-    ///   exprs.
-    /// - `init`: the initial accumulator value (multi-slot).
-    /// - `target`: the direct-call function name (e.g.
-    ///   `lifted_0`).
-    /// - `captures`: closure-environment values passed to
-    ///   `target` alongside `acc` and `elem`.
-    /// - `elem_ty`: element type of `list`.
-    /// - `ty`: result type (the accumulator's type after the
-    ///   fold).
-    ListWalk {
-        list_slots: Vec<Expr>,
-        init: Vec<Expr>,
-        target: String,
-        captures: Vec<Expr>,
-        elem_ty: Type,
-        ty: Type,
-    },
-
-    /// Same as `ListWalk`, except `target`'s return is a `Step(b)`
-    /// tag union (`[Continue(b), Break(b)]`). After each step call,
-    /// the loop dispatches on the tag: `Continue` → next iteration
-    /// with payload as new acc; `Break` → jump to `done` with
-    /// payload as result.
-    ListWalkUntil {
-        list_slots: Vec<Expr>,
-        init: Vec<Expr>,
-        target: String,
-        captures: Vec<Expr>,
-        elem_ty: Type,
-        ty: Type,
-    },
-
     /// `ListAppend(list_slots, val_slots, elem_ty, ty)` — produces
     /// a new `(len, cap, data)` trio with `val_slots` written at
     /// index `len`. For multi-slot elements (records, Str, nested
@@ -403,8 +380,6 @@ impl Expr {
             | Self::ListLit { ty, .. }
             | Self::BufLoad { ty, .. }
             | Self::ListRange { ty, .. }
-            | Self::ListWalk { ty, .. }
-            | Self::ListWalkUntil { ty, .. }
             | Self::ListAppend { ty, .. }
             | Self::ListSet { ty, .. }
             | Self::Cast { ty, .. } => ty,
@@ -429,8 +404,6 @@ impl Expr {
             | Self::ListLit { ty, .. }
             | Self::BufLoad { ty, .. }
             | Self::ListRange { ty, .. }
-            | Self::ListWalk { ty, .. }
-            | Self::ListWalkUntil { ty, .. }
             | Self::ListAppend { ty, .. }
             | Self::ListSet { ty, .. }
             | Self::Cast { ty, .. } => *ty = new_ty,
