@@ -163,7 +163,8 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             for a in args {
                 arg_vals.extend(lower_slots(ctx, a)?);
             }
-            Ok(ctx.builder.call_multi(target, arg_vals, &ret_slots))
+            let target_name = ctx.symbols.display(*target);
+            Ok(ctx.builder.call_multi(target_name, arg_vals, &ret_slots))
         }
 
         // Match's natural multi-slot return — the merge block has
@@ -206,20 +207,6 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             } else {
                 Ok(ctx.builder.call_multi(fold_fn, arg_vals, &ret_slots))
             }
-        }
-
-        // Str literals fan out to (len, cap, data) directly — the
-        // canonical SROA shape, same as List(U8). Single-slot
-        // callers re-materialize via `lower` below.
-        Expr::Lit { value: Literal::Str(bytes), .. } => {
-            let len = bytes.len();
-            let data = ctx.builder.alloc(len * 8);
-            for (i, &b) in bytes.iter().enumerate() {
-                let v = ctx.builder.const_u8(b);
-                ctx.builder.store(data, i * 8, v);
-            }
-            let len_val = ctx.builder.const_u64(len as u64);
-            Ok(vec![len_val, len_val, data])
         }
 
         // List literals fan out to (len, cap, data) directly so
@@ -463,26 +450,6 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
 
         Expr::Lit { value: Literal::Float(f), .. } => Ok(ctx.builder.const_f64(*f)),
 
-        Expr::Lit { value: Literal::Str(bytes), .. } => {
-            // Same shape as existing-lower's lower_str_literal:
-            // alloc bytes (U8 per slot at 8-byte stride) + alloc the
-            // (len, cap, data) 24-byte header + return header ptr.
-            // static_promote (opt pass) hoists this to a static when
-            // the bytes are constant — we don't pre-promote here.
-            let len = bytes.len();
-            let data = ctx.builder.alloc(len * 8);
-            for (i, &b) in bytes.iter().enumerate() {
-                let v = ctx.builder.const_u8(b);
-                ctx.builder.store(data, i * 8, v);
-            }
-            let header = ctx.builder.alloc(24);
-            let len_val = ctx.builder.const_u64(len as u64);
-            ctx.builder.store(header, 0, len_val);
-            ctx.builder.store(header, 8, len_val);
-            ctx.builder.store(header, 16, data);
-            Ok(header)
-        }
-
         Expr::Let { binders, value, body, .. } => {
             // Shared-Let memoization. When N `Let`s share the same
             // `binders` (the `bind_multi_slot` pattern, or
@@ -626,7 +593,8 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             } else {
                 resolve_scalar_type(ty, &ctx.fieldless)
             };
-            Ok(ctx.builder.call(target, arg_vals, ret_ty))
+            let target_name = ctx.symbols.display(*target);
+            Ok(ctx.builder.call(target_name, arg_vals, ret_ty))
         }
 
         // Single-slot Cata path: defer to the multi-slot lowering
@@ -2457,7 +2425,7 @@ mod tests {
             SymbolKind::Func,
         );
         let core = Expr::App {
-            target: symbols.display(f).to_owned(),
+            target: f,
             args: vec![
                 Expr::Lit { value: Literal::Int(1), ty: i64_ty() },
                 Expr::Lit { value: Literal::Int(2), ty: i64_ty() },

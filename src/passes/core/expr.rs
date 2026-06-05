@@ -35,14 +35,15 @@ use crate::types::engine::Type;
 /// shows it matters.
 pub type TagId = String;
 
-/// A scalar literal value. Matches what `ExprKind::IntLit` /
-/// `FloatLit` / `StrLit` produce in the AST, but we keep the variant
-/// distinction explicit so the Core stays self-describing.
+/// A scalar literal value. Strings are not a Core literal — they
+/// desugar to `BufLit { elem_ty: U8, elements: [byte literals] }`
+/// at AST→Core because `Str := List(U8)` makes a separate string
+/// literal redundant. Pattern-side string literals (`Pattern::StrLit`)
+/// stay distinct since they gate a runtime equality check.
 #[derive(Debug, Clone)]
 pub enum Literal {
     Int(i64),
     Float(f64),
-    Str(Vec<u8>),
 }
 
 /// A pattern in a `Match` arm. Restricted to **shallow** patterns —
@@ -122,13 +123,15 @@ pub enum Expr {
 
     /// `App(target, args, return_type)` — first-order call to a known
     /// top-level function. After lambda-lift + defunctionalization,
-    /// `target` always resolves to a top-level definition; we use the
-    /// **mangled display name** (a `String`) rather than `SymbolId`
-    /// because the rest of the type system + SSA `Call.target` work
-    /// in strings, and several callers (resolved `MethodCall` /
-    /// `QualifiedCall`) deliver names directly without a `SymbolId`.
+    /// `target` always resolves to a top-level definition. The target
+    /// is a `SymbolId` into the compilation's `SymbolTable`; the
+    /// mangled display name is recovered via `symbols.display(target)`
+    /// at Core → SSA. String-keyed call targets that arrive at Core
+    /// (mono-resolved methods, synthesized helpers like `__crash`,
+    /// `__builtin.*` intrinsics) are interned into the symbol table
+    /// at construction via `SymbolTable::intern`.
     App {
-        target: String,
+        target: SymbolId,
         args: Vec<Expr>,
         ty: Type,
     },

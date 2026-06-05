@@ -81,9 +81,20 @@ pub struct SymbolInfo {
 /// Owns the display names for every [`SymbolId`] in the current
 /// compilation. Lookup is `O(1)` and the returned `&str` is valid for
 /// the lifetime of the table.
+///
+/// `by_display` is a reverse index, populated lazily as symbols are
+/// minted via [`SymbolTable::fresh`]. It supports [`SymbolTable::intern`]
+/// — Core lowering's lookup-or-create semantics for callable targets
+/// that arrive as mangled strings (mono-specialized funcs, synthesized
+/// helpers like `__crash`, `__builtin.*` intrinsics). If two symbols
+/// happen to share a display name (defensive — callers normally mangle
+/// to ensure uniqueness), `by_display` points at the most-recently-minted
+/// one. The reverse index is not used for symbol identity comparisons —
+/// those still go through `SymbolId`.
 #[derive(Debug, Default)]
 pub struct SymbolTable {
     entries: Vec<SymbolInfo>,
+    by_display: HashMap<String, SymbolId>,
 }
 
 /// Interned identifier for a record field name (`FieldAccess.field`,
@@ -140,9 +151,10 @@ impl FieldInterner {
 }
 
 impl SymbolTable {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            by_display: HashMap::new(),
         }
     }
 
@@ -152,12 +164,32 @@ impl SymbolTable {
     #[allow(clippy::impl_trait_in_params)]
     pub fn fresh(&mut self, display: impl Into<String>, span: Span, kind: SymbolKind) -> SymbolId {
         let id = u32::try_from(self.entries.len()).expect("too many symbols");
+        let display = display.into();
+        self.by_display.insert(display.clone(), SymbolId(id));
         self.entries.push(SymbolInfo {
-            display: display.into(),
+            display,
             span,
             kind,
         });
         SymbolId(id)
+    }
+
+    /// Look up a `SymbolId` by display name, or allocate a fresh one
+    /// if no symbol with that name has been minted yet. The fresh
+    /// entry uses the provided `span` and `kind` — callers should
+    /// supply something meaningful (e.g. the call-site span) since
+    /// later passes inspect them.
+    ///
+    /// Used by Core lowering to bridge string-keyed call targets
+    /// (`QualifiedCall.resolved`, `MethodCall.resolved`, synthesized
+    /// `__crash` etc.) into the `SymbolId`-typed `Expr::App.target`.
+    #[allow(clippy::impl_trait_in_params)]
+    pub fn intern(&mut self, display: impl AsRef<str>, span: Span, kind: SymbolKind) -> SymbolId {
+        let display = display.as_ref();
+        if let Some(&sym) = self.by_display.get(display) {
+            return sym;
+        }
+        self.fresh(display.to_owned(), span, kind)
     }
 
     #[allow(

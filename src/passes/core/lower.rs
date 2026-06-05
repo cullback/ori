@@ -200,10 +200,21 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             ty: ast.ty.clone(),
         }]),
 
-        ExprKind::StrLit(bytes) => Ok(vec![Expr::Lit {
-            value: Literal::Str(bytes.clone()),
-            ty: ast.ty.clone(),
-        }]),
+        ExprKind::StrLit(bytes) => {
+            // Str := List(U8): a string literal is just a buffer
+            // literal of byte-typed Int constants. No separate Core
+            // representation for strings.
+            let u8_ty = Type::Con("U8".to_string());
+            let elements: Vec<Expr> = bytes
+                .iter()
+                .map(|&b| Expr::Lit { value: Literal::Int(b as i64), ty: u8_ty.clone() })
+                .collect();
+            Ok(vec![Expr::BufLit {
+                elements,
+                elem_ty: u8_ty,
+                ty: ast.ty.clone(),
+            }])
+        }
 
         ExprKind::Name(sym) => {
             // If the binding has been slot-expanded (e.g., its value
@@ -283,7 +294,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 let display = info.display.clone();
                 if ctx.funcs.contains(&display) {
                     return Ok(vec![Expr::App {
-                        target: display,
+                        target: *sym,
                         args: vec![],
                         ty: ast.ty.clone(),
                     }]);
@@ -543,7 +554,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 }])
             } else {
                 Ok(vec![Expr::App {
-                    target: name,
+                    target: *target,
                     args: arg_exprs,
                     ty: ast.ty.clone(),
                 }])
@@ -634,8 +645,9 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     ty: ast.ty.clone(),
                 }])
             } else {
+                let target_sym = ctx.symbols.intern(name, ast.span, crate::symbol::SymbolKind::Func);
                 Ok(vec![Expr::App {
-                    target: name.clone(),
+                    target: target_sym,
                     args: arg_exprs,
                     ty: ast.ty.clone(),
                 }])
@@ -814,8 +826,9 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             for a in args {
                 arg_exprs.extend(lower_expr_slots(ctx, a)?);
             }
+            let target_sym = ctx.symbols.intern(name, ast.span, crate::symbol::SymbolKind::Func);
             Ok(vec![Expr::App {
-                target: name.clone(),
+                target: target_sym,
                 args: arg_exprs,
                 ty: ast.ty.clone(),
             }])
@@ -1107,9 +1120,10 @@ fn try_lower_stdlib_intrinsic(
                     args.len()
                 ));
             }
+            let crash_sym = ctx.symbols.intern("__crash", args[0].span, crate::symbol::SymbolKind::Func);
             let msg_slots = lower_expr_slots_expanded(ctx, &args[0])?;
             Ok(Some(vec![Expr::App {
-                target: "__crash".to_string(),
+                target: crash_sym,
                 args: msg_slots,
                 ty: ret_ty.clone(),
             }]))

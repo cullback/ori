@@ -13,7 +13,7 @@
 //! arithmetic, `if`/`match` over fieldless tag unions, calls between
 //! user functions). Fails (returns Err) for anything outside that
 //! coverage: list operations that go through stdlib, payload-carrying
-//! constructors needing field binders, `Lit::Str`, etc.
+//! constructors needing field binders, etc.
 //!
 //! Not yet wired into `src/main.rs::compile()`. Stays opt-in via
 //! tests until coverage is comprehensive enough for hybrid lowering
