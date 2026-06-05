@@ -711,9 +711,9 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     let bits = if slot_ty == crate::ssa::ScalarType::U64 {
                         slot_expr
                     } else if slot_ty == crate::ssa::ScalarType::F64 {
-                        Expr::Cast { src: Box::new(slot_expr), dest_ty: crate::ssa::ScalarType::U64, bitcast: true, ty: u64_ty.clone() }
+                        Expr::App { target: builtins.bitcast, args: vec![slot_expr], ty: u64_ty.clone() }
                     } else {
-                        Expr::Cast { src: Box::new(slot_expr), dest_ty: crate::ssa::ScalarType::U64, bitcast: false, ty: u64_ty.clone() }
+                        Expr::App { target: builtins.cast, args: vec![slot_expr], ty: u64_ty.clone() }
                     };
                     let xord = mk_binop_app(builtins, crate::ssa::BinaryOp::Xor, mk_const(offset_basis), bits, u64_ty.clone());
                     mk_binop_app(builtins, crate::ssa::BinaryOp::Mul, xord, mk_const(prime), u64_ty.clone())
@@ -1331,9 +1331,9 @@ fn try_lower_stdlib_intrinsic(
             }
             let start = lower_expr(ctx, &args[0])?;
             let end = lower_expr(ctx, &args[1])?;
-            Ok(Some(vec![Expr::Range {
-                start: Box::new(start),
-                end: Box::new(end),
+            Ok(Some(vec![Expr::App {
+                target: ctx.builtins.range,
+                args: vec![start, end],
                 ty: ret_ty.clone(),
             }]))
         }
@@ -1776,10 +1776,14 @@ fn try_lower_unary_builtin(
         "from_bits" => (ScalarType::F64, true),
         _ => return Ok(None),
     };
-    Ok(Some(vec![Expr::Cast {
-        src: Box::new(src),
-        dest_ty,
-        bitcast,
+    let target = if bitcast { ctx.builtins.bitcast } else { ctx.builtins.cast };
+    // `dest_ty` is left implicit in the App's result `ty`: at to_ssa
+    // the builtin cast handler reads `ty` via `resolve_scalar_type`
+    // to recover the destination scalar. Drop the redundant field.
+    let _ = dest_ty;
+    Ok(Some(vec![Expr::App {
+        target,
+        args: vec![src],
         ty: result_ty.clone(),
     }]))
 }

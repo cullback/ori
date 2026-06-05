@@ -104,12 +104,6 @@ fn recurse(expr: Expr, builtins: &BuiltinRegistry) -> Expr {
             ty,
         },
 
-        Expr::Range { start, end, ty } => Expr::Range {
-            start: Box::new(simplify(*start, builtins)),
-            end: Box::new(simplify(*end, builtins)),
-            ty,
-        },
-
         Expr::BufAppend { buf_slots, val_slots, elem_ty, ty } => Expr::BufAppend {
             buf_slots: buf_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
             val_slots: val_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
@@ -122,13 +116,6 @@ fn recurse(expr: Expr, builtins: &BuiltinRegistry) -> Expr {
             idx: Box::new(simplify(*idx, builtins)),
             val_slots: val_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
             elem_ty,
-            ty,
-        },
-
-        Expr::Cast { src, dest_ty, bitcast, ty } => Expr::Cast {
-            src: Box::new(simplify(*src, builtins)),
-            dest_ty,
-            bitcast,
             ty,
         },
     }
@@ -206,7 +193,6 @@ fn body_uses(expr: &Expr, target: SymbolId) -> bool {
         Expr::Con { args, .. } => args.iter().any(|a| body_uses(a, target)),
         Expr::BufLit { elements, .. } => elements.iter().any(|e| body_uses(e, target)),
         Expr::BufLoad { buf, idx, .. } => body_uses(buf, target) || body_uses(idx, target),
-        Expr::Range { start, end, .. } => body_uses(start, target) || body_uses(end, target),
         Expr::BufAppend { buf_slots, val_slots, .. } => {
             buf_slots.iter().any(|e| body_uses(e, target))
                 || val_slots.iter().any(|e| body_uses(e, target))
@@ -216,7 +202,6 @@ fn body_uses(expr: &Expr, target: SymbolId) -> bool {
                 || body_uses(idx, target)
                 || val_slots.iter().any(|e| body_uses(e, target))
         }
-        Expr::Cast { src, .. } => body_uses(src, target),
     }
 }
 

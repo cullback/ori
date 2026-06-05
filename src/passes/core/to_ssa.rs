@@ -360,58 +360,6 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             Ok(vec![new_len, new_len, new_data])
         }
 
-        // List.range emits a counter-driven fill loop and returns
-        // the resulting (len, cap, data) trio. Empty range
-        // (`end <= start`) yields count=0 with a 0-byte data buffer.
-        Expr::Range { start, end, .. } => {
-            use crate::ssa::{BinaryOp, ScalarType};
-            let start_v = lower(ctx, start)?;
-            let end_v = lower(ctx, end)?;
-
-            let nonempty = ctx.builder.binop(BinaryOp::Gt, end_v, start_v, ScalarType::U8);
-            let then_block = ctx.builder.create_block();
-            let else_block = ctx.builder.create_block();
-            let count_merge = ctx.builder.create_block();
-            let count = ctx.builder.add_block_param(count_merge, ScalarType::U64);
-            ctx.builder.branch(nonempty, then_block, vec![], else_block, vec![]);
-
-            ctx.builder.switch_to(then_block);
-            let diff = ctx.builder.binop(BinaryOp::Sub, end_v, start_v, ScalarType::U64);
-            ctx.builder.jump(count_merge, vec![diff]);
-
-            ctx.builder.switch_to(else_block);
-            let zero = ctx.builder.const_u64(0);
-            ctx.builder.jump(count_merge, vec![zero]);
-
-            ctx.builder.switch_to(count_merge);
-            let eight = ctx.builder.const_u64(8);
-            let byte_len = ctx.builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
-            let data = ctx.builder.alloc_dyn(byte_len);
-
-            let header = ctx.builder.create_block();
-            let body = ctx.builder.create_block();
-            let exit = ctx.builder.create_block();
-            let header_i = ctx.builder.add_block_param(header, ScalarType::U64);
-            let body_i = ctx.builder.add_block_param(body, ScalarType::U64);
-
-            let zero2 = ctx.builder.const_u64(0);
-            ctx.builder.jump(header, vec![zero2]);
-
-            ctx.builder.switch_to(header);
-            let cond = ctx.builder.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
-            ctx.builder.branch(cond, body, vec![header_i], exit, vec![]);
-
-            ctx.builder.switch_to(body);
-            let val = ctx.builder.binop(BinaryOp::Add, start_v, body_i, ScalarType::U64);
-            ctx.builder.store_dyn(data, body_i, val);
-            let one = ctx.builder.const_u64(1);
-            let next_i = ctx.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
-            ctx.builder.jump(header, vec![next_i]);
-
-            ctx.builder.switch_to(exit);
-            Ok(vec![count, count, data])
-        }
-
         // Var with multi-slot binding: return all slot values
         // directly. `lower` errors on multi-slot Vars; this is the
         // multi-slot read path. Single-slot Vars also flow through
@@ -570,17 +518,6 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             }
         }
 
-        Expr::Cast { src, dest_ty, bitcast, .. } => {
-            // Numeric conversion. `bitcast` preserves the bit
-            // pattern (to_bits / from_bits); regular cast does
-            // zero/sign-extend or truncate as the SSA op dictates.
-            let v = lower(ctx, src)?;
-            Ok(if *bitcast {
-                ctx.builder.bitcast(v, *dest_ty)
-            } else {
-                ctx.builder.cast(v, *dest_ty)
-            })
-        }
 
         Expr::App { target, args, ty } => {
             // Builtin dispatch: primitive arithmetic / cast / range
@@ -728,17 +665,6 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
                 .ok_or_else(|| format!(
                     "core::to_ssa: Con `{tag}` has unsupported discriminant type {disc:?}"
                 ))
-        }
-
-        // Multi-slot primitives — single-slot caller asks for a
-        // header pointer; materialize the trio into a 24-byte shell.
-        Expr::Range { .. } => {
-            let slots = lower_slots(ctx, expr)?;
-            let shell = ctx.builder.alloc(slots.len() * 8);
-            for (i, v) in slots.iter().enumerate() {
-                ctx.builder.store(shell, i * 8, *v);
-            }
-            Ok(shell)
         }
 
         // ListSet single-slot caller: materialize the trio.

@@ -292,20 +292,6 @@ pub enum Expr {
     },
 
     /// `ListRange(start, end, ty)` — produces a `(len, cap, data)`
-    /// trio whose buffer holds `start, start+1, …, end-1` (or an
-    /// empty list when `end <= start`). The leaf primitive backing
-    /// `List.range(start, end)`. At `to_ssa` it expands into a
-    /// counter-driven fill loop; at the Core layer it stays opaque
-    /// so future Ana ∘ Cata → Hylo deforestation can recognize it
-    /// as an unfold.
-    ///
-    /// `ty` is the result `List(U64)` type.
-    Range {
-        start: Box<Expr>,
-        end: Box<Expr>,
-        ty: Type,
-    },
-
     /// `ListAppend(buf_slots, val_slots, elem_ty, ty)` — produces
     /// a new `(len, cap, data)` trio with `val_slots` written at
     /// index `len`. For multi-slot elements (records, Str, nested
@@ -334,18 +320,6 @@ pub enum Expr {
         ty: Type,
     },
 
-    /// `Cast { src, dest_ty, bitcast, ty }` — a scalar conversion
-    /// (e.g. `U8 → U32` zero-extend, `F64 → U64` bitcast). Lowers
-    /// directly to SSA's `Cast` or `BitCast` instruction. `bitcast =
-    /// true` preserves the bit pattern (used for `to_bits` /
-    /// `from_bits`); `false` does a typed cast (zero/sign-extend,
-    /// truncate).
-    Cast {
-        src: Box<Expr>,
-        dest_ty: crate::ssa::ScalarType,
-        bitcast: bool,
-        ty: Type,
-    },
 }
 
 impl Expr {
@@ -362,10 +336,8 @@ impl Expr {
             | Self::Con { ty, .. }
             | Self::BufLit { ty, .. }
             | Self::BufLoad { ty, .. }
-            | Self::Range { ty, .. }
             | Self::BufAppend { ty, .. }
-            | Self::BufSet { ty, .. }
-            | Self::Cast { ty, .. } => ty,
+            | Self::BufSet { ty, .. } => ty,
         }
     }
 
@@ -385,10 +357,8 @@ impl Expr {
             | Self::Con { ty, .. }
             | Self::BufLit { ty, .. }
             | Self::BufLoad { ty, .. }
-            | Self::Range { ty, .. }
             | Self::BufAppend { ty, .. }
-            | Self::BufSet { ty, .. }
-            | Self::Cast { ty, .. } => *ty = new_ty,
+            | Self::BufSet { ty, .. } => *ty = new_ty,
         }
     }
 }
