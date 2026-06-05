@@ -24,6 +24,7 @@
 //! case-of-case, free theorems) land as we grow the set.
 
 use crate::ssa::BinaryOp as SsaBinaryOp;
+use crate::symbol::SymbolId;
 
 use super::expr::{Expr, Literal, MatchArm, Pattern};
 
@@ -177,7 +178,64 @@ fn apply_local_rules(expr: Expr) -> Expr {
             }
         }
 
+        // Dead-binding elimination: `let x = e in body` where body
+        // doesn't reference any of the binders → `body`. Sound in Ori
+        // because the language is total and pure: `e` can't observe-
+        // ably escape, and `e`'s evaluation has no effect we need to
+        // preserve. The equivalent SSA-level pass needs alias analy-
+        // sis (would `e`'s value escape via some store?) and DCE; in
+        // Core it's a single shape check.
+        Expr::Let { binders, value, body, ty } => {
+            if binders.iter().all(|s| !body_uses(&body, *s)) {
+                *body
+            } else {
+                Expr::Let { binders, value, body, ty }
+            }
+        }
+
         other => other,
+    }
+}
+
+/// Does `expr` reference `target` anywhere in its tree?
+fn body_uses(expr: &Expr, target: SymbolId) -> bool {
+    match expr {
+        Expr::Var { sym, .. } => *sym == target,
+        Expr::Lit { .. } => false,
+        Expr::BinOp { lhs, rhs, .. } => body_uses(lhs, target) || body_uses(rhs, target),
+        Expr::App { args, .. } => args.iter().any(|a| body_uses(a, target)),
+        Expr::Let { value, body, .. } => body_uses(value, target) || body_uses(body, target),
+        Expr::Match { scrutinee_slots, arms, .. } => {
+            scrutinee_slots.iter().any(|e| body_uses(e, target))
+                || arms.iter().any(|a| {
+                    a.guards.iter().any(|g| body_uses(g, target))
+                        || a.body.iter().any(|b| body_uses(b, target))
+                })
+        }
+        Expr::Cata { target_slots, extra_args, .. } => {
+            target_slots.iter().any(|e| body_uses(e, target))
+                || extra_args.iter().any(|e| body_uses(e, target))
+        }
+        Expr::Con { args, .. } => args.iter().any(|a| body_uses(a, target)),
+        Expr::ListLit { elements, .. } => elements.iter().any(|e| body_uses(e, target)),
+        Expr::BufLoad { buf, idx, .. } => body_uses(buf, target) || body_uses(idx, target),
+        Expr::ListRange { start, end, .. } => body_uses(start, target) || body_uses(end, target),
+        Expr::ListWalk { list_slots, init, captures, .. }
+        | Expr::ListWalkUntil { list_slots, init, captures, .. } => {
+            list_slots.iter().any(|e| body_uses(e, target))
+                || init.iter().any(|e| body_uses(e, target))
+                || captures.iter().any(|e| body_uses(e, target))
+        }
+        Expr::ListAppend { list_slots, val_slots, .. } => {
+            list_slots.iter().any(|e| body_uses(e, target))
+                || val_slots.iter().any(|e| body_uses(e, target))
+        }
+        Expr::ListSet { list_slots, idx, val_slots, .. } => {
+            list_slots.iter().any(|e| body_uses(e, target))
+                || body_uses(idx, target)
+                || val_slots.iter().any(|e| body_uses(e, target))
+        }
+        Expr::Cast { src, .. } => body_uses(src, target),
     }
 }
 
@@ -263,6 +321,71 @@ mod tests {
         assert_eq!(op, SsaBinaryOp::Add);
         assert!(matches!(*lhs, Expr::Var { sym: SymbolId(1), .. }));
         assert!(matches!(*rhs, Expr::Var { sym: SymbolId(2), .. }));
+    }
+
+    #[test]
+    fn dead_let_drops_binding() {
+        // `let x = 7 in 42` → `42`  (binding never used)
+        let e = Expr::Let {
+            binders: vec![SymbolId(1)],
+            value: Box::new(lit_int(7)),
+            body: Box::new(lit_int(42)),
+            ty: i64_ty(),
+        };
+        let simplified = simplify(e);
+        match simplified {
+            Expr::Lit { value: Literal::Int(42), .. } => {}
+            other => panic!("expected Lit(42), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_let_is_preserved() {
+        // `let x = 7 in x + 1` → unchanged (x is used)
+        let e = Expr::Let {
+            binders: vec![SymbolId(1)],
+            value: Box::new(lit_int(7)),
+            body: Box::new(Expr::BinOp {
+                op: SsaBinaryOp::Add,
+                lhs: Box::new(var(1)),
+                rhs: Box::new(lit_int(1)),
+                ty: i64_ty(),
+            }),
+            ty: i64_ty(),
+        };
+        let simplified = simplify(e);
+        // Must still be a Let — the binder is live.
+        assert!(matches!(simplified, Expr::Let { .. }));
+    }
+
+    #[test]
+    fn dead_let_inside_let_drops() {
+        // `let x = 1 in (let y = 2 in x + x)` — y is dead, x is live.
+        // After simplify: `let x = 1 in x + x` (inner Let dropped).
+        let inner_let = Expr::Let {
+            binders: vec![SymbolId(2)],
+            value: Box::new(lit_int(2)),
+            body: Box::new(Expr::BinOp {
+                op: SsaBinaryOp::Add,
+                lhs: Box::new(var(1)),
+                rhs: Box::new(var(1)),
+                ty: i64_ty(),
+            }),
+            ty: i64_ty(),
+        };
+        let outer = Expr::Let {
+            binders: vec![SymbolId(1)],
+            value: Box::new(lit_int(1)),
+            body: Box::new(inner_let),
+            ty: i64_ty(),
+        };
+        let simplified = simplify(outer);
+        let Expr::Let { binders, body, .. } = simplified else {
+            panic!("expected outer Let");
+        };
+        assert_eq!(binders, vec![SymbolId(1)]);
+        // body should be the BinOp directly (inner Let collapsed)
+        assert!(matches!(*body, Expr::BinOp { .. }));
     }
 
     #[test]
