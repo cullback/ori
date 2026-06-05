@@ -461,11 +461,20 @@ impl<'a> Synthesizer<'a> {
                 SymbolKind::Type,
             );
 
+            // Look up the lifted target's leading param types so
+            // the synthesized TagDecl reflects the real capture
+            // shape (e.g. `List(I64)` instead of `I64`).
+            let cap_tys = lifted_func_capture_types(
+                self.func_schemes,
+                &target_func,
+                num_captures,
+            );
+
             // Add a TagDecl in the module.
             self.new_decls.push(build_singleton_tagdecl(
                 new_closure_type_sym,
                 leak_str(&new_tag_display),
-                num_captures,
+                &cap_tys,
             ));
 
             // Register tag_targets entry so lower's
@@ -488,6 +497,7 @@ impl<'a> Synthesizer<'a> {
                 new_closure_type_name: new_closure_type_display.clone(),
                 num_captures,
                 target_func: target_func.clone(),
+                cap_tys: cap_tys.clone(),
             };
             new_arg_tys.push(Some(singleton_tagunion_type(&info_for_ty)));
             narrow_info.push(Some(NarrowedTag {
@@ -499,6 +509,7 @@ impl<'a> Synthesizer<'a> {
                 new_closure_type_name: new_closure_type_display.clone(),
                 num_captures,
                 target_func,
+                cap_tys,
             }));
         }
 
@@ -599,6 +610,12 @@ struct NarrowedTag {
     new_closure_type_name: String,
     num_captures: usize,
     target_func: String,
+    /// Capture types, pulled from the lifted target's leading params.
+    /// Multi-slot captures (e.g. `List(I64)`) must keep their real
+    /// type here so `expand_slots` on the singleton TagUnion fans out
+    /// to all slots — without this, the closure shell is sized for
+    /// 8-byte captures only and the call-boundary loses slots.
+    cap_tys: Vec<Type>,
 }
 
 /// Build the canonical singleton TagUnion type for a narrowed closure
@@ -606,16 +623,11 @@ struct NarrowedTag {
 /// directly, so setting the closure expr's `ty` to this shape (rather
 /// than to a Type::Con that would need a `transparent` table lookup)
 /// makes Phase E fire without further registration. The capture types
-/// are `I64`-shaped: that's the same simplification `lambda_specialize`
-/// uses for its synthesized `TagDecl` fields and is correct as long as
-/// every capture is 8 bytes (which Ori's current scalar types and
-/// pointer kinds all satisfy).
+/// reflect the lifted target's leading params verbatim — including
+/// multi-slot ones (e.g. `List(I64)` decomposes to 3 SSA slots).
 fn singleton_tagunion_type(info: &NarrowedTag) -> Type {
-    let cap_tys: Vec<Type> = (0..info.num_captures)
-        .map(|_| Type::Con("I64".to_owned()))
-        .collect();
     Type::TagUnion {
-        tags: vec![(info.new_tag_name.clone(), cap_tys)],
+        tags: vec![(info.new_tag_name.clone(), info.cap_tys.clone())],
         rest: None,
     }
 }
@@ -1291,11 +1303,19 @@ fn retype_scheme_params(orig: &Scheme, info_by_pos: &HashMap<usize, NarrowedTag>
 fn build_singleton_tagdecl(
     type_sym: SymbolId,
     tag_name: &'static str,
-    captures_count: usize,
+    cap_tys: &[Type],
 ) -> Decl<'static> {
+    // Convert each capture's `Type` to a TypeExpr so decl_info's
+    // constructor scheme reflects the real capture shape (e.g.
+    // `List(I64)` instead of `I64`). Without this, the parent union
+    // type registered at decl_info time has I64 fields and Core's
+    // Con lowering uses that wrong type, fanning out to the wrong
+    // number of SSA slots.
+    let fields: Vec<TypeExpr<'static>> =
+        cap_tys.iter().map(type_to_type_expr).collect();
     let tag = TagDecl {
         name: tag_name,
-        fields: vec![TypeExpr::Named("I64"); captures_count],
+        fields,
     };
     Decl::TypeAnno {
         span: synth_span(),
@@ -1306,6 +1326,31 @@ fn build_singleton_tagdecl(
         methods: Vec::new(),
         kind: TypeDeclKind::Transparent,
         doc: None,
+    }
+}
+
+/// Convert a `Type` to a `TypeExpr<'static>` for synth TagDecls.
+/// Handles the shapes that lifted-function capture types actually
+/// take post-mono (Con, App, Tuple, Record). Records and Tuples
+/// nest via recursion; Arrow / Var are panics (post-mono shouldn't
+/// surface them as a capture).
+fn type_to_type_expr(ty: &Type) -> TypeExpr<'static> {
+    match ty {
+        Type::Con(name) => TypeExpr::Named(leak_str(name)),
+        Type::App(name, args) => TypeExpr::App(
+            leak_str(name),
+            args.iter().map(type_to_type_expr).collect(),
+        ),
+        Type::Tuple(elems) => {
+            TypeExpr::Tuple(elems.iter().map(type_to_type_expr).collect())
+        }
+        Type::Record { .. } | Type::Arrow(_, _, _) | Type::Var(_) | Type::TagUnion { .. } => {
+            // Fall back to I64 for shapes we don't expect to encode
+            // as a capture (a closure or unbound var as a capture
+            // would already be a bug). Keeping the conversion total
+            // avoids cascading failures further downstream.
+            TypeExpr::Named("I64")
+        }
     }
 }
 

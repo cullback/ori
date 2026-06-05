@@ -1284,21 +1284,53 @@ fn lower_match(
                 _ => continue,
             };
             // Bind each slot to the corresponding binder sym. For a
-            // Constructor pattern, `binders` is per-field; for
-            // Wildcard / Binding, just bind the whole thing.
+            // Constructor pattern, `binders` is per-field. Field
+            // types may expand to N slots (e.g. List(I64) = 3); when
+            // the field has only one source-level binder, that binder
+            // absorbs all of the field's slots as a multi-slot local.
+            // Otherwise binder_slots's syms each take one slot.
             let mut bound: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
             if let Some(binders) = binders_opt {
+                let field_tys: Vec<Type> = match &unwrapped_ty {
+                    Type::TagUnion { tags, .. } if tags.len() == 1 => {
+                        tags[0].1.clone()
+                    }
+                    _ => Vec::new(),
+                };
                 let mut slot_idx = 0;
-                for binder_slots in binders {
-                    for &sym in binder_slots {
-                        if slot_idx >= scrutinee_slots.len() {
-                            break;
-                        }
-                        let v = scrutinee_slots[slot_idx];
+                for (field_i, binder_slots) in binders.iter().enumerate() {
+                    let field_slot_count = field_tys
+                        .get(field_i)
+                        .map(|ft| {
+                            super::lower::expand_slots_with(
+                                ft,
+                                &ctx.fieldless,
+                                &ctx.transparent,
+                                &ctx.payload_unions,
+                            )
+                            .len()
+                            .max(1)
+                        })
+                        .unwrap_or(binder_slots.len().max(1));
+                    if binder_slots.len() == 1 && field_slot_count > 1 {
+                        let sym = binder_slots[0];
+                        let end = (slot_idx + field_slot_count).min(scrutinee_slots.len());
+                        let vals: Vec<Value> = scrutinee_slots[slot_idx..end].to_vec();
                         if sym.0 != u32::MAX {
-                            bound.push((sym, ctx.locals.insert(sym, vec![v])));
+                            bound.push((sym, ctx.locals.insert(sym, vals)));
                         }
-                        slot_idx += 1;
+                        slot_idx = end;
+                    } else {
+                        for &sym in binder_slots {
+                            if slot_idx >= scrutinee_slots.len() {
+                                break;
+                            }
+                            let v = scrutinee_slots[slot_idx];
+                            if sym.0 != u32::MAX {
+                                bound.push((sym, ctx.locals.insert(sym, vec![v])));
+                            }
+                            slot_idx += 1;
+                        }
                     }
                 }
             } else if let Pattern::Binding(sym) = &arm.pattern {
