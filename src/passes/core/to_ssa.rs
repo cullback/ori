@@ -1005,7 +1005,17 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             for a in args {
                 arg_vals.extend(lower_slots(ctx, a)?);
             }
-            let ret_ty = resolve_scalar_type(ty, &ctx.fieldless);
+            // Use expand_slots for the return scalar so single-slot
+            // Phase-E TagUnions ([Wrapped(I64)] → I64) match the
+            // callee's actual SSA return. resolve_scalar_type alone
+            // would give RcPtr (TagUnion default) where the callee
+            // returns I64.
+            let ret_slots = super::lower::expand_slots_with(ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
+            let ret_ty = if ret_slots.len() == 1 {
+                ret_slots[0]
+            } else {
+                resolve_scalar_type(ty, &ctx.fieldless)
+            };
             Ok(ctx.builder.call(target, arg_vals, ret_ty))
         }
 
@@ -1019,7 +1029,12 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             for a in extra_args {
                 arg_vals.extend(lower_slots(ctx, a)?);
             }
-            let ret_ty = resolve_scalar_type(ty, &ctx.fieldless);
+            let ret_slots = super::lower::expand_slots_with(ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
+            let ret_ty = if ret_slots.len() == 1 {
+                ret_slots[0]
+            } else {
+                resolve_scalar_type(ty, &ctx.fieldless)
+            };
             Ok(ctx.builder.call(fold_fn, arg_vals, ret_ty))
         }
 
