@@ -158,6 +158,20 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         // App where the return type is multi-slot — emit call_multi
         // and return the result slot list directly.
         Expr::App { target, args, ty } => {
+            // Builtin dispatch: `Range` is the only currently-defined
+            // builtin with a multi-slot return (the buffer trio).
+            // Binary / Cast / Bitcast return a scalar — delegate
+            // through `lower` so we hit the single-slot dispatch.
+            if let Some(kind) = ctx.builtins.classify(*target) {
+                return match kind {
+                    crate::symbol::BuiltinKind::Range => emit_builtin_range(ctx, args, ty),
+                    crate::symbol::BuiltinKind::Binary(_)
+                    | crate::symbol::BuiltinKind::Cast
+                    | crate::symbol::BuiltinKind::Bitcast => {
+                        Ok(vec![emit_builtin_single_slot(ctx, kind, args, ty)?])
+                    }
+                };
+            }
             let ret_slots = super::lower::expand_slots_with(ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
             if ret_slots.len() == 1 {
                 return Ok(vec![lower(ctx, expr)?]);
@@ -556,76 +570,6 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             }
         }
 
-        Expr::BinOp { op, lhs, rhs, ty } => {
-            // Core's BinOp uses ssa::BinaryOp directly — short-
-            // circuit And/Or were desugared to Match at AST→Core
-            // time and don't appear here.
-            //
-            // Equality / inequality on buffer-trio operands (List,
-            // Str) takes a multi-slot path: length-check + element-
-            // wise loop. Comes from the literal-pattern desugar
-            // synthesizing `Eq(Var(trio_sym), BufLit(bytes))` and
-            // from any future direct `xs == ys` on lists. Scalar
-            // operands take the fast path.
-            if matches!(op, crate::ssa::BinaryOp::Eq | crate::ssa::BinaryOp::Neq) {
-                let lhs_slots = lower_slots(ctx, lhs)?;
-                let rhs_slots = lower_slots(ctx, rhs)?;
-                if lhs_slots.len() == 3 && rhs_slots.len() == 3 {
-                    let lhs_ty_unwrapped =
-                        super::lower::resolve_transparent(lhs.ty(), &ctx.transparent);
-                    let elem_ty = match &lhs_ty_unwrapped {
-                        Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
-                        _ => return Err(format!(
-                            "core::to_ssa: BinOp::Eq on 3-slot operands but lhs type \
-                             isn't List(_): {lhs_ty_unwrapped:?}"
-                        )),
-                    };
-                    let elem_tys = super::lower::expand_slots_with(
-                        &elem_ty,
-                        &ctx.fieldless,
-                        &ctx.transparent,
-                        &ctx.payload_unions,
-                    );
-                    if elem_tys.len() != 1 {
-                        return Err(format!(
-                            "core::to_ssa: BinOp::Eq on List({elem_ty:?}) — multi-slot \
-                             elements not yet supported"
-                        ));
-                    }
-                    let result = buf_eq(ctx, &lhs_slots, &rhs_slots, elem_tys[0]);
-                    if matches!(op, crate::ssa::BinaryOp::Neq) {
-                        let one = ctx.builder.const_u8(1);
-                        return Ok(ctx.builder.binop(
-                            crate::ssa::BinaryOp::Xor,
-                            result,
-                            one,
-                            ScalarType::U8,
-                        ));
-                    }
-                    return Ok(result);
-                }
-                // Fall through to scalar path for single-slot operands.
-                if lhs_slots.len() == 1 && rhs_slots.len() == 1 {
-                    let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
-                    return Ok(ctx.builder.binop(
-                        *op,
-                        lhs_slots[0],
-                        rhs_slots[0],
-                        result_ty,
-                    ));
-                }
-                return Err(format!(
-                    "core::to_ssa: BinOp::Eq operand slot mismatch — lhs={}, rhs={}",
-                    lhs_slots.len(),
-                    rhs_slots.len()
-                ));
-            }
-            let l = lower(ctx, lhs)?;
-            let r = lower(ctx, rhs)?;
-            let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
-            Ok(ctx.builder.binop(*op, l, r, result_ty))
-        }
-
         Expr::Cast { src, dest_ty, bitcast, .. } => {
             // Numeric conversion. `bitcast` preserves the bit
             // pattern (to_bits / from_bits); regular cast does
@@ -639,6 +583,12 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
         }
 
         Expr::App { target, args, ty } => {
+            // Builtin dispatch: primitive arithmetic / cast / range
+            // are App-shaped at Core but lower to inline ops, not
+            // function calls.
+            if let Some(kind) = ctx.builtins.classify(*target) {
+                return emit_builtin_single_slot(ctx, kind, args, ty);
+            }
             // Use lower_slots for args so multi-slot args (records,
             // payload Cons, multi-result Calls) spread into multiple
             // SSA call args. Single-result return; multi-result goes
@@ -1701,6 +1651,179 @@ fn lower_match(
     Ok(merge_params)
 }
 
+/// Lower a builtin-target `App` whose result is single-slot
+/// (every kind except `Range`). Dispatches to the matching SSA
+/// op emission.
+fn emit_builtin_single_slot(
+    ctx: &mut Ctx<'_>,
+    kind: crate::symbol::BuiltinKind,
+    args: &[Expr],
+    ty: &Type,
+) -> Result<Value, String> {
+    use crate::symbol::BuiltinKind;
+    match kind {
+        BuiltinKind::Binary(op) => emit_builtin_binop(ctx, op, args, ty),
+        BuiltinKind::Cast => emit_builtin_cast(ctx, args, ty, false),
+        BuiltinKind::Bitcast => emit_builtin_cast(ctx, args, ty, true),
+        BuiltinKind::Range => Err(
+            "core::to_ssa: __builtin.list.range result is multi-slot (use lower_slots)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Lower a binary builtin: `Add`, `Sub`, ..., `Eq`, `Neq`. For scalar
+/// operands lowers to a single `Inst::BinOp`. For trio (`List` / `Str`)
+/// operands `Eq` / `Neq` route through `buf_eq` (length check +
+/// elementwise loop). Other ops on trios are an error.
+fn emit_builtin_binop(
+    ctx: &mut Ctx<'_>,
+    op: crate::ssa::BinaryOp,
+    args: &[Expr],
+    ty: &Type,
+) -> Result<Value, String> {
+    use crate::ssa::BinaryOp;
+    if args.len() != 2 {
+        return Err(format!(
+            "core::to_ssa: binary builtin expects 2 args, got {}",
+            args.len()
+        ));
+    }
+    let lhs = &args[0];
+    let rhs = &args[1];
+    if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+        let lhs_slots = lower_slots(ctx, lhs)?;
+        let rhs_slots = lower_slots(ctx, rhs)?;
+        if lhs_slots.len() == 3 && rhs_slots.len() == 3 {
+            let lhs_ty_unwrapped =
+                super::lower::resolve_transparent(lhs.ty(), &ctx.transparent);
+            let elem_ty = match &lhs_ty_unwrapped {
+                Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
+                _ => return Err(format!(
+                    "core::to_ssa: builtin Eq on 3-slot operands but lhs type \
+                     isn't List(_): {lhs_ty_unwrapped:?}"
+                )),
+            };
+            let elem_tys = super::lower::expand_slots_with(
+                &elem_ty,
+                &ctx.fieldless,
+                &ctx.transparent,
+                &ctx.payload_unions,
+            );
+            if elem_tys.len() != 1 {
+                return Err(format!(
+                    "core::to_ssa: builtin Eq on List({elem_ty:?}) — multi-slot \
+                     elements not yet supported"
+                ));
+            }
+            let result = buf_eq(ctx, &lhs_slots, &rhs_slots, elem_tys[0]);
+            if matches!(op, BinaryOp::Neq) {
+                let one = ctx.builder.const_u8(1);
+                return Ok(ctx.builder.binop(BinaryOp::Xor, result, one, ScalarType::U8));
+            }
+            return Ok(result);
+        }
+        if lhs_slots.len() == 1 && rhs_slots.len() == 1 {
+            let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
+            return Ok(ctx.builder.binop(op, lhs_slots[0], rhs_slots[0], result_ty));
+        }
+        return Err(format!(
+            "core::to_ssa: builtin Eq operand slot mismatch — lhs={}, rhs={}",
+            lhs_slots.len(),
+            rhs_slots.len()
+        ));
+    }
+    let l = lower(ctx, lhs)?;
+    let r = lower(ctx, rhs)?;
+    let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
+    Ok(ctx.builder.binop(op, l, r, result_ty))
+}
+
+/// Lower a cast / bitcast builtin: `dest_ty` is taken from the
+/// `App`'s result type. Zero / sign-extend or truncate for `cast`;
+/// bit-pattern preserving for `bitcast`.
+fn emit_builtin_cast(
+    ctx: &mut Ctx<'_>,
+    args: &[Expr],
+    ty: &Type,
+    bitcast: bool,
+) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "core::to_ssa: cast builtin expects 1 arg, got {}",
+            args.len()
+        ));
+    }
+    let v = lower(ctx, &args[0])?;
+    let dest_ty = resolve_scalar_type(ty, &ctx.fieldless);
+    Ok(if bitcast {
+        ctx.builder.bitcast(v, dest_ty)
+    } else {
+        ctx.builder.cast(v, dest_ty)
+    })
+}
+
+/// Lower a `range(start, end)` builtin to the buffer-trio counter
+/// loop. Result is `(len, cap, data)` — three SSA values.
+fn emit_builtin_range(
+    ctx: &mut Ctx<'_>,
+    args: &[Expr],
+    _ty: &Type,
+) -> Result<Vec<Value>, String> {
+    use crate::ssa::BinaryOp;
+    if args.len() != 2 {
+        return Err(format!(
+            "core::to_ssa: range builtin expects 2 args, got {}",
+            args.len()
+        ));
+    }
+    let start_v = lower(ctx, &args[0])?;
+    let end_v = lower(ctx, &args[1])?;
+
+    let nonempty = ctx.builder.binop(BinaryOp::Gt, end_v, start_v, ScalarType::U8);
+    let then_block = ctx.builder.create_block();
+    let else_block = ctx.builder.create_block();
+    let count_merge = ctx.builder.create_block();
+    let count = ctx.builder.add_block_param(count_merge, ScalarType::U64);
+    ctx.builder.branch(nonempty, then_block, vec![], else_block, vec![]);
+
+    ctx.builder.switch_to(then_block);
+    let diff = ctx.builder.binop(BinaryOp::Sub, end_v, start_v, ScalarType::U64);
+    ctx.builder.jump(count_merge, vec![diff]);
+
+    ctx.builder.switch_to(else_block);
+    let zero = ctx.builder.const_u64(0);
+    ctx.builder.jump(count_merge, vec![zero]);
+
+    ctx.builder.switch_to(count_merge);
+    let eight = ctx.builder.const_u64(8);
+    let byte_len = ctx.builder.binop(BinaryOp::Mul, count, eight, ScalarType::U64);
+    let data = ctx.builder.alloc_dyn(byte_len);
+
+    let header = ctx.builder.create_block();
+    let body = ctx.builder.create_block();
+    let exit = ctx.builder.create_block();
+    let header_i = ctx.builder.add_block_param(header, ScalarType::U64);
+    let body_i = ctx.builder.add_block_param(body, ScalarType::U64);
+
+    let zero2 = ctx.builder.const_u64(0);
+    ctx.builder.jump(header, vec![zero2]);
+
+    ctx.builder.switch_to(header);
+    let cond = ctx.builder.binop(BinaryOp::Lt, header_i, count, ScalarType::U8);
+    ctx.builder.branch(cond, body, vec![header_i], exit, vec![]);
+
+    ctx.builder.switch_to(body);
+    let val = ctx.builder.binop(BinaryOp::Add, start_v, body_i, ScalarType::U64);
+    ctx.builder.store_dyn(data, body_i, val);
+    let one = ctx.builder.const_u64(1);
+    let next_i = ctx.builder.binop(BinaryOp::Add, body_i, one, ScalarType::U64);
+    ctx.builder.jump(header, vec![next_i]);
+
+    ctx.builder.switch_to(exit);
+    Ok(vec![count, count, data])
+}
+
 /// Buffer-trio equality: `(l_len, _l_cap, l_data) == (r_len, _r_cap, r_data)`
 /// is logical-content equality — same length and every element equal.
 /// `cap` is an allocation detail and is intentionally ignored.
@@ -2323,22 +2446,20 @@ mod tests {
     }
 
     /// Build the Core for `let x = 1 + 2 in x + 3`.
-    fn build_test_core() -> (Expr, SymbolId) {
+    fn build_test_core(builtins: &crate::symbol::BuiltinRegistry) -> (Expr, SymbolId) {
         let x = SymbolId(100);
         let one = Expr::Lit { value: Literal::Int(1), ty: i64_ty() };
         let two = Expr::Lit { value: Literal::Int(2), ty: i64_ty() };
-        let one_plus_two = Expr::BinOp {
-            op: SsaBinaryOp::Add,
-            lhs: Box::new(one),
-            rhs: Box::new(two),
+        let one_plus_two = Expr::App {
+            target: builtins.add,
+            args: vec![one, two],
             ty: i64_ty(),
         };
         let x_ref = Expr::Var { sym: x, ty: i64_ty() };
         let three = Expr::Lit { value: Literal::Int(3), ty: i64_ty() };
-        let x_plus_three = Expr::BinOp {
-            op: SsaBinaryOp::Add,
-            lhs: Box::new(x_ref),
-            rhs: Box::new(three),
+        let x_plus_three = Expr::App {
+            target: builtins.add,
+            args: vec![x_ref, three],
             ty: i64_ty(),
         };
         let body = Expr::Let {
@@ -2352,12 +2473,12 @@ mod tests {
 
     #[test]
     fn lowers_let_with_binops_to_ssa() {
-        let (core, _x) = build_test_core();
+        let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
+        let (core, _x) = build_test_core(&builtins);
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
-        let mut symbols = SymbolTable::new();
-        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
@@ -2390,12 +2511,12 @@ mod tests {
     fn end_to_end_let_with_binops_evaluates_correctly() {
         // Round-trip the Core `let x = 1 + 2 in x + 3` through SSA and
         // eval. Expected: 6.
-        let (core, _x) = build_test_core();
+        let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
+        let (core, _x) = build_test_core(&builtins);
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));
-        let mut symbols = SymbolTable::new();
-        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let decls = crate::passes::decl_info::DeclInfo::default();
         let mut ctx = Ctx {
             builder: &mut builder,
@@ -2479,17 +2600,23 @@ mod tests {
     fn lowers_match_with_binding_arm() {
         // Core: match (1 + 2) of x -> x * 10
         // Expected eval: 30.
+        let mut symbols = SymbolTable::new();
+        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let x = SymbolId(50);
-        let one_plus_two = Expr::BinOp {
-            op: SsaBinaryOp::Add,
-            lhs: Box::new(Expr::Lit { value: Literal::Int(1), ty: i64_ty() }),
-            rhs: Box::new(Expr::Lit { value: Literal::Int(2), ty: i64_ty() }),
+        let one_plus_two = Expr::App {
+            target: builtins.add,
+            args: vec![
+                Expr::Lit { value: Literal::Int(1), ty: i64_ty() },
+                Expr::Lit { value: Literal::Int(2), ty: i64_ty() },
+            ],
             ty: i64_ty(),
         };
-        let body = Expr::BinOp {
-            op: SsaBinaryOp::Mul,
-            lhs: Box::new(Expr::Var { sym: x, ty: i64_ty() }),
-            rhs: Box::new(Expr::Lit { value: Literal::Int(10), ty: i64_ty() }),
+        let body = Expr::App {
+            target: builtins.mul,
+            args: vec![
+                Expr::Var { sym: x, ty: i64_ty() },
+                Expr::Lit { value: Literal::Int(10), ty: i64_ty() },
+            ],
             ty: i64_ty(),
         };
         let core = Expr::Match {
@@ -2501,9 +2628,6 @@ mod tests {
             )],
             ty: i64_ty(),
         };
-
-        let mut symbols = SymbolTable::new();
-        let builtins = crate::symbol::BuiltinRegistry::bootstrap(&mut symbols);
         let mut builder = Builder::new();
         let _entry = builder.create_block();
         builder.switch_to(crate::ssa::BlockId(0));

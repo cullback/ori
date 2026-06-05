@@ -385,20 +385,22 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     let lhs_slots = lower_expr_slots(ctx, lhs)?;
                     let rhs_slots = lower_expr_slots(ctx, rhs)?;
                     if lhs_slots.len() == 1 && rhs_slots.len() == 1 {
-                        let result = Expr::BinOp {
-                            op: crate::ssa::BinaryOp::Eq,
-                            lhs: Box::new(lhs_slots.into_iter().next().unwrap()),
-                            rhs: Box::new(rhs_slots.into_iter().next().unwrap()),
-                            ty: ast.ty.clone(),
-                        };
+                        let result = mk_binop_app(
+                            ctx.builtins,
+                            crate::ssa::BinaryOp::Eq,
+                            lhs_slots.into_iter().next().unwrap(),
+                            rhs_slots.into_iter().next().unwrap(),
+                            ast.ty.clone(),
+                        );
                         if matches!(op, BinOp::Neq) {
                             let one = Expr::Lit { value: Literal::Int(1), ty: ast.ty.clone() };
-                            return Ok(vec![Expr::BinOp {
-                                op: crate::ssa::BinaryOp::Xor,
-                                lhs: Box::new(result),
-                                rhs: Box::new(one),
-                                ty: ast.ty.clone(),
-                            }]);
+                            return Ok(vec![mk_binop_app(
+                                ctx.builtins,
+                                crate::ssa::BinaryOp::Xor,
+                                result,
+                                one,
+                                ast.ty.clone(),
+                            )]);
                         }
                         return Ok(vec![result]);
                     }
@@ -430,43 +432,48 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     let bool_ty = ast.ty.clone();
                     let mut iter = lhs_slots.into_iter().zip(rhs_slots);
                     let (l0, r0) = iter.next().unwrap();
-                    let mut acc = Expr::BinOp {
-                        op: crate::ssa::BinaryOp::Eq,
-                        lhs: Box::new(l0),
-                        rhs: Box::new(r0),
-                        ty: bool_ty.clone(),
-                    };
+                    let mut acc = mk_binop_app(
+                        ctx.builtins,
+                        crate::ssa::BinaryOp::Eq,
+                        l0,
+                        r0,
+                        bool_ty.clone(),
+                    );
                     for (l, r) in iter {
-                        let slot_eq = Expr::BinOp {
-                            op: crate::ssa::BinaryOp::Eq,
-                            lhs: Box::new(l),
-                            rhs: Box::new(r),
-                            ty: bool_ty.clone(),
-                        };
-                        acc = Expr::BinOp {
-                            op: crate::ssa::BinaryOp::And,
-                            lhs: Box::new(acc),
-                            rhs: Box::new(slot_eq),
-                            ty: bool_ty.clone(),
-                        };
+                        let slot_eq = mk_binop_app(
+                            ctx.builtins,
+                            crate::ssa::BinaryOp::Eq,
+                            l,
+                            r,
+                            bool_ty.clone(),
+                        );
+                        acc = mk_binop_app(
+                            ctx.builtins,
+                            crate::ssa::BinaryOp::And,
+                            acc,
+                            slot_eq,
+                            bool_ty.clone(),
+                        );
                     }
                     if matches!(op, BinOp::Neq) {
                         let one = Expr::Lit { value: Literal::Int(1), ty: bool_ty.clone() };
-                        acc = Expr::BinOp {
-                            op: crate::ssa::BinaryOp::Xor,
-                            lhs: Box::new(acc),
-                            rhs: Box::new(one),
-                            ty: bool_ty,
-                        };
+                        acc = mk_binop_app(
+                            ctx.builtins,
+                            crate::ssa::BinaryOp::Xor,
+                            acc,
+                            one,
+                            bool_ty,
+                        );
                     }
                     Ok(vec![acc])
                 }
-                _ => Ok(vec![Expr::BinOp {
-                    op: ast_binop_to_ssa(*op),
-                    lhs: Box::new(lower_expr(ctx, lhs)?),
-                    rhs: Box::new(lower_expr(ctx, rhs)?),
-                    ty: ast.ty.clone(),
-                }]),
+                _ => Ok(vec![mk_binop_app(
+                    ctx.builtins,
+                    ast_binop_to_ssa(*op),
+                    lower_expr(ctx, lhs)?,
+                    lower_expr(ctx, rhs)?,
+                    ast.ty.clone(),
+                )]),
             }
         }
 
@@ -605,12 +612,13 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                         args.len()
                     ));
                 }
-                return Ok(vec![Expr::BinOp {
+                return Ok(vec![mk_binop_app(
+                    ctx.builtins,
                     op,
-                    lhs: Box::new(lower_expr(ctx, &args[0])?),
-                    rhs: Box::new(lower_expr(ctx, &args[1])?),
-                    ty: ast.ty.clone(),
-                }]);
+                    lower_expr(ctx, &args[0])?,
+                    lower_expr(ctx, &args[1])?,
+                    ast.ty.clone(),
+                )]);
             }
             if name.starts_with("__builtin.") {
                 // Unary numeric conversions (`__builtin.to_u8`,
@@ -697,6 +705,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 let u64_ty = Type::Con("U64".to_string());
                 let offset_basis: u64 = 14695981039346656037;
                 let prime: u64 = 1099511628211;
+                let builtins = ctx.builtins;
                 let mk_const = |n: u64| Expr::Lit { value: Literal::Int(n as i64), ty: u64_ty.clone() };
                 let mk_slot_hash = |slot_expr: Expr, slot_ty: crate::ssa::ScalarType| -> Expr {
                     let bits = if slot_ty == crate::ssa::ScalarType::U64 {
@@ -706,14 +715,14 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     } else {
                         Expr::Cast { src: Box::new(slot_expr), dest_ty: crate::ssa::ScalarType::U64, bitcast: false, ty: u64_ty.clone() }
                     };
-                    let xord = Expr::BinOp { op: crate::ssa::BinaryOp::Xor, lhs: Box::new(mk_const(offset_basis)), rhs: Box::new(bits), ty: u64_ty.clone() };
-                    Expr::BinOp { op: crate::ssa::BinaryOp::Mul, lhs: Box::new(xord), rhs: Box::new(mk_const(prime)), ty: u64_ty.clone() }
+                    let xord = mk_binop_app(builtins, crate::ssa::BinaryOp::Xor, mk_const(offset_basis), bits, u64_ty.clone());
+                    mk_binop_app(builtins, crate::ssa::BinaryOp::Mul, xord, mk_const(prime), u64_ty.clone())
                 };
                 let mut acc = mk_const(offset_basis);
                 for (slot_expr, slot_ty) in recv_slots.into_iter().zip(slot_tys.iter().copied()) {
                     let s_hash = mk_slot_hash(slot_expr, slot_ty);
-                    let xord = Expr::BinOp { op: crate::ssa::BinaryOp::Xor, lhs: Box::new(acc), rhs: Box::new(s_hash), ty: u64_ty.clone() };
-                    acc = Expr::BinOp { op: crate::ssa::BinaryOp::Mul, lhs: Box::new(xord), rhs: Box::new(mk_const(prime)), ty: u64_ty.clone() };
+                    let xord = mk_binop_app(builtins, crate::ssa::BinaryOp::Xor, acc, s_hash, u64_ty.clone());
+                    acc = mk_binop_app(builtins, crate::ssa::BinaryOp::Mul, xord, mk_const(prime), u64_ty.clone());
                 }
                 return Ok(vec![acc]);
             }
@@ -761,25 +770,28 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 }
                 let mut iter = lhs_slots.into_iter().zip(rhs_slots);
                 let (l0, r0) = iter.next().unwrap();
-                let mut acc = Expr::BinOp {
-                    op: crate::ssa::BinaryOp::Eq,
-                    lhs: Box::new(l0),
-                    rhs: Box::new(r0),
-                    ty: bool_ty.clone(),
-                };
+                let mut acc = mk_binop_app(
+                    ctx.builtins,
+                    crate::ssa::BinaryOp::Eq,
+                    l0,
+                    r0,
+                    bool_ty.clone(),
+                );
                 for (l, r) in iter {
-                    let slot_eq = Expr::BinOp {
-                        op: crate::ssa::BinaryOp::Eq,
-                        lhs: Box::new(l),
-                        rhs: Box::new(r),
-                        ty: bool_ty.clone(),
-                    };
-                    acc = Expr::BinOp {
-                        op: crate::ssa::BinaryOp::And,
-                        lhs: Box::new(acc),
-                        rhs: Box::new(slot_eq),
-                        ty: bool_ty.clone(),
-                    };
+                    let slot_eq = mk_binop_app(
+                        ctx.builtins,
+                        crate::ssa::BinaryOp::Eq,
+                        l,
+                        r,
+                        bool_ty.clone(),
+                    );
+                    acc = mk_binop_app(
+                        ctx.builtins,
+                        crate::ssa::BinaryOp::And,
+                        acc,
+                        slot_eq,
+                        bool_ty.clone(),
+                    );
                 }
                 return Ok(vec![acc]);
             }
@@ -798,12 +810,13 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                         args.len()
                     ));
                 }
-                return Ok(vec![Expr::BinOp {
+                return Ok(vec![mk_binop_app(
+                    ctx.builtins,
                     op,
-                    lhs: Box::new(lower_expr(ctx, receiver)?),
-                    rhs: Box::new(lower_expr(ctx, &args[0])?),
-                    ty: ast.ty.clone(),
-                }]);
+                    lower_expr(ctx, receiver)?,
+                    lower_expr(ctx, &args[0])?,
+                    ast.ty.clone(),
+                )]);
             }
             if name.starts_with("__builtin.") {
                 // Unary numeric conversions on a method receiver.
@@ -1393,16 +1406,18 @@ fn try_lower_stdlib_intrinsic(
             }
             let len = xs_slots[0].clone();
             let data = xs_slots[2].clone();
-            let bounds_check = Expr::BinOp {
-                op: crate::ssa::BinaryOp::Lt,
-                lhs: Box::new(idx_expr.clone()),
-                rhs: Box::new(len),
-                ty: bool_ty.clone(),
-            };
+            let bounds_check = mk_binop_app(
+                ctx.builtins,
+                crate::ssa::BinaryOp::Lt,
+                idx_expr.clone(),
+                len,
+                bool_ty.clone(),
+            );
             // Compute the per-slot indices: `idx * N + j` for j in
             // 0..N. The N=1 single-slot case reduces to a plain
             // `data[idx]` load (no multiplication).
             let n = elem_slots.len();
+            let builtins = ctx.builtins;
             let elem_args: Vec<Expr> = (0..n)
                 .map(|j| {
                     let inner_idx = if n == 1 {
@@ -1412,12 +1427,13 @@ fn try_lower_stdlib_intrinsic(
                             value: Literal::Int(n as i64),
                             ty: u64_ty.clone(),
                         };
-                        let base = Expr::BinOp {
-                            op: crate::ssa::BinaryOp::Mul,
-                            lhs: Box::new(idx_expr.clone()),
-                            rhs: Box::new(n_const),
-                            ty: u64_ty.clone(),
-                        };
+                        let base = mk_binop_app(
+                            builtins,
+                            crate::ssa::BinaryOp::Mul,
+                            idx_expr.clone(),
+                            n_const,
+                            u64_ty.clone(),
+                        );
                         if j == 0 {
                             base
                         } else {
@@ -1425,12 +1441,13 @@ fn try_lower_stdlib_intrinsic(
                                 value: Literal::Int(j as i64),
                                 ty: u64_ty.clone(),
                             };
-                            Expr::BinOp {
-                                op: crate::ssa::BinaryOp::Add,
-                                lhs: Box::new(base),
-                                rhs: Box::new(j_const),
-                                ty: u64_ty.clone(),
-                            }
+                            mk_binop_app(
+                                builtins,
+                                crate::ssa::BinaryOp::Add,
+                                base,
+                                j_const,
+                                u64_ty.clone(),
+                            )
                         }
                     };
                     Expr::BufLoad {
@@ -1814,6 +1831,41 @@ fn builtin_to_binop(name: &str) -> Option<crate::ssa::BinaryOp> {
         "__builtin.shr" => BinaryOp::Shr,
         _ => return None,
     })
+}
+
+/// Build an `Expr::App` for a binary primitive: looks up the
+/// matching builtin `SymbolId` in the registry and wraps `lhs` /
+/// `rhs` as the App's args. Replaces the deleted `Expr::BinOp`
+/// constructor — every primitive arithmetic / comparison / bitwise
+/// op is now a bodyless App that to_ssa dispatches inline.
+fn mk_binop_app(
+    builtins: crate::symbol::BuiltinRegistry,
+    op: crate::ssa::BinaryOp,
+    lhs: Expr,
+    rhs: Expr,
+    ty: Type,
+) -> Expr {
+    use crate::ssa::BinaryOp;
+    let target = match op {
+        BinaryOp::Add => builtins.add,
+        BinaryOp::Sub => builtins.sub,
+        BinaryOp::Mul => builtins.mul,
+        BinaryOp::Div => builtins.div,
+        BinaryOp::Rem => builtins.rem,
+        BinaryOp::Eq => builtins.eq,
+        BinaryOp::Neq => builtins.neq,
+        BinaryOp::Lt => builtins.lt,
+        BinaryOp::Gt => builtins.gt,
+        BinaryOp::Le => builtins.le,
+        BinaryOp::Ge => builtins.ge,
+        BinaryOp::And => builtins.bit_and,
+        BinaryOp::Or => builtins.bit_or,
+        BinaryOp::Xor => builtins.bit_xor,
+        BinaryOp::Shl => builtins.shl,
+        BinaryOp::Shr => builtins.shr,
+        BinaryOp::Max => builtins.max,
+    };
+    Expr::App { target, args: vec![lhs, rhs], ty }
 }
 
 /// Map an AST surface `BinOp` to its SSA `BinaryOp`. The two enums
@@ -2517,12 +2569,13 @@ fn desugar_lit_pattern(
                 crate::symbol::SymbolKind::Local,
             );
             let scrutinee_ty_owned = scrutinee_ty.clone();
-            let guard = Expr::BinOp {
-                op: crate::ssa::BinaryOp::Eq,
-                lhs: Box::new(Expr::Var { sym, ty: scrutinee_ty_owned.clone() }),
-                rhs: Box::new(Expr::Lit { value: Literal::Int(*n), ty: scrutinee_ty_owned }),
-                ty: bool_ty,
-            };
+            let guard = mk_binop_app(
+                ctx.builtins,
+                crate::ssa::BinaryOp::Eq,
+                Expr::Var { sym, ty: scrutinee_ty_owned.clone() },
+                Expr::Lit { value: Literal::Int(*n), ty: scrutinee_ty_owned },
+                bool_ty,
+            );
             Ok((Pattern::Binding(sym), vec![guard]))
         }
         AstPattern::StrLit(bytes) => {
@@ -2537,16 +2590,17 @@ fn desugar_lit_pattern(
                 .map(|&b| Expr::Lit { value: Literal::Int(b as i64), ty: u8_ty.clone() })
                 .collect();
             let scrutinee_ty_owned = scrutinee_ty.clone();
-            let guard = Expr::BinOp {
-                op: crate::ssa::BinaryOp::Eq,
-                lhs: Box::new(Expr::Var { sym, ty: scrutinee_ty_owned.clone() }),
-                rhs: Box::new(Expr::BufLit {
+            let guard = mk_binop_app(
+                ctx.builtins,
+                crate::ssa::BinaryOp::Eq,
+                Expr::Var { sym, ty: scrutinee_ty_owned.clone() },
+                Expr::BufLit {
                     elements,
                     elem_ty: u8_ty,
                     ty: scrutinee_ty_owned,
-                }),
-                ty: bool_ty,
-            };
+                },
+                bool_ty,
+            );
             Ok((Pattern::Binding(sym), vec![guard]))
         }
         _ => Ok((lower_pattern(pat)?, Vec::new())),

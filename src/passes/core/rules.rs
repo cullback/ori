@@ -22,9 +22,12 @@
 //! These are trivially obvious but exist primarily to **establish the
 //! rule-writing pattern**. Bigger wins (fusion, beta reduction,
 //! case-of-case, free theorems) land as we grow the set.
+//!
+//! Arithmetic / comparison primitives are `Expr::App` whose `target`
+//! is a builtin `SymbolId`. The identity rules match against
+//! `BuiltinRegistry::classify` rather than a closed `BinOp` enum.
 
-use crate::ssa::BinaryOp as SsaBinaryOp;
-use crate::symbol::SymbolId;
+use crate::symbol::{BuiltinKind, BuiltinRegistry, SymbolId};
 
 use super::expr::{Expr, Literal, MatchArm, Pattern};
 
@@ -32,46 +35,39 @@ use super::expr::{Expr, Literal, MatchArm, Pattern};
 /// applying local rules at each node. Type-preserving by
 /// construction — every rewrite produces an expression of the same
 /// type as its input.
-pub fn simplify(expr: Expr) -> Expr {
-    let expr = recurse(expr);
-    apply_local_rules(expr)
+pub fn simplify(expr: Expr, builtins: &BuiltinRegistry) -> Expr {
+    let expr = recurse(expr, builtins);
+    apply_local_rules(expr, builtins)
 }
 
 /// Apply each variant's children recursively. Each Expr variant's
 /// fields are mapped through `simplify` in turn.
-fn recurse(expr: Expr) -> Expr {
+fn recurse(expr: Expr, builtins: &BuiltinRegistry) -> Expr {
     match expr {
         Expr::Var { .. } | Expr::Lit { .. } => expr,
 
-        Expr::BinOp { op, lhs, rhs, ty } => Expr::BinOp {
-            op,
-            lhs: Box::new(simplify(*lhs)),
-            rhs: Box::new(simplify(*rhs)),
-            ty,
-        },
-
         Expr::App { target, args, ty } => Expr::App {
             target,
-            args: args.into_iter().map(simplify).collect(),
+            args: args.into_iter().map(|e| simplify(e, builtins)).collect(),
             ty,
         },
 
         Expr::Let { binders, value, body, ty } => Expr::Let {
             binders,
-            value: Box::new(simplify(*value)),
-            body: Box::new(simplify(*body)),
+            value: Box::new(simplify(*value, builtins)),
+            body: Box::new(simplify(*body, builtins)),
             ty,
         },
 
         Expr::Match { scrutinee_slots, scrutinee_ty, arms, ty } => Expr::Match {
-            scrutinee_slots: scrutinee_slots.into_iter().map(simplify).collect(),
+            scrutinee_slots: scrutinee_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
             scrutinee_ty,
             arms: arms
                 .into_iter()
                 .map(|a| MatchArm {
                     pattern: a.pattern,
-                    guards: a.guards.into_iter().map(simplify).collect(),
-                    body: a.body.into_iter().map(simplify).collect(),
+                    guards: a.guards.into_iter().map(|e| simplify(e, builtins)).collect(),
+                    body: a.body.into_iter().map(|e| simplify(e, builtins)).collect(),
                     is_return: a.is_return,
                 })
                 .collect(),
@@ -80,10 +76,10 @@ fn recurse(expr: Expr) -> Expr {
 
         Expr::Cata { fold_fn, target_slots, target_ty, init, captures, elem_ty, early_exit, ty } => Expr::Cata {
             fold_fn,
-            target_slots: target_slots.into_iter().map(simplify).collect(),
+            target_slots: target_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
             target_ty,
-            init: init.into_iter().map(simplify).collect(),
-            captures: captures.into_iter().map(simplify).collect(),
+            init: init.into_iter().map(|e| simplify(e, builtins)).collect(),
+            captures: captures.into_iter().map(|e| simplify(e, builtins)).collect(),
             elem_ty,
             early_exit,
             ty,
@@ -91,46 +87,46 @@ fn recurse(expr: Expr) -> Expr {
 
         Expr::Con { tag, args, field_slot_counts, ty } => Expr::Con {
             tag,
-            args: args.into_iter().map(simplify).collect(),
+            args: args.into_iter().map(|e| simplify(e, builtins)).collect(),
             field_slot_counts,
             ty,
         },
 
         Expr::BufLit { elements, elem_ty, ty } => Expr::BufLit {
-            elements: elements.into_iter().map(simplify).collect(),
+            elements: elements.into_iter().map(|e| simplify(e, builtins)).collect(),
             elem_ty,
             ty,
         },
 
         Expr::BufLoad { buf, idx, ty } => Expr::BufLoad {
-            buf: Box::new(simplify(*buf)),
-            idx: Box::new(simplify(*idx)),
+            buf: Box::new(simplify(*buf, builtins)),
+            idx: Box::new(simplify(*idx, builtins)),
             ty,
         },
 
         Expr::Range { start, end, ty } => Expr::Range {
-            start: Box::new(simplify(*start)),
-            end: Box::new(simplify(*end)),
+            start: Box::new(simplify(*start, builtins)),
+            end: Box::new(simplify(*end, builtins)),
             ty,
         },
 
         Expr::BufAppend { buf_slots, val_slots, elem_ty, ty } => Expr::BufAppend {
-            buf_slots: buf_slots.into_iter().map(simplify).collect(),
-            val_slots: val_slots.into_iter().map(simplify).collect(),
+            buf_slots: buf_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
+            val_slots: val_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
             elem_ty,
             ty,
         },
 
         Expr::BufSet { buf_slots, idx, val_slots, elem_ty, ty } => Expr::BufSet {
-            buf_slots: buf_slots.into_iter().map(simplify).collect(),
-            idx: Box::new(simplify(*idx)),
-            val_slots: val_slots.into_iter().map(simplify).collect(),
+            buf_slots: buf_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
+            idx: Box::new(simplify(*idx, builtins)),
+            val_slots: val_slots.into_iter().map(|e| simplify(e, builtins)).collect(),
             elem_ty,
             ty,
         },
 
         Expr::Cast { src, dest_ty, bitcast, ty } => Expr::Cast {
-            src: Box::new(simplify(*src)),
+            src: Box::new(simplify(*src, builtins)),
             dest_ty,
             bitcast,
             ty,
@@ -140,29 +136,34 @@ fn recurse(expr: Expr) -> Expr {
 
 /// Apply rewrite rules at a single node. Returns the rewritten
 /// expression (or the original if no rule applies).
-fn apply_local_rules(expr: Expr) -> Expr {
+fn apply_local_rules(expr: Expr, builtins: &BuiltinRegistry) -> Expr {
+    use crate::ssa::BinaryOp;
     match expr {
-        // Additive identity: x + 0 → x, 0 + x → x.
-        Expr::BinOp { op: SsaBinaryOp::Add, lhs, rhs, ty } => {
-            if is_int_zero(&rhs) {
-                *lhs
-            } else if is_int_zero(&lhs) {
-                *rhs
-            } else {
-                Expr::BinOp { op: SsaBinaryOp::Add, lhs, rhs, ty }
+        // Additive identity (`x + 0 → x`, `0 + x → x`) and
+        // multiplicative identity (`x * 1 → x`, `1 * x → x`) on
+        // builtin binary App targets. Other App targets (regular
+        // function calls) pass through.
+        Expr::App { target, args, ty } => match builtins.classify(target) {
+            Some(BuiltinKind::Binary(BinaryOp::Add)) if args.len() == 2 => {
+                if is_int_zero(&args[1]) {
+                    args.into_iter().next().unwrap()
+                } else if is_int_zero(&args[0]) {
+                    args.into_iter().nth(1).unwrap()
+                } else {
+                    Expr::App { target, args, ty }
+                }
             }
-        }
-
-        // Multiplicative identity: x * 1 → x, 1 * x → x.
-        Expr::BinOp { op: SsaBinaryOp::Mul, lhs, rhs, ty } => {
-            if is_int_one(&rhs) {
-                *lhs
-            } else if is_int_one(&lhs) {
-                *rhs
-            } else {
-                Expr::BinOp { op: SsaBinaryOp::Mul, lhs, rhs, ty }
+            Some(BuiltinKind::Binary(BinaryOp::Mul)) if args.len() == 2 => {
+                if is_int_one(&args[1]) {
+                    args.into_iter().next().unwrap()
+                } else if is_int_one(&args[0]) {
+                    args.into_iter().nth(1).unwrap()
+                } else {
+                    Expr::App { target, args, ty }
+                }
             }
-        }
+            _ => Expr::App { target, args, ty },
+        },
 
         // Dead-binding elimination: `let x = e in body` where body
         // doesn't reference any of the binders → `body`. Sound in Ori
@@ -188,7 +189,6 @@ fn body_uses(expr: &Expr, target: SymbolId) -> bool {
     match expr {
         Expr::Var { sym, .. } => *sym == target,
         Expr::Lit { .. } => false,
-        Expr::BinOp { lhs, rhs, .. } => body_uses(lhs, target) || body_uses(rhs, target),
         Expr::App { args, .. } => args.iter().any(|a| body_uses(a, target)),
         Expr::Let { value, body, .. } => body_uses(value, target) || body_uses(body, target),
         Expr::Match { scrutinee_slots, arms, .. } => {
@@ -231,7 +231,7 @@ fn is_int_one(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::symbol::SymbolId;
+    use crate::symbol::{BuiltinRegistry, SymbolId, SymbolTable};
     use crate::types::engine::Type;
 
     fn i64_ty() -> Type {
@@ -246,15 +246,25 @@ mod tests {
         Expr::Var { sym: SymbolId(id), ty: i64_ty() }
     }
 
+    fn registry() -> BuiltinRegistry {
+        let mut symbols = SymbolTable::new();
+        BuiltinRegistry::bootstrap(&mut symbols)
+    }
+
+    fn binop(builtins: &BuiltinRegistry, op: crate::ssa::BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+        let target = match op {
+            crate::ssa::BinaryOp::Add => builtins.add,
+            crate::ssa::BinaryOp::Mul => builtins.mul,
+            _ => panic!("test helper supports Add/Mul only"),
+        };
+        Expr::App { target, args: vec![lhs, rhs], ty: i64_ty() }
+    }
+
     #[test]
     fn add_zero_collapses() {
-        let e = Expr::BinOp {
-            op: SsaBinaryOp::Add,
-            lhs: Box::new(var(1)),
-            rhs: Box::new(lit_int(0)),
-            ty: i64_ty(),
-        };
-        let simplified = simplify(e);
+        let b = registry();
+        let e = binop(&b, crate::ssa::BinaryOp::Add, var(1), lit_int(0));
+        let simplified = simplify(e, &b);
         match simplified {
             Expr::Var { sym, .. } => assert_eq!(sym, SymbolId(1)),
             other => panic!("expected Var, got {other:?}"),
@@ -263,13 +273,9 @@ mod tests {
 
     #[test]
     fn mul_one_collapses() {
-        let e = Expr::BinOp {
-            op: SsaBinaryOp::Mul,
-            lhs: Box::new(lit_int(1)),
-            rhs: Box::new(var(2)),
-            ty: i64_ty(),
-        };
-        let simplified = simplify(e);
+        let b = registry();
+        let e = binop(&b, crate::ssa::BinaryOp::Mul, lit_int(1), var(2));
+        let simplified = simplify(e, &b);
         match simplified {
             Expr::Var { sym, .. } => assert_eq!(sym, SymbolId(2)),
             other => panic!("expected Var, got {other:?}"),
@@ -279,41 +285,30 @@ mod tests {
     #[test]
     fn rule_recurses_into_children() {
         // (x + 0) + (y * 1) → x + y
-        let e = Expr::BinOp {
-            op: SsaBinaryOp::Add,
-            lhs: Box::new(Expr::BinOp {
-                op: SsaBinaryOp::Add,
-                lhs: Box::new(var(1)),
-                rhs: Box::new(lit_int(0)),
-                ty: i64_ty(),
-            }),
-            rhs: Box::new(Expr::BinOp {
-                op: SsaBinaryOp::Mul,
-                lhs: Box::new(var(2)),
-                rhs: Box::new(lit_int(1)),
-                ty: i64_ty(),
-            }),
-            ty: i64_ty(),
+        let b = registry();
+        let inner_l = binop(&b, crate::ssa::BinaryOp::Add, var(1), lit_int(0));
+        let inner_r = binop(&b, crate::ssa::BinaryOp::Mul, var(2), lit_int(1));
+        let e = binop(&b, crate::ssa::BinaryOp::Add, inner_l, inner_r);
+        let simplified = simplify(e, &b);
+        let Expr::App { target, args, .. } = simplified else {
+            panic!("expected App");
         };
-        let simplified = simplify(e);
-        let Expr::BinOp { op, lhs, rhs, .. } = simplified else {
-            panic!("expected BinOp");
-        };
-        assert_eq!(op, SsaBinaryOp::Add);
-        assert!(matches!(*lhs, Expr::Var { sym: SymbolId(1), .. }));
-        assert!(matches!(*rhs, Expr::Var { sym: SymbolId(2), .. }));
+        assert_eq!(target, b.add);
+        assert!(matches!(args[0], Expr::Var { sym: SymbolId(1), .. }));
+        assert!(matches!(args[1], Expr::Var { sym: SymbolId(2), .. }));
     }
 
     #[test]
     fn dead_let_drops_binding() {
         // `let x = 7 in 42` → `42`  (binding never used)
+        let b = registry();
         let e = Expr::Let {
             binders: vec![SymbolId(1)],
             value: Box::new(lit_int(7)),
             body: Box::new(lit_int(42)),
             ty: i64_ty(),
         };
-        let simplified = simplify(e);
+        let simplified = simplify(e, &b);
         match simplified {
             Expr::Lit { value: Literal::Int(42), .. } => {}
             other => panic!("expected Lit(42), got {other:?}"),
@@ -323,18 +318,14 @@ mod tests {
     #[test]
     fn live_let_is_preserved() {
         // `let x = 7 in x + 1` → unchanged (x is used)
+        let b = registry();
         let e = Expr::Let {
             binders: vec![SymbolId(1)],
             value: Box::new(lit_int(7)),
-            body: Box::new(Expr::BinOp {
-                op: SsaBinaryOp::Add,
-                lhs: Box::new(var(1)),
-                rhs: Box::new(lit_int(1)),
-                ty: i64_ty(),
-            }),
+            body: Box::new(binop(&b, crate::ssa::BinaryOp::Add, var(1), lit_int(1))),
             ty: i64_ty(),
         };
-        let simplified = simplify(e);
+        let simplified = simplify(e, &b);
         // Must still be a Let — the binder is live.
         assert!(matches!(simplified, Expr::Let { .. }));
     }
@@ -342,16 +333,11 @@ mod tests {
     #[test]
     fn dead_let_inside_let_drops() {
         // `let x = 1 in (let y = 2 in x + x)` — y is dead, x is live.
-        // After simplify: `let x = 1 in x + x` (inner Let dropped).
+        let b = registry();
         let inner_let = Expr::Let {
             binders: vec![SymbolId(2)],
             value: Box::new(lit_int(2)),
-            body: Box::new(Expr::BinOp {
-                op: SsaBinaryOp::Add,
-                lhs: Box::new(var(1)),
-                rhs: Box::new(var(1)),
-                ty: i64_ty(),
-            }),
+            body: Box::new(binop(&b, crate::ssa::BinaryOp::Add, var(1), var(1))),
             ty: i64_ty(),
         };
         let outer = Expr::Let {
@@ -360,26 +346,22 @@ mod tests {
             body: Box::new(inner_let),
             ty: i64_ty(),
         };
-        let simplified = simplify(outer);
+        let simplified = simplify(outer, &b);
         let Expr::Let { binders, body, .. } = simplified else {
             panic!("expected outer Let");
         };
         assert_eq!(binders, vec![SymbolId(1)]);
-        // body should be the BinOp directly (inner Let collapsed)
-        assert!(matches!(*body, Expr::BinOp { .. }));
+        // body should be the App directly (inner Let collapsed)
+        assert!(matches!(*body, Expr::App { .. }));
     }
 
     #[test]
     fn unrelated_expressions_pass_through() {
-        let e = Expr::BinOp {
-            op: SsaBinaryOp::Add,
-            lhs: Box::new(var(1)),
-            rhs: Box::new(var(2)),
-            ty: i64_ty(),
-        };
-        let simplified = simplify(e);
+        let b = registry();
+        let e = binop(&b, crate::ssa::BinaryOp::Add, var(1), var(2));
+        let simplified = simplify(e, &b);
         // Unchanged
-        let Expr::BinOp { op, .. } = simplified else { panic!("expected BinOp"); };
-        assert_eq!(op, SsaBinaryOp::Add);
+        let Expr::App { target, .. } = simplified else { panic!("expected App"); };
+        assert_eq!(target, b.add);
     }
 }

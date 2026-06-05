@@ -249,6 +249,7 @@ pub struct BuiltinRegistry {
     pub bit_xor: SymbolId,
     pub shl: SymbolId,
     pub shr: SymbolId,
+    pub max: SymbolId,
     /// Regular numeric cast (zero/sign extend or truncate).
     pub cast: SymbolId,
     /// `to_bits` / `from_bits` — same bit pattern, different type.
@@ -287,6 +288,7 @@ impl BuiltinRegistry {
             bit_xor: mk("__builtin.bit_xor"),
             shl: mk("__builtin.shl"),
             shr: mk("__builtin.shr"),
+            max: mk("__builtin.max"),
             cast: mk("__builtin.cast"),
             bitcast: mk("__builtin.bitcast"),
             range: mk("__builtin.list.range"),
@@ -314,6 +316,7 @@ impl BuiltinRegistry {
         if sym == self.bit_xor { return Some(BuiltinKind::Binary(BinaryOp::Xor)); }
         if sym == self.shl { return Some(BuiltinKind::Binary(BinaryOp::Shl)); }
         if sym == self.shr { return Some(BuiltinKind::Binary(BinaryOp::Shr)); }
+        if sym == self.max { return Some(BuiltinKind::Binary(BinaryOp::Max)); }
         if sym == self.cast { return Some(BuiltinKind::Cast); }
         if sym == self.bitcast { return Some(BuiltinKind::Bitcast); }
         if sym == self.range { return Some(BuiltinKind::Range); }

@@ -432,7 +432,10 @@ pub fn lower_module(
 
         // Apply Core-level rewrite rules. Currently algebraic
         // identities only (x + 0, x * 1); fusion rules land here.
-        let core_body: Vec<_> = core_body.into_iter().map(super::rules::simplify).collect();
+        let core_body: Vec<_> = core_body
+            .into_iter()
+            .map(|e| super::rules::simplify(e, builtins))
+            .collect();
 
         // Core → SSA via lower_slots so payload Con / multi-result
         // App / multi-slot Match return their full slot list.

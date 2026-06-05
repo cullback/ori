@@ -253,23 +253,6 @@ pub enum Expr {
         ty: Type,
     },
 
-    /// `BinOp(op, lhs, rhs, type)` — scalar arithmetic / comparison /
-    /// bitwise / shift / boolean operator. **Not** modeled as `App`
-    /// to an intrinsic symbol — scalar primitives sit outside the
-    /// algebraic rewrite system (fusion laws don't touch them) and
-    /// `App` should mean "call a user or library function."
-    ///
-    /// Uses the SSA-level `BinaryOp` directly rather than the AST's
-    /// narrower `BinOp` so Core can carry bitwise-and / shl / shr —
-    /// ops the surface syntax exposes only through `__builtin.*`
-    /// intrinsic methods (no infix form).
-    BinOp {
-        op: BinaryOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-        ty: Type,
-    },
-
     /// `ListLit(elements, elem_ty, ty)` — list literal `[a, b, c]`.
     /// Lowers to alloc + N stores + header alloc, matching existing-
     /// lower's convention. Doesn't decompose at SROA (lists are
@@ -377,7 +360,6 @@ impl Expr {
             | Self::Match { ty, .. }
             | Self::Cata { ty, .. }
             | Self::Con { ty, .. }
-            | Self::BinOp { ty, .. }
             | Self::BufLit { ty, .. }
             | Self::BufLoad { ty, .. }
             | Self::Range { ty, .. }
@@ -401,7 +383,6 @@ impl Expr {
             | Self::Match { ty, .. }
             | Self::Cata { ty, .. }
             | Self::Con { ty, .. }
-            | Self::BinOp { ty, .. }
             | Self::BufLit { ty, .. }
             | Self::BufLoad { ty, .. }
             | Self::Range { ty, .. }
