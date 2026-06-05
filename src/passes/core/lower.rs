@@ -543,7 +543,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     extras.extend(lower_expr_slots(ctx, a)?);
                 }
                 Ok(vec![Expr::Cata {
-                    fold_fn: name,
+                    fold_fn: *target,
                     target_slots,
                     target_ty: args[0].ty.clone(),
                     init: Vec::new(),
@@ -1175,8 +1175,13 @@ fn try_lower_stdlib_intrinsic(
                 }
                 _ => return Ok(None),
             };
+            let fold_sym = ctx.symbols.intern(
+                &target_func,
+                closure_expr.span,
+                crate::symbol::SymbolKind::Func,
+            );
             return Ok(Some(vec![Expr::Cata {
-                fold_fn: target_func,
+                fold_fn: fold_sym,
                 target_slots: buf_slots,
                 target_ty: xs_ty,
                 init: init_slots,
@@ -1225,8 +1230,13 @@ fn try_lower_stdlib_intrinsic(
                 }
                 _ => return Ok(None),
             };
+            let fold_sym = ctx.symbols.intern(
+                &target_func,
+                closure_expr.span,
+                crate::symbol::SymbolKind::Func,
+            );
             Ok(Some(vec![Expr::Cata {
-                fold_fn: target_func,
+                fold_fn: fold_sym,
                 target_slots: buf_slots,
                 target_ty: xs_ty,
                 init: init_slots,

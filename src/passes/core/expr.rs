@@ -182,11 +182,12 @@ pub enum Expr {
     /// `__fold_N` helpers into `Cata` so that algebraic rewrites
     /// can pattern-match on them.
     ///
-    /// `fold_fn` is the mangled function name (matches an SSA
-    /// `Call.target`). `target` is the inductive value being
-    /// consumed. `extra_args` are the trailing parameters of the
-    /// fold function — captured free variables from the original
-    /// `fold` expression, plus any accumulator passed alongside the
+    /// `fold_fn` is the symbol of the lifted helper function (the
+    /// same symbol table entry that the helper's `Function` carries
+    /// at SSA). `target` is the inductive value being consumed.
+    /// `extra_args` are the trailing parameters of the fold
+    /// function — captured free variables from the original `fold`
+    /// expression, plus any accumulator passed alongside the
     /// inductive value.
     ///
     /// At Core→SSA the lowering is identical to an `App` call;
@@ -195,7 +196,7 @@ pub enum Expr {
     /// literal list constant-folding, etc. become syntactic
     /// rewrites instead of SCEV-style reconstruction.
     Cata {
-        fold_fn: String,
+        fold_fn: SymbolId,
         /// Parallel slot list for the inductive value. For
         /// recursive inductives (Lnk, Tree, Nat — multi-variant
         /// payload unions), this is the (tag, payload) pair. For

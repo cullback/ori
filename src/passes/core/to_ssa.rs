@@ -186,8 +186,9 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
         Expr::Cata { fold_fn, target_slots, target_ty, init, captures, elem_ty, early_exit, ty } => {
             let unwrapped = super::lower::resolve_transparent(target_ty, &ctx.transparent);
             let is_list = matches!(&unwrapped, Type::App(n, ts) if n == "List" && ts.len() == 1);
+            let fold_name = ctx.symbols.display(*fold_fn);
             if is_list {
-                return lower_list_cata(ctx, target_slots, init, captures, elem_ty, *early_exit, fold_fn, ty);
+                return lower_list_cata(ctx, target_slots, init, captures, elem_ty, *early_exit, fold_name, ty);
             }
             // Helper-call path: Call(fold_fn, target_slots ++ init ++ captures).
             let ret_slots = super::lower::expand_slots_with(ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
@@ -203,9 +204,9 @@ pub fn lower_slots(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Vec<Value>, String>
             }
             if ret_slots.len() == 1 {
                 let ret_ty = resolve_scalar_type(ty, &ctx.fieldless);
-                Ok(vec![ctx.builder.call(fold_fn, arg_vals, ret_ty)])
+                Ok(vec![ctx.builder.call(fold_name, arg_vals, ret_ty)])
             } else {
-                Ok(ctx.builder.call_multi(fold_fn, arg_vals, &ret_slots))
+                Ok(ctx.builder.call_multi(fold_name, arg_vals, &ret_slots))
             }
         }
 
