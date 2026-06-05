@@ -372,13 +372,15 @@ pub fn lower_module(
                     continue;
                 };
                 let closure_ty = Type::Con(cname.clone());
-                let unfolded = super::lower::resolve_transparent(&closure_ty, &transparent);
-                let multi_variant_with_payload = matches!(
-                    &unfolded,
-                    Type::TagUnion { tags, .. }
-                        if tags.len() > 1 && tags.iter().any(|(_, fs)| !fs.is_empty())
-                );
-                if multi_variant_with_payload {
+                // Override when the closure's slot shape isn't a
+                // single slot (the Arrow → 1 RcPtr default). Covers
+                // multi-variant payload (tag, payload = 2 slots) and
+                // single-variant Phase-E (N captures fanned out).
+                // Fieldless multi-variant (1 U8 discriminant) is
+                // skipped — the override there cascades into block-
+                // param mismatches without a deeper consistency fix.
+                let expanded = expand_slots_with(&closure_ty, &decls.fieldless_tags, &transparent, &payload_unions);
+                if expanded.len() > 1 {
                     ctx.ho_param_override.insert(*param_sym, closure_ty);
                 }
             }
@@ -396,28 +398,24 @@ pub fn lower_module(
             //      `register_apply_scheme`). Their param 0 is the
             //      closure tag-union by construction; user `apply`'s
             //      body calls these via `__apply_K(f, ...)`.
-            let is_multi_variant_payload = |ty: &Type| -> bool {
-                let unfolded = super::lower::resolve_transparent(ty, &transparent);
-                matches!(
-                    &unfolded,
-                    Type::TagUnion { tags, .. }
-                        if tags.len() > 1 && tags.iter().any(|(_, fs)| !fs.is_empty())
-                )
+            let is_multi_slot = |ty: &Type| -> bool {
+                expand_slots_with(ty, &decls.fieldless_tags, &transparent, &payload_unions).len() > 1
             };
             for ((fname, idx), cname) in &mono.ho_param_closure {
                 let closure_ty = Type::Con(cname.clone());
-                if is_multi_variant_payload(&closure_ty) {
+                if is_multi_slot(&closure_ty) {
                     ctx.callee_ho_arg
                         .insert((fname.clone(), *idx), closure_ty);
                 }
             }
             // Apply dispatchers: walk infer.func_schemes for any
-            // function whose first param is a multi-variant payload-
-            // carrying tag union (i.e. the synthesized closure type).
+            // function whose first param expands to multi-slot (i.e.
+            // the synthesized closure type, either multi-variant
+            // payload or singleton Phase-E).
             for (fname, scheme) in &mono.infer.func_schemes {
                 if let Type::Arrow(ps, _, _) = &scheme.ty {
                     if let Some(first) = ps.first() {
-                        if is_multi_variant_payload(first) {
+                        if is_multi_slot(first) {
                             ctx.callee_ho_arg
                                 .entry((fname.clone(), 0))
                                 .or_insert_with(|| first.clone());
@@ -613,14 +611,8 @@ fn param_slot_types(
                         .get(&(name_str.to_owned(), i))
                         .and_then(|cname| {
                             let cty = Type::Con(cname.clone());
-                            let unfolded = super::lower::resolve_transparent(&cty, transparent);
-                            let mp = matches!(
-                                &unfolded,
-                                Type::TagUnion { tags, .. }
-                                    if tags.len() > 1
-                                        && tags.iter().any(|(_, fs)| !fs.is_empty())
-                            );
-                            if mp { Some(cty) } else { None }
+                            let multi = expand_slots_with(&cty, fieldless, transparent, payload_unions).len() > 1;
+                            if multi { Some(cty) } else { None }
                         });
                     let ty = effective.as_ref().unwrap_or(t);
                     expand_slots_with(ty, fieldless, transparent, payload_unions)

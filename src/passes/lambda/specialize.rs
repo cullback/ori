@@ -607,10 +607,19 @@ impl<'src> Rewriter<'_> {
                                 })
                                 .collect();
                             call_args.append(args);
-                            let call = Expr::new(ExprKind::Call {
-                                target: direct_target,
-                                args: call_args,
-                            }, span);
+                            // Type the direct call as the original
+                            // call's return so Core's App lowering
+                            // emits the right scalar return type
+                            // (otherwise Expr::new leaves it as
+                            // Var(0) which resolves to RcPtr).
+                            let call = Expr::typed(
+                                ExprKind::Call {
+                                    target: direct_target,
+                                    args: call_args,
+                                },
+                                span,
+                                expr.ty.clone(),
+                            );
                             expr.kind = ExprKind::If {
                                 expr: closure_expr,
                                 arms: vec![MatchArm {

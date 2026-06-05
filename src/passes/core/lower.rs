@@ -952,7 +952,18 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // payload)). lower_expr_slots returns the parallel slot
             // list; to_ssa flattens it into the SSA Values it dispatches
             // on.
-            let scrutinee_ty = expr.ty.clone();
+            //
+            // HO param override: when scrutinee is `Name(f)` where f
+            // is in `ho_param_override`, the source-level type is
+            // Arrow but the actual SSA shape is the closure tag-
+            // union. Use the override type as scrutinee_ty so the
+            // Match-dispatch path can recognize it as Phase-E /
+            // multi-variant payload as appropriate.
+            let scrutinee_ty = if let ExprKind::Name(sym) = &expr.kind {
+                ctx.ho_param_override.get(sym).cloned().unwrap_or_else(|| expr.ty.clone())
+            } else {
+                expr.ty.clone()
+            };
             let scrutinee_slots = lower_expr_slots(ctx, expr)?;
             let mut core_arms: Vec<MatchArm> = arms
                 .iter()
@@ -1805,6 +1816,36 @@ fn lower_call_args(
 /// instead of the source-level Arrow. Leaves nested
 /// expressions (Match scrutinees, Let values) alone — they don't
 /// affect the surface type.
+/// Walk a value expression to find a closure tag constructor. If
+/// any Con's tag is in `ctx.tag_targets` (the closure-tag registry
+/// populated from decl_info), that means the value is closure-
+/// valued and its true SSA shape is the closure tag-union, not the
+/// source-level Arrow. Returns the closure type to retype with.
+fn detect_closure_value_ty(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<Type> {
+    fn walk(expr: &Expr, ctx: &LowerCtx<'_>) -> Option<String> {
+        match expr {
+            Expr::Con { tag, .. } if ctx.tag_targets.contains_key(tag) => {
+                // The tag is a closure constructor; resolve its
+                // parent union type from constructor_return_types.
+                if let Some(ty) = ctx.constructor_return_types.get(tag) {
+                    match ty {
+                        Type::Con(name) | Type::App(name, _) => Some(name.clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            Expr::Match { arms, .. } => {
+                arms.iter().find_map(|a| a.body.iter().find_map(|b| walk(b, ctx)))
+            }
+            Expr::Let { body, .. } => walk(body, ctx),
+            _ => None,
+        }
+    }
+    walk(expr, ctx).map(Type::Con)
+}
+
 fn retype_closure_expr(expr: &mut Expr, closure_ty: &Type) {
     expr.set_ty(closure_ty.clone());
     match expr {
@@ -1881,8 +1922,30 @@ fn lower_block<'src>(
     for stmt in stmts {
         match stmt {
             Stmt::Let { name, val } => {
-                let value_slots = lower_expr_slots(ctx, val)?;
-                let expected_slot_count = expand_slots_with(&val.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions).len();
+                let mut value_slots = lower_expr_slots(ctx, val)?;
+                let mut expected_slot_count = expand_slots_with(&val.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions).len();
+
+                // Closure-value let: if the value's source type is
+                // Arrow but the value's structural shape (Con tags
+                // in arms) is a known closure tag union, retype the
+                // value to the closure type and bind multi-slot.
+                // Without this, `f = if cond then ConA else ConB`
+                // would bind 1 slot for f (Arrow → 1 RcPtr) but
+                // later uses (like `apply(f, ...)`) expect f as
+                // multi-slot decomposed.
+                if value_slots.len() == 1 && expected_slot_count == 1 {
+                    if let Some(closure_ty) = detect_closure_value_ty(&value_slots[0], ctx) {
+                        let new_expected = expand_slots_with(&closure_ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions).len();
+                        if new_expected > 1 {
+                            retype_closure_expr(&mut value_slots[0], &closure_ty);
+                            expected_slot_count = new_expected;
+                            // Also propagate the closure type to the
+                            // let-bound sym so Name(sym) lookups in
+                            // the body use it.
+                            ctx.ho_param_override.insert(*name, closure_ty);
+                        }
+                    }
+                }
 
                 if value_slots.len() == 1 && expected_slot_count == 1 {
                     // Scalar binding — bind to the AST sym directly.
