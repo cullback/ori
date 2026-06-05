@@ -655,6 +655,42 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                     &owned
                 }
             };
+            // `__record_hash` / `__tuple_hash` — inline FNV-1a over
+            // each slot value. Scalar-only slot lists work inline;
+            // heap-bearing slots bail to existing-lower.
+            if name == "__record_hash" || name == "__tuple_hash" {
+                if !args.is_empty() {
+                    return Err(format!("core::lower_expr: {name} expects 0 args, got {}", args.len()));
+                }
+                let recv_slots = lower_expr_slots(ctx, receiver)?;
+                let recv_ty_unwrapped = resolve_transparent(&receiver.ty, &ctx.transparent);
+                let slot_tys = expand_slots_with(&recv_ty_unwrapped, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
+                if slot_tys.iter().any(|t| t.is_heap_ptr()) {
+                    return Err(format!("core::lower_expr: {name} on heap-bearing fields needs recursive helper"));
+                }
+                let u64_ty = Type::Con("U64".to_string());
+                let offset_basis: u64 = 14695981039346656037;
+                let prime: u64 = 1099511628211;
+                let mk_const = |n: u64| Expr::Lit { value: Literal::Int(n as i64), ty: u64_ty.clone() };
+                let mk_slot_hash = |slot_expr: Expr, slot_ty: crate::ssa::ScalarType| -> Expr {
+                    let bits = if slot_ty == crate::ssa::ScalarType::U64 {
+                        slot_expr
+                    } else if slot_ty == crate::ssa::ScalarType::F64 {
+                        Expr::Cast { src: Box::new(slot_expr), dest_ty: crate::ssa::ScalarType::U64, bitcast: true, ty: u64_ty.clone() }
+                    } else {
+                        Expr::Cast { src: Box::new(slot_expr), dest_ty: crate::ssa::ScalarType::U64, bitcast: false, ty: u64_ty.clone() }
+                    };
+                    let xord = Expr::BinOp { op: crate::ssa::BinaryOp::Xor, lhs: Box::new(mk_const(offset_basis)), rhs: Box::new(bits), ty: u64_ty.clone() };
+                    Expr::BinOp { op: crate::ssa::BinaryOp::Mul, lhs: Box::new(xord), rhs: Box::new(mk_const(prime)), ty: u64_ty.clone() }
+                };
+                let mut acc = mk_const(offset_basis);
+                for (slot_expr, slot_ty) in recv_slots.into_iter().zip(slot_tys.iter().copied()) {
+                    let s_hash = mk_slot_hash(slot_expr, slot_ty);
+                    let xord = Expr::BinOp { op: crate::ssa::BinaryOp::Xor, lhs: Box::new(acc), rhs: Box::new(s_hash), ty: u64_ty.clone() };
+                    acc = Expr::BinOp { op: crate::ssa::BinaryOp::Mul, lhs: Box::new(xord), rhs: Box::new(mk_const(prime)), ty: u64_ty.clone() };
+                }
+                return Ok(vec![acc]);
+            }
             // `__record_equals` / `__tuple_equals` (inference's
             // placeholder for `==` on records/tuples) routes through
             // the structural BinOp::Eq path: lower both sides as

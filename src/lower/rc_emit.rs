@@ -168,8 +168,17 @@ fn emit_block(
         }
     }
 
-    let term_ops: HashSet<Value> =
-        block.terminator.operands().into_iter().collect();
+    let term_op_list: Vec<Value> = block.terminator.operands();
+    let term_ops: HashSet<Value> = term_op_list.iter().copied().collect();
+    // Per-RcPtr "consumption count" at terminator. For a Jump the
+    // count is the number of times v appears in jump args (each is
+    // taken). For Branch / SwitchInt, only one edge fires at
+    // runtime — so the count is the *max* multiplicity across edges
+    // (the value reaches each successor block-param N times, but
+    // only one successor runs). Cond / scrutinee are borrows (eval
+    // doesn't consume them) — exclude.
+    let term_count: HashMap<Value, usize> =
+        per_value_terminator_consumption(&block.terminator);
 
     for (v, is_func_param) in defined {
         // Walk instructions to find each use of v with its kind.
@@ -184,6 +193,7 @@ fn emit_block(
         }
 
         let in_term = term_ops.contains(&v);
+        let term_uses = term_count.get(&v).copied().unwrap_or(0);
         // For function params, "later need" extends into successors via
         // live_out.
         let live_out = if is_func_param {
@@ -217,7 +227,14 @@ fn emit_block(
 
         // Where does v's slot end?
         if in_term {
-            // Terminator transfer takes the slot. No rc_dec needed.
+            // Terminator transfer takes one slot per appearance. If v
+            // appears N times we need own_count == N going in; emit
+            // (N - own_count) rc_incs before the terminator.
+            let needed = term_uses as i32;
+            while own_count < needed {
+                inserts.push((block.insts.len(), Inst::RcInc(v)));
+                own_count += 1;
+            }
             debug_assert!(own_count >= 0, "own_count went negative for v{}", v.id);
         } else if live_out {
             // Function param needed by a successor — we're carrying
@@ -244,6 +261,60 @@ fn emit_block(
     for (idx, inst) in inserts {
         block_mut.insts.insert(idx, inst);
     }
+}
+
+/// For each Ptr value, how many consuming uses it has in this
+/// terminator. Jump sums across args; Branch / SwitchInt takes the
+/// max across edges (since only one fires). Cond / scrutinee are
+/// borrows and don't contribute.
+fn per_value_terminator_consumption(
+    term: &crate::ssa::instruction::Terminator,
+) -> HashMap<Value, usize> {
+    use crate::ssa::instruction::Terminator;
+    let mut count: HashMap<Value, usize> = HashMap::new();
+    let count_edge = |edge_args: &[Value], out: &mut HashMap<Value, usize>| {
+        let mut local: HashMap<Value, usize> = HashMap::new();
+        for v in edge_args {
+            if needs_rc_emit(v.ty) {
+                *local.entry(*v).or_insert(0) += 1;
+            }
+        }
+        for (v, n) in local {
+            let cur = out.entry(v).or_insert(0);
+            if n > *cur {
+                *cur = n;
+            }
+        }
+    };
+    match term {
+        Terminator::Return(vs) => {
+            for v in vs {
+                if needs_rc_emit(v.ty) {
+                    *count.entry(*v).or_insert(0) += 1;
+                }
+            }
+        }
+        Terminator::Jump(edge) => {
+            for v in &edge.args {
+                if needs_rc_emit(v.ty) {
+                    *count.entry(*v).or_insert(0) += 1;
+                }
+            }
+        }
+        Terminator::Branch { then_edge, else_edge, .. } => {
+            count_edge(&then_edge.args, &mut count);
+            count_edge(&else_edge.args, &mut count);
+        }
+        Terminator::SwitchInt { arms, default, .. } => {
+            for (_, edge) in arms {
+                count_edge(&edge.args, &mut count);
+            }
+            if let Some(edge) = default {
+                count_edge(&edge.args, &mut count);
+            }
+        }
+    }
+    count
 }
 
 #[derive(Debug, Clone, Copy)]
