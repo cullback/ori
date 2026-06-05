@@ -78,6 +78,15 @@ pub struct Monomorphized<'src> {
     pub singletons: std::collections::HashMap<String, crate::passes::lambda::SingletonTarget>,
     /// Maps closure tag constructor names to direct call targets (all entries, not just singletons).
     pub tag_targets: std::collections::HashMap<String, crate::passes::lambda::SingletonTarget>,
+    /// `(user_func_name, param_idx) → closure_tag_union_type_name` for
+    /// every HO param position. Set by `lambda::specialize`. Core
+    /// consults this to override the source-level Arrow type when
+    /// computing slot counts for the param and for Name references to
+    /// it inside the function body — without that, the body's
+    /// `__apply_K(f, ...)` call expects f decomposed to multi-slots
+    /// but the param/Name are 1 RcPtr. Existing-lower ignores the map
+    /// and reads the original Arrow (its own plumbing depends on it).
+    pub ho_param_closure: std::collections::HashMap<(String, usize), String>,
 }
 
 /// Specialize every polymorphic function reachable from `main`.
@@ -194,6 +203,7 @@ pub fn specialize<'src>(
         symbols,
         singletons: std::collections::HashMap::new(),
         tag_targets: std::collections::HashMap::new(),
+        ho_param_closure: std::collections::HashMap::new(),
     }
 }
 

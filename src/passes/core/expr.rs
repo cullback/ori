@@ -410,4 +410,30 @@ impl Expr {
             | Self::Cast { ty, .. } => ty,
         }
     }
+
+    /// Overwrite the result type. Used at HO call sites to retype an
+    /// arg's closure-valued expression from the source-level Arrow
+    /// to the post-specialize closure tag-union so downstream
+    /// slot-count computations (Match merge params, Let binders)
+    /// match what the callee expects.
+    pub fn set_ty(&mut self, new_ty: Type) {
+        match self {
+            Self::Var { ty, .. }
+            | Self::Lit { ty, .. }
+            | Self::App { ty, .. }
+            | Self::Let { ty, .. }
+            | Self::Match { ty, .. }
+            | Self::Cata { ty, .. }
+            | Self::Con { ty, .. }
+            | Self::BinOp { ty, .. }
+            | Self::ListLit { ty, .. }
+            | Self::BufLoad { ty, .. }
+            | Self::ListRange { ty, .. }
+            | Self::ListWalk { ty, .. }
+            | Self::ListWalkUntil { ty, .. }
+            | Self::ListAppend { ty, .. }
+            | Self::ListSet { ty, .. }
+            | Self::Cast { ty, .. } => *ty = new_ty,
+        }
+    }
 }

@@ -54,6 +54,15 @@ pub fn specialize(mono: &mut Monomorphized<'_>, solution: &LambdaSolution) {
     mono.module = new_module;
     mono.singletons = singletons;
     mono.tag_targets = tag_targets;
+    // Record HO param positions so Core can override the source-level
+    // Arrow type with the closure tag-union when computing slot
+    // counts. See `Monomorphized::ho_param_closure`.
+    for ((fname, idx), &ls_idx) in &solution.param_to_set {
+        mono.ho_param_closure.insert(
+            (fname.clone(), *idx),
+            solution.sets[ls_idx].closure_type_name.clone(),
+        );
+    }
 }
 
 fn specialize_module<'src>(

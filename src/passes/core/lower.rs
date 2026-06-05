@@ -148,6 +148,21 @@ pub struct LowerCtx<'a> {
     /// scans this for `TypeName.method` matches when inference
     /// left a MethodCall unresolved.
     pub funcs: HashSet<String>,
+    /// For each HO param sym in the *currently-lowering* function,
+    /// the closure tag-union type. Populated by `pipeline.rs` per
+    /// function before lowering its body. Source AST nodes for an HO
+    /// param's `Name(sym)` still carry the original Arrow type;
+    /// `lower_expr_slots` consults this map to fall back to the
+    /// closure type's slot shape (multi-slot for multi-variant
+    /// payload unions, fanned-out captures for singletons).
+    pub ho_param_override: HashMap<SymbolId, Type>,
+    /// Module-wide `(callee_func, arg_idx) → closure_tag_union_type`
+    /// for HO param positions that warrant the override. Populated
+    /// once in `pipeline.rs` from `mono.ho_param_closure` (gated to
+    /// multi-variant payload-carrying closures). Consulted by
+    /// `lower_call_args` to expand caller-side args to the multi-
+    /// slot shape the callee expects.
+    pub callee_ho_arg: HashMap<(String, usize), Type>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -165,6 +180,8 @@ impl<'a> LowerCtx<'a> {
             slot_paths: HashMap::new(),
             tag_targets: HashMap::new(),
             funcs: HashSet::new(),
+            ho_param_override: HashMap::new(),
+            callee_ho_arg: HashMap::new(),
         }
     }
 }
@@ -194,6 +211,17 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
             // symbols. Otherwise treat the AST sym as itself a
             // single SSA value (function params, scalar lets).
             if let Some(slot_syms) = ctx.locals.get(sym).cloned() {
+                // HO param override: source-level type is Arrow but
+                // post-specialize the slot shape is the closure tag-
+                // union's. Use the override's expand_slots if present
+                // — otherwise the Arrow's expand_slots (1 RcPtr) would
+                // mismatch the multi-slot locals binding established
+                // by `add_function_param`.
+                let effective_ty = ctx
+                    .ho_param_override
+                    .get(sym)
+                    .cloned()
+                    .unwrap_or_else(|| ast.ty.clone());
                 // `ast.ty` may be a `Type::Var` left unresolved by
                 // inference (the __apply closure-param case), in
                 // which case `expand_slots_with` returns fewer slots
@@ -203,7 +231,7 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 // placeholders so every minted slot sym surfaces as
                 // its own `Var`. `Match`'s scrutinee_ty is what's
                 // used for actual shape resolution downstream.
-                let mut slot_tys = expand_slots_with(&ast.ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
+                let mut slot_tys = expand_slots_with(&effective_ty, &ctx.fieldless, &ctx.transparent, &ctx.payload_unions);
                 while slot_tys.len() < slot_syms.len() {
                     slot_tys.push(ScalarType::RcPtr);
                 }
@@ -1721,18 +1749,40 @@ fn ast_binop_to_ssa(op: crate::ast::BinOp) -> crate::ssa::BinaryOp {
 
 fn lower_call_args(
     ctx: &mut LowerCtx<'_>,
-    _callee: &str,
+    callee: &str,
     args: &[AstExpr<'_>],
 ) -> Result<Vec<Expr>, String> {
     let mut out = Vec::new();
-    for a in args {
-        let lowered = lower_expr_slots(ctx, a)?;
+    for (i, a) in args.iter().enumerate() {
+        // HO call-site override: if the callee declared this arg
+        // position as a multi-variant payload-carrying closure, the
+        // caller's source-level Arrow type doesn't reflect the slot
+        // count the callee expects. Use the closure tag-union shape
+        // for `expected` so we expand to the right number of slots.
+        let mut lowered = lower_expr_slots(ctx, a)?;
+        let effective_ty = ctx
+            .callee_ho_arg
+            .get(&(callee.to_owned(), i))
+            .cloned()
+            .unwrap_or_else(|| a.ty.clone());
         let expected = expand_slots_with(
-            &a.ty,
+            &effective_ty,
             &ctx.fieldless,
             &ctx.transparent,
             &ctx.payload_unions,
         );
+        // When the override fires (effective_ty != a.ty), retype the
+        // lowered Core expressions so downstream slot-count logic
+        // (Match merge params, Let binders) sees the closure shape
+        // instead of the source-level Arrow. Without this, an
+        // `if cond then ConA else ConB` value-expression keeps its
+        // Match ty as Arrow → 1 merge param, but bind_multi_slot
+        // here would create N binders → arity mismatch.
+        if effective_ty != a.ty {
+            for e in &mut lowered {
+                retype_closure_expr(e, &effective_ty);
+            }
+        }
         // Multi-slot single-Expr fan-out: when a multi-slot arg
         // (closure value, Result, Maybe, record-typed arg) lowers
         // to one Core Expr (e.g. a single Match or App), expand
@@ -1740,12 +1790,38 @@ fn lower_call_args(
         // arg list matches the callee's per-slot signature. See
         // `bind_multi_slot` for the shared-Let convention.
         if lowered.len() == 1 && expected.len() > 1 {
-            out.extend(bind_multi_slot(ctx, lowered.into_iter().next().unwrap(), &expected, &a.ty));
+            out.extend(bind_multi_slot(ctx, lowered.into_iter().next().unwrap(), &expected, &effective_ty));
         } else {
             out.extend(lowered);
         }
     }
     Ok(out)
+}
+
+/// Recursively rewrite a closure-valued expression's type. Walks
+/// through expression shapes that propagate the value type
+/// (Match, Let, Var, Con) and sets each node's `ty` field so
+/// `to_ssa`'s slot-count logic uses the closure tag-union shape
+/// instead of the source-level Arrow. Leaves nested
+/// expressions (Match scrutinees, Let values) alone — they don't
+/// affect the surface type.
+fn retype_closure_expr(expr: &mut Expr, closure_ty: &Type) {
+    expr.set_ty(closure_ty.clone());
+    match expr {
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                for body_e in &mut arm.body {
+                    retype_closure_expr(body_e, closure_ty);
+                }
+            }
+        }
+        Expr::Let { body, .. } => {
+            retype_closure_expr(body, closure_ty);
+        }
+        // Con / Var / App / others: top-level ty was already set;
+        // these don't propagate to children.
+        _ => {}
+    }
 }
 
 fn lower_block<'src>(

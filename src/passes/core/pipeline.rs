@@ -350,6 +350,81 @@ pub fn lower_module(
                 .map(|(k, v)| (k.clone(), v.target_func.clone()))
                 .collect();
             ctx.funcs = decls.funcs.clone();
+            // For each HO param, map its sym to the closure tag-
+            // union type — but ONLY when the closure is multi-variant
+            // AND payload-carrying. That's the apply-style case where
+            // the body's `__apply_K(f, ...)` needs the multi-slot
+            // shape and the (Arrow → 1 RcPtr) default mismatches.
+            //
+            // Fieldless lambda sets (e.g. List.map with two
+            // capture-free lambdas) collapse to a single discriminant
+            // slot — but the body's downstream block params get
+            // sized from the Match/expression result types, which
+            // still see the Arrow → RcPtr shape. Applying the
+            // override there causes jump-arg/block-param type
+            // mismatches without a corresponding consistency fix.
+            // Skip those: the existing convention handles them.
+            for (i, param_sym) in params.iter().enumerate() {
+                let Some(cname) = mono
+                    .ho_param_closure
+                    .get(&(name_str.clone(), i))
+                else {
+                    continue;
+                };
+                let closure_ty = Type::Con(cname.clone());
+                let unfolded = super::lower::resolve_transparent(&closure_ty, &transparent);
+                let multi_variant_with_payload = matches!(
+                    &unfolded,
+                    Type::TagUnion { tags, .. }
+                        if tags.len() > 1 && tags.iter().any(|(_, fs)| !fs.is_empty())
+                );
+                if multi_variant_with_payload {
+                    ctx.ho_param_override.insert(*param_sym, closure_ty);
+                }
+            }
+            // Module-wide call-site override: every (callee, arg_idx)
+            // where the callee declared a multi-variant payload-
+            // carrying HO param. Caller's source type for that arg
+            // is still Arrow → 1 RcPtr, but the callee expects 2
+            // slots. `lower_call_args` consults this map and expands
+            // accordingly.
+            //
+            // Two sources of entries:
+            //   1. User functions with HO params (from
+            //      `mono.ho_param_closure`).
+            //   2. Synthesized `__apply_K` dispatchers (from
+            //      `register_apply_scheme`). Their param 0 is the
+            //      closure tag-union by construction; user `apply`'s
+            //      body calls these via `__apply_K(f, ...)`.
+            let is_multi_variant_payload = |ty: &Type| -> bool {
+                let unfolded = super::lower::resolve_transparent(ty, &transparent);
+                matches!(
+                    &unfolded,
+                    Type::TagUnion { tags, .. }
+                        if tags.len() > 1 && tags.iter().any(|(_, fs)| !fs.is_empty())
+                )
+            };
+            for ((fname, idx), cname) in &mono.ho_param_closure {
+                let closure_ty = Type::Con(cname.clone());
+                if is_multi_variant_payload(&closure_ty) {
+                    ctx.callee_ho_arg
+                        .insert((fname.clone(), *idx), closure_ty);
+                }
+            }
+            // Apply dispatchers: walk infer.func_schemes for any
+            // function whose first param is a multi-variant payload-
+            // carrying tag union (i.e. the synthesized closure type).
+            for (fname, scheme) in &mono.infer.func_schemes {
+                if let Type::Arrow(ps, _, _) = &scheme.ty {
+                    if let Some(first) = ps.first() {
+                        if is_multi_variant_payload(first) {
+                            ctx.callee_ho_arg
+                                .entry((fname.clone(), 0))
+                                .or_insert_with(|| first.clone());
+                        }
+                    }
+                }
+            }
             ctx.locals = core_locals;
             lower_expr_slots(&mut ctx, &body).map_err(|e| {
                 format!("function `{name_str}`: AST→Core: {e}")
@@ -519,19 +594,37 @@ fn param_slot_types(
     transparent: &TransparentTable,
     payload_unions: &std::collections::HashSet<String>,
 ) -> Vec<Vec<ScalarType>> {
-    // HO params still carry `Type::Arrow` in the scheme — Arrow
-    // expands to 1 RcPtr slot via the default path below, which
-    // keeps callee+caller consistent. existing-lower handles HO
-    // values via shell-wrap materialization (`to_slots`'
-    // Multi→Single).
-    let _ = mono;
+    // HO params: when the closure is multi-variant payload-carrying,
+    // use the closure tag-union type instead of the source-level
+    // Arrow so the body's `__apply_K(f, ...)` call sees the right
+    // slot count. For fieldless / singleton closures, the override
+    // would cascade into block-param mismatches downstream — see
+    // the per-function note in `lower_module` for the rationale.
     mono.infer
         .func_schemes
         .get(name_str)
         .map(|s| match &s.ty {
             Type::Arrow(ps, _, _) => ps
                 .iter()
-                .map(|t| expand_slots_with(t, fieldless, transparent, payload_unions))
+                .enumerate()
+                .map(|(i, t)| {
+                    let effective = mono
+                        .ho_param_closure
+                        .get(&(name_str.to_owned(), i))
+                        .and_then(|cname| {
+                            let cty = Type::Con(cname.clone());
+                            let unfolded = super::lower::resolve_transparent(&cty, transparent);
+                            let mp = matches!(
+                                &unfolded,
+                                Type::TagUnion { tags, .. }
+                                    if tags.len() > 1
+                                        && tags.iter().any(|(_, fs)| !fs.is_empty())
+                            );
+                            if mp { Some(cty) } else { None }
+                        });
+                    let ty = effective.as_ref().unwrap_or(t);
+                    expand_slots_with(ty, fieldless, transparent, payload_unions)
+                })
                 .collect(),
             _ => vec![vec![ScalarType::RcPtr]; params.len()],
         })
