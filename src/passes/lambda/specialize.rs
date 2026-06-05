@@ -90,7 +90,7 @@ fn specialize_module<'src>(
     let mut singletons = HashMap::new();
     let mut tag_targets = HashMap::new();
     for (ls_idx, ls) in solution.sets.iter().enumerate() {
-        new_decls.push(build_closure_type(ls, &alloc, ls_idx));
+        new_decls.push(build_closure_type(ls, &alloc, ls_idx, &*func_schemes, symbols));
         // Register the apply's scheme before building its body so
         // `build_apply_function` can read back the concrete return
         // type and tag the synthesized `If`/arm expressions with it.
@@ -180,25 +180,56 @@ fn build_closure_type<'src>(
     ls: &LambdaSet,
     alloc: &AllocatedSymbols,
     ls_idx: usize,
+    func_schemes: &HashMap<String, Scheme>,
+    symbols: &SymbolTable,
 ) -> Decl<'src> {
+    // Each tag's fields reflect the lifted target's real capture
+    // types (List → 3 slots etc.). Hardcoded `I64` was the
+    // multi-slot-capture bug — same root cause as narrow's
+    // build_singleton_tagdecl (commit 92568cb).
     let tags: Vec<TagDecl<'src>> = ls
         .entries
         .iter()
-        .map(|entry| TagDecl {
-            name: leak_str(&entry.tag_name),
-            fields: vec![TypeExpr::Named("I64"); entry.captures.len()],
+        .map(|entry| {
+            let cap_tys = lifted_func_capture_types(func_schemes, entry, symbols);
+            let fields: Vec<TypeExpr<'src>> = cap_tys.iter().map(type_to_type_expr).collect();
+            TagDecl {
+                name: leak_str(&entry.tag_name),
+                fields,
+            }
         })
         .collect();
 
     Decl::TypeAnno {
         span: synth_span(),
-        name: alloc.set_syms[ls_idx].1, // closure type sym
+        name: alloc.set_syms[ls_idx].1,
         type_params: Vec::new(),
         ty: TypeExpr::TagUnion(tags, false),
         where_clause: Vec::new(),
         methods: Vec::new(),
         kind: TypeDeclKind::Transparent,
         doc: None,
+    }
+}
+
+/// Convert a `Type` to a `TypeExpr<'static>` for synth TagDecls.
+/// Falls back to `I64` for shapes that shouldn't surface as a
+/// capture post-mono (Records are decomposed per-field upstream;
+/// closures, type vars, and tag unions as captures would already
+/// be a bug).
+fn type_to_type_expr<'src>(ty: &Type) -> TypeExpr<'src> {
+    match ty {
+        Type::Con(name) => TypeExpr::Named(leak_str(name)),
+        Type::App(name, args) => TypeExpr::App(
+            leak_str(name),
+            args.iter().map(type_to_type_expr).collect(),
+        ),
+        Type::Tuple(elems) => {
+            TypeExpr::Tuple(elems.iter().map(type_to_type_expr).collect())
+        }
+        Type::Record { .. } | Type::Arrow(_, _, _) | Type::Var(_) | Type::TagUnion { .. } => {
+            TypeExpr::Named("I64")
+        }
     }
 }
 
