@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::lower::constructor::structural_con_layout;
+use crate::passes::decl_info::structural_con_layout;
 use crate::passes::decl_info::{DeclInfo, resolve_scalar_type};
 use crate::ssa::instruction::ScalarType;
 use crate::ssa::{Builder, Value};

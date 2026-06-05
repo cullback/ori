@@ -1,8 +1,11 @@
 pub mod builder;
 mod display;
+pub mod elim_dead_allocs;
 pub mod eval;
 pub mod instruction;
 pub mod loops;
+pub mod rc_emit;
+pub mod ssa_form;
 pub mod validate;
 
 #[allow(unused_imports)]

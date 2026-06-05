@@ -74,6 +74,45 @@ pub fn discriminant_type(num_variants: usize) -> ScalarType {
     }
 }
 
+/// Compute the layout (tag index, max-fields-across-variants,
+/// field types) for a structural constructor used in an inferred
+/// TagUnion context. Variants are sorted alphabetically for stable
+/// tag indexing. Panics if `ty` isn't a closed `Type::TagUnion` or
+/// if `con_name` isn't among its tags — those are bugs in earlier
+/// passes that should have been caught by inference/mono.
+pub fn structural_con_layout(
+    ty: &Type,
+    con_name: &str,
+    fieldless: &HashMap<String, ScalarType>,
+) -> (u64, usize, Vec<ScalarType>) {
+    let Type::TagUnion { tags, rest } = ty else {
+        panic!(
+            "structural constructor '{con_name}' expected TagUnion context, got {ty:?}"
+        );
+    };
+    assert!(
+        rest.is_none(),
+        "structural constructor '{con_name}' context has open row — mono should have closed it"
+    );
+    let mut sorted: Vec<(String, Vec<Type>)> = tags.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let max_fields = sorted.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+    let idx = sorted
+        .iter()
+        .position(|(n, _)| n == con_name)
+        .unwrap_or_else(|| {
+            panic!("structural constructor '{con_name}' not in union {tags:?}")
+        });
+    #[allow(clippy::cast_possible_truncation, reason = "tag count fits in u64")]
+    let tag_index = idx as u64;
+    let field_types: Vec<ScalarType> = sorted[idx]
+        .1
+        .iter()
+        .map(|t| resolve_scalar_type(t, fieldless))
+        .collect();
+    (tag_index, max_fields, field_types)
+}
+
 /// Extract the return type from a function type scheme, unwrapping
 /// transparent aliases so a `Foo := I64`-declared return surfaces as
 /// `I64` rather than `Ptr`.

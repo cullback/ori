@@ -2,7 +2,6 @@ mod ast;
 mod ast_display;
 mod codegen;
 mod error;
-mod lower;
 mod numeric;
 mod opt;
 mod passes;
@@ -64,58 +63,22 @@ fn compile(
     let pre_prune_decls = passes::decl_info::build(&mono);
     passes::reachable::prune(&mut mono, &pre_prune_decls);
 
-    // Try the new Core pipeline first. Two failure modes:
-    //   (a) lower_module returns Err for any unsupported AST/Core
-    //       variant — silent fallback.
-    //   (b) lower_module returns Ok but produces SSA the validator
-    //       rejects — silent fallback (covers cases where Core's
-    //       lowering is unsound for that program shape).
-    // Either way we fall through to the established direct AST→SSA
-    // path. Core is additive — never regresses programs that worked
-    // before, only takes over for ones it handles correctly.
+    // Core is the only AST→SSA path. Pipeline does AST → Core →
+    // raw SSA; ssa_form threads block params; rc_emit inserts
+    // Perceus traffic; elim_dead_allocs cleans up.
     let decls = passes::decl_info::build(&mono);
-    let core_attempt = passes::core::pipeline::lower_module(
+    let mut ssa_module = passes::core::pipeline::lower_module(
         &mut mono, &resolved.fields, &decls,
-    );
-    if let Err(e) = &core_attempt {
-        if std::env::var("ORI_TRACE_CORE").is_ok() {
-            eprintln!("[core] fallback: {e}");
-        }
+    ).map_err(|e| CompileError { message: e, span: None })?;
+    if std::env::var("ORI_DUMP_CORE_RAW").is_ok() {
+        eprintln!("=== raw Core SSA (pre ssa_form) ===\n{ssa_module}");
     }
-    // Run ssa_form + rc_emit + elim_dead_allocs before validating
-    // so Core's emission can use implicit cross-block refs (which
-    // ssa_form threads into explicit block params). Mirrors the
-    // tail of existing-lower's `lower::lower`.
-    let core_module = core_attempt.ok().map(|mut m| {
-        if std::env::var("ORI_DUMP_CORE_RAW").is_ok() {
-            eprintln!("=== raw Core SSA (pre ssa_form) ===\n{m}");
-        }
-        lower::ssa_form::run(&mut m);
-        lower::rc_emit::run(&mut m);
-        lower::elim_dead_allocs::run(&mut m);
-        m
-    }).filter(|m| {
-        let r = ssa::validate::validate(m);
-        let ok = r.is_clean() && r.warnings.is_empty();
-        if !ok && std::env::var("ORI_TRACE_CORE").is_ok() {
-            eprintln!("[core] fallback: validation errors={:?} warnings={:?}",
-                r.errors, r.warnings);
-        }
-        ok
-    });
-    if core_module.is_some() && std::env::var("ORI_TRACE_CORE").is_ok() {
-        eprintln!("[core] used Core pipeline");
-    }
-
-    let (ssa_module, input_vals) = if let Some(m) = core_module {
-        let main_params = m.functions.get("__main")
-            .map(|f| f.params.clone())
-            .unwrap_or_default();
-        (m, main_params)
-    } else {
-        lower::lower(&mono, &resolved.fields)?
-    };
-    let mut ssa_module = ssa_module;
+    ssa::ssa_form::run(&mut ssa_module);
+    ssa::rc_emit::run(&mut ssa_module);
+    ssa::elim_dead_allocs::run(&mut ssa_module);
+    let input_vals = ssa_module.functions.get("__main")
+        .map(|f| f.params.clone())
+        .unwrap_or_default();
     run_ssa_pipeline(&mut ssa_module);
     Ok((ssa_module, input_vals))
 }

@@ -2,15 +2,6 @@ use crate::passes::resolve::Resolved;
 use crate::source::{FileId, SourceArena};
 use crate::ssa::eval::Scalar;
 
-/// Global counters: (core_taken, fallback_taken). Bumped per
-/// compile_until_lower call. The diagnostic test
-/// `core_coverage_summary` reads + prints.
-static CORE_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static FALLBACK_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static FALLBACK_REASONS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, usize>>,
-> = std::sync::OnceLock::new();
-
 // ---- Shared pipeline helpers ----
 
 /// Parse source and run resolve (the only IO pass).
@@ -62,66 +53,19 @@ fn compile_until_lower(source: &str) -> (crate::ssa::Module, Vec<crate::ssa::Val
     let pre_prune_decls = crate::passes::decl_info::build(&mono);
     crate::passes::reachable::prune(&mut mono, &pre_prune_decls);
 
-    // Mirror main.rs::compile — try Core first, fall back to direct
-    // AST→SSA on Err or invalid SSA. This exercises the Core path in
-    // every test that can use it; programs Core doesn't yet support
-    // (lists, payload-carrying constructors, etc.) silently fall back.
+    // Core is the only AST→SSA path. ssa_form + rc_emit +
+    // elim_dead_allocs run after Core's emission to finalize SSA
+    // for validation.
     let decls = crate::passes::decl_info::build(&mono);
-    let core_attempt = crate::passes::core::pipeline::lower_module(
+    let mut ssa_module = crate::passes::core::pipeline::lower_module(
         &mut mono, &resolved.fields, &decls,
-    );
-    if let Err(e) = &core_attempt {
-        // Strip the leading "function `<name>`: <Stage>: " prefix so
-        // similar errors group regardless of which function or stage
-        // hit them.
-        let key = e
-            .split("core::")
-            .nth(1)
-            .map(|s| s.split(" (").next().unwrap_or(s))
-            .map(|s| s.split(" got ").next().unwrap_or(s))
-            .unwrap_or(e.as_str())
-            .to_string();
-        let m = FALLBACK_REASONS.get_or_init(Default::default);
-        let mut g = m.lock().unwrap();
-        *g.entry(key).or_insert(0) += 1;
-        if std::env::var("ORI_DUMP_FALLBACK_SOURCE").is_ok() {
-            eprintln!("[fallback-source]\n{e}\n---SOURCE---\n{source}\n---END---");
-        }
-    }
-    // Run the same post-lower passes the CLI binary runs in main.rs
-    // before validating — ssa_form threads implicit cross-block
-    // refs into explicit block params, which is required by
-    // validate.
-    let core_module = core_attempt.ok().map(|mut m| {
-        crate::lower::ssa_form::run(&mut m);
-        crate::lower::rc_emit::run(&mut m);
-        crate::lower::elim_dead_allocs::run(&mut m);
-        m
-    }).filter(|m| {
-        let r = crate::ssa::validate::validate(m);
-        let ok = r.is_clean() && r.warnings.is_empty();
-        if !ok {
-            let reason = format!("validation: errors={:?} warnings={:?}", r.errors, r.warnings);
-            let m_reasons = FALLBACK_REASONS.get_or_init(Default::default);
-            let mut g = m_reasons.lock().unwrap();
-            *g.entry(reason).or_insert(0) += 1;
-        }
-        ok
-    });
-    let used_core = core_module.is_some();
-    let (ssa_module, input_vals) = if let Some(m) = core_module {
-        let main_params = m.functions.get("__main")
-            .map(|f| f.params.clone())
-            .unwrap_or_default();
-        (m, main_params)
-    } else {
-        crate::lower::lower(&mono, &resolved.fields).unwrap()
-    };
-    if used_core {
-        CORE_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
-        FALLBACK_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    ).unwrap();
+    crate::ssa::ssa_form::run(&mut ssa_module);
+    crate::ssa::rc_emit::run(&mut ssa_module);
+    crate::ssa::elim_dead_allocs::run(&mut ssa_module);
+    let input_vals = ssa_module.functions.get("__main")
+        .map(|f| f.params.clone())
+        .unwrap_or_default();
     crate::ssa::validate::check(&ssa_module, "lower");
     (ssa_module, input_vals)
 }
@@ -4636,27 +4580,6 @@ main = |n| helper(n) + 1
     let result = crate::ssa::eval::eval(&module, &mut heap, &[Scalar::I64(5)]);
     assert_eq!(result, Scalar::I64(11),
         "helper(5) + 1 should evaluate to 11");
-}
-
-#[test]
-#[ignore = "diagnostic; run with --ignored to see Core coverage"]
-fn zzz_core_coverage_summary() {
-    let core = CORE_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
-    let fb = FALLBACK_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
-    eprintln!(
-        "Core coverage across the test-suite run that just happened:\n  \
-         used Core: {core}\n  fellback: {fb}\n  pct Core: {:.1}%",
-        100.0 * core as f64 / (core + fb).max(1) as f64
-    );
-    if let Some(m) = FALLBACK_REASONS.get() {
-        let g = m.lock().unwrap();
-        let mut entries: Vec<_> = g.iter().collect();
-        entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
-        eprintln!("\nAll fallback reasons:");
-        for (reason, count) in &entries {
-            eprintln!("  {count:4}  {reason}");
-        }
-    }
 }
 
 #[test]

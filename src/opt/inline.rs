@@ -73,7 +73,7 @@ pub fn inline(module: &mut Module) {
     // now be referenced from outside their renumbered blocks).
     // ssa_form re-threads those uses through block params, restoring
     // the invariant before any subsequent pass observes the module.
-    crate::lower::ssa_form::run(module);
+    crate::ssa::ssa_form::run(module);
 }
 
 /// Identify functions small enough to inline.
