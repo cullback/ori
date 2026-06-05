@@ -555,6 +555,66 @@ pub fn lower(ctx: &mut Ctx<'_>, expr: &Expr) -> Result<Value, String> {
             // Core's BinOp uses ssa::BinaryOp directly — short-
             // circuit And/Or were desugared to Match at AST→Core
             // time and don't appear here.
+            //
+            // Equality / inequality on buffer-trio operands (List,
+            // Str) takes a multi-slot path: length-check + element-
+            // wise loop. Comes from the literal-pattern desugar
+            // synthesizing `Eq(Var(trio_sym), BufLit(bytes))` and
+            // from any future direct `xs == ys` on lists. Scalar
+            // operands take the fast path.
+            if matches!(op, crate::ssa::BinaryOp::Eq | crate::ssa::BinaryOp::Neq) {
+                let lhs_slots = lower_slots(ctx, lhs)?;
+                let rhs_slots = lower_slots(ctx, rhs)?;
+                if lhs_slots.len() == 3 && rhs_slots.len() == 3 {
+                    let lhs_ty_unwrapped =
+                        super::lower::resolve_transparent(lhs.ty(), &ctx.transparent);
+                    let elem_ty = match &lhs_ty_unwrapped {
+                        Type::App(n, ts) if n == "List" && ts.len() == 1 => ts[0].clone(),
+                        _ => return Err(format!(
+                            "core::to_ssa: BinOp::Eq on 3-slot operands but lhs type \
+                             isn't List(_): {lhs_ty_unwrapped:?}"
+                        )),
+                    };
+                    let elem_tys = super::lower::expand_slots_with(
+                        &elem_ty,
+                        &ctx.fieldless,
+                        &ctx.transparent,
+                        &ctx.payload_unions,
+                    );
+                    if elem_tys.len() != 1 {
+                        return Err(format!(
+                            "core::to_ssa: BinOp::Eq on List({elem_ty:?}) — multi-slot \
+                             elements not yet supported"
+                        ));
+                    }
+                    let result = buf_eq(ctx, &lhs_slots, &rhs_slots, elem_tys[0]);
+                    if matches!(op, crate::ssa::BinaryOp::Neq) {
+                        let one = ctx.builder.const_u8(1);
+                        return Ok(ctx.builder.binop(
+                            crate::ssa::BinaryOp::Xor,
+                            result,
+                            one,
+                            ScalarType::U8,
+                        ));
+                    }
+                    return Ok(result);
+                }
+                // Fall through to scalar path for single-slot operands.
+                if lhs_slots.len() == 1 && rhs_slots.len() == 1 {
+                    let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
+                    return Ok(ctx.builder.binop(
+                        *op,
+                        lhs_slots[0],
+                        rhs_slots[0],
+                        result_ty,
+                    ));
+                }
+                return Err(format!(
+                    "core::to_ssa: BinOp::Eq operand slot mismatch — lhs={}, rhs={}",
+                    lhs_slots.len(),
+                    rhs_slots.len()
+                ));
+            }
             let l = lower(ctx, lhs)?;
             let r = lower(ctx, rhs)?;
             let result_ty = resolve_scalar_type(ty, &ctx.fieldless);
@@ -1158,32 +1218,34 @@ fn lower_match(
         // No matching arm — fall through to error.
         }
     }
-    // Str-literal Match: scrutinee is a Str (3 slots: len, cap,
-    // data), arms are `StrLit` patterns with a Wildcard default.
-    // Emit a chain of (length-eq && bytewise-eq) checks; on match,
-    // jump to the arm's body; otherwise fall through to the next
-    // arm; final fall-through goes to the default.
-    if scrutinee_slots.len() == 3
-        && arms.iter().any(|a| matches!(a.pattern, Pattern::StrLit(_)))
-    {
-        return lower_strlit_match(ctx, &scrutinee_slots, arms, ty);
-    }
-    let (tag_val, payload_val) = match scrutinee_slots.as_slice() {
-        [v] => {
-            if is_payload_carrying_union {
-                let shell = *v;
-                let tag = ctx.builder.load(shell, 0, ScalarType::U64);
-                let payload = ctx.builder.load(shell, 8, ScalarType::RcPtr);
-                (tag, Some(payload))
-            } else {
-                (*v, None)
+    // Whether any arm needs a real scrutinee-derived tag. Pure
+    // Binding/Wildcard dispatches (literal-pattern desugar) don't —
+    // a const-0 synth tag drives the SwitchInt's single arm. This
+    // also lets multi-slot scrutinees (Str, List) match through
+    // Binding patterns without a meaningful single-Value tag.
+    let need_real_tag = arms
+        .iter()
+        .any(|a| matches!(a.pattern, Pattern::Constructor { .. }));
+    let (tag_val, payload_val) = if need_real_tag {
+        match scrutinee_slots.as_slice() {
+            [v] => {
+                if is_payload_carrying_union {
+                    let shell = *v;
+                    let tag = ctx.builder.load(shell, 0, ScalarType::U64);
+                    let payload = ctx.builder.load(shell, 8, ScalarType::RcPtr);
+                    (tag, Some(payload))
+                } else {
+                    (*v, None)
+                }
             }
+            [t, p] => (*t, Some(*p)),
+            _ => return Err(format!(
+                "core::to_ssa: Match scrutinee produced {} slots (expected 1 or 2)",
+                scrutinee_slots.len()
+            )),
         }
-        [t, p] => (*t, Some(*p)),
-        _ => return Err(format!(
-            "core::to_ssa: Match scrutinee produced {} slots (expected 1 or 2)",
-            scrutinee_slots.len()
-        )),
+    } else {
+        (ctx.builder.const_u64(0), None)
     };
 
     // Single-arm wildcard / binding — no dispatch.
@@ -1192,13 +1254,20 @@ fn lower_match(
         match &arm.pattern {
             Pattern::Wildcard => return lower_arm_body_slots(ctx, &arm.body),
             Pattern::Binding(sym) => {
-                let prev = ctx.locals.insert(*sym, vec![tag_val]);
-                let result = lower_arm_body_slots(ctx, &arm.body);
-                match prev {
-                    Some(p) => { ctx.locals.insert(*sym, p); }
-                    None => { ctx.locals.remove(sym); }
+                // Bind to the full scrutinee slot list (multi-slot
+                // for List/Str scrutinees post lit-pattern desugar).
+                // Skip when the arm has guards — they need the
+                // per-arm-block fall-through machinery, not the
+                // single-arm fast path.
+                if arm.guards.is_empty() {
+                    let prev = ctx.locals.insert(*sym, scrutinee_slots.clone());
+                    let result = lower_arm_body_slots(ctx, &arm.body);
+                    match prev {
+                        Some(p) => { ctx.locals.insert(*sym, p); }
+                        None => { ctx.locals.remove(sym); }
+                    }
+                    return result;
                 }
-                return result;
             }
             // Phase E shape: a single-variant union whose scrutinee
             // expanded to its captures directly (no tag, no payload
@@ -1274,16 +1343,19 @@ fn lower_match(
                 }
                 constructor_arms.push((tag_idx, arm, field_tys));
             }
-            // IntLit patterns dispatch on the literal value as the
-            // SwitchInt arm tag. Works because the scrutinee is itself
-            // the integer being matched. No field binders.
-            Pattern::IntLit(n) => {
-                if payload_val.is_some() {
-                    return Err(format!(
-                        "core::to_ssa: IntLit pattern can't match a multi-slot scrutinee"
-                    ));
-                }
-                constructor_arms.push((*n as u64, arm, vec![]));
+            // Binding arms come from literal-pattern desugar: each
+            // such arm is `Binding(fresh_sym)` + a synthesized
+            // `Eq(fresh_sym, lit)` guard. The binding itself always
+            // succeeds; the guard chain handles fall-through. We
+            // assign every Binding arm the same synthetic tag (0)
+            // so they all share `next_same_tag` linkage — guard
+            // failure on arm i flows to arm i+1, last falls through
+            // to the default. The `SwitchInt` for this match emits
+            // a single case (tag=0 → arm0_block) over a const-zero
+            // tag value (computed below); semantically equivalent
+            // to an unconditional jump to the chain head.
+            Pattern::Binding(_) => {
+                constructor_arms.push((0, arm, vec![]));
             }
             Pattern::Wildcard => {
                 if default_arm.is_some() {
@@ -1364,6 +1436,12 @@ fn lower_match(
         // and single-slot binders bind one Value directly from the
         // payload slot.
         let mut bound: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
+        // Binding arm (literal-pattern desugar): bind the fresh sym
+        // to the full scrutinee slot list. The guard then references
+        // it via `Var(fresh_sym)`.
+        if let Pattern::Binding(sym) = &arm.pattern {
+            bound.push((*sym, ctx.locals.insert(*sym, scrutinee_slots.clone())));
+        }
         if let Pattern::Constructor { tag, binders } = &arm.pattern {
             if let Some(payload_param) = payload_block_param {
                 // Resolve the per-field types by substituting the
@@ -1593,8 +1671,23 @@ fn lower_match(
     };
 
     ctx.builder.switch_to(tag_block);
+    // All-Binding dispatch (literal-pattern desugar) uses synth tag=0
+    // for every arm. The original `tag_val` is the scrutinee slot,
+    // which for non-scalar scrutinees may not be a numeric Value the
+    // SwitchInt can read. Replace it with a const-0 so the case-0
+    // arm is always taken — the guard chain handles per-arm
+    // dispatch from there.
+    let all_binding = !constructor_arms.is_empty()
+        && constructor_arms
+            .iter()
+            .all(|(_, a, _)| matches!(a.pattern, Pattern::Binding(_)));
+    let dispatch_tag = if all_binding {
+        ctx.builder.const_u64(0)
+    } else {
+        tag_val
+    };
     ctx.builder.switch_int(
-        tag_val,
+        dispatch_tag,
         arm_blocks,
         default_block.map(|b| (b, vec![])),
     );
@@ -1603,161 +1696,70 @@ fn lower_match(
     Ok(merge_params)
 }
 
-/// Lower a Match whose scrutinee is a `Str` (3-slot len/cap/data
-/// trio) and whose arms are `StrLit` patterns. Emit each arm as
-/// (length-equality && bytewise-loop equality) gated by a branch
-/// to the arm body or fallthrough to the next arm. The final
-/// fallthrough goes to the `Wildcard` default arm.
-fn lower_strlit_match(
+/// Buffer-trio equality: `(l_len, _l_cap, l_data) == (r_len, _r_cap, r_data)`
+/// is logical-content equality — same length and every element equal.
+/// `cap` is an allocation detail and is intentionally ignored.
+///
+/// Emits a length check followed by an element-wise loop:
+///
+/// ```text
+/// entry:    if l_len == r_len jump loop(0, false_block)
+///           else              jump merge(false)
+/// loop(i):  if i == l_len     jump merge(true)
+///           else              jump body(i)
+/// body(i):  l_e = load(l_data, i); r_e = load(r_data, i)
+///           if l_e == r_e     jump loop(i + 1)
+///           else              jump merge(false)
+/// merge(r): r
+/// ```
+///
+/// Returns a Bool Value (`U8`). Only supports single-slot element
+/// types (every scalar — `U8` for `Str = List(U8)`, `I64` for
+/// `List(I64)`, etc.). Multi-slot elements (lists of records) would
+/// need per-slot recursion at the comparison site.
+fn buf_eq(
     ctx: &mut Ctx<'_>,
-    scrutinee_slots: &[Value],
-    arms: &[MatchArm],
-    ty: &Type,
-) -> Result<Vec<Value>, String> {
-    use crate::ssa::{BinaryOp, ScalarType};
-    debug_assert_eq!(scrutinee_slots.len(), 3, "Str scrutinee has 3 slots");
-    let s_len = scrutinee_slots[0];
-    let s_data = scrutinee_slots[2];
+    lhs_slots: &[Value],
+    rhs_slots: &[Value],
+    elem_scalar: ScalarType,
+) -> Value {
+    use crate::ssa::BinaryOp;
 
-    let result_slot_tys = super::lower::expand_slots_with(
-        ty,
-        &ctx.fieldless,
-        &ctx.transparent,
-        &ctx.payload_unions,
-    );
+    let l_len = lhs_slots[0];
+    let l_data = lhs_slots[2];
+    let r_len = rhs_slots[0];
+    let r_data = rhs_slots[2];
+
+    let loop_block = ctx.builder.create_block();
+    let i_param = ctx.builder.add_block_param(loop_block, ScalarType::U64);
+    let body_block = ctx.builder.create_block();
     let merge = ctx.builder.create_block();
-    let merge_params: Vec<Value> = result_slot_tys
-        .iter()
-        .map(|&t| ctx.builder.add_block_param(merge, t))
-        .collect();
+    let result_param = ctx.builder.add_block_param(merge, ScalarType::U8);
 
-    // Split into StrLit arms (ordered) and at most one default.
-    let mut lit_arms: Vec<(&Vec<u8>, &MatchArm)> = Vec::new();
-    let mut default_arm: Option<&MatchArm> = None;
-    for arm in arms {
-        match &arm.pattern {
-            Pattern::StrLit(bytes) => lit_arms.push((bytes, arm)),
-            Pattern::Wildcard => {
-                if default_arm.is_some() {
-                    return Err("core::to_ssa: Str Match has multiple Wildcard arms".into());
-                }
-                default_arm = Some(arm);
-            }
-            other => {
-                return Err(format!(
-                    "core::to_ssa: Str Match pattern not supported: {other:?}"
-                ));
-            }
-        }
-    }
+    // entry: length check.
+    let len_eq = ctx.builder.binop(BinaryOp::Eq, l_len, r_len, ScalarType::U8);
+    let zero = ctx.builder.const_u64(0);
+    let false_v = ctx.builder.const_u8(0);
+    ctx.builder.branch(len_eq, loop_block, vec![zero], merge, vec![false_v]);
 
-    let lower_arm_to_merge = |ctx: &mut Ctx<'_>, arm: &MatchArm| -> Result<(), String> {
-        let arm_slots = lower_arm_body_slots(ctx, &arm.body)?;
-        if arm.is_return {
-            if arm_slots.len() == 1 {
-                ctx.builder.ret(arm_slots[0]);
-            } else {
-                ctx.builder.ret_multi(arm_slots);
-            }
-            return Ok(());
-        }
-        let arm_body_ty = arm.body.first().map(|e| e.ty())
-            .unwrap_or(&Type::Con("__none".to_string())).clone();
-        let arm_slots = reconcile_arm_slots(ctx, arm_slots, &result_slot_tys, &arm_body_ty)?;
-        if arm_slots.len() != merge_params.len() {
-            return Err(format!(
-                "core::to_ssa: Str Match arm body produced {} slots but merge expects {}",
-                arm_slots.len(),
-                merge_params.len()
-            ));
-        }
-        ctx.builder.jump(merge, arm_slots);
-        Ok(())
-    };
+    // loop(i): done check.
+    ctx.builder.switch_to(loop_block);
+    let done = ctx.builder.binop(BinaryOp::Eq, i_param, l_len, ScalarType::U8);
+    let true_v = ctx.builder.const_u8(1);
+    ctx.builder.branch(done, merge, vec![true_v], body_block, vec![]);
 
-    // Default block (or self-looping sink if no default).
-    let default_block = if let Some(arm) = default_arm {
-        let b = ctx.builder.create_block();
-        let prev = ctx.builder.current_block;
-        ctx.builder.switch_to(b);
-        lower_arm_to_merge(ctx, arm)?;
-        if let Some(p) = prev { ctx.builder.switch_to(p); }
-        b
-    } else {
-        let sink = ctx.builder.create_block();
-        let prev = ctx.builder.current_block;
-        ctx.builder.switch_to(sink);
-        let ret_tys: Vec<ScalarType> = ctx
-            .builder
-            .func
-            .return_type
-            .clone()
-            .unwrap_or_else(|| vec![ScalarType::I64]);
-        let zeros: Vec<Value> = ret_tys.iter().map(|&t| zero_value(ctx, t)).collect();
-        if zeros.len() == 1 {
-            ctx.builder.ret(zeros[0]);
-        } else {
-            ctx.builder.ret_multi(zeros);
-        }
-        if let Some(p) = prev { ctx.builder.switch_to(p); }
-        sink
-    };
-
-    // Chain each StrLit arm: (s.len == lit.len) && bytewise_eq.
-    // On success, jump to the arm's body block; on failure, fall
-    // through to the next arm's length check (or the default).
-    for (i, (lit_bytes, arm)) in lit_arms.iter().enumerate() {
-        let body_block = ctx.builder.create_block();
-        let next_block = if i + 1 < lit_arms.len() {
-            ctx.builder.create_block()
-        } else {
-            default_block
-        };
-        // Length check.
-        let lit_len = ctx.builder.const_u64(lit_bytes.len() as u64);
-        let len_eq = ctx.builder.binop(BinaryOp::Eq, s_len, lit_len, ScalarType::U8);
-        let bytewise_block = ctx.builder.create_block();
-        ctx.builder.branch(len_eq, bytewise_block, vec![], next_block, vec![]);
-
-        // Bytewise loop: iterate i from 0 to lit_len; on first mismatch
-        // jump to next_block; on completion jump to body_block.
-        ctx.builder.switch_to(bytewise_block);
-        if lit_bytes.is_empty() {
-            // Empty string — length match alone is enough.
-            ctx.builder.jump(body_block, vec![]);
-        } else {
-            // Inline the byte compares (typical literal-Match arms are
-            // short — emit one compare per byte for clarity and speed).
-            let mut cur_block = bytewise_block;
-            for (idx, &b) in lit_bytes.iter().enumerate() {
-                ctx.builder.switch_to(cur_block);
-                let idx_val = ctx.builder.const_u64(idx as u64);
-                let s_byte = ctx.builder.load_dyn(s_data, idx_val, ScalarType::U8);
-                let lit_byte = ctx.builder.const_u8(b);
-                let byte_eq = ctx.builder.binop(BinaryOp::Eq, s_byte, lit_byte, ScalarType::U8);
-                let next_byte_block = if idx + 1 < lit_bytes.len() {
-                    ctx.builder.create_block()
-                } else {
-                    body_block
-                };
-                ctx.builder.branch(byte_eq, next_byte_block, vec![], next_block, vec![]);
-                cur_block = next_byte_block;
-            }
-        }
-
-        // Body block: lower the arm.
-        ctx.builder.switch_to(body_block);
-        lower_arm_to_merge(ctx, arm)?;
-
-        // Switch to next_block for the next arm's length check (only
-        // if there is a next arm — otherwise we're done).
-        if i + 1 < lit_arms.len() {
-            ctx.builder.switch_to(next_block);
-        }
-    }
+    // body: load both elements; compare.
+    ctx.builder.switch_to(body_block);
+    let l_e = ctx.builder.load_dyn(l_data, i_param, elem_scalar);
+    let r_e = ctx.builder.load_dyn(r_data, i_param, elem_scalar);
+    let elem_eq = ctx.builder.binop(BinaryOp::Eq, l_e, r_e, elem_scalar);
+    let one = ctx.builder.const_u64(1);
+    let next_i = ctx.builder.binop(BinaryOp::Add, i_param, one, ScalarType::U64);
+    let false_v2 = ctx.builder.const_u8(0);
+    ctx.builder.branch(elem_eq, loop_block, vec![next_i], merge, vec![false_v2]);
 
     ctx.builder.switch_to(merge);
-    Ok(merge_params)
+    result_param
 }
 
 fn zero_value(ctx: &mut Ctx<'_>, ty: crate::ssa::ScalarType) -> Value {

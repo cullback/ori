@@ -946,9 +946,12 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
         ExprKind::Is { expr, pattern } => {
             // `expr : pattern` is sugar for a 2-arm Match returning Bool.
             //   match expr of pattern -> True | _ -> False
+            // Literal patterns desugar to Binding+Eq guard like in
+            // lower_match_arm so the same downstream path handles
+            // them.
             let scrutinee_ty = expr.ty.clone();
             let scrutinee_slots = lower_expr_slots(ctx, expr)?;
-            let pat = lower_pattern(pattern)?;
+            let (pat, synth_guards) = desugar_lit_pattern(ctx, pattern, &scrutinee_ty, ast.span)?;
             let bool_ty = ast.ty.clone();
             let true_body = Expr::Con {
                 tag: "True".to_string(),
@@ -966,7 +969,12 @@ pub fn lower_expr_slots(ctx: &mut LowerCtx<'_>, ast: &AstExpr<'_>) -> Result<Vec
                 scrutinee_slots,
                 scrutinee_ty,
                 arms: vec![
-                    MatchArm::plain(pat, true_body),
+                    MatchArm {
+                        pattern: pat,
+                        guards: synth_guards,
+                        body: vec![true_body],
+                        is_return: false,
+                    },
                     MatchArm::plain(Pattern::Wildcard, false_body),
                 ],
                 ty: bool_ty,
@@ -2465,12 +2473,73 @@ fn type_for_scalar(s: ScalarType) -> Type {
     }
 }
 
+/// Literal patterns desugar to `Binding(fresh_sym) and Eq(fresh_sym, lit)`:
+/// returns the replacement pattern and the synthesized guard (if any).
+/// All other patterns pass through untouched with an empty guard list.
+///
+/// Doing the desugar at AST→Core (not flatten_patterns) keeps the AST
+/// + infer pipeline unchanged — infer still sees `Pattern::IntLit` /
+/// `Pattern::StrLit` and runs its exhaustiveness check. By the time
+/// Core IR is built, literal patterns are gone and the match compiler
+/// only deals with `Constructor` / `Binding` / `Wildcard`.
+fn desugar_lit_pattern(
+    ctx: &mut LowerCtx<'_>,
+    pat: &AstPattern<'_>,
+    scrutinee_ty: &Type,
+    span: crate::ast::Span,
+) -> Result<(Pattern, Vec<Expr>), String> {
+    let bool_ty = Type::Con("Bool".to_string());
+    match pat {
+        AstPattern::IntLit(n) => {
+            let sym = ctx.symbols.fresh(
+                format!("__pat_lit_{}", n),
+                span,
+                crate::symbol::SymbolKind::Local,
+            );
+            let scrutinee_ty_owned = scrutinee_ty.clone();
+            let guard = Expr::BinOp {
+                op: crate::ssa::BinaryOp::Eq,
+                lhs: Box::new(Expr::Var { sym, ty: scrutinee_ty_owned.clone() }),
+                rhs: Box::new(Expr::Lit { value: Literal::Int(*n), ty: scrutinee_ty_owned }),
+                ty: bool_ty,
+            };
+            Ok((Pattern::Binding(sym), vec![guard]))
+        }
+        AstPattern::StrLit(bytes) => {
+            let sym = ctx.symbols.fresh(
+                "__pat_lit_str",
+                span,
+                crate::symbol::SymbolKind::Local,
+            );
+            let u8_ty = Type::Con("U8".to_string());
+            let elements: Vec<Expr> = bytes
+                .iter()
+                .map(|&b| Expr::Lit { value: Literal::Int(b as i64), ty: u8_ty.clone() })
+                .collect();
+            let scrutinee_ty_owned = scrutinee_ty.clone();
+            let guard = Expr::BinOp {
+                op: crate::ssa::BinaryOp::Eq,
+                lhs: Box::new(Expr::Var { sym, ty: scrutinee_ty_owned.clone() }),
+                rhs: Box::new(Expr::BufLit {
+                    elements,
+                    elem_ty: u8_ty,
+                    ty: scrutinee_ty_owned,
+                }),
+                ty: bool_ty,
+            };
+            Ok((Pattern::Binding(sym), vec![guard]))
+        }
+        _ => Ok((lower_pattern(pat)?, Vec::new())),
+    }
+}
+
 fn lower_match_arm(
     ctx: &mut LowerCtx<'_>,
     arm: &AstMatchArm<'_>,
     scrutinee_ty: &Type,
 ) -> Result<MatchArm, String> {
-    let mut pattern = lower_pattern(&arm.pattern)?;
+    let (mut pattern, synth_guards) =
+        desugar_lit_pattern(ctx, &arm.pattern, scrutinee_ty, arm.body.span)?;
 
     // For each constructor binder whose source type expands to
     // multiple slots, mint slot syms and register them in
@@ -2529,11 +2598,13 @@ fn lower_match_arm(
     // pattern binders). Each guard is a Bool-typed expression that
     // must evaluate to True for the arm to fire; to_ssa chains them
     // as branches that fall through to subsequent arms on False.
-    let guards: Vec<Expr> = arm
+    let user_guards: Vec<Expr> = arm
         .guards
         .iter()
         .map(|g| lower_expr(ctx, g))
         .collect::<Result<_, _>>()?;
+    let mut guards = synth_guards;
+    guards.extend(user_guards);
     let body = lower_expr_slots(ctx, &arm.body)?;
 
     // Restore the outer scope's `ctx.locals` so sibling arms don't
@@ -2573,8 +2644,10 @@ fn lower_pattern(pat: &AstPattern<'_>) -> Result<Pattern, String> {
                 binders,
             })
         }
-        AstPattern::IntLit(n) => Ok(Pattern::IntLit(*n)),
-        AstPattern::StrLit(bytes) => Ok(Pattern::StrLit(bytes.clone())),
+        AstPattern::IntLit(_) | AstPattern::StrLit(_) => Err(format!(
+            "core::lower_pattern: literal pattern {pat:?} reached lower_pattern; \
+             callers should route through desugar_lit_pattern instead"
+        )),
         AstPattern::Wildcard => Ok(Pattern::Wildcard),
         AstPattern::Binding(sym) => Ok(Pattern::Binding(*sym)),
         AstPattern::Record { .. } | AstPattern::List(_) | AstPattern::Tuple(_) => {

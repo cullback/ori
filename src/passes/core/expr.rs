@@ -38,8 +38,7 @@ pub type TagId = String;
 /// A scalar literal value. Strings are not a Core literal — they
 /// desugar to `BufLit { elem_ty: U8, elements: [byte literals] }`
 /// at AST→Core because `Str := List(U8)` makes a separate string
-/// literal redundant. Pattern-side string literals (`Pattern::StrLit`)
-/// stay distinct since they gate a runtime equality check.
+/// literal redundant.
 #[derive(Debug, Clone)]
 pub enum Literal {
     Int(i64),
@@ -47,9 +46,12 @@ pub enum Literal {
 }
 
 /// A pattern in a `Match` arm. Restricted to **shallow** patterns —
-/// `flatten_patterns` runs before Core, so nested constructor /
-/// record / list / tuple patterns have already been desugared into
-/// chains of shallow matches.
+/// `flatten_patterns` desugars nested constructor / record / list /
+/// tuple patterns before Core. Literal patterns (`Pattern::IntLit` /
+/// `Pattern::StrLit` in the AST) are desugared at AST→Core to
+/// `Binding(fresh_sym)` + a synthesized `Eq(fresh_sym, lit)` guard
+/// at the head of the arm's guard list, so Core only needs three
+/// pattern shapes.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     /// `Cons(x, xs)` — a tag-union constructor with field binders.
@@ -63,11 +65,6 @@ pub enum Pattern {
     /// `ctx.locals` maps the source binder to in `Name` expansion.
     /// A wildcard binder has its `SymbolId` set to `u32::MAX`.
     Constructor { tag: TagId, binders: Vec<Vec<SymbolId>> },
-    /// `42` — match a specific integer literal. The scrutinee's
-    /// equality with the literal gates the arm.
-    IntLit(i64),
-    /// `"foo"` — match a specific string literal.
-    StrLit(Vec<u8>),
     /// `_` — match anything, bind nothing.
     Wildcard,
     /// `x` (bare name) — match anything, bind to `x`.
