@@ -375,6 +375,154 @@ Records and tuples flatten into parallel slot lists via
   that tag, so they chain via guard fall-through — a sequential
   guard test, conceptually.
 
+## Refcounting, ownership, and reuse
+
+Ori's runtime model is Perceus-style refcounting plus FBIP: every
+heap object carries an `rc`, reaching zero frees it and recursively
+decrements its `RcPtr` children; mutating primitives (`BufAppend`,
+`BufSet`) lower to `cow_*` runtime checks that mutate in place when
+`rc == 1` and clone when `rc > 1`. The question this section answers
+is: **what part of that runtime model lives at Core, and what part
+lives at SSA?**
+
+The split is between **operations** and **analyses**.
+
+### Operations live at SSA
+
+The instruction-level mechanics of refcounting — `rc_inc`, `rc_dec`,
+`cow_resize_dyn`, `cow_store_dyn`, a hypothetical `reuse_alloc` —
+are per-instruction events. Each one corresponds to a specific point
+in execution. Their natural home is SSA, where dominance and def-use
+chains let you place them precisely.
+
+Putting raw RC ops at Core would be a category error. Every algebraic
+rewrite — fusion, beta, case-of-case — would have to thread `dup` /
+`drop` through to keep refcounts honest, multiplying the surface
+area of every rule by a factor of "RC bookkeeping" with no
+algebraic benefit. The Core IR has no `Expr::Dup(sym)` or
+`Expr::Drop(sym)` variants for this reason.
+
+What does live at SSA:
+
+- `Inst::RcInc` / `Inst::RcDec` for explicit refcount adjustments.
+- Auto-rc-on-Store / auto-rc-on-Load conventions on `RcPtr` values
+  (every owning slot is a duplication point by construction; every
+  load of an owning reference is too).
+- `cow_resize_dyn` / `cow_store_dyn` runtime calls — the FBIP path
+  for buffer mutation.
+- Whatever explicit RC traffic balancing the above conventions
+  requires.
+
+A conservative SSA emission strategy (rc_inc on every consuming
+use, rc_dec at every scope end) is sufficient for correctness on
+its own — the analyses below sharpen it.
+
+### Analyses live at Core
+
+Refcount optimizations — eliding the counter when ownership is
+provable, recognizing reuse opportunities, inferring borrows,
+specializing drops by constructor shape — want to see the
+**algebraic structure** of the program. That structure is gone at
+SSA (a `Con` is `alloc + N stores`; a `Match` is `SwitchInt + N
+loads`). It's present at Core.
+
+Each analysis is a walk over the Core term that produces an
+annotation; SSA emission consumes the annotation to make a precise
+choice instead of the conservative default.
+
+| Analysis              | What it proves                                                          | What SSA does with it                                  |
+| --------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------ |
+| Uniqueness            | This `RcPtr` is never aliased — no store, no escape, no capture        | Skip the counter entirely; treat as a stack value     |
+| Borrow inference      | This function arg is only inspected, never stored or returned          | Caller skips the inc before the call                  |
+| Reuse fusion (FBIP)   | This `Match` arm drops a `Cons` box and constructs a same-shape `Cons` | Emit a reuse-alloc instead of free + alloc            |
+| Drop specialization   | This `drop x` is over `x: Result(I64, Str)`                            | Inline the type-directed drop instead of a generic call |
+| Reuse-across-scopes   | This `alloc` follows a drop of a same-sized box in the same scope      | Reuse the freed memory                                |
+
+The DAG call graph + lambda-lifted calls + no aggregate identity
+mean every one of these analyses is a finite bottom-up walk per
+function. No fixpoint, no escape-hatch handling.
+
+### The variant-vs-annotation line
+
+Some ownership-related semantics earn a Core *variant*. Others stay
+as out-of-band annotations.
+
+A variant earns its keep when **lowering needs to distinguish a
+shape**. Two cases qualify today:
+
+- **`BufAppend` / `BufSet`** carry mutation intent at the variant
+  level. The lowering doesn't ask "could this be in-place?" — the
+  variant says "this is an FBIP mutation site." Without the
+  distinct variant, lowering would have to recognize `BufLit`-into-
+  store patterns and reverse-engineer the intent.
+- **`Cata`** carries iteration semantics. Lowering specializes RC
+  handling for the loop (decrement-once-at-loop-exit instead of
+  per-iteration) because it knows the shape is a fold.
+
+An out-of-band annotation suffices when the analysis result is just
+"this site is special" — no new lowering shape needed, just a
+modifier on existing lowering. Uniqueness, borrow flags, and reuse
+pairings all fit this — they're side tables produced by Core
+analyses, consumed by the SSA emitter.
+
+**A future variant earns its keep** if user-defined inductive reuse
+becomes a thing: a hypothetical `Reuse(scrutinee_box, tag, fields)`
+that says "build this constructor by reusing the dropped scrutinee's
+memory" would be a genuinely different lowering shape than `Con` —
+the alloc instruction is different. The annotation alternative
+(just mark the `Con` with a side-table flag) is possible but
+clunkier; the lowering would have to consult the table per `Con`
+to decide between fresh-alloc and reuse-alloc.
+
+### What Core IR enforces vs preserves
+
+A common worry: with primitives this simple, can we really enforce
+all the RC invariants — no double-free, no use-after-free, in-place
+when safe?
+
+The framing that resolves it: **Core doesn't enforce these
+invariants at the variant level. Core preserves the structure that
+lets downstream analyses prove them.** Enforcement is a property of
+the runtime model + the type system (Perceus precision, total
+purity), not of the Core IR itself.
+
+Compare to records and tuples: Core has no "this record doesn't
+escape" variant; instead, the IR has clean tree structure that an
+escape analysis can walk. Same idea for RC. Clean scopes, clean
+type info, clean constructor/match shapes — these are what
+linearity, borrow, and reuse analyses operate on. The primitives
+don't need a substructural type system; the analyses do the work.
+
+The IR's job is to **not introduce escape hatches** that would
+hide ownership flow from those analyses. The current variant set
+doesn't — every `RcPtr`-producing site is one of the listed
+primitives, every consuming use is visible in the tree, every
+scope is a `Let` or a `Match` arm.
+
+### The path from "conservative RC" to "precise RC"
+
+The progression isn't all-or-nothing. Each piece is an analysis +
+an emission refinement:
+
+1. **Baseline (today's conservative emit).** Every `RcPtr`-typed
+   value gets `rc_inc` on consuming uses, `rc_dec` at scope ends.
+   Buffer primitives use `cow_*`. Correct, but verbose.
+2. **Uniqueness analysis.** Mark bindings that don't escape and
+   aren't aliased. Emission elides their RC traffic. Pure win, no
+   IR changes.
+3. **Borrow inference at call boundaries.** Function args that the
+   callee only inspects don't need a caller-side inc. Annotation
+   on the call site; emission omits the inc.
+4. **Reuse fusion for user inductives.** Recognize `Match(x,
+   Cons(h, t) → ... Con("Cons", ...))` syntactically; emit reuse
+   instead of free + alloc. May warrant a `Reuse` variant.
+5. **Drop specialization.** Type-directed expansion of generic
+   drops. Pure Core rewrite; no new variants.
+
+Each step is independently shippable. None require the IR to
+become more complex than it is — at most, one or two new variants
+when lowering genuinely needs a new shape.
+
 ## Soundness
 
 The algebraic rewrites that Core enables are sound only because of
