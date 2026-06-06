@@ -9,27 +9,14 @@ and monomorphization for those rewrites to apply.
 
 ## Motivation
 
-Ori provides six language guarantees that mainstream compilers fight
-thousands of lines of engineering to recover:
-
-- **Totality** — structural recursion via `fold` only; every closed
-  term reduces in bounded time.
-- **Purity** — no source-level mutation, no effects in the pure
-  fragment.
-- **Strictness** — left-to-right, no laziness.
-- **Lambda-lifted, first-order calls** — every `App` resolves to a
-  known top-level target.
-- **DAG call graph** — no mutual recursion across user functions.
-- **No aggregate identity** — no pointer-take on records, no
-  by-reference equality, no FFI opacity, no varargs.
-
-In this setting, algebraic rewrites — fusion, case-of-case,
-case-of-known-constructor, free theorems, hylomorphism
-deforestation, whole-program specialization, compile-time evaluation
-of arbitrary closed terms — are **unconditional**. No side
-conditions, no ⊥-safety arguments, no fixpoint over the call graph.
-The soundness cost is paid once, at the language level, not at every
-rewrite site.
+Algebraic rewrites — fusion, case-of-case, case-of-known-constructor,
+free theorems, hylomorphism deforestation, whole-program
+specialization, compile-time evaluation of arbitrary closed terms —
+are **unconditional** in Ori. No side conditions, no ⊥-safety
+arguments, no fixpoint over the call graph. Each is hundreds-to-
+thousands of lines in LLVM or GHC; they exist there because the
+source language doesn't provide the guarantees that make them safe.
+Ori's does.
 
 These rewrites operate on the **algebraic structure** of the
 program — `Map`, `Cata`, `Con`, `Match`. By the time the program
@@ -38,59 +25,69 @@ parallel `Value`s, folds are loops with block params, map-over-map
 is two loop-with-buffer patterns separated by an allocation.
 Recovering the algebra at SSA is the SCEV pattern in miniature —
 substantial engineering to reconstruct what the front-end already
-knew. Core exists to preserve the algebra past inference and mono
-so the rewrites can run on the natural shape.
+knew. **Core exists to preserve the algebra past inference and mono
+so the rewrites can run on the natural shape.**
 
-### What each guarantee unlocks
+### The guarantees
 
-Each item below is hundreds-to-thousands of lines in LLVM or GHC.
-They exist there because the source languages don't provide the
-guarantee. Ori's do.
+Each property names what Ori enforces and the optimizations it
+enables. The optimizations are the *direct payoff* of the
+guarantee — that's why they're listed together.
 
-**DAG call graph:**
+**Totality.** Structural recursion only; every closed term reduces
+in bounded time.
 
-- Single-pass bottom-up optimization. Topo-sort callees first; by
-  the time `f` is processed, every callee is at its optimized form.
-  No fixpoint iteration over the graph.
-- Bounded inlining (in topological order). Bounded whole-program
-  specialization (`callsites × shapes` variants per function).
-  Whole-program escape analysis as a finite DAG walk. Cross-
-  function CSE: inline, then dedupe.
-
-**Totality:**
-
-- Every equational rewrite preserves totality.
-- Compile-time evaluation terminates trivially — any closed term
-  reduces in bounded time. `length [1,2,3]` evaluates to `3`
-  anywhere in the program.
+- Every equational rewrite preserves totality unconditionally.
+- Compile-time evaluation terminates trivially. `length [1,2,3]`
+  evaluates to `3` anywhere in the program.
 - Hylomorphism deforestation works fully: `cata f ∘ ana g = hylo f g`
   eliminates the intermediate inductive type entirely.
 - Free theorems via parametricity hold without side conditions
   (`length . map f = length`, `map id = id`).
 
-**Purity:**
+**Structural recursion (no general recursion).** Loops are folds
+over inductive types — the data's shape is the loop bound.
 
-- Memoization sound (compile-time and runtime). Speculative
-  evaluation sound; reordering free. Dead-binding elimination
-  needs no effect analysis. CSE needs no alias analysis.
-
-**Lambda-lifting + defunctionalization:**
-
-- All call edges statically known. No virtual calls; devirtualization
-  is free. Inlining is purely syntactic substitution.
-
-**Structural recursion (no general recursion):**
-
-- Trip counts are syntactic — the data's shape *is* the loop bound.
-  No SCEV needed.
+- Trip counts are syntactic; no SCEV needed.
 - Fold fusion laws are universal, not heuristic.
 - TCO isn't a separate analysis — folds *are* loops.
 - Static unrolling over known-shape data: `Fold f z [a,b,c]`
   becomes `f(f(f(z, a), b), c)`, no loop emitted.
 
-**No aggregate identity:**
+**Purity.** No source-level mutation, no effects in the pure
+fragment.
 
-- Records and tuples can be SROA-ed at the IR level (no observable
+- Memoization sound (compile-time and runtime).
+- Speculative evaluation sound; reordering free.
+- Dead-binding elimination needs no effect analysis.
+- CSE needs no alias analysis.
+
+**Strictness.** Left-to-right, no laziness. Underwrites the
+deterministic evaluation order the other guarantees assume; no
+distinct algebraic payoff of its own.
+
+**Lambda-lifted, first-order calls.** Every `App` resolves to a
+known top-level target.
+
+- All call edges statically known. No virtual calls;
+  devirtualization is free.
+- Inlining is purely syntactic substitution.
+
+**DAG call graph.** No mutual recursion across user functions.
+
+- Single-pass bottom-up optimization. Topo-sort callees first; by
+  the time `f` is processed, every callee is at its optimized
+  form. No fixpoint iteration over the graph.
+- Bounded inlining (in topological order).
+- Bounded whole-program specialization (`callsites × shapes`
+  variants per function).
+- Whole-program escape analysis as a finite DAG walk.
+- Cross-function CSE: inline, then dedupe.
+
+**No aggregate identity.** No pointer-take on records, no
+by-reference equality, no FFI opacity, no varargs.
+
+- Records and tuples SROA-able at the IR level (no observable
   difference between `r.x` and a let-bound slot).
 - Aggregate-returning `If` / `Match` can be duplicated per slot
   (re-evaluating the condition is equivalent under purity).
