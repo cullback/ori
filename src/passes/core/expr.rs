@@ -249,6 +249,19 @@ pub enum Expr {
         /// args.len()`. `to_ssa` uses this to re-group the flat
         /// args list when materializing a wrapper per source field
         /// in the Con's payload.
+        ///
+        /// **Why this isn't derivable at to_ssa:** the natural
+        /// source of truth would be the constructor's scheme
+        /// substituted against the Con's `ty`. But `ty` is stamped
+        /// from `constructor_return_types` which stores the
+        /// *polymorphic* scheme return (`Result(Var, Var)` for the
+        /// `Result` family) so the closure-constructor case has
+        /// a meaningful union-shaped type. Subst against a
+        /// polymorphic ty is identity, leaving every field
+        /// collapsing to its default 1 slot. The monomorphic info
+        /// the derivation would need (the actual AST args' types
+        /// at the call site) is available at AST→Core lower time
+        /// but not at to_ssa — so we compute and store it here.
         field_slot_counts: Vec<usize>,
         ty: Type,
     },
