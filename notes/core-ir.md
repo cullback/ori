@@ -1,55 +1,112 @@
 # Core IR
 
-## Status
+The Core IR sits between Ori's AST and its SSA. It exists because
+the algebraic structure of an Ori program — `Map(f, Map(g, xs))`,
+`Cata(f, z, Build(p))`, `Match(Con(tag, args), arms)` — is the
+natural domain for the rewrites Ori's language properties make
+unconditional, and that structure must be preserved past inference
+and monomorphization for those rewrites to apply.
 
-Shipped. Lives in `src/passes/core/`:
+## Motivation
 
-- `expr.rs` — Core `Expr` type (11 variants), `Pattern` (3 variants),
-  `Literal` (2 variants), `MatchArm`.
-- `lower.rs` — AST → Core. Establishes language semantics 1:1.
-  Where SROA happens, where desugars happen, where the buffer trio
-  gets stamped.
-- `to_ssa.rs` — Core → SSA. Resource discipline (RC, FBIP) lives
-  here. Knows about the buffer trio at a structural level; lowers
-  via `cow_*` for FBIP.
-- `rules.rs` — algebraic rewrites on Core. Today: dead-let elim,
-  add-zero / mul-one. The empirical gate (see below) is the
-  trigger for adding more.
-- `pipeline.rs` — drives the whole module through AST→Core →
-  optional simplify → Core→SSA.
+Ori's design hands you language guarantees that mainstream
+optimizing compilers fight thousands of lines of engineering to
+recover:
 
-The original motivation was fusion (`xs.map(f).walk(g)` compiles to
-one zero-alloc loop). The empirical gate on fusion **has not fired
-yet** — the infrastructure is in place but no fusion rule has
-demonstrated a win on a real Ori program. Most of what shipped is
-IR plumbing, not optimization.
+- **Totality** — no general recursion, structural recursion via
+  `fold` only. Every closed term reduces in bounded time.
+- **Purity** — no source-level mutation, no effects in the pure
+  fragment.
+- **Strictness** — left-to-right evaluation order, no laziness.
+- **Lambda-lifted, first-order calls** — every `App` after the
+  front-end is to a known top-level target.
+- **DAG call graph** — no mutual recursion across user functions.
+  The only recursion is structural, into smaller subterms of an
+  inductive value.
+- **No aggregate identity** — no pointer-take on records, no
+  by-reference equality, no FFI opacity, no varargs.
 
-## The problem this solves
-
-Ori's design hands you language guarantees that mainstream optimizing
-compilers fight thousands of lines of engineering to recover:
-totality, purity, strictness, lambda-lifted first-order calls, a DAG
-call graph (no mutual recursion; the only recursion is structural
-via `fold`), and **no aggregate identity** (no pointer-takes, no
-record-by-reference equality, no FFI opacity, no varargs).
-
-Those guarantees enable algebraic rewriting — fusion, case-of-case,
+Algebraic rewrites — fusion, case-of-case, case-of-known-constructor,
 free theorems, hylomorphism deforestation, whole-program
 specialization, compile-time evaluation of arbitrary closed terms —
-to be **unconditional**. No side conditions, no ⊥-safety arguments,
-no fixpoint over the call graph.
+are **unconditional** in this setting. There are no side conditions,
+no ⊥-safety arguments, no fixpoint over the call graph. The cost of
+checking soundness is paid once, at the language level, not at every
+rewrite site.
 
 These rewrites are most naturally expressed on the **algebraic
-structure of the program**: terms like `Map(f, Map(g, xs))`. By the
-time we reach SSA, that structure is flattened. Aggregates are
-decomposed into parallel `Value`s. Folds are loops with block params.
-The map-of-map is two loop-with-buffer patterns separated by an
-allocation. Recovering the algebra at the SSA layer is the SCEV
-problem in miniature — a substantial engineering investment to
-reconstruct what was thrown away.
+structure of the program** — terms shaped like `Map`, `Cata`, `Con`.
+By the time the program reaches SSA, that structure is gone.
+Aggregates are decomposed into parallel `Value`s. Folds are loops
+with block params. A map-over-map is two loop-with-buffer patterns
+separated by an allocation. Recovering the algebra at SSA is the
+SCEV pattern in miniature — a substantial engineering investment to
+reconstruct what the front-end already knew.
 
-Core sits between AST and SSA. The algebraic structure is still
-visible. Rewrites operate on it directly.
+Core preserves the algebra past inference and mono, so the
+rewrites can run on the natural shape.
+
+## What the language properties unlock
+
+The architectural value isn't "we want deforestation." It's that the
+following items become tractable *only if* a layer between AST and
+SSA preserves the structure. At SSA, each item is either expensive
+or impossible.
+
+**Enabled by the DAG call graph:**
+
+- Single-pass bottom-up optimization over the call graph. Topo-sort
+  callees first. By the time `f` is processed, every callee of `f`
+  is at its optimized form. No fixpoint iteration over the graph.
+- Inlining is bounded and tractable. Inline in topological order.
+- Whole-program specialization is bounded: at most
+  `callsites_of_f × shapes` variants per function.
+- Whole-program escape analysis is a finite DAG walk.
+- Cross-function CSE: inline, then dedupe. No termination concern.
+
+**Enabled by totality:**
+
+- Every equational rewrite preserves totality unconditionally.
+- Compile-time evaluation terminates trivially. Any closed term
+  reduces in bounded time; `length [1,2,3]` evaluates to `3` at
+  compile time, anywhere in the program.
+- Hylomorphism deforestation works fully: `cata f ∘ ana g = hylo f g`
+  eliminates the intermediate inductive type entirely.
+- Free theorems via parametricity hold without side conditions
+  (`length . map f = length`, `id . f = f`, `map id = id`).
+
+**Enabled by purity:**
+
+- Memoization is sound (compile-time and runtime).
+- Speculative evaluation is sound; reordering is free.
+- Dead-binding elimination doesn't need effect analysis.
+- CSE doesn't need alias analysis.
+
+**Enabled by lambda-lifting + defunctionalization:**
+
+- All call edges statically known. No virtual calls. Devirtualization
+  is free.
+- Inlining is purely syntactic substitution.
+
+**Enabled by structural recursion (no general recursion):**
+
+- Trip counts are syntactic — the data's shape *is* the loop bound.
+  No SCEV needed.
+- Fold fusion laws are universal, not heuristic.
+- Tail-call optimization isn't a separate analysis — folds *are*
+  loops.
+- Static unrolling of folds over known-shape data — `Fold f z [a,b,c]`
+  becomes `f(f(f(z, a), b), c)` and no loop is emitted.
+
+**Enabled by no aggregate identity:**
+
+- Records and tuples can be SROA-ed at the IR level (no observable
+  difference between `r.x` and a let-bound slot).
+- `If` and `Match` returning a record can be duplicated per slot
+  (the condition is re-evaluated, but purity makes that equivalent).
+
+Each of those is hundreds-to-thousands of lines in LLVM or GHC. They
+exist there because the source languages don't give them. Ori's does.
 
 ## Architecture
 
@@ -58,320 +115,322 @@ is visible:
 
 | Layer          | Job                  | Style                       | Examples                                                |
 | -------------- | -------------------- | --------------------------- | ------------------------------------------------------- |
-| `passes/core/` | Algebraic rewriting  | Pattern rewriting on Core   | fusion, beta, eta, case-of-case, banana, free theorems  |
+| `passes/core/` | Algebraic rewriting  | Pattern rewriting on terms  | fusion, beta, eta, case-of-case, banana, free theorems  |
 | `src/opt/`     | Scalar dataflow      | Local SSA peephole          | const-fold, branch-fold, DCE, GVN, rc-fusion, LICM      |
 | `src/lower/`   | Resource discipline  | Declarative emission        | FBIP via cow_*, RC traffic, aggregate decomposition     |
 
-The bottom layer is *not* a rewrite layer — it's where the source's
+The bottom layer is not a rewrite layer — it's where the source's
 semantics get expressed as IR. The middle layer is local dataflow
-rewriting where the SSA shape is natural. The top layer is
-algebraic rewriting where the term structure is natural.
+rewriting where the SSA shape is natural. The top layer is algebraic
+rewriting where the term structure is natural.
 
-**Rule of thumb:** if a rewrite's natural form is `Map`, `Cata`,
-`Con` — i.e. the algebra of the source — it goes in `passes/core/`.
-If its natural form is "find a chain of `Binary` instructions and
-constant-fold" — i.e. SSA shape — it goes in `src/opt/`. Putting
-either at the wrong layer forces the SCEV pattern: reconstructing
-structure the layer above threw away.
+**The placement rule:** if a rewrite's natural form is `Map`,
+`Cata`, `Con` — i.e. the algebra of the source — it belongs in
+`passes/core/`. If its natural form is "find a chain of `Binary`
+instructions and constant-fold" — i.e. SSA shape — it belongs in
+`src/opt/`. Putting either at the wrong layer forces the SCEV
+pattern: reconstructing structure the layer above threw away.
 
 ## The IR
 
-Eleven `Expr` variants. The design rule: a primitive earns its keep
-when either (a) it's load-bearing for a memory invariant the rest of
-the IR can't express, or (b) it can't be source-defined without
-circularity. Everything else is `App` to a builtin or stdlib
-function.
-
 ```rust
 enum Expr {
-    // Universal — present in any sane IR
     Var    { sym: SymbolId, ty: Type },
     Lit    { value: Literal, ty: Type },
     App    { target: SymbolId, args: Vec<Expr>, ty: Type },
-    Let    { binders: Vec<SymbolId>, value, body, ty },
+    Let    { binders: Vec<SymbolId>, value: Box<Expr>, body: Box<Expr>, ty: Type },
 
-    // Algebraic structure — rewrites pattern-match on these
-    Match  { scrutinee_slots, scrutinee_ty, arms, ty },
-    Cata   { fold_fn, target_slots, target_ty, init, captures,
-             elem_ty, early_exit, ty },
-    Con    { tag, args, field_slot_counts, ty },
+    Match  { scrutinee_slots: Vec<Expr>, scrutinee_ty: Type,
+             arms: Vec<MatchArm>, ty: Type },
+    Cata   { fold_fn: SymbolId, target_slots: Vec<Expr>, target_ty: Type,
+             init: Vec<Expr>, captures: Vec<Expr>,
+             elem_ty: Type, early_exit: bool, ty: Type },
+    Con    { tag: TagId, args: Vec<Expr>,
+             field_slot_counts: Vec<usize>, ty: Type },
 
-    // Buffer trio (List = Str = (len, cap, data))
-    BufLit    { elements, elem_ty, ty },
-    BufLoad   { buf, idx, ty },
-    BufAppend { buf_slots, val_slots, elem_ty, ty },
-    BufSet    { buf_slots, idx, val_slots, elem_ty, ty },
+    BufLit    { elements: Vec<Expr>, elem_ty: Type, ty: Type },
+    BufLoad   { buf: Box<Expr>, idx: Box<Expr>, ty: Type },
+    BufAppend { buf_slots: Vec<Expr>, val_slots: Vec<Expr>,
+                elem_ty: Type, ty: Type },
+    BufSet    { buf_slots: Vec<Expr>, idx: Box<Expr>,
+                val_slots: Vec<Expr>, elem_ty: Type, ty: Type },
 }
 
-enum Pattern { Constructor { tag, binders }, Wildcard, Binding(sym) }
+enum Pattern { Constructor { tag: TagId, binders: Vec<Vec<SymbolId>> },
+               Wildcard,
+               Binding(SymbolId) }
+
 enum Literal { Int(i64), Float(f64) }
 ```
 
-### Why each variant earns its keep
+Direct-style (not ANF), typed at every node (`ty: Type` on every
+variant), post-monomorphization.
 
-| Variant     | Justification |
-|-------------|---------------|
-| `Var`       | Trivial — reference a binding. |
-| `Lit`       | Scalar literals (Int, Float). `Str` literals desugar to `BufLit` of byte Lits at AST→Core; `Str = List(U8)`, no separate string. |
-| `App`       | First-order call. After lambda-lift + mono, every call has a known top-level target. `target: SymbolId`; the name is recovered via `symbols.display()` at Core→SSA. |
-| `Let`       | Binding. Preserves binding structure for let-floating, CSE, dead-binding elimination. |
-| `Match`     | Non-recursive case analysis on tag unions. Distinct from `Cata` because not every case-of is a fold (`Maybe`, `Result`, single-variant unions are non-recursive). |
-| `Cata`      | The **only iteration primitive**. Source-defining a fold would be circular (you'd need a fold to define fold). After `fold_lift` runs, every source `fold` becomes a call to a `__fold_N` helper; AST→Core promotes those calls into `Cata` so algebraic rewrites can see them. `early_exit: bool` distinguishes the `walk_until` shape. |
-| `Con`       | Tag-union constructor. Explicit, not folded into `App`. Critical for `case-of-known-constructor`: `Match(Con(tag, args), arms) → arms[tag][args]` is a syntactic rewrite. |
-| `BufLit`    | `[1, 2, 3]` and `"abc"` — buffer literals. Could desugar to chained `BufAppend` but every literal would then alloc-thrash. Zero-cost literal is load-bearing. |
-| `BufLoad`   | `xs.get(idx)` — bounds-checked index returning `Result(T, OutOfBounds)`. Could be a stdlib method; primitive avoids the call. |
-| `BufAppend` | `xs.append(y)` — produces new trio via `cow_resize_dyn` (in-place when rc=1, clone when rc>1). **Source can't express in-place mutation**, so this primitive is load-bearing for FBIP. |
-| `BufSet`    | `xs.set(i, y)` — same FBIP justification via `cow_store_dyn`. |
+### Earn-its-keep rule
 
-### What's *not* a primitive (anymore)
+A primitive earns its keep when at least one of:
 
-Things that look primitive but lower as `App` to a bodyless builtin
-SymbolId (dispatched at to_ssa via `BuiltinRegistry::classify`):
+1. **It can't be source-defined** without circularity. A `fold`
+   defined as a `fold` would be circular; iteration must be primitive.
+2. **It's load-bearing for a memory invariant** the rest of the IR
+   can't express. In-place mutation (`xs.append(y)` reusing the
+   buffer when `rc == 1`) is impossible to express in pure source;
+   it must be a primitive.
+3. **An algebraic rewrite matches on its shape.** Case-of-known-
+   constructor needs `Con` to be a distinct shape from `App`.
 
-- **Arithmetic / comparison / bitwise** (`Add`, `Sub`, `Mul`, ..., `Eq`, `Lt`, ..., `And`, `Or`, `Xor`, `Shl`, `Shr`, `Max`). To_ssa emits `Inst::BinOp(op, lhs, rhs, ty)`. `Eq` / `Neq` on buffer trios delegates to `buf_eq` (length check + elementwise loop).
-- **Numeric conversion** (`cast`, `bitcast`). Destination scalar type is read off the App's result `ty`.
-- **`List.range(start, end)`** — anamorphism (unfold). To_ssa emits the counter-driven fill loop returning the trio.
+Everything else — including arithmetic, casts, list ranges, scalar
+comparisons — is `Expr::App` to a target that the lowering layer
+recognizes as a builtin and emits inline. The mental model: **a
+primitive is a function the CPU handles directly, with no body in
+the module**. Regular `App` is a function the user (or stdlib)
+defined.
 
-The unification rule: **a builtin App is a "function the CPU handles
-directly" — no SSA function body, no `Inst::Call`, just inline
-emission.** Regular App targets resolve to functions with bodies and
-emit `Inst::Call`.
+### Per-variant rationale
 
-### How aggregates flow without IR nodes for them
+| Variant     | Justification                                                                                                                                                                                                                                                                          |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Var`       | Trivial — reference a binding.                                                                                                                                                                                                                                                         |
+| `Lit`       | Scalar literal (Int, Float). String literals are not a Core node — they desugar to `BufLit { elem_ty: U8, elements: [byte Lits] }`. `Str ≡ List(U8)`; there's no separate string type.                                                                                                  |
+| `App`       | First-order call. After lambda-lift + mono, every call has a known top-level target. `target` is a `SymbolId`; the mangled name is recovered via the symbol table at Core → SSA. **Bodyless builtin targets (arithmetic, cast, range) dispatch inline at the lowering layer.**         |
+| `Let`       | Binding. Preserves binding structure for let-floating, CSE, dead-binding elimination. Multi-slot bindings carry N binders.                                                                                                                                                              |
+| `Match`     | Non-recursive case analysis on a tag union. Distinct from `Cata` because not every case-of is a fold (`Maybe`, `Result`, single-variant unions are non-recursive). Critical for case-of-case and case-of-known-constructor: both are syntactic rewrites only if `Match` is a variant.   |
+| `Cata`      | The **only iteration primitive**. Source-defining a fold would be circular. After fold-lifting, every source `fold` becomes a call to a `__fold_N` helper; AST → Core promotes those calls into `Cata` so the rewrite system can see them. `early_exit` distinguishes the `walk_until` shape. |
+| `Con`       | Tag-union constructor. Explicit, not folded into `App`. Critical for case-of-known-constructor: `Match(Con(tag, args), arms) → arms[tag][args]` is a syntactic rewrite — no analysis, no fixpoint.                                                                                      |
+| `BufLit`    | Buffer literal (`[1,2,3]`, `"abc"`). Could desugar to chained `BufAppend` from `[]`, but every literal would alloc-thrash. Zero-cost literal is load-bearing.                                                                                                                            |
+| `BufLoad`   | Bounds-checked index, returning `Result(T, OutOfBounds)`. Could be a stdlib method; primitive avoids the call and lets the bounds check participate in algebraic simplification.                                                                                                       |
+| `BufAppend` | Produces a new buffer trio. **Load-bearing for FBIP**: lowers to `cow_resize_dyn` — mutate in place when `rc == 1`, clone when `rc > 1`. Source can't express in-place mutation, so the primitive carries the invariant.                                                                |
+| `BufSet`    | Same FBIP rationale, via `cow_store_dyn`. `[1,2,3].set(1, 99)` runs in place when the list isn't shared.                                                                                                                                                                                |
 
-Records and tuples are **not** Core variants. They live at the AST
-(source structure) and at SSA (decomposed parallel `Value`s + memory
-layout) — never at Core. The IR is SROA-ed.
+### What is deliberately not a primitive
 
-- `lower_expr_slots(ctx, ast) -> Vec<Expr>` — one Core Expr per slot
-  of the AST expression's type. Slot count is
-  `expand_slots(ast.ty)`, deterministic from type.
-- Scalars: 1-element Vec. Records/tuples: N-element Vec.
-- `ExprKind::Tuple` / `ExprKind::Record`: concatenate child slot
-  lists.
-- `ExprKind::FieldAccess`: take the record's slot list, pick the
-  slice at the field's offset.
-- `Pattern::Record` / `Pattern::Tuple`: flatten_patterns runs before
-  Core and rewrites these into per-slot bindings.
+The following all look primitive at the surface but aren't Core
+variants — they lower as `App` to a builtin `SymbolId` that the
+lowering layer dispatches inline:
 
-Records and tuples don't participate in algebraic rewriting — fusion
-laws operate on `Cata`, `Match`, `Con`. Keeping them as Core nodes
-would make every rewrite walk past inert plumbing. SROA-ing them
-out matches Core's purpose exactly: every primitive has an
-algebraic role, nothing inert.
+- **Arithmetic, comparison, bitwise, shifts** (`Add`, `Sub`, `Mul`,
+  `Div`, `Rem`, `Eq`, `Neq`, `Lt`, `Gt`, `Le`, `Ge`, `And`, `Or`,
+  `Xor`, `Shl`, `Shr`, `Max`). To_ssa emits `Inst::BinOp(op, lhs, rhs)`.
+  `Eq` / `Neq` on buffer trios delegates to an inline length-check +
+  elementwise loop.
+- **Numeric conversion** (`cast`, `bitcast`). Destination scalar type
+  is read off the `App.ty` at lowering time.
+- **`List.range(start, end)`** — anamorphism. To_ssa emits a counter-
+  driven fill loop returning the trio.
 
-This is sound **only because** Ori has no aggregate identity. In
-any language with pointer-takes or by-reference equality on
-records, this SROA would be unsound. See `notes/language-properties.md`.
+These could be Core variants — earlier iterations had them as
+`Expr::BinOp`, `Expr::Cast`, `Expr::Range`. They aren't, because:
 
-### Aggregate-producing control flow
+1. The algebraic rewrite system never matched on them. Fusion and
+   case-of-case don't recognize `1 + 2` as a fusion site.
+2. With dispatch driven by a `SymbolId`, user-defined types can
+   override `+` by defining their own `add` method — the same path
+   handles built-in scalar `add` (no function body) and user
+   `Vec3.add` (a real function call). One mental model.
+3. The IR stays smaller. Each additional variant is another arm
+   every walker, every rewrite rule, and every type-equality check
+   has to handle.
 
-When an `If` or `Match` returns a multi-slot type, the construct is
-duplicated per slot. `if c then {a:1, b:2} else {a:3, b:4}` lowers
-to two parallel `Match` expressions:
+### Records, tuples, strings — not Core variants
 
-- slot 0 (`a`): `Match(c, True → 1, False → 3)`
-- slot 1 (`b`): `Match(c, True → 2, False → 4)`
+Records and tuples are SROA-ed at AST → Core: the AST node becomes
+parallel slot lists, not a Core node. A `Record { x: 1, y: 2 }`
+typed `{ x: I64, y: I64 }` becomes two Core `Expr`s — one per slot.
+A `Tuple(a, b, c)` concatenates the three children's slot lists.
+`FieldAccess(record, field)` slices the record's slot list at the
+field's offset. Pattern-matching on records is flattened before
+Core into per-slot bindings.
 
-The condition `c` is duplicated. **Pure + total → semantically
-free.** The runtime cost (re-evaluating `c`) is a future CSE/GVN
-target at the Core opt layer.
+This works for the same reason aggregate-returning `If` can be
+duplicated per slot: **Ori has no aggregate identity**. There's no
+observable difference between a record value and the parallel
+sequence of its fields. In any language with pointer-takes,
+by-reference equality, or FFI varargs, this SROA would be unsound.
 
-`Match.scrutinee_slots: Vec<Expr>` and `MatchArm.body: Vec<Expr>`
-carry the parallel slot lists. At to_ssa each Vec lowers to N
-parallel SSA `Value`s; the merge block has N block params.
+Strings are not a Core variant either. `Str` is a transparent
+alias for `List(U8)` at the type system; at Core, a string literal
+desugars to a `BufLit` of byte-typed Int constants. `'a' + 'b' +
+"hello"` is just buffer operations on `List(U8)`.
 
-### Buffer trio
+Eliminating these from Core matches the layer's purpose: every
+variant has an algebraic role, nothing inert. Walkers and rewrites
+don't waste cycles stepping past plumbing.
 
-`List(T)` and `Str` (alias for `List(U8)`) decompose to a 3-slot
-trio at every layer:
+### The buffer trio
+
+`List(T)` and `Str = List(U8)` decompose to a 3-slot trio at every
+layer where slots are visible:
 
 ```
 (len: U64, cap: U64, data: RcPtr)
 ```
 
-Functions take and return the trio (`call_multi`). Pattern binders
-bind three SSA values. Payload `Con`s store the trio inline (one
-RcPtr slot per source field; the field's wrapper holds the trio
-contents). The only place the trio collapses to a single header
-pointer is the `__main` ABI boundary, where it's an explicit
-materialization.
+Functions take and return the trio (multi-result calls). Pattern
+binders bind three SSA values. Payload `Con`s store the trio inline
+(one wrapper-RcPtr slot per source field; the wrapper holds the
+trio contents). The only place the trio collapses to a single
+header pointer is the `__main` ABI boundary.
 
 Element layout in the data buffer: each source-level element
-occupies `slot_count * 8` bytes. A `List(I64)` strides 8 bytes;
-`List({a: I64, b: I64})` strides 16. `BufLoad` / `BufAppend` /
-`BufSet` know the stride from `elem_ty`.
+occupies `slot_count(elem_ty) * 8` bytes. A `List(I64)` strides 8
+bytes; `List({ a: I64, b: I64 })` strides 16. The `elem_ty` field
+on `BufLit` / `BufAppend` / `BufSet` carries the stride info; the
+SSA layer reads it.
 
-`cap` is intentionally ignored by structural equality (`buf_eq`):
-`[1, 2, 3]` and a longer-capacity buffer holding `[1, 2, 3]` are
-equal. `cap` is an allocation detail, not part of the value.
+**`cap` is intentionally not part of equality.** `[1, 2, 3]` and a
+list with `cap = 16` holding `[1, 2, 3]` are equal values. `cap` is
+an allocation detail, not part of the value. The structural
+equality lowering (length-check + elementwise loop) ignores `cap`
+by construction.
 
-## AST → Core (what gets desugared)
+### Aggregate-producing control flow
 
-Lower-time rewrites that happen so Core stays small:
+When `If` or `Match` returns a multi-slot value, the construct is
+duplicated per slot. `if c then { a: 1, b: 2 } else { a: 3, b: 4 }`
+becomes two parallel `Match` expressions:
 
-| Source shape                          | Becomes                                          |
-|---------------------------------------|--------------------------------------------------|
-| `a + b`, `a == b`, …                  | `App(builtins.add, [a, b])` etc.                 |
-| `x.to_u8()`, `x.to_bits()`            | `App(builtins.cast, [x])` / `bitcast`            |
-| `List.range(s, e)`                    | `App(builtins.range, [s, e])`                    |
-| `"abc"` (`StrLit`)                    | `BufLit { elem_ty: U8, elements: [97, 98, 99] }` |
-| `: 5 then body` (`Pattern::IntLit`)   | `: v and v == 5 then body`                       |
-| `: "foo" then body` (`Pattern::StrLit`)| `: v and v == "foo" then body`                  |
-| `f(...)` to `__fold_N`                | `Cata { fold_fn, … }`                            |
-| `crash(msg)`                          | `App(__crash, [msg])`                            |
+- slot 0 (`a`): `Match(c, True → 1, False → 3)`
+- slot 1 (`b`): `Match(c, True → 2, False → 4)`
 
-Records and tuples flatten via `lower_expr_slots`; nested patterns
-flatten via `flatten_patterns` (runs before infer).
+The condition `c` is duplicated. **Pure + total ⇒ semantically
+free** — re-evaluating `c` is equivalent to evaluating it once.
+The runtime cost of duplicated work is a future CSE / GVN target
+at the SSA layer.
 
-## Core → SSA
+`Match.scrutinee_slots` and `MatchArm.body` are `Vec<Expr>` for the
+parallel slot lists. At Core → SSA, each Vec lowers to N parallel
+`Value`s; the Match's merge block has N block params.
 
-`to_ssa` lowers each Core variant to SSA instructions. The
-interesting bits:
+### Patterns
 
-- **App dispatch.** `Expr::App { target }` first asks
-  `ctx.builtins.classify(target)`. If it's a builtin (Binary, Cast,
-  Bitcast, Range), emit inline (`Inst::BinOp`, `Inst::Cast`, …) via
-  `emit_builtin_single_slot` / `emit_builtin_range`. Otherwise
-  resolve the target's display name and emit `Inst::Call`.
-- **`buf_eq`.** Binary `Eq` / `Neq` on 3-slot operands (List, Str)
-  doesn't go through `Inst::BinOp(Eq, ...)` — that's scalar only.
-  Instead `buf_eq` emits length check + elementwise loop, returning
-  a Bool. `cap` is ignored.
-- **Cata dispatch.** `Expr::Cata` checks if the target is a `List`;
-  if so, `lower_list_cata` emits a counter-driven loop (with
-  optional `early_exit` Continue/Break dispatch for `walk_until`).
-  Otherwise it emits `Inst::Call` to the `__fold_N` helper which
-  contains the structural recursion.
-- **Con boundary.** For multi-variant payload unions (Result, Maybe,
-  user unions), the per-source-field grouping is encoded in the
-  Con's `field_slot_counts`. To_ssa regroups the flat args back into
-  field-shaped wrappers via `group_args_by_field`. See "Reverts"
-  below for why this isn't derivable.
-- **Match dispatch.** All-Constructor multi-arm: `SwitchInt` on the
-  scrutinee's tag. All-Binding (from literal-pattern desugar):
-  `SwitchInt` on a const-0 with all arms sharing tag 0, so they
-  chain via `next_same_tag` guard fall-through — effectively a
-  guard chain.
+Patterns are restricted to three shallow shapes:
+
+- `Constructor { tag, binders }` — match a tag-union variant with
+  per-field bindings. `binders` is `Vec<Vec<SymbolId>>`: the outer
+  Vec is per source-level field, the inner Vec is the slot symbols
+  that field expands to.
+- `Wildcard` — match anything, bind nothing.
+- `Binding(sym)` — match anything, bind to `sym`.
+
+Nested constructor patterns are flattened by a pre-Core pass into
+`Constructor` arms with extra `is` guards. Literal patterns
+(`Pattern::IntLit`, `Pattern::StrLit` in the AST) are desugared at
+AST → Core to `Binding(fresh_sym)` with a synthesized
+`Eq(fresh_sym, lit)` guard prepended to the arm's guard list — so
+Core never needs to special-case literal patterns. Three shapes
+cover everything.
+
+### AST → Core (semantic desugaring)
+
+Source shapes that don't survive into Core:
+
+| Source                                | Core                                                |
+| ------------------------------------- | --------------------------------------------------- |
+| `a + b`, `a == b`, …                  | `App(builtins.add, [a, b])` etc.                    |
+| `x.to_u8()`, `x.to_bits()`            | `App(builtins.cast, [x])` / `App(builtins.bitcast,...)` |
+| `List.range(s, e)`                    | `App(builtins.range, [s, e])`                       |
+| `"abc"` (`ExprKind::StrLit`)          | `BufLit { elem_ty: U8, elements: [Lit 97, Lit 98, Lit 99] }` |
+| `[1, 2, 3]` (`ExprKind::ListLit`)     | `BufLit { elem_ty: I64, elements: [...] }`          |
+| `: 5 then body` (`Pattern::IntLit`)   | `: v and v == 5 then body`                          |
+| `: "foo" then body` (`Pattern::StrLit`)| `: v and v == "foo" then body`                     |
+| `f(...)` where `f` is `__fold_N`      | `Cata { fold_fn, ... }`                             |
+| `crash(msg)`                          | `App(__crash, [msg])`                               |
+
+Records and tuples flatten into parallel slot lists via
+`lower_expr_slots`. Nested patterns flatten via a pre-Core pass.
+
+### Core → SSA
+
+`to_ssa` emits SSA for each Core variant. The notable shapes:
+
+- **App dispatch.** Before emitting `Inst::Call`, the App handler
+  asks the builtin registry whether `target` names a builtin. If
+  so, the builtin's kind (`Binary(op)`, `Cast`, `Bitcast`, `Range`)
+  drives inline emission — `Inst::BinOp(op, args[0], args[1])` for
+  Binary, the counter loop for Range, etc. Otherwise, regular
+  `Inst::Call`.
+
+- **Buffer equality.** Binary `Eq` or `Neq` whose operands are
+  3-slot trios (List, Str) doesn't go through scalar `Inst::BinOp(Eq)`.
+  It lowers to a length check followed by an elementwise loop. The
+  loop reads from each buffer at index `i`, compares, and short-
+  circuits to `False` on mismatch.
+
+- **Cata dispatch.** If the Cata's target is a `List`, lower to a
+  counter-driven loop directly (with optional Continue/Break
+  dispatch when `early_exit` is set for `walk_until`). Otherwise
+  emit a recursive helper `Inst::Call` to the `__fold_N` function
+  that carries the structural recursion.
+
+- **Con boundary.** Multi-variant payload unions (Result, Maybe,
+  user-defined) materialize the constructor by allocating a
+  payload, storing one wrapper per source-level field at
+  consecutive 8-byte offsets, and returning `(tag, payload)`.
+  Single-variant payload unions (Phase E shape) skip the wrapping
+  entirely and return the variant's slots directly.
+
+- **Match dispatch.** All-Constructor arms emit a `SwitchInt` on
+  the scrutinee's tag. All-Binding arms (from literal-pattern
+  desugar) use a constant-zero synth tag with all arms sharing
+  that tag, so they chain via guard fall-through — a sequential
+  guard test, conceptually.
+
+## Soundness
+
+The algebraic rewrites that Core enables are sound only because of
+the language guarantees listed at the top:
+
+- **Reorderings** (CSE, code motion, let-floating) are sound because
+  Ori is pure. No expression's evaluation has an effect we'd need
+  to preserve.
+- **Compile-time evaluation** of any closed term is sound because
+  Ori is total. The evaluator terminates by construction.
+- **Eliminations** (dead-let, unreachable arm, case-of-known-
+  constructor) are sound because Ori is total — there's no ⊥ to
+  preserve. A dead `let` doesn't hide a divergence.
+- **Aggregate SROA** is sound because Ori has no aggregate identity.
+  No source program can observe the difference between a record
+  value and the parallel sequence of its fields.
+- **Fold fusion** (banana, deforestation) is sound because Ori's
+  iteration is structural — every loop terminates by descending
+  into smaller subterms of an inductive value. Fusion laws don't
+  need a termination side-condition.
+
+A rewrite added to Core inherits these properties — every rule
+should preserve them without needing a per-rule soundness argument.
+If a rule needs one, the layer is wrong or the rule is unsound.
 
 ## What we explicitly reject
 
-- **CCC-style combinators (`id, ∘, fst, snd, ...`).** Beautiful for
-  fusion but far from source; debugging output incomprehensible.
-- **ANF as Core form.** Cleaner for dataflow but buries the algebra
-  under naming. Better: ANF-transform *before* lower-to-SSA as a
-  separate pass; keep Core direct-style.
+Design choices that look attractive and that we deliberately don't
+make:
+
+- **CCC-style combinators (`id`, `∘`, `fst`, `snd`, …).** Pleasant
+  for fusion but far from source; debugging output becomes
+  incomprehensible.
+- **ANF as the Core form.** Cleaner for dataflow but buries the
+  algebra under naming. Better to ANF-normalize *before* SSA
+  lowering as a separate pass; keep Core direct-style.
 - **CPS.** Wrong shape for algebraic rewriting; right shape for
-  compilation. Same answer: not as Core.
-- **Sea-of-nodes.** Wrong layer; V8 is moving away from it anyway.
-- **de Bruijn indices for binders.** Tempting (alpha-equivalence is
-  free, useful if we ever adopt e-graphs). But less readable, harder
-  to debug. Defer; can add a canonicalize pass later.
-- **`BinOp` / `Cast` / `Range` as dedicated variants.** They
-  were primitives in the original design; we collapsed them to
-  builtin `App` because the algebraic rewrite system never matched
-  on them. The dispatch table is the seam between "function with a
-  body" and "function the CPU handles directly."
-- **`Record` / `Tuple` as Core variants.** SROA-ed at AST→Core.
-  Sound only because Ori has no aggregate identity (see above).
-
-## What we defer
-
-- **e-graphs / equality saturation.** Our laws are mostly monotonic
-  (fusion strictly improves cost), so fixpoint application of
-  hand-rolled rules produces the same result as cost-based extraction.
-  Signal to adopt: phase-ordering pain in practice (e.g. we end up
-  with a Core-level `run_full_pipeline` calling `apply_rules` four
-  times). Until then, hand-rolled is faster per-rule and easier to
-  debug.
-- **Effects / I/O.** We're pure today. If/when we add I/O, an
-  effect annotation on `App` (or separate `EffApp`) is the likely
-  shape. The pure subset stays as-is.
+  compilation. Not Core's job.
+- **Sea-of-nodes.** Wrong layer for algebra; V8 is moving away
+  from it anyway.
+- **de Bruijn indices for binders.** Alpha-equivalence becomes
+  free, useful if we ever adopt e-graphs, but less readable and
+  harder to debug. A canonicalize pass can add this if/when needed.
+- **`Record` / `Tuple` as Core variants.** SROA-ed at AST → Core
+  for the reasons above.
+- **Arithmetic / cast / range as Core variants.** Their natural
+  rewrite home is the SSA layer (constant folding), not Core. They
+  flow through as builtin `App` targets.
+- **e-graphs / equality saturation.** Ori's rewrite laws are mostly
+  monotonic (fusion strictly improves cost), so hand-rolled rules
+  applied to fixpoint match what cost-based extraction would find.
+  The infrastructure isn't free, and the value over hand-rolled
+  passes is empirically modest. Reach for e-graphs only if phase-
+  ordering pain shows up in practice.
+- **Effects / I/O at Core.** Ori is pure today. If/when I/O lands,
+  an effect annotation on `App` is the likely shape. The pure
+  subset stays as-is.
 - **Higher-rank polymorphism past mono.** Would need type
-  abstractions in Core. We mono first, so this is moot for now.
-
-## The empirical gate
-
-The original plan: gate fusion-rule investment on a real benchmark
-showing a meaningful win. The first deliverable was supposed to be
-one end-to-end fusion case (`Cata(f, z, Map(g, xs)) → Cata(λ. f acc
-(g x), z, xs)`) with a measured allocation + runtime delta.
-
-**Status: the gate has not fired.** Today's `rules.rs` has
-add-zero / mul-one identity rules and a dead-let-eliminator. No
-actual fusion rule has been written. All the infrastructure (Core
-IR, AST→Core, Core→SSA, BuiltinRegistry, App dispatch, simplify
-plumbing) is in place; the gate is the next missing piece.
-
-If the gap on real Ori programs turns out to be small (≤2× on
-`xs.map(f).walk(g)`), the question becomes whether the Core IR
-infrastructure earns its keep at all. FBIP plus AST-level
-`range.walk` recognition might capture most of the win on its own.
-
-## Reverts and corrections from prior work
-
-Mistakes from the journey, recorded so the next attempt at each
-reads the lesson first.
-
-- **`stream_fuse` and `loops.rs` SCEV-style reconstruction**
-  (`21c4335`, `8ed81c8`) — reverted. We tried recovering algebraic
-  structure at the SSA layer. The IR layer was the right home;
-  Core exists because of this lesson.
-- **`Con.field_slot_counts` derivation at to_ssa** (`b2cc924`) —
-  attempted, reverted. The natural derivation walks the
-  constructor's scheme substituted against `Con.ty`. But `Con.ty`
-  is stamped from `constructor_return_types` which holds the
-  *polymorphic* scheme return (`Result(Var, Var)`) so that closure
-  constructors get a meaningful union-shaped type — substituting
-  against polymorphic ty is identity, every field collapses to 1
-  default slot. The monomorphic info derivation needs is in the
-  AST args' types at the call site, which Core doesn't carry. The
-  field stays. If you want to retry this, fix `Con.ty` to always
-  carry the monomorphic instantiation first (distinguish closure
-  constructors from declared at lower time).
-- **`Pattern::IntLit` / `Pattern::StrLit` decomposition** — landed.
-  Both desugared to `Binding(fresh) + Eq guard` at AST→Core.
-  Tradeoff: lost the `SwitchInt` jump-table for dense int matches
-  (the `Binding`-arms chain is a sequential guard test). Recoverable
-  as an SSA-opt pass that rebuilds `SwitchInt` from chained
-  `Binding + Eq(x, lit)` arms; not yet written.
-
-## Open questions
-
-- **Stdlib marking story.** For fusion to fire, stdlib `List.map`,
-  `List.filter`, `List.walk` need to be recognizable as `Cata` /
-  `Map` / `Build` at Core. Options: (a) annotate in source
-  (`@cata`, `@build`); (b) recognize by name in the lowerer;
-  (c) write these stdlib functions in Core directly. Probably (c) —
-  stdlib is the bridge between user surface syntax and Core
-  primitives.
-- **Fix `Con.ty` to be monomorphic.** Today the polymorphic-ty
-  workaround for closure constructors infects everything. The
-  fix is to distinguish closure tags from declared tags at lower
-  time and stamp `ast.ty` (monomorphic) for the latter,
-  `constructor_return_types` (synth TagUnion) only for the former.
-  Standalone win — makes one of the IR's invariants honest —
-  and unblocks the `field_slot_counts` derivation as a follow-up.
-- **Switch-table recovery at SSA-opt.** Today's IntLit-pattern
-  decomposition trades the dense-int-match jump table for a guard
-  chain. An SSA pass that recognizes `Binding + Eq(scrutinee, lit)`
-  chains and rebuilds `SwitchInt` recovers the perf without
-  re-introducing `Pattern::IntLit`.
-- **`loops.rs`.** Currently unused. LICM is the obvious consumer
-  once we have it; codegen could use it for hot-loop heuristics.
-  Worth keeping but not maintained beyond what consumers demand.
-- **ANF before SSA?** Probably yes — ANF naturalizes the SSA
-  lowering (each subexpression names its intermediate). This would
-  be a Core→ANF→SSA chain, not changing what Core is.
-
-## Success criteria
-
-Original: get to a Core with 3-5 fusion rules and demonstrate on a
-benchmark that `xs.map(f).walk(g)` compiles to a single zero-alloc
-loop (within a small constant factor of hand-written C).
-
-**Where we are:** the IR exists, the rewriting infrastructure is
-plumbed, but no fusion rule has been written. The next milestone
-is firing the empirical gate — pick one fusion case, write the
-rule, measure. The answer determines whether more rewrites are
-worth the investment.
+  abstractions in Core. Mono runs before Core; this is moot.
