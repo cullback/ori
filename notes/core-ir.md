@@ -28,14 +28,13 @@ substantial engineering to reconstruct what the front-end already
 knew. **Core exists to preserve the algebra past inference and mono
 so the rewrites can run on the natural shape.**
 
-### The guarantees
+Each section below names a guarantee Ori enforces and the
+optimizations that fall out of it.
 
-Each property names what Ori enforces and the optimizations it
-enables. The optimizations are the *direct payoff* of the
-guarantee — that's why they're listed together.
+### Totality
 
-**Totality.** Structural recursion only; every closed term reduces
-in bounded time.
+Structural recursion only; every closed term reduces in bounded
+time.
 
 - Every equational rewrite preserves totality unconditionally.
 - Compile-time evaluation terminates trivially. `length [1,2,3]`
@@ -45,8 +44,10 @@ in bounded time.
 - Free theorems via parametricity hold without side conditions
   (`length . map f = length`, `map id = id`).
 
-**Structural recursion (no general recursion).** Loops are folds
-over inductive types — the data's shape is the loop bound.
+### Structural recursion (no general recursion)
+
+Loops are folds over inductive types — the data's shape is the
+loop bound.
 
 - Trip counts are syntactic; no SCEV needed.
 - Fold fusion laws are universal, not heuristic.
@@ -54,26 +55,32 @@ over inductive types — the data's shape is the loop bound.
 - Static unrolling over known-shape data: `Fold f z [a,b,c]`
   becomes `f(f(f(z, a), b), c)`, no loop emitted.
 
-**Purity.** No source-level mutation, no effects in the pure
-fragment.
+### Purity
+
+No source-level mutation, no effects in the pure fragment.
 
 - Memoization sound (compile-time and runtime).
 - Speculative evaluation sound; reordering free.
 - Dead-binding elimination needs no effect analysis.
 - CSE needs no alias analysis.
 
-**Strictness.** Left-to-right, no laziness. Underwrites the
-deterministic evaluation order the other guarantees assume; no
-distinct algebraic payoff of its own.
+### Strictness
 
-**Lambda-lifted, first-order calls.** Every `App` resolves to a
-known top-level target.
+Left-to-right, no laziness. Underwrites the deterministic
+evaluation order the other guarantees assume; no distinct algebraic
+payoff of its own.
+
+### Lambda-lifted, first-order calls
+
+Every `App` resolves to a known top-level target.
 
 - All call edges statically known. No virtual calls;
   devirtualization is free.
 - Inlining is purely syntactic substitution.
 
-**DAG call graph.** No mutual recursion across user functions.
+### DAG call graph
+
+No mutual recursion across user functions.
 
 - Single-pass bottom-up optimization. Topo-sort callees first; by
   the time `f` is processed, every callee is at its optimized
@@ -84,8 +91,10 @@ known top-level target.
 - Whole-program escape analysis as a finite DAG walk.
 - Cross-function CSE: inline, then dedupe.
 
-**No aggregate identity.** No pointer-take on records, no
-by-reference equality, no FFI opacity, no varargs.
+### No aggregate identity
+
+No pointer-take on records, no by-reference equality, no FFI
+opacity, no varargs.
 
 - Records and tuples SROA-able at the IR level (no observable
   difference between `r.x` and a let-bound slot).
