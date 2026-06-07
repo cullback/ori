@@ -37,8 +37,11 @@ Structural recursion only; every closed term reduces in bounded
 time.
 
 - Every equational rewrite preserves totality unconditionally.
-- Compile-time evaluation terminates trivially. `length [1,2,3]`
-  evaluates to `3` anywhere in the program.
+- Compile-time evaluation works on any closed term, including
+  user-defined recursive functions. The compiler can pre-execute a
+  call like `factorial 10` and emit `3628800` directly — no
+  termination analysis required, because the language guarantees
+  termination.
 - Hylomorphism deforestation works fully: `cata f ∘ ana g = hylo f g`
   eliminates the intermediate inductive type entirely.
 - Free theorems via parametricity hold without side conditions
