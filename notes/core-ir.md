@@ -162,6 +162,70 @@ enum Literal { Int(i64), Float(f64) }
 Direct-style (not ANF), typed at every node (`ty: Type` on every
 variant), post-monomorphization.
 
+### Types in Core
+
+Every Core node carries `ty: Type`, the source-level type from
+inference. The `Type` enum (defined in `types/engine.rs`):
+
+- `Type::Con(name)` — primitive scalar (`I64`, `U8`, `Bool`, `F64`)
+  or a named user type (`MyUnion`, `Box`).
+- `Type::App(name, args)` — applied type constructor: `Result(I64,
+  Str)`, `List(I64)`, `Maybe(T)`.
+- `Type::Arrow(params, ret, lambda_set?)` — function type, with an
+  optional lambda set (the closures that flow through this Arrow
+  after row-polymorphic inference).
+- `Type::Tuple(elems)` — anonymous product. Decomposed at AST → Core.
+- `Type::Record { fields }` — named-field product. Decomposed at
+  AST → Core.
+- `Type::TagUnion { tags, rest }` — discriminated union.
+- `Type::Var(tv)` — type variable. Should not appear in Core
+  post-mono, **with one exception** (the polymorphic-`Con.ty`
+  workaround below).
+
+Transparent newtypes (`Str := List(U8)`) are registered in a side
+table; `resolve_transparent` unwraps them at use sites. Opaque
+newtypes (`Foo :: Bar`) aren't transparent — the underlying type is
+hidden outside the methods block.
+
+**The polymorphic-`Con.ty` footgun.** For declared constructors
+(`Ok`, `Err`, user union tags), AST → Core stamps `Con.ty` from
+`constructor_return_types`, which holds the *scheme's* return type
+(`Result(Var(a), Var(e))`), not the monomorphic instantiation
+(`Result(I64, Str)`). Why: closure constructors like `__lambda_K`
+need a union-shaped type at the construction site, but the
+surrounding AST's `ty` is just the closure's return type (`I64`).
+`constructor_return_types` provides a union shape for both
+declared and closure cases, at the cost of being polymorphic for
+declared. Analyses that substitute against `Con.ty` get identity
+subst and silently produce wrong results — the monomorphic info
+lives in the AST args' types at the call site, which is why
+`Con.field_slot_counts` is stored as derived data on the variant.
+The real fix is distinguishing closure tags from declared tags at
+lower time so declared `Con`s can stamp the monomorphic `ast.ty`;
+not yet done.
+
+### Evaluation order
+
+Strict, left-to-right at the language level. At Core:
+
+- **`App(f, [a, b, c])`** — args left to right, then the call.
+  Same for builtin Apps.
+- **`Let(binders, value, body)`** — `value` before `body`; binders
+  come into scope for `body` only.
+- **`Match(scrutinee_slots, arms)`** — scrutinee slots left to
+  right; pattern dispatch picks an arm; guards left to right; arm
+  body.
+- **`Cata`** — target slots, then init, then captures, then the
+  loop.
+- **`Con(tag, args)`** — args left to right, then construction.
+- **`BufLit { elements }`** — elements left to right, then the
+  alloc + stores.
+
+Purity makes evaluation order unobservable for most rewrites
+(reordering pure expressions is sound). Order matters for `crash`
+(the divergence happens at its source-level position) and for the
+runtime sequencing of RC `inc` / `dec` operations.
+
 ### Earn-its-keep rule
 
 A primitive earns its keep when at least one of:
@@ -192,11 +256,62 @@ defined.
 | `Let`       | Binding. Preserves binding structure for let-floating, CSE, dead-binding elimination. Multi-slot bindings carry N binders.                                                                                                                                                              |
 | `Match`     | Non-recursive case analysis on a tag union. Distinct from `Cata` because not every case-of is a fold (`Maybe`, `Result`, single-variant unions are non-recursive). Critical for case-of-case and case-of-known-constructor: both are syntactic rewrites only if `Match` is a variant.   |
 | `Cata`      | The **only iteration primitive**. Source-defining a fold would be circular. After fold-lifting, every source `fold` becomes a call to a `__fold_N` helper; AST → Core promotes those calls into `Cata` so the rewrite system can see them. `early_exit` distinguishes the `walk_until` shape. |
-| `Con`       | Tag-union constructor. Explicit, not folded into `App`. Critical for case-of-known-constructor: `Match(Con(tag, args), arms) → arms[tag][args]` is a syntactic rewrite — no analysis, no fixpoint.                                                                                      |
+| `Con`       | Tag-union constructor. Explicit, not folded into `App`. Critical for case-of-known-constructor: `Match(Con(tag, args), arms) → arms[tag][args]` is a syntactic rewrite. **Footgun**: `Con.ty` for declared constructors carries the *polymorphic* scheme return type (`Result(Var, Var)`), not the monomorphic instantiation — see "Types in Core" below. |
 | `BufLit`    | Buffer literal (`[1,2,3]`, `"abc"`). Could desugar to chained `BufAppend` from `[]`, but every literal would alloc-thrash. Zero-cost literal is load-bearing.                                                                                                                            |
 | `BufLoad`   | Bounds-checked index, returning `Result(T, OutOfBounds)`. Could be a stdlib method; primitive avoids the call and lets the bounds check participate in algebraic simplification.                                                                                                       |
 | `BufAppend` | Produces a new buffer trio. **Load-bearing for FBIP**: lowers to `cow_resize_dyn` — mutate in place when `rc == 1`, clone when `rc > 1`. Source can't express in-place mutation, so the primitive carries the invariant.                                                                |
 | `BufSet`    | Same FBIP rationale, via `cow_store_dyn`. `[1,2,3].set(1, 99)` runs in place when the list isn't shared.                                                                                                                                                                                |
+
+### `Cata` in detail
+
+Cata is the only iteration primitive and the central rewrite target.
+Each field plays a specific role:
+
+| Field           | Meaning |
+| --------------- | ------- |
+| `fold_fn`       | SymbolId of the lifted recursive helper (`__fold_N`, or a stdlib fold). Holds the actual recursion. |
+| `target_slots`  | The inductive value being consumed, as a parallel slot list. For `List`, the 3-slot trio. For `Lnk` / `Tree` / multi-variant unions, `(tag, payload)`. |
+| `target_ty`     | Source-level type of the target, preserved separately because `target_slots[i].ty()` carries per-slot scalar placeholders that lose the inductive shape. |
+| `init`          | Seed accumulator values for walk-style folds. Empty Vec for pure catamorphisms. |
+| `captures`      | Free variables of the fold closure, threaded as parallel block params through the loop. |
+| `elem_ty`       | For List-shaped Catas: the element type. Used by the data-buffer stride calculation. |
+| `early_exit`    | When `true`, `fold_fn` returns `Step(b) = Continue(b) \| Break(b)`. Lowering emits Continue/Break dispatch. The `walk_until` shape. |
+| `ty`            | Result type of the whole expression. |
+
+**What rewrites can match syntactically:**
+
+- Cata over `Range`: fuse into a counter loop without building the
+  intermediate list.
+- Cata over Cata (banana): nested folds over the same target,
+  combine into one.
+- Cata over a `Build`-form (deforestation): eliminate the
+  intermediate inductive entirely (`cata f ∘ ana g = hylo f g`).
+- Cata over a known-constructor scrutinee: unfold the recursion's
+  first step at compile time.
+
+**What rewrites can't easily match:** when `fold_fn` is a
+user-defined `__fold_N`, the algebraic shape of *what the fold
+computes* is hidden inside the helper body. Fusion that requires
+seeing into the fold needs either:
+
+- Core-level inlining of `__fold_N` (the helper body is available
+  in the module), or
+- A stdlib-recognition convention that names known fold shapes
+  (`__List_map`, `__List_filter`, `__List_walk`) so the rewrite
+  can pattern-match by name without inlining.
+
+This is the **stdlib marking** question: for `xs.map(f).walk(g)` to
+fuse, `map`'s underlying helper has to be recognized as `Map(f)`
+rather than just "a fold." Three real options exist:
+
+- **Source annotations** (`@map`, `@build`, `@cata`) — explicit
+  intent at the stdlib declaration.
+- **Name-based recognition** at AST → Core — match on `__List_map`
+  by string convention.
+- **Write stdlib fold-shaped functions directly in Core** — the
+  stdlib bridges between user surface syntax and Core primitives.
+
+Not yet decided; needed before the first real fusion rule lands.
 
 ### What is deliberately not a primitive
 
@@ -252,6 +367,32 @@ Eliminating these from Core matches the layer's purpose: every
 variant has an algebraic role, nothing inert. Walkers and rewrites
 don't waste cycles stepping past plumbing.
 
+### Multi-slot bindings
+
+`Var` and `Let` are slot-aware. When a binding's value is
+multi-slot (a record, tuple, List trio, or multi-variant payload):
+
+- **`Let { binders: Vec<SymbolId>, value, body }`** — the value
+  produces N slots; `binders.len() == N`; each binder names one
+  slot. The body references each binder as a single-slot `Var`.
+- **`Var { sym, ty }`** — if `sym` is a multi-slot binding,
+  `lower_expr_slots(Var)` looks `sym` up in `ctx.locals:
+  HashMap<SymbolId, Vec<SymbolId>>` and expands to N parallel
+  slot-Var references. The single-slot `lower(Var)` errors on
+  multi-slot bindings — the caller must use `lower_expr_slots`.
+
+Slot symbols are minted fresh by AST → Core when it encounters a
+multi-slot binding site. The AST source name maps to the slot
+symbol list via `ctx.locals`. Slot symbols carry source-derived
+dotted paths (`r.x`, `r.b.c`, `t.0`) via `ctx.slot_paths` for debug
+output.
+
+**Invariant**: every `Var` reference at Core resolves to either
+(a) a function parameter (1 SSA value), (b) a single-slot
+let-binding (1 SSA value), or (c) a multi-slot let-binding (N SSA
+values, where N is derivable from the binding's type). Walkers
+matching on `Var` must know which case they're in.
+
 ### The buffer trio
 
 `List(T)` and `Str = List(U8)` decompose to a 3-slot trio at every
@@ -278,6 +419,51 @@ list with `cap = 16` holding `[1, 2, 3]` are equal values. `cap` is
 an allocation detail, not part of the value. The structural
 equality lowering (length-check + elementwise loop) ignores `cap`
 by construction.
+
+### Closures and higher-order functions
+
+Ori has higher-order functions but no first-class closures *at Core*
+— every closure becomes a tag-union value before Core sees it. The
+front-end pipeline (`lambda_lift` → infer → `lambda::specialize` →
+`lambda::narrow`) does the work:
+
+1. **The lambda becomes a top-level function.** `lambda_lift`
+   emits a `FuncDef` for `__lambda_K(captures..., args...)`. The
+   lambda's free variables become leading capture parameters.
+
+2. **The closure value is a `Con` over a synthesized tag union.**
+   A new `__Closure_X` type is registered with one variant per
+   closure that can flow through the relevant Arrow position. The
+   value at the lambda site is `Con("__lambda_K_tag", [captures...])`.
+   The closure's runtime representation is just the tag and its
+   captures — same as any payload-carrying union.
+
+3. **Calling a closure dispatches via `__apply_K`.** A call to a
+   parameter `f: __Closure_X` lowers as `App(__apply_K, [f, args...])`.
+   The synthesized `__apply_K` body is a `Match` on the closure tag
+   forwarding to the right `__lambda_K`.
+
+4. **Singleton lambda sets specialize to direct calls.** When
+   inference proves only one closure can flow through a given Arrow
+   position (the lambda set has exactly one element), `lambda::narrow`
+   rewrites the call site as a direct `App(__lambda_K, [captures...,
+   args...])` — no dispatch.
+
+Consequences for Core:
+
+- Higher-order functions look like any other tag-union consumer.
+  `xs.map(f)` where `f` is a closure parameter compiles to a
+  `Cata` whose `fold_fn` is `__apply_K` (or, in the singleton case,
+  the `__lambda_K` directly) and whose `captures` include the
+  closure value.
+- The `Type::Arrow`'s `lambda_set` carries the set of closures that
+  flow through that Arrow. Mono specializes on the lambda set,
+  producing one variant per closure shape.
+- Closures introduce no runtime indirection beyond a tag dispatch
+  — the lambda set is closed at compile time.
+- Pattern-matching rewrites on closure types work identically to
+  any other multi-variant union; case-of-known-constructor on a
+  fresh closure value collapses the dispatch.
 
 ### Aggregate-producing control flow
 
@@ -315,6 +501,37 @@ AST → Core to `Binding(fresh_sym)` with a synthesized
 `Eq(fresh_sym, lit)` guard prepended to the arm's guard list — so
 Core never needs to special-case literal patterns. Three shapes
 cover everything.
+
+**Return arms.** `MatchArm` carries `is_return: bool`. When `true`,
+the arm's body short-circuits the *enclosing function* instead of
+merging into the match's result. The `?` operator desugars to a
+match whose `Err` arm is a return arm; explicit `: pat return body`
+syntax produces the same. Rewrites that flatten nested matches
+(case-of-case and friends) must preserve the short-circuit semantics
+— a return arm exits the outer function, which may not be the
+immediately surrounding match expression.
+
+### Crash and divergence
+
+`crash(msg)` is the only way an Ori program can fail to produce a
+value (totality rules out infinite loops). At Core it's `App(__crash,
+[msg])` to a runtime function that prints `msg` and exits.
+
+Implications for rewrites:
+
+- **Reordering past `crash` is unsound.** The divergence happens
+  at the source-level evaluation point. A rewrite that moves an
+  expression across a `crash` changes whether the expression runs.
+- **Duplicating `crash` is sound.** Both copies diverge.
+- **Eliminating a `crash` dominated by another `crash` is sound.**
+  The dominated one never runs.
+- **`crash`'s result type is whatever the surrounding context
+  expects** (it never returns). No rewrite should depend on the
+  "value" of a `crash`.
+
+Algebraic rewrites treat `crash` as an evaluation barrier — sound
+rewrites preserve which crashes happen and in what order relative
+to other observable events.
 
 ### AST → Core (semantic desugaring)
 
