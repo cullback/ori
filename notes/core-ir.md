@@ -127,6 +127,118 @@ instructions and constant-fold" — i.e. SSA shape — it belongs in
 `src/opt/`. Putting either at the wrong layer forces the SCEV
 pattern: reconstructing structure the layer above threw away.
 
+## From source to Core
+
+Core's variant set is small because the front end has done
+substantial work to massage the AST into a shape where the
+algebraic structure is uniform. Each pass below establishes an
+invariant Core relies on; deleting any one of them would force a
+Core variant or analysis to recover it.
+
+### Pre-Core passes
+
+In source-to-Core order:
+
+1. **Parse → resolve.** Every identifier becomes a `SymbolId`;
+   imports and declarations are registered in the symbol table.
+2. **`fold_lift`.** Every source `fold` expression becomes a Call
+   to a synthesized top-level `__fold_N(target, captures...)`
+   helper whose body holds the structural recursion. *Establishes:*
+   the only iteration form left at Core is a Call to a `__fold_N`
+   (or stdlib fold) — Cata recognition becomes a name match.
+3. **`flatten_patterns`.** Nested constructor patterns and
+   record/tuple patterns inside arms hoist into chained `is`-guards
+   and per-field destructures. *Establishes:* every arm's top
+   pattern is shallow — `Constructor { fields: [Binding | Wildcard] }`
+   or a leaf (`IntLit` / `StrLit` / `Wildcard` / `Binding`).
+4. **`lambda::lift`.** Every source lambda becomes a top-level
+   `FuncDef` whose leading params are captures; the lambda site
+   becomes a `Closure { func, captures }`. *Establishes:* no
+   lambda expression survives — only `App` to known top-level
+   targets.
+5. **`topo::compute`.** Topologically sorts the call graph. Mutual
+   recursion is rejected here (fails compilation). *Establishes:*
+   the call graph is a DAG; the only recursion left is structural
+   via `__fold_N` self-calls.
+6. **`infer::check`.** Hindley-Milner inference with row-polymorphic
+   lambda sets. *Establishes:* every AST `Expr` has a resolved
+   `Type`; method calls have resolved mangled targets; binary-op
+   method resolutions are recorded.
+7. **`mono::specialize`.** **Full monomorphization** — every
+   polymorphic function gets one specialized copy per concrete
+   substitution that reaches it. *Establishes:* every call site
+   resolves to a monomorphic target; `Type::Var` doesn't survive
+   in expression positions (the polymorphic-`Con.ty` is the one
+   stored-type exception).
+8. **`lambda::solve` + `lambda::specialize`.** Solves which closure
+   shapes flow through each lambda-set position; specializes
+   higher-order functions per lambda set. *Establishes:* every
+   Arrow's lambda set is closed; each HOF call site has a finite,
+   known set of closures it might receive.
+9. **`lambda::narrow`.** Singleton lambda sets rewrite to direct
+   calls. *Establishes:* singleton-closure positions have
+   zero-overhead dispatch — just a `Call`.
+10. **`reachable::prune`.** Drops `Decl`s not reachable from
+    `main`. *Establishes:* the module contains only definitions
+    that affect program behavior.
+
+After this pipeline, the AST is **monomorphic, fully resolved,
+fold-lifted, lambda-lifted, defunctionalized, and reachable-pruned.**
+
+### AST → Core itself
+
+Core lowering does more than copy the AST — it performs the final
+transformations that depend on having concrete types and resolved
+targets:
+
+- **SROA of aggregates.** Records and tuples flatten to parallel
+  slot lists; `FieldAccess` becomes a slice. Sound under "no
+  aggregate identity."
+- **Per-slot control-flow duplication.** Aggregate-returning
+  `If` / `Match` duplicates the construct per slot; sound under
+  purity.
+- **String literals → `BufLit`** of byte-typed Int constants
+  (`Str ≡ List(U8)`).
+- **Operator desugar.** `BinOp`, `Cast`, `Range` become `App` to
+  interned builtin `SymbolId`s. `__builtin.*` intrinsics interned
+  at compile init via `BuiltinRegistry::bootstrap`.
+- **Literal pattern desugar.** `Pattern::IntLit` / `Pattern::StrLit`
+  become `Pattern::Binding(fresh)` plus a synthesized
+  `Eq(fresh, lit)` guard at the head of the arm's guard list.
+- **Method-call resolution.** `MethodCall { resolved }` and
+  `QualifiedCall { resolved }` become `App` with the mangled
+  target name interned to a `SymbolId`.
+- **Multi-slot binding minting.** Multi-slot let-bindings get
+  fresh slot symbols; `ctx.locals` maps the AST source name to
+  the slot list; debug paths recorded in `ctx.slot_paths`.
+
+### What Core can assume
+
+By the time `lower_module` produces a Core program, the following
+hold:
+
+- Every `App.target` is a `SymbolId` resolving to either a
+  builtin (dispatched inline) or a top-level definition in the
+  module.
+- Every type is monomorphic in expression positions. `Type::Var`
+  appears only in the polymorphic-`Con.ty` workaround for
+  declared-constructor types.
+- Every iteration is a `Cata` over `__fold_N` or a stdlib fold.
+- Every closure is a `Con` value over a synthesized
+  `__Closure_X` tag union.
+- Every match arm is shallow; deeper patterns have been hoisted
+  into guard chains.
+- Every method and qualified call has been resolved to a top-level
+  target.
+- The call graph is a DAG; topological order is meaningful for
+  bottom-up rewrites.
+- The module contains only reachable definitions.
+
+These invariants are what let Core stay small. Every one is
+load-bearing — removing any pre-Core pass would force Core to
+either grow a variant or carry an analysis to recover the lost
+structure.
+
 ## The IR
 
 ```rust
