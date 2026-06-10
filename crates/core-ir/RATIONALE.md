@@ -182,6 +182,112 @@ minimal for "any pure functional IR" — that's GHC Core's six, and
 Ori would have to give up either fusion-as-syntactic-rewrite or
 FBIP to reach it.
 
+## What the IR enforces vs. what relies on convention
+
+The variant set above does some work by what's *absent*. Every
+missing variant rules out a class of malformed programs the IR
+literally can't represent. But many invariants the language
+guarantees aren't enforceable at the variant level — they're
+carried through the IR and checked at upstream passes,
+downstream validators, or at runtime.
+
+Knowing which is which matters for:
+
+- **Writing rewrites** — a rewrite can rely on structurally-
+  enforced invariants without re-checking them; for the
+  convention-carried ones it must preserve them or risk producing
+  a malformed program.
+- **Picking what to fix in v1** — every "carried but not
+  enforced" item is a potential candidate to push into the type
+  system if it earns its keep.
+
+### Enforced by construction (the IR can't express the violation)
+
+| Invariant                          | Why enforced                                                                                                                                       |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No source-level mutation           | No mutating variants. The only "mutation"-shaped primitives are `BufAppend`/`BufSet` which produce *new* trios (cow at runtime).                  |
+| No aggregate identity              | No `Record`/`Tuple` variants. Aggregates can't be stamped with an identity because they don't exist as values — they're parallel slot lists.       |
+| No general recursion (syntactic)   | No `Lam`. `Cata` is the only iteration variant. `App` requires a known top-level target (`SymbolId`). The IR can't express "lambda recursing on itself." |
+| No first-class closures            | No `Lam`. Closures are `Con` values over synthesized tag unions — same shape as any other tag-union value.                                          |
+| No string-as-distinct-type         | No `Lit::Str`. `Str ≡ List(U8)`; literals are `BufLit` of byte `Lit::Int`s.                                                                          |
+| No arithmetic-as-special-form      | No `BinOp`/`Cast` variants. Operators are `App` to builtin SymbolIds. The IR makes "is this a primitive?" the same question as "what's the target's symbol?" |
+| No effects, no laziness, no IO     | No `Effect`/`Thunk`/`IO` variants. The runtime model is strict-and-pure; the IR has no surface for anything else.                                  |
+| Pattern arms are shallow           | `Pattern` has three variants and `Constructor.binders` only allows `SymbolId`s, not nested patterns. Deeper patterns can't be expressed.            |
+| Aggregate-returning `If` per-slot  | `Match.scrutinee_slots` and `arms[].body` are `Vec<Expr>` keyed by slot index. The IR forces N parallel matches for an N-slot result; there's no "one match returns a record" shape. |
+
+These nine invariants are *structurally* impossible to violate.
+A rewrite that preserves the IR's variant shape preserves them
+for free.
+
+### Carried but not statically checked
+
+| Invariant                                      | What checks it                                                                                                |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Type correctness (`App` args match target sig) | Validator. `ty` is stamped on every node but the IR doesn't enforce inter-node consistency.                  |
+| Scope correctness (every `Var.sym` is bound)   | Validator. `SymbolId` is opaque; the IR can't tell bound from free.                                          |
+| Pattern exhaustiveness                         | Upstream (inference). A `Match` with no arms is structurally allowed; would error at lowering.               |
+| DAG call graph                                 | Upstream (`topo::compute`). The IR can express any `App` target; mutual recursion is rejected before Core.   |
+| Total termination of `__fold_N` bodies         | Upstream (the fold-lift convention). `Cata`'s `fold_fn` is just a `SymbolId`; the IR doesn't see the body.   |
+| Slot-count consistency (`Let.binders.len()` == `expand_slots(value.ty())`) | Validator. Easy to violate by hand-construction; the IR doesn't relate binder count to value type. |
+| Monomorphic types in expression positions      | Validator. `Type::Var` is structurally allowed; the polymorphic-`Con.ty` workaround means we can't even outlaw it via the type. |
+| `MatchArm.body.len()` matches result slot count | Validator. The IR doesn't link arm body length to the match's `ty`.                                          |
+| Wildcard binders use the sentinel `u32::MAX`   | Convention only. Real binders accidentally matching the sentinel would silently behave as wildcards.        |
+
+These nine invariants are *load-bearing* but rely on either a
+validator pass or upstream guarantees. A rewrite that ignores
+them can produce an IR program that compiles but does the wrong
+thing at runtime.
+
+### Runtime-checked (the IR can express the violation; runtime catches it)
+
+| Invariant                  | Runtime mechanism                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Bounds correctness         | `BufLoad` returns `Result<T, OutOfBounds>` via the surrounding `Match`. The check is at runtime.       |
+| FBIP correctness (rc == 1) | `cow_resize_dyn` / `cow_store_dyn` check the refcount at runtime and pick in-place vs. clone.          |
+| RC precision (no leak/free) | Reference counts maintained by `rc_inc`/`rc_dec` at SSA, derived from Core's linearity by `rc_emit`. |
+| Crash semantics            | `App(__crash, [msg])` calls the runtime's exit function. The IR doesn't model divergence in `ty`.    |
+
+These are deliberately deferred. Static analysis (uniqueness,
+bounds-elimination, RC elision) can move some of these
+violations into "structurally impossible" but the floor is the
+runtime check.
+
+### Where v1 could enforce more
+
+Three places where the existing implementation is laxer than it
+needs to be, and v1 could be tighter:
+
+1. **`Type::Var` could be removed.** It exists only because
+   declared-constructor `Con.ty` is stamped with the polymorphic
+   scheme return. Distinguishing closure tags from declared tags
+   at construction would let declared `Con`s stamp the
+   monomorphic `ast.ty`, and `Type::Var` would have no remaining
+   use at Core. **Net effect:** "monomorphic in expression
+   positions" moves from validator-checked to structurally
+   enforced. This is the polymorphic-`Con.ty` keystone — fixing
+   it unlocks several other simplifications.
+
+2. **`Con.field_slot_counts` could be derived.** Blocked today by
+   `Con.ty` being polymorphic. With (1) fixed, `field_slot_counts`
+   is just `expand_slots(field_ty)` per source field. **Net
+   effect:** "slot grouping is consistent with type" moves from
+   stored-redundantly to structurally implied.
+
+3. **`Pattern::Constructor.binders` could use a `Binder` enum.**
+   The sentinel-`u32::MAX` for wildcards is a classic
+   make-illegal-states-representable smell. An enum `Binder {
+   Sym(SymbolId), Wildcard }` catches the "compared a sentinel
+   against a real id" bug at the type level. **Net effect:**
+   "wildcards are distinguishable from real binders" moves from
+   convention to structurally enforced. Cheap.
+
+Beyond these three, the other "carried but not checked"
+invariants are probably correctly placed at the validator level —
+encoding type correctness or scope correctness in the Rust type
+system would require either phantom types per binding scope or a
+linearity discipline, both invasive enough to outweigh the
+benefit.
+
 ## What this means for v1
 
 Two implications for the prototype in this crate:
