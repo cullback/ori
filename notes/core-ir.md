@@ -1,79 +1,90 @@
 # Core IR
 
 The Core IR sits between Ori's AST and its SSA. It exists because
-the algebraic structure of an Ori program — `Map(f, Map(g, xs))`,
-`Cata(f, z, Build(p))`, `Match(Con(tag, args), arms)` — is the
-natural domain for the rewrites Ori's language properties make
-unconditional, and that structure must be preserved past inference
-and monomorphization for those rewrites to apply.
+the algebraic structure of an Ori program — `Fold(f, Map(g, xs))`,
+`Match(Con(tag, args), arms)`, `Fold ∘ Gen` — is the natural domain
+for the rewrites Ori's language properties make unconditional, and
+that structure must survive past inference and monomorphization for
+those rewrites to apply.
 
 ## Motivation
 
 Algebraic rewrites — fusion, case-of-case, case-of-known-constructor,
 free theorems, hylomorphism deforestation, whole-program
-specialization, compile-time evaluation of arbitrary closed terms —
-are **unconditional** in Ori. No side conditions, no ⊥-safety
-arguments, no fixpoint over the call graph. Each is hundreds-to-
-thousands of lines in LLVM or GHC; they exist there because the
-source language doesn't provide the guarantees that make them safe.
-Ori's does.
+specialization, compile-time evaluation of arbitrary closed total
+terms — are **unconditional on total subtrees** in Ori. No side
+conditions, no ⊥-safety arguments, no fixpoint over the call graph.
+The soundness cost is paid once, at the language level, not at every
+rewrite site.
 
 These rewrites operate on the **algebraic structure** of the
-program — `Map`, `Cata`, `Con`, `Match`. By the time the program
+program — `Map`, `Fold`, `Con`, `Match`. By the time the program
 reaches SSA, that structure is gone: aggregates decomposed into
 parallel `Value`s, folds are loops with block params, map-over-map
 is two loop-with-buffer patterns separated by an allocation.
 Recovering the algebra at SSA is the SCEV pattern in miniature —
 substantial engineering to reconstruct what the front-end already
-knew. **Core exists to preserve the algebra past inference and mono
-so the rewrites can run on the natural shape.**
+knew. **Core exists to preserve the algebra past inference and
+mono so the rewrites can run on the natural shape.**
 
-Each section below names a guarantee Ori enforces and the
-optimizations that fall out of it.
+### The guarantees
 
-### Totality
+Each property names what Ori enforces and the optimizations it
+enables.
+
+#### Totality
 
 Structural recursion only; every closed term reduces in bounded
-time.
+time. **The one allowed source of partiality is the explicit
+`Crash` variant** — totality is therefore a *derived bit* on every
+function and subtree, computed bottom-up over the DAG call graph
+in a single pass.
 
-- Every equational rewrite preserves totality unconditionally.
-- Compile-time evaluation works on any closed term, including
-  user-defined recursive functions. The compiler can pre-execute a
-  call like `factorial 10` and emit `3628800` directly — no
-  termination analysis required, because the language guarantees
-  termination.
-- Hylomorphism deforestation works fully: `cata f ∘ ana g = hylo f g`
+- Every equational rewrite preserves totality unconditionally on
+  total subtrees.
+- Compile-time evaluation works on any closed total term —
+  `factorial 10` becomes the literal `3628800`. Evaluation respects
+  a fuel budget; total ≠ feasibly computable.
+- Hylomorphism deforestation works fully: `Fold f z (Gen g b) → Hylo`
   eliminates the intermediate inductive type entirely.
-- Free theorems via parametricity hold without side conditions
-  (`length . map f = length`, `map id = id`).
+- Free theorems via parametricity hold without side conditions on
+  total subtrees (`length . map f = length` requires `f` total;
+  on a crash-tainted `f`, the law holds modulo the inserted crash).
 
-### Structural recursion (no general recursion)
+#### Structural recursion (no general recursion)
 
 Loops are folds over inductive types — the data's shape is the
 loop bound.
 
-- Trip counts are syntactic; no SCEV needed.
+- Trip counts are syntactic; no SCEV needed at Core.
 - Fold fusion laws are universal, not heuristic.
-- TCO isn't a separate analysis — folds *are* loops.
+- TCO isn't a separate analysis — folds *are* loops at lowering.
 - Static unrolling over known-shape data: `Fold f z [a,b,c]`
   becomes `f(f(f(z, a), b), c)`, no loop emitted.
 
-### Purity
+#### Purity
 
 No source-level mutation, no effects in the pure fragment.
+`BufAppend` / `BufSet` are *cow* operations — they produce new
+values; the runtime may reuse memory when `rc == 1` but the
+observable semantics is functional.
 
 - Memoization sound (compile-time and runtime).
-- Speculative evaluation sound; reordering free.
-- Dead-binding elimination needs no effect analysis.
+- Speculative evaluation sound on total subtrees; reordering free
+  there.
+- Dead-binding elimination on a total `value` needs no effect
+  analysis.
 - CSE needs no alias analysis.
 
-### Strictness
+#### Strictness
 
 Left-to-right, no laziness. Underwrites the deterministic
-evaluation order the other guarantees assume; no distinct algebraic
-payoff of its own.
+evaluation order the other guarantees assume; no distinct
+algebraic payoff of its own. Strictness is what makes `Crash`'s
+position observable (and therefore what makes totality a useful
+derived property).
 
-### Lambda-lifted, first-order calls
+#### Lambda-lifted, first-order calls
 
 Every `App` resolves to a known top-level target.
 
@@ -81,28 +92,37 @@ Every `App` resolves to a known top-level target.
   devirtualization is free.
 - Inlining is purely syntactic substitution.
 
-### DAG call graph
+#### DAG call graph
 
 No mutual recursion across user functions.
 
 - Single-pass bottom-up optimization. Topo-sort callees first; by
-  the time `f` is processed, every callee is at its optimized
-  form. No fixpoint iteration over the graph.
+  the time `f` is processed, every callee is at its optimized form.
+  No fixpoint iteration over the graph.
 - Bounded inlining (in topological order).
-- Bounded whole-program specialization (`callsites × shapes`
-  variants per function).
+- Bounded whole-program specialization (`callsites × shapes`).
 - Whole-program escape analysis as a finite DAG walk.
+- The **totality bit** propagates over the DAG in one walk.
 - Cross-function CSE: inline, then dedupe.
 
-### No aggregate identity
+#### No aggregate identity
 
 No pointer-take on records, no by-reference equality, no FFI
 opacity, no varargs.
 
-- Records and tuples SROA-able at the IR level (no observable
-  difference between `r.x` and a let-bound slot).
-- Aggregate-returning `If` / `Match` can be duplicated per slot
-  (re-evaluating the condition is equivalent under purity).
+- **Core→SSA may unconditionally SROA every aggregate.** No escape
+  analysis needed. Records, tuples, and the `List` trio are
+  *single values at Core* and flatten at the lowering layer.
+- Aggregate-returning `If` / `Match` at Core is a single `Match`
+  producing a single value — no per-slot duplication at the
+  algebraic layer. SROA at lowering produces the parallel-slot
+  SSA.
+
+This last property is the keystone: it lets Core preserve full
+algebraic structure (values nest, `Con(record_fields...)` is just a
+constructor, `Fold(Fold(...))` is direct nesting) while delivering
+"no boxing by default" as a **lowering guarantee** rather than an
+IR shape.
 
 ## Architecture
 
@@ -115,795 +135,681 @@ is visible:
 | `src/opt/`     | Scalar dataflow      | Local SSA peephole          | const-fold, branch-fold, DCE, GVN, rc-fusion, LICM      |
 | `src/lower/`   | Resource discipline  | Declarative emission        | FBIP via cow_*, RC traffic, aggregate decomposition     |
 
-The bottom layer is not a rewrite layer — it's where the source's
-semantics get expressed as IR. The middle layer is local dataflow
-rewriting where the SSA shape is natural. The top layer is algebraic
-rewriting where the term structure is natural.
-
 **The placement rule:** if a rewrite's natural form is `Map`,
-`Cata`, `Con` — i.e. the algebra of the source — it belongs in
+`Fold`, `Con` — i.e. the algebra of the source — it belongs in
 `passes/core/`. If its natural form is "find a chain of `Binary`
 instructions and constant-fold" — i.e. SSA shape — it belongs in
 `src/opt/`. Putting either at the wrong layer forces the SCEV
 pattern: reconstructing structure the layer above threw away.
 
+The bottom layer is not a rewrite layer — it's where the source's
+semantics get expressed as IR. The middle layer is local dataflow
+rewriting where the SSA shape is natural. The top layer is
+algebraic rewriting where the term structure is natural.
+
 ## From source to Core
 
 Core's variant set is small because the front end has done
 substantial work to massage the AST into a shape where the
-algebraic structure is uniform. Each pass below establishes an
-invariant Core relies on; deleting any one of them would force a
-Core variant or analysis to recover it.
+algebraic structure is uniform.
 
 ### Pre-Core passes
 
-In source-to-Core order:
+In source-to-Core order, each pass with the invariant it establishes:
 
 1. **Parse → resolve.** Every identifier becomes a `SymbolId`;
-   imports and declarations are registered in the symbol table.
+   imports and declarations registered in the symbol table.
 2. **`fold_lift`.** Every source `fold` expression becomes a Call
    to a synthesized top-level `__fold_N(target, captures...)`
-   helper whose body holds the structural recursion. *Establishes:*
-   the only iteration form left at Core is a Call to a `__fold_N`
-   (or stdlib fold) — Cata recognition becomes a name match.
+   helper. *Establishes:* the only iteration form left is a known
+   helper — `Fold` recognition becomes a structural match.
 3. **`flatten_patterns`.** Nested constructor patterns and
    record/tuple patterns inside arms hoist into chained `is`-guards
    and per-field destructures. *Establishes:* every arm's top
-   pattern is shallow — `Constructor { fields: [Binding | Wildcard] }`
-   or a leaf (`IntLit` / `StrLit` / `Wildcard` / `Binding`).
-4. **`lambda::lift`.** Every source lambda becomes a top-level
+   pattern is shallow.
+4. **`lambda_lift`.** Every source lambda becomes a top-level
    `FuncDef` whose leading params are captures; the lambda site
-   becomes a `Closure { func, captures }`. *Establishes:* no
-   lambda expression survives — only `App` to known top-level
-   targets.
-5. **`topo::compute`.** Topologically sorts the call graph. Mutual
-   recursion is rejected here (fails compilation). *Establishes:*
-   the call graph is a DAG; the only recursion left is structural
-   via `__fold_N` self-calls.
-6. **`infer::check`.** Hindley-Milner inference with row-polymorphic
-   lambda sets. *Establishes:* every AST `Expr` has a resolved
-   `Type`; method calls have resolved mangled targets; binary-op
-   method resolutions are recorded.
-7. **`mono::specialize`.** **Full monomorphization** — every
-   polymorphic function gets one specialized copy per concrete
-   substitution that reaches it. *Establishes:* every call site
-   resolves to a monomorphic target; `Type::Var` doesn't survive
-   in expression positions (the polymorphic-`Con.ty` is the one
-   stored-type exception).
-8. **`lambda::solve` + `lambda::specialize`.** Solves which closure
-   shapes flow through each lambda-set position; specializes
-   higher-order functions per lambda set. *Establishes:* every
-   Arrow's lambda set is closed; each HOF call site has a finite,
-   known set of closures it might receive.
-9. **`lambda::narrow`.** Singleton lambda sets rewrite to direct
-   calls. *Establishes:* singleton-closure positions have
-   zero-overhead dispatch — just a `Call`.
-10. **`reachable::prune`.** Drops `Decl`s not reachable from
-    `main`. *Establishes:* the module contains only definitions
-    that affect program behavior.
+   becomes a `Closure { func, captures }` placeholder.
+   *Establishes:* no lambda expression survives — every call is
+   `App` to a known top-level target.
+5. **`topo`.** Topologically sorts the call graph. Mutual recursion
+   is rejected. *Establishes:* the call graph is a DAG.
+6. **`infer`.** Hindley-Milner with row-polymorphic lambda sets.
+   *Establishes:* every AST `Expr` has a resolved `Type`; method
+   calls have resolved targets.
+7. **`mono`.** Full monomorphization. *Establishes:* every call
+   site resolves to a monomorphic target; no `Type::Var` in
+   expression positions.
+8. **`lambda_solve` + `lambda_specialize`.** Solves lambda sets;
+   specializes higher-order functions per set. *Establishes:* every
+   `Arrow`'s lambda set is closed and concrete.
+9. **`lambda_narrow`.** Singleton lambda sets rewrite to direct
+   calls. *Establishes:* singleton-closure positions are zero-overhead.
+10. **`reachable_prune`.** Drops definitions unreachable from
+    `main`. *Establishes:* module contains only definitions that
+    affect behavior.
+11. **`totalize_builtins`.** Replaces partial builtin operations
+    with their total counterparts (see *Crash and totality*).
+    *Establishes:* the only partial construct is the user-visible
+    `crash`.
 
 After this pipeline, the AST is **monomorphic, fully resolved,
-fold-lifted, lambda-lifted, defunctionalized, and reachable-pruned.**
+fold-lifted, lambda-lifted, defunctionalized, reachable-pruned,
+and totalized.**
 
-### AST → Core itself
+### AST → Core
 
-Core lowering does more than copy the AST — it performs the final
-transformations that depend on having concrete types and resolved
-targets:
+Core lowering performs the final transformations that depend on
+concrete types and resolved targets. Crucially, it does **not** do
+SROA — aggregates stay as nested values.
 
-- **SROA of aggregates.** Records and tuples flatten to parallel
-  slot lists; `FieldAccess` becomes a slice. Sound under "no
-  aggregate identity."
-- **Per-slot control-flow duplication.** Aggregate-returning
-  `If` / `Match` duplicates the construct per slot; sound under
-  purity.
-- **String literals → `BufLit`** of byte-typed Int constants
-  (`Str ≡ List(U8)`).
 - **Operator desugar.** `BinOp`, `Cast`, `Range` become `App` to
-  interned builtin `SymbolId`s. `__builtin.*` intrinsics interned
-  at compile init via `BuiltinRegistry::bootstrap`.
+  interned builtin `FnId`s. `__builtin.*` intrinsics interned at
+  compile init.
 - **Literal pattern desugar.** `Pattern::IntLit` / `Pattern::StrLit`
-  become `Pattern::Binding(fresh)` plus a synthesized
-  `Eq(fresh, lit)` guard at the head of the arm's guard list.
-- **Method-call resolution.** `MethodCall { resolved }` and
-  `QualifiedCall { resolved }` become `App` with the mangled
-  target name interned to a `SymbolId`.
-- **Multi-slot binding minting.** Multi-slot let-bindings get
-  fresh slot symbols; `ctx.locals` maps the AST source name to
-  the slot list; debug paths recorded in `ctx.slot_paths`.
+  become `Binding(fresh)` plus a synthesized `Eq(fresh, lit)`
+  guard.
+- **String literal desugar.** `"abc"` becomes a `BufLit` of byte
+  `Lit::Int`s (`Str ≡ List(U8)`).
+- **Method-call resolution.** `MethodCall` / `QualifiedCall`
+  become `App` with the mangled target interned to a `FnId`.
+- **Closure construction.** Lambda-lift's `Closure { func,
+  captures }` becomes `Con { tag: TagId::Closure(...), args:
+  captures, ty }`.
+- **Fold recognition + shape annotation.** Calls to `__fold_N`
+  helpers become `Fold` nodes. If the helper's body matches a
+  recognized algebra template (`Map`, `Filter`, `Scan`, ...), the
+  resulting `Fold.shape` is `Some(MatchedShape)`; otherwise `None`.
 
 ### What Core can assume
 
-By the time `lower_module` produces a Core program, the following
-hold:
+By the time Core lowering completes:
 
-- Every `App.target` is a `SymbolId` resolving to either a
-  builtin (dispatched inline) or a top-level definition in the
-  module.
-- Every type is monomorphic in expression positions. `Type::Var`
-  appears only in the polymorphic-`Con.ty` workaround for
-  declared-constructor types.
-- Every iteration is a `Cata` over `__fold_N` or a stdlib fold.
-- Every closure is a `Con` value over a synthesized
-  `__Closure_X` tag union.
-- Every match arm is shallow; deeper patterns have been hoisted
-  into guard chains.
-- Every method and qualified call has been resolved to a top-level
-  target.
-- The call graph is a DAG; topological order is meaningful for
-  bottom-up rewrites.
+- Every `App.target` is a `FnId` resolving to either a builtin
+  (dispatched inline at lowering) or a top-level definition.
+- Every type is monomorphic in expression positions. `CoreType`
+  doesn't have a `Var` variant — type-variable values can't be
+  expressed.
+- Every iteration is a `Fold` (catamorphism) or `Gen`
+  (anamorphism). General recursion is structurally absent.
+- Every closure is a `Con` value with a `TagId::Closure(_)` tag.
+- Every match arm is shallow; nested patterns are guard chains.
+- The call graph is a DAG; topological order is meaningful.
 - The module contains only reachable definitions.
+- Every builtin operation is total. The only partial construct is
+  `Crash`.
 
-These invariants are what let Core stay small. Every one is
-load-bearing — removing any pre-Core pass would force Core to
-either grow a variant or carry an analysis to recover the lost
-structure.
+These invariants are what let Core stay small. Removing any
+pre-Core pass would force Core to grow a variant or carry an
+analysis to recover the lost structure.
 
 ## The IR
 
 ```rust
 enum Expr {
-    Var    { sym: SymbolId, ty: Type },
-    Lit    { value: Literal, ty: Type },
-    App    { target: SymbolId, args: Vec<Expr>, ty: Type },
-    Let    { binders: Vec<SymbolId>, value: Box<Expr>, body: Box<Expr>, ty: Type },
+    // Universal
+    Var   { sym: LocalId, ty: CoreType },
+    Lit   { value: Literal, ty: CoreType },
+    App   { target: FnId, args: Vec<Expr>, ty: CoreType },
+    Let   { binder: LocalId, value: Box<Expr>, body: Box<Expr>, ty: CoreType },
 
-    Match  { scrutinee_slots: Vec<Expr>, scrutinee_ty: Type,
-             arms: Vec<MatchArm>, ty: Type },
-    Cata   { fold_fn: SymbolId, target_slots: Vec<Expr>, target_ty: Type,
-             init: Vec<Expr>, captures: Vec<Expr>,
-             elem_ty: Type, early_exit: bool, ty: Type },
-    Con    { tag: TagId, args: Vec<Expr>,
-             field_slot_counts: Vec<usize>, ty: Type },
+    // Algebraic structure
+    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm>, ty: CoreType },
+    Con   { tag: TagId, args: Vec<Expr>, ty: CoreType },
+    Fold  {
+        kind: FoldKind,                  // Total | EarlyExit
+        fold_fn: FnId,
+        target: Box<Expr>,
+        init: Vec<Expr>,
+        captures: Vec<Expr>,
+        shape: Option<FoldShape>,        // Map | Filter | ... — verified
+        ty: CoreType,
+    },
+    Gen   {
+        bound: Box<Expr>,                // bounded anamorphism
+        step_fn: FnId,
+        init: Vec<Expr>,
+        captures: Vec<Expr>,
+        elem_ty: CoreType,
+        ty: CoreType,
+    },
 
-    BufLit    { elements: Vec<Expr>, elem_ty: Type, ty: Type },
-    BufLoad   { buf: Box<Expr>, idx: Box<Expr>, ty: Type },
-    BufAppend { buf_slots: Vec<Expr>, val_slots: Vec<Expr>,
-                elem_ty: Type, ty: Type },
-    BufSet    { buf_slots: Vec<Expr>, idx: Box<Expr>,
-                val_slots: Vec<Expr>, elem_ty: Type, ty: Type },
+    // Divergence
+    Crash { msg: StrLit, ty: CoreType },  // msg is a static string literal
+
+    // Buffer primitives (single-valued; trio is an SSA story)
+    BufLit          { elements: Vec<Expr>, elem_ty: CoreType, ty: CoreType },
+    BufLoad         { buf: Box<Expr>, idx: Box<Expr>, ty: CoreType },
+    BufLoadUnchecked{ buf: Box<Expr>, idx: Box<Expr>, ty: CoreType },
+    BufAppend       { buf: Box<Expr>, val: Box<Expr>, ty: CoreType },
+    BufSet          { buf: Box<Expr>, idx: Box<Expr>, val: Box<Expr>, ty: CoreType },
 }
 
-enum Pattern { Constructor { tag: TagId, binders: Vec<Vec<SymbolId>> },
-               Wildcard,
-               Binding(SymbolId) }
+enum Pattern {
+    Constructor { tag: TagId, binders: Vec<Binder> },
+    Wildcard,
+    Binding(LocalId),
+}
 
+enum Binder { Sym(LocalId), Wildcard }
+
+enum TagId {
+    Declared(DeclTagId),  // user-declared tag union
+    Closure(ClosureTagId), // synthesized __Closure_X
+}
+
+enum CoreType {
+    Prim(Scalar),                   // I8..I64, U8..U64, F32, F64, Bool
+    Adt(TypeId, Vec<CoreType>),     // monomorphic constructed type (no Var)
+}
+
+enum FoldKind { Total, EarlyExit }   // EarlyExit returns Step(b)
+enum FoldShape { Map, Filter, Scan, Zip, Take, Drop } // grows with rule set
 enum Literal { Int(i64), Float(f64) }
 ```
 
-Direct-style (not ANF), typed at every node (`ty: Type` on every
-variant), post-monomorphization.
+Thirteen `Expr` variants. Direct-style (not ANF), typed at every
+node, post-monomorphization, single-valued throughout.
+
+### Earn-its-keep principle
+
+A variant earns its keep when **erasure of its shape is
+irreversible downstream**. Three cases manifest this:
+
+1. **Source-circular to define.** `Fold` and `Gen` can't be expressed
+   in pure source without general recursion.
+2. **Load-bearing for a runtime invariant** the rest of the IR
+   can't express. `BufAppend` / `BufSet` carry FBIP mutation intent;
+   without them the SSA layer would reconstruct from alloc + store
+   patterns.
+3. **An algebraic rewrite matches on its shape**, and the shape is
+   gone after lowering. `Match`, `Con`, `Fold`, `Gen`, `Crash` —
+   collapsing into `App` makes case-of-known-constructor,
+   case-of-case, fusion, hylo-deforestation, and crash-barrier-
+   detection all recognize-by-convention, which is silent-miscompile-
+   prone.
+
+Every variant passes at least one. **Constant folding doesn't
+qualify**: `1 + 2` is equally foldable at any layer, so `BinOp` is
+not a variant — it's an `App` to a builtin `FnId`. Same for `Cast`
+and `Range`'s scalar arithmetic.
 
 ### Types in Core
 
-Every Core node carries `ty: Type`, the source-level type from
-inference. The `Type` enum (defined in `types/engine.rs`):
+`CoreType` is **a separate enum from inference's `Type`**, by
+construction unable to express `Type::Var`. AST → Core converts
+and fails loudly on residual Vars. The polymorphic-`Con.ty` trap
+the previous design suffered cannot occur — there's no surface
+for it.
 
-- `Type::Con(name)` — primitive scalar (`I64`, `U8`, `Bool`, `F64`)
-  or a named user type (`MyUnion`, `Box`).
-- `Type::App(name, args)` — applied type constructor: `Result(I64,
-  Str)`, `List(I64)`, `Maybe(T)`.
-- `Type::Arrow(params, ret, lambda_set?)` — function type, with an
-  optional lambda set (the closures that flow through this Arrow
-  after row-polymorphic inference).
-- `Type::Tuple(elems)` — anonymous product. Decomposed at AST → Core.
-- `Type::Record { fields }` — named-field product. Decomposed at
-  AST → Core.
-- `Type::TagUnion { tags, rest }` — discriminated union.
-- `Type::Var(tv)` — type variable. Should not appear in Core
-  post-mono, **with one exception** (the polymorphic-`Con.ty`
-  workaround below).
+- `CoreType::Prim(Scalar)` — `I8`–`I64`, `U8`–`U64`, `F32`, `F64`,
+  `Bool`.
+- `CoreType::Adt(TypeId, Vec<CoreType>)` — a monomorphic
+  constructed type. `Result(I64, Str)` is `Adt(Result, [I64, Str])`.
 
-Transparent newtypes (`Str := List(U8)`) are registered in a side
-table; `resolve_transparent` unwraps them at use sites. Opaque
-newtypes (`Foo :: Bar`) aren't transparent — the underlying type is
-hidden outside the methods block.
+There's no `Arrow` variant. Function references at Core go through
+`FnId`, which the symbol table maps to a signature; there's no
+need to model the function type as a value carried by other terms,
+because closures aren't values at Core (see *Closures*).
 
-**The polymorphic-`Con.ty` footgun.** For declared constructors
-(`Ok`, `Err`, user union tags), AST → Core stamps `Con.ty` from
-`constructor_return_types`, which holds the *scheme's* return type
-(`Result(Var(a), Var(e))`), not the monomorphic instantiation
-(`Result(I64, Str)`). Why: closure constructors like `__lambda_K`
-need a union-shaped type at the construction site, but the
-surrounding AST's `ty` is just the closure's return type (`I64`).
-`constructor_return_types` provides a union shape for both
-declared and closure cases, at the cost of being polymorphic for
-declared. Analyses that substitute against `Con.ty` get identity
-subst and silently produce wrong results — the monomorphic info
-lives in the AST args' types at the call site, which is why
-`Con.field_slot_counts` is stored as derived data on the variant.
-The real fix is distinguishing closure tags from declared tags at
-lower time so declared `Con`s can stamp the monomorphic `ast.ty`;
-not yet done.
+Transparent newtypes (`Str := List(U8)`) are resolved at AST → Core
+— the underlying `Adt(List, [U8])` is what Core sees. Opaque
+newtypes are likewise resolved; Core operates on the underlying
+shape.
+
+`TagId` is **kinded** — `Declared(_)` for user tag unions,
+`Closure(_)` for the synthesized `__Closure_X` family. The two
+paths share no code in lowering or rewriting; mixing them up is a
+type error.
 
 ### Evaluation order
 
-Strict, left-to-right at the language level. At Core:
+Strict, left-to-right. At each variant:
 
-- **`App(f, [a, b, c])`** — args left to right, then the call.
-  Same for builtin Apps.
-- **`Let(binders, value, body)`** — `value` before `body`; binders
-  come into scope for `body` only.
-- **`Match(scrutinee_slots, arms)`** — scrutinee slots left to
-  right; pattern dispatch picks an arm; guards left to right; arm
-  body.
-- **`Cata`** — target slots, then init, then captures, then the
-  loop.
-- **`Con(tag, args)`** — args left to right, then construction.
-- **`BufLit { elements }`** — elements left to right, then the
-  alloc + stores.
+- `App(f, args)` — args left to right, then call.
+- `Let(value, body)` — value before body.
+- `Match(scrutinee, arms)` — scrutinee, pattern dispatch, then
+  guards left to right, then arm body.
+- `Fold` / `Gen` — target/bound, then init, then captures, then
+  the loop.
+- `Con(args)` — args left to right, then construction.
 
-Purity makes evaluation order unobservable for most rewrites
-(reordering pure expressions is sound). Order matters for `crash`
-(the divergence happens at its source-level position) and for the
-runtime sequencing of RC `inc` / `dec` operations.
-
-### Earn-its-keep rule
-
-A primitive earns its keep when at least one of:
-
-1. **It can't be source-defined** without circularity. A `fold`
-   defined as a `fold` would be circular; iteration must be primitive.
-2. **It's load-bearing for a memory invariant** the rest of the IR
-   can't express. In-place mutation (`xs.append(y)` reusing the
-   buffer when `rc == 1`) is impossible to express in pure source;
-   it must be a primitive.
-3. **An algebraic rewrite matches on its shape.** Case-of-known-
-   constructor needs `Con` to be a distinct shape from `App`.
-
-Everything else — including arithmetic, casts, list ranges, scalar
-comparisons — is `Expr::App` to a target that the lowering layer
-recognizes as a builtin and emits inline. The mental model: **a
-primitive is a function the CPU handles directly, with no body in
-the module**. Regular `App` is a function the user (or stdlib)
-defined.
+Purity makes evaluation order unobservable on total subtrees;
+rewrites that reorder *total* expressions are unconditionally
+sound. Order matters at `Crash` boundaries: a rewrite that moves
+an expression across a `Crash` changes whether the expression
+runs, so `Crash` is a syntactic barrier (see *Crash and totality*).
 
 ### Per-variant rationale
 
-| Variant     | Justification                                                                                                                                                                                                                                                                          |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `Var`       | Trivial — reference a binding.                                                                                                                                                                                                                                                         |
-| `Lit`       | Scalar literal (Int, Float). String literals are not a Core node — they desugar to `BufLit { elem_ty: U8, elements: [byte Lits] }`. `Str ≡ List(U8)`; there's no separate string type.                                                                                                  |
-| `App`       | First-order call. After lambda-lift + mono, every call has a known top-level target. `target` is a `SymbolId`; the mangled name is recovered via the symbol table at Core → SSA. **Bodyless builtin targets (arithmetic, cast, range) dispatch inline at the lowering layer.**         |
-| `Let`       | Binding. Preserves binding structure for let-floating, CSE, dead-binding elimination. Multi-slot bindings carry N binders.                                                                                                                                                              |
-| `Match`     | Non-recursive case analysis on a tag union. Distinct from `Cata` because not every case-of is a fold (`Maybe`, `Result`, single-variant unions are non-recursive). Critical for case-of-case and case-of-known-constructor: both are syntactic rewrites only if `Match` is a variant.   |
-| `Cata`      | The **only iteration primitive**. Source-defining a fold would be circular. After fold-lifting, every source `fold` becomes a call to a `__fold_N` helper; AST → Core promotes those calls into `Cata` so the rewrite system can see them. `early_exit` distinguishes the `walk_until` shape. |
-| `Con`       | Tag-union constructor. Explicit, not folded into `App`. Critical for case-of-known-constructor: `Match(Con(tag, args), arms) → arms[tag][args]` is a syntactic rewrite. **Footgun**: `Con.ty` for declared constructors carries the *polymorphic* scheme return type (`Result(Var, Var)`), not the monomorphic instantiation — see "Types in Core" below. |
-| `BufLit`    | Buffer literal (`[1,2,3]`, `"abc"`). Could desugar to chained `BufAppend` from `[]`, but every literal would alloc-thrash. Zero-cost literal is load-bearing.                                                                                                                            |
-| `BufLoad`   | Bounds-checked index, returning `Result(T, OutOfBounds)`. Could be a stdlib method; primitive avoids the call and lets the bounds check participate in algebraic simplification.                                                                                                       |
-| `BufAppend` | Produces a new buffer trio. **Load-bearing for FBIP**: lowers to `cow_resize_dyn` — mutate in place when `rc == 1`, clone when `rc > 1`. Source can't express in-place mutation, so the primitive carries the invariant.                                                                |
-| `BufSet`    | Same FBIP rationale, via `cow_store_dyn`. `[1,2,3].set(1, 99)` runs in place when the list isn't shared.                                                                                                                                                                                |
+| Variant            | Justification                                                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Var`              | Trivial — reference a binding.                                                                                                            |
+| `Lit`              | Scalar literal (Int, Float). Strings desugar to `BufLit`.                                                                                  |
+| `App`              | First-order call. `target: FnId` resolves to a top-level definition or a builtin dispatched inline.                                       |
+| `Let`              | Single-binder. Binding scope for let-floating, CSE, dead-binding elimination.                                                              |
+| `Match`            | Non-recursive case analysis. Single scrutinee value; case-of-case and case-of-known-constructor are syntactic.                            |
+| `Con`              | Tag-union constructor — including records (single-tag), tuples (single-tag), closures (`TagId::Closure(_)`). Case-of-known-constructor.    |
+| `Fold`             | Catamorphism. `kind` separates total from `EarlyExit` (Step-returning); fusion laws differ between them. `shape` records verified algebra. |
+| `Gen`              | Bounded anamorphism (range, replicate, tabulate). Enables hylo deforestation as a syntactic match against `Fold ∘ Gen`.                    |
+| `Crash`            | Explicit divergence. The one partial construct; structural barrier for rewrites. Replaces name-recognition on `__crash`.                  |
+| `BufLit`           | Buffer literal. Without it every literal would chain `BufAppend`s. Also: literal-to-static-data lowering matches on this shape.            |
+| `BufLoad`          | Bounds-checked index, returning `Result<T, OutOfBounds>` shape. The check is observable in the IR; Core rewrites can elide it.            |
+| `BufLoadUnchecked` | Produced by bounds-elimination rewrites that prove `idx < len`. **Never emitted by AST → Core.** The variant exists so the rewrite has a representable output. |
+| `BufAppend`        | FBIP intent. Lowers to `cow_resize_dyn`. Without it the lowering layer would reconstruct mutation intent from alloc + store patterns.    |
+| `BufSet`           | FBIP intent. Lowers to `cow_store_dyn`. Same rationale.                                                                                   |
 
-### `Cata` in detail
+### Fold in detail
 
-Cata is the only iteration primitive and the central rewrite target.
-Each field plays a specific role:
+`Fold` is the central rewrite target. Each field:
 
-| Field           | Meaning |
-| --------------- | ------- |
-| `fold_fn`       | SymbolId of the lifted recursive helper (`__fold_N`, or a stdlib fold). Holds the actual recursion. |
-| `target_slots`  | The inductive value being consumed, as a parallel slot list. For `List`, the 3-slot trio. For `Lnk` / `Tree` / multi-variant unions, `(tag, payload)`. |
-| `target_ty`     | Source-level type of the target, preserved separately because `target_slots[i].ty()` carries per-slot scalar placeholders that lose the inductive shape. |
-| `init`          | Seed accumulator values for walk-style folds. Empty Vec for pure catamorphisms. |
-| `captures`      | Free variables of the fold closure, threaded as parallel block params through the loop. |
-| `elem_ty`       | For List-shaped Catas: the element type. Used by the data-buffer stride calculation. |
-| `early_exit`    | When `true`, `fold_fn` returns `Step(b) = Continue(b) \| Break(b)`. Lowering emits Continue/Break dispatch. The `walk_until` shape. |
-| `ty`            | Result type of the whole expression. |
+| Field      | Meaning |
+| ---------- | ------- |
+| `kind`     | `Total` (catamorphism, fold_fn returns `b`) or `EarlyExit` (fold_fn returns `Step(b) = Continue(b) \| Break(b)`). Lowering emits different shapes; fusion laws differ. |
+| `fold_fn`  | `FnId` of the lifted helper. After fold-lift the body holds the structural recursion. |
+| `target`   | The inductive value being consumed (single Expr; nested algebra preserved). |
+| `init`     | Seed accumulator values. Empty for pure catamorphisms; populated for walk-style folds. |
+| `captures` | Free variables of the fold closure, threaded as loop block params. |
+| `shape`    | `Some(FoldShape)` when AST→Core verified the body matches a known algebra template; `None` when opaque. Drives rewrite matching. |
+| `ty`       | Result type. |
 
-**What rewrites can match syntactically:**
+**On `shape`**: AST → Core checks the synthesized fold body
+against a closed set of algebra templates (the `FoldShape`
+variants). A match stamps the shape; a near-miss is a developer
+hint that gets surfaced when the user explicitly requested a
+shape (the source-level `@map` annotation, when present, is a
+*demand* — disagreement is a compile error, not a silent miss).
 
-- Cata over `Range`: fuse into a counter loop without building the
-  intermediate list.
-- Cata over Cata (banana): nested folds over the same target,
-  combine into one.
-- Cata over a `Build`-form (deforestation): eliminate the
-  intermediate inductive entirely (`cata f ∘ ana g = hylo f g`).
-- Cata over a known-constructor scrutinee: unfold the recursion's
-  first step at compile time.
+`FoldShape` is a **closed enum tied to the rewrite rule set**:
+adding `Filter` to `FoldShape` is the same commitment as adding
+the filter fusion rules. The enum never grows past what rules
+exist; opaque folds always fall back to `shape: None` and still
+work, just without seeing inside.
 
-**What rewrites can't easily match:** when `fold_fn` is a
-user-defined `__fold_N`, the algebraic shape of *what the fold
-computes* is hidden inside the helper body. Fusion that requires
-seeing into the fold needs either:
+**Fusion laws differ by `kind`**: total folds satisfy
+`fold/build`-style cata-fusion (Gill, Launchbury, Peyton Jones,
+*A Short Cut to Deforestation*, FPCA 1993); early-exit folds
+satisfy stream-fusion-style laws (Coutts, Leshchinskiy, Stewart,
+ICFP 2007). Each rule lists the `FoldKind` it applies to.
 
-- Core-level inlining of `__fold_N` (the helper body is available
-  in the module), or
-- A stdlib-recognition convention that names known fold shapes
-  (`__List_map`, `__List_filter`, `__List_walk`) so the rewrite
-  can pattern-match by name without inlining.
+### Gen in detail
 
-This is the **stdlib marking** question: for `xs.map(f).walk(g)` to
-fuse, `map`'s underlying helper has to be recognized as `Map(f)`
-rather than just "a fold." Three real options exist:
+`Gen` is the anamorphism — the unfold dual of `Fold`. Without it,
+hylo deforestation couldn't be syntactic.
 
-- **Source annotations** (`@map`, `@build`, `@cata`) — explicit
-  intent at the stdlib declaration.
-- **Name-based recognition** at AST → Core — match on `__List_map`
-  by string convention.
-- **Write stdlib fold-shaped functions directly in Core** — the
-  stdlib bridges between user surface syntax and Core primitives.
+| Field      | Meaning |
+| ---------- | ------- |
+| `bound`    | Value computed before the loop that determines the maximum number of steps. Totality is preserved because `bound` is a finite value (e.g., the count for `List.range`). |
+| `step_fn`  | `FnId` of the per-step function: `(i, captures) → elem`. |
+| `init`     | Seed values threaded through if the generator is stateful (e.g., `iterate`). |
+| `captures` | Loop-invariant free variables. |
+| `elem_ty`  | Element type produced; `ty` is then `List(elem_ty)`. |
 
-Not yet decided; needed before the first real fusion rule lands.
+`List.range(start, end)` lowers as `Gen { bound: end - start,
+step_fn: __range_step, init: [start], captures: [], elem_ty: I64,
+... }`. The key fusion rule `Fold(f, init, Gen(bound, step, ...))
+→ Hylo(...)` eliminates the intermediate list entirely.
 
-### What is deliberately not a primitive
+### Match and Con: case-of-* are syntactic
 
-The following all look primitive at the surface but aren't Core
-variants — they lower as `App` to a builtin `SymbolId` that the
-lowering layer dispatches inline:
+Because values nest at Core, the classical algebraic rewrites
+fire as direct pattern matches:
 
-- **Arithmetic, comparison, bitwise, shifts** (`Add`, `Sub`, `Mul`,
-  `Div`, `Rem`, `Eq`, `Neq`, `Lt`, `Gt`, `Le`, `Ge`, `And`, `Or`,
-  `Xor`, `Shl`, `Shr`, `Max`). To_ssa emits `Inst::BinOp(op, lhs, rhs)`.
-  `Eq` / `Neq` on buffer trios delegates to an inline length-check +
-  elementwise loop.
-- **Numeric conversion** (`cast`, `bitcast`). Destination scalar type
-  is read off the `App.ty` at lowering time.
-- **`List.range(start, end)`** — anamorphism. To_ssa emits a counter-
-  driven fill loop returning the trio.
+- **Case-of-known-constructor.** `Match(Con(tag, args), arms) →
+  arms[tag][args]`. No analysis, no fixpoint.
+- **Case-of-case.** `Match(Match(e, arms₁), arms₂) →
+  Match(e, [{ pat, guard, body: Match(body, arms₂) } for arm in
+  arms₁])`. Code duplication is bounded by join points (see
+  *Future variants*).
+- **Projection-of-known-constructor.** `Match(Con(field_pattern,
+  binders), [pat → binder])` is just constructor injection +
+  pattern projection canceling — a syntactic identity.
 
-These could be Core variants — earlier iterations had them as
-`Expr::BinOp`, `Expr::Cast`, `Expr::Range`. They aren't, because:
-
-1. The algebraic rewrite system never matched on them. Fusion and
-   case-of-case don't recognize `1 + 2` as a fusion site.
-2. With dispatch driven by a `SymbolId`, user-defined types can
-   override `+` by defining their own `add` method — the same path
-   handles built-in scalar `add` (no function body) and user
-   `Vec3.add` (a real function call). One mental model.
-3. The IR stays smaller. Each additional variant is another arm
-   every walker, every rewrite rule, and every type-equality check
-   has to handle.
-
-### Records, tuples, strings — not Core variants
-
-Records and tuples are SROA-ed at AST → Core: the AST node becomes
-parallel slot lists, not a Core node. A `Record { x: 1, y: 2 }`
-typed `{ x: I64, y: I64 }` becomes two Core `Expr`s — one per slot.
-A `Tuple(a, b, c)` concatenates the three children's slot lists.
-`FieldAccess(record, field)` slices the record's slot list at the
-field's offset. Pattern-matching on records is flattened before
-Core into per-slot bindings.
-
-This works for the same reason aggregate-returning `If` can be
-duplicated per slot: **Ori has no aggregate identity**. There's no
-observable difference between a record value and the parallel
-sequence of its fields. In any language with pointer-takes,
-by-reference equality, or FFI varargs, this SROA would be unsound.
-
-Strings are not a Core variant either. `Str` is a transparent
-alias for `List(U8)` at the type system; at Core, a string literal
-desugars to a `BufLit` of byte-typed Int constants. `'a' + 'b' +
-"hello"` is just buffer operations on `List(U8)`.
-
-Eliminating these from Core matches the layer's purpose: every
-variant has an algebraic role, nothing inert. Walkers and rewrites
-don't waste cycles stepping past plumbing.
-
-### Multi-slot bindings
-
-`Var` and `Let` are slot-aware. When a binding's value is
-multi-slot (a record, tuple, List trio, or multi-variant payload):
-
-- **`Let { binders: Vec<SymbolId>, value, body }`** — the value
-  produces N slots; `binders.len() == N`; each binder names one
-  slot. The body references each binder as a single-slot `Var`.
-- **`Var { sym, ty }`** — if `sym` is a multi-slot binding,
-  `lower_expr_slots(Var)` looks `sym` up in `ctx.locals:
-  HashMap<SymbolId, Vec<SymbolId>>` and expands to N parallel
-  slot-Var references. The single-slot `lower(Var)` errors on
-  multi-slot bindings — the caller must use `lower_expr_slots`.
-
-Slot symbols are minted fresh by AST → Core when it encounters a
-multi-slot binding site. The AST source name maps to the slot
-symbol list via `ctx.locals`. Slot symbols carry source-derived
-dotted paths (`r.x`, `r.b.c`, `t.0`) via `ctx.slot_paths` for debug
-output.
-
-**Invariant**: every `Var` reference at Core resolves to either
-(a) a function parameter (1 SSA value), (b) a single-slot
-let-binding (1 SSA value), or (c) a multi-slot let-binding (N SSA
-values, where N is derivable from the binding's type). Walkers
-matching on `Var` must know which case they're in.
-
-### The buffer trio
-
-`List(T)` and `Str = List(U8)` decompose to a 3-slot trio at every
-layer where slots are visible:
-
-```
-(len: U64, cap: U64, data: RcPtr)
-```
-
-Functions take and return the trio (multi-result calls). Pattern
-binders bind three SSA values. Payload `Con`s store the trio inline
-(one wrapper-RcPtr slot per source field; the wrapper holds the
-trio contents). The only place the trio collapses to a single
-header pointer is the `__main` ABI boundary.
-
-Element layout in the data buffer: each source-level element
-occupies `slot_count(elem_ty) * 8` bytes. A `List(I64)` strides 8
-bytes; `List({ a: I64, b: I64 })` strides 16. The `elem_ty` field
-on `BufLit` / `BufAppend` / `BufSet` carries the stride info; the
-SSA layer reads it.
-
-**`cap` is intentionally not part of equality.** `[1, 2, 3]` and a
-list with `cap = 16` holding `[1, 2, 3]` are equal values. `cap` is
-an allocation detail, not part of the value. The structural
-equality lowering (length-check + elementwise loop) ignores `cap`
-by construction.
-
-### Closures and higher-order functions
-
-Ori has higher-order functions but no first-class closures *at Core*
-— every closure becomes a tag-union value before Core sees it. The
-front-end pipeline (`lambda_lift` → infer → `lambda::specialize` →
-`lambda::narrow`) does the work:
-
-1. **The lambda becomes a top-level function.** `lambda_lift`
-   emits a `FuncDef` for `__lambda_K(captures..., args...)`. The
-   lambda's free variables become leading capture parameters.
-
-2. **The closure value is a `Con` over a synthesized tag union.**
-   A new `__Closure_X` type is registered with one variant per
-   closure that can flow through the relevant Arrow position. The
-   value at the lambda site is `Con("__lambda_K_tag", [captures...])`.
-   The closure's runtime representation is just the tag and its
-   captures — same as any payload-carrying union.
-
-3. **Calling a closure dispatches via `__apply_K`.** A call to a
-   parameter `f: __Closure_X` lowers as `App(__apply_K, [f, args...])`.
-   The synthesized `__apply_K` body is a `Match` on the closure tag
-   forwarding to the right `__lambda_K`.
-
-4. **Singleton lambda sets specialize to direct calls.** When
-   inference proves only one closure can flow through a given Arrow
-   position (the lambda set has exactly one element), `lambda::narrow`
-   rewrites the call site as a direct `App(__lambda_K, [captures...,
-   args...])` — no dispatch.
-
-Consequences for Core:
-
-- Higher-order functions look like any other tag-union consumer.
-  `xs.map(f)` where `f` is a closure parameter compiles to a
-  `Cata` whose `fold_fn` is `__apply_K` (or, in the singleton case,
-  the `__lambda_K` directly) and whose `captures` include the
-  closure value.
-- The `Type::Arrow`'s `lambda_set` carries the set of closures that
-  flow through that Arrow. Mono specializes on the lambda set,
-  producing one variant per closure shape.
-- Closures introduce no runtime indirection beyond a tag dispatch
-  — the lambda set is closed at compile time.
-- Pattern-matching rewrites on closure types work identically to
-  any other multi-variant union; case-of-known-constructor on a
-  fresh closure value collapses the dispatch.
-
-### Aggregate-producing control flow
-
-When `If` or `Match` returns a multi-slot value, the construct is
-duplicated per slot. `if c then { a: 1, b: 2 } else { a: 3, b: 4 }`
-becomes two parallel `Match` expressions:
-
-- slot 0 (`a`): `Match(c, True → 1, False → 3)`
-- slot 1 (`b`): `Match(c, True → 2, False → 4)`
-
-The condition `c` is duplicated. **Pure + total ⇒ semantically
-free** — re-evaluating `c` is equivalent to evaluating it once.
-The runtime cost of duplicated work is a future CSE / GVN target
-at the SSA layer.
-
-`Match.scrutinee_slots` and `MatchArm.body` are `Vec<Expr>` for the
-parallel slot lists. At Core → SSA, each Vec lowers to N parallel
-`Value`s; the Match's merge block has N block params.
+Records and tuples are `Con`s with a single tag (`TagId::Declared`
+for the record/tuple's nominal type). Field access compiles to
+`Match` with a single arm; the pretty-printer renders it as
+projection. **No `Record` or `Tuple` variants** because the
+syntactic shape is exactly `Con` over a one-variant union.
 
 ### Patterns
 
-Patterns are restricted to three shallow shapes:
+Three shallow shapes:
 
-- `Constructor { tag, binders }` — match a tag-union variant with
-  per-field bindings. `binders` is `Vec<Vec<SymbolId>>`: the outer
-  Vec is per source-level field, the inner Vec is the slot symbols
-  that field expands to.
+- `Constructor { tag, binders: Vec<Binder> }` — match a tag-union
+  variant. `binders` is one entry per source-level field.
 - `Wildcard` — match anything, bind nothing.
-- `Binding(sym)` — match anything, bind to `sym`.
+- `Binding(LocalId)` — match anything, bind to the local.
 
-Nested constructor patterns are flattened by a pre-Core pass into
-`Constructor` arms with extra `is` guards. Literal patterns
-(`Pattern::IntLit`, `Pattern::StrLit` in the AST) are desugared at
-AST → Core to `Binding(fresh_sym)` with a synthesized
-`Eq(fresh_sym, lit)` guard prepended to the arm's guard list — so
-Core never needs to special-case literal patterns. Three shapes
-cover everything.
+`Binder` is an enum (`Sym(LocalId) | Wildcard`), not a sentinel.
+Wildcards-inside-constructors are structurally distinguishable
+from real binders.
 
-**Return arms.** `MatchArm` carries `is_return: bool`. When `true`,
-the arm's body short-circuits the *enclosing function* instead of
-merging into the match's result. The `?` operator desugars to a
-match whose `Err` arm is a return arm; explicit `: pat return body`
-syntax produces the same. Rewrites that flatten nested matches
-(case-of-case and friends) must preserve the short-circuit semantics
-— a return arm exits the outer function, which may not be the
-immediately surrounding match expression.
+Literal patterns are gone — `Pattern::IntLit` / `Pattern::StrLit`
+desugar to `Pattern::Binding(fresh)` plus a synthesized
+`Eq(fresh, lit)` guard at AST → Core. Three shapes cover
+everything.
 
-### Crash and divergence
+**Return arms.** `MatchArm.is_return: bool` short-circuits the
+enclosing function (`?` operator desugar). Rewrites that flatten
+nested matches must preserve this — case-of-case in the presence
+of return arms is a known sticky case where **join points** (see
+below) are the principled future fix; for now, the rule
+preservation is a *carried invariant* (validator-checked).
 
-`crash(msg)` is the only way an Ori program can fail to produce a
-value (totality rules out infinite loops). At Core it's `App(__crash,
-[msg])` to a runtime function that prints `msg` and exits.
+### Closures and HOFs
 
-Implications for rewrites:
+After `lambda_lift` + `lambda_specialize` + `lambda_narrow`, every
+closure is a `Con` value with a `TagId::Closure(_)` tag:
 
-- **Reordering past `crash` is unsound.** The divergence happens
-  at the source-level evaluation point. A rewrite that moves an
-  expression across a `crash` changes whether the expression runs.
-- **Duplicating `crash` is sound.** Both copies diverge.
-- **Eliminating a `crash` dominated by another `crash` is sound.**
-  The dominated one never runs.
-- **`crash`'s result type is whatever the surrounding context
-  expects** (it never returns). No rewrite should depend on the
-  "value" of a `crash`.
+1. **Each lambda becomes a top-level function.** `__lambda_K(captures..., args...)`.
+2. **The closure value is a `Con`.** `Con { tag: Closure(K), args:
+   captures, ty: Adt(__Closure_X, ...) }`. Same shape as any
+   payload-carrying union.
+3. **Calling a closure dispatches via `__apply_K`.** `App(__apply_K,
+   [closure_value, args...])`. The synthesized `__apply_K` body is
+   a `Match` over the closure tag forwarding to the right
+   `__lambda_K`.
+4. **Singleton lambda sets are direct calls.** `lambda_narrow`
+   rewrites `App(__apply_K, [closure, args...])` to
+   `App(__lambda_K, [captures..., args...])` when the lambda set
+   has one element.
 
-Algebraic rewrites treat `crash` as an evaluation barrier — sound
-rewrites preserve which crashes happen and in what order relative
-to other observable events.
+Higher-order functions look like any other tag-union consumer.
+`xs.map(f)` where `f` is a closure compiles to a `Fold` whose
+`fold_fn` is `__apply_K` (or, in the singleton case, the
+`__lambda_K` directly) and whose `captures` include the closure
+value.
 
-### AST → Core (semantic desugaring)
+### Crash and totality
 
-Source shapes that don't survive into Core:
+Crash semantics is the design's hardest call. Three options
+exist; this design takes the third.
 
-| Source                                | Core                                                |
-| ------------------------------------- | --------------------------------------------------- |
-| `a + b`, `a == b`, …                  | `App(builtins.add, [a, b])` etc.                    |
-| `x.to_u8()`, `x.to_bits()`            | `App(builtins.cast, [x])` / `App(builtins.bitcast,...)` |
-| `List.range(s, e)`                    | `App(builtins.range, [s, e])`                       |
-| `"abc"` (`ExprKind::StrLit`)          | `BufLit { elem_ty: U8, elements: [Lit 97, Lit 98, Lit 99] }` |
-| `[1, 2, 3]` (`ExprKind::ListLit`)     | `BufLit { elem_ty: I64, elements: [...] }`          |
-| `: 5 then body` (`Pattern::IntLit`)   | `: v and v == 5 then body`                          |
-| `: "foo" then body` (`Pattern::StrLit`)| `: v and v == "foo" then body`                     |
-| `f(...)` where `f` is `__fold_N`      | `Cata { fold_fn, ... }`                             |
-| `crash(msg)`                          | `App(__crash, [msg])`                               |
+1. **Poison (crashes as values)**: validates every rewrite but
+   forces runtime tag-checks everywhere. Beautiful semantics,
+   dishonest implementation.
+2. **Imprecise exceptions**: GHC's choice. Recovers most
+   reordering at the cost of "the program crashes with *some*
+   crash from a set" semantics; in a strict language, dead-let
+   elimination still needs a refinement direction.
+3. **Track totality, totalize the builtins**: the partial constructs
+   shrink to exactly one — the user's explicit `crash` — and a
+   totality bit propagates over the DAG. Total subtrees get
+   unconditional algebra; crash-tainted subtrees treat `Crash` as a
+   syntactic barrier.
 
-Records and tuples flatten into parallel slot lists via
-`lower_expr_slots`. Nested patterns flatten via a pre-Core pass.
+The third option requires two halves working together.
 
-### Core → SSA
+**Half one: totalize the builtins.** AST → Core's
+`totalize_builtins` pass makes every builtin total at the source
+level:
 
-`to_ssa` emits SSA for each Core variant. The notable shapes:
+- **`x / 0 = 0`** and **`x % 0 = 0`**. Lean-style. Users who care
+  pre-check the divisor (the type system can encode `NonZero(T)`
+  for the unchecked form; `divChecked: I64 → I64 → Result(I64,
+  DivByZero)` is the explicit-check form).
+- **Integer overflow wraps** (two's-complement, C-style).
+  Explicit `add_checked` / `mul_checked` return `Result(T,
+  Overflow)`.
+- **Cast saturates.** `cast::<U8>(-1)` is `0`. Explicit
+  `try_cast: T → Result(U, CastError)` returns `Result` for the
+  range-violating case.
+- **`BufLoad` returns `Result<T, OutOfBounds>`**. Bounds violation
+  is operationally distinct (the user needs to handle the failure
+  with different control flow), so Result is the right shape.
 
-- **App dispatch.** Before emitting `Inst::Call`, the App handler
-  asks the builtin registry whether `target` names a builtin. If
-  so, the builtin's kind (`Binary(op)`, `Cast`, `Bitcast`, `Range`)
-  drives inline emission — `Inst::BinOp(op, args[0], args[1])` for
-  Binary, the counter loop for Range, etc. Otherwise, regular
-  `Inst::Call`.
+After totalization, **the only partial construct in any Ori
+program is `crash(msg)`**.
 
-- **Buffer equality.** Binary `Eq` or `Neq` whose operands are
-  3-slot trios (List, Str) doesn't go through scalar `Inst::BinOp(Eq)`.
-  It lowers to a length check followed by an elementwise loop. The
-  loop reads from each buffer at index `i`, compares, and short-
-  circuits to `False` on mismatch.
+**Half two: `Crash` is a variant; totality is a derived bit.**
+`Expr::Crash { msg: StrLit, ty: CoreType }`. The message is a
+static string literal — guaranteeing `Crash` is a leaf node and
+the rewrite-barrier semantics are simple.
 
-- **Cata dispatch.** If the Cata's target is a `List`, lower to a
-  counter-driven loop directly (with optional Continue/Break
-  dispatch when `early_exit` is set for `walk_until`). Otherwise
-  emit a recursive helper `Inst::Call` to the `__fold_N` function
-  that carries the structural recursion.
+Totality of a function/subtree is computed bottom-up:
 
-- **Con boundary.** Multi-variant payload unions (Result, Maybe,
-  user-defined) materialize the constructor by allocating a
-  payload, storing one wrapper per source-level field at
-  consecutive 8-byte offsets, and returning `(tag, payload)`.
-  Single-variant payload unions (Phase E shape) skip the wrapping
-  entirely and return the variant's slots directly.
+```
+total(Crash _) = false
+total(App f args) = total(f) ∧ all total(args)
+total(Match s arms) = total(s) ∧ all (total(arm.guards) ∧ total(arm.body)) for arms
+total(Fold _ _ t i c _) = total(t) ∧ all total(i) ∧ all total(c)
+... etc, recurse through fields
+```
 
-- **Match dispatch.** All-Constructor arms emit a `SwitchInt` on
-  the scrutinee's tag. All-Binding arms (from literal-pattern
-  desugar) use a constant-zero synth tag with all arms sharing
-  that tag, so they chain via guard fall-through — a sequential
-  guard test, conceptually.
+A function's `total` bit is `total(body)`; the bit propagates
+over the DAG call graph in one walk. With this, every law in the
+*Motivation* section gets the honest statement:
+
+- "Equational rewrites preserve totality unconditionally" — on
+  total subtrees.
+- "Dead-binding elimination needs no effect analysis" — when
+  the bound value is total.
+- "Free theorems hold without side conditions" — on total
+  subtrees.
+
+In crash-tainted subtrees, rewrites obey two contracts:
+
+- **Reordering past `Crash` is unsound** — the divergence's
+  source-level position is observable. Rewrites that move
+  expressions across a `Crash` are barred.
+- **Eliminating dominated `Crash`es is sound** — `Crash; Crash` is
+  `Crash`.
+
+The "is this a barrier?" check is a variant match (`is Crash`),
+not a name comparison against `__crash`. Forgetting it is a
+**compile error**, not a silent miscompile.
+
+### The buffer trio (an SSA story)
+
+`List(T)` and `Str = List(U8)` are **single values at Core**.
+There is no slot list, no `(len, cap, data)` decomposition at the
+algebraic layer. `xs.len()`, `xs.append(y)`, `xs == ys` all
+operate on `List(T)` values.
+
+The trio decomposition `(len: U64, cap: U64, data: RcPtr)`
+happens at **Core → SSA**, at the function-boundary ABI. Multi-
+result calls return the three slots; pattern binders bind three
+SSA values; payload `Con`s store the trio inline. The only place
+the trio collapses to a single header pointer is the `__main` ABI
+boundary.
+
+`cap` is intentionally not part of value equality at any layer —
+two lists with the same length and elements are equal regardless
+of allocated capacity. The structural equality lowering (length
+check + elementwise loop) ignores `cap` by construction.
+
+Element layout in the data buffer: each source-level element
+occupies `slot_count(elem_ty) * 8` bytes. `List(I64)` strides 8;
+`List({a: I64, b: I64})` strides 16. The `elem_ty` field on
+`BufLit` / `BufAppend` / `BufSet` carries the stride info; SSA
+reads it.
+
+**Why this works at Core**: no Core rewrite needs the slots
+separately. `len` laws (`len(xs.append(y)) = len(xs) + 1`) work
+at the value level. Bounds elimination relates `idx` to `len`
+within the same value (not across slots). The trio's consumers —
+multi-result ABI, stride calculation, cow calls — are all SSA
+concerns.
+
+This is the *No aggregate identity* guarantee paying off: SROA at
+Core→SSA is unconditionally sound, so Core gets to keep `List` as
+a single value while still delivering "the trio doesn't box" as a
+lowering guarantee.
 
 ## Refcounting, ownership, and reuse
 
-Ori's runtime model is Perceus-style refcounting plus FBIP: every
-heap object carries an `rc`, reaching zero frees it and recursively
-decrements its `RcPtr` children; mutating primitives (`BufAppend`,
-`BufSet`) lower to `cow_*` runtime checks that mutate in place when
-`rc == 1` and clone when `rc > 1`. The question this section answers
-is: **what part of that runtime model lives at Core, and what part
-lives at SSA?**
+Ori's runtime model is Perceus-style precise refcounting plus
+FBIP: every heap object carries an `rc`; mutating primitives
+(`BufAppend`, `BufSet`) lower to `cow_*` runtime checks; reaching
+`rc == 0` frees and recursively decrements children.
 
-The split is between **operations** and **analyses**.
+The split between **operations** and **analyses** decides what
+lives at Core vs. SSA.
 
 ### Operations live at SSA
 
-The instruction-level mechanics of refcounting — `rc_inc`, `rc_dec`,
-`cow_resize_dyn`, `cow_store_dyn`, a hypothetical `reuse_alloc` —
-are per-instruction events. Each one corresponds to a specific point
-in execution. Their natural home is SSA, where dominance and def-use
-chains let you place them precisely.
+Instruction-level mechanics — `rc_inc`, `rc_dec`,
+`cow_resize_dyn`, `cow_store_dyn`, hypothetical `reuse_alloc` —
+are per-instruction events with precise placement requirements.
+SSA's dominance and def-use chains make this natural.
 
-Putting raw RC ops at Core would be a category error. Every algebraic
-rewrite — fusion, beta, case-of-case — would have to thread `dup` /
-`drop` through to keep refcounts honest, multiplying the surface
-area of every rule by a factor of "RC bookkeeping" with no
-algebraic benefit. The Core IR has no `Expr::Dup(sym)` or
-`Expr::Drop(sym)` variants for this reason.
+Putting raw RC ops at Core would force every algebraic rewrite to
+thread `dup` / `drop` through to keep refcounts honest, with no
+algebraic benefit. The Core IR has **no `Dup` / `Drop` variants**.
 
-What does live at SSA:
-
-- `Inst::RcInc` / `Inst::RcDec` for explicit refcount adjustments.
-- Auto-rc-on-Store / auto-rc-on-Load conventions on `RcPtr` values
-  (every owning slot is a duplication point by construction; every
-  load of an owning reference is too).
-- `cow_resize_dyn` / `cow_store_dyn` runtime calls — the FBIP path
-  for buffer mutation.
-- Whatever explicit RC traffic balancing the above conventions
-  requires.
-
-A conservative SSA emission strategy (rc_inc on every consuming
-use, rc_dec at every scope end) is sufficient for correctness on
-its own — the analyses below sharpen it.
+Auto-rc conventions at SSA: `Store(ptr, off, val)` with `val.ty ==
+RcPtr` auto-`rc_inc`s `val`; `Load`/`LoadDyn` of an `RcPtr`
+auto-`rc_inc`s the loaded value. Explicit `rc_inc`/`rc_dec` balance
+these around consuming uses and scope ends.
 
 ### Analyses live at Core
 
-Refcount optimizations — eliding the counter when ownership is
-provable, recognizing reuse opportunities, inferring borrows,
-specializing drops by constructor shape — want to see the
-**algebraic structure** of the program. That structure is gone at
-SSA (a `Con` is `alloc + N stores`; a `Match` is `SwitchInt + N
-loads`). It's present at Core.
+Refcount optimizations want algebraic structure. That structure is
+gone at SSA. Each analysis is a walk over the Core term producing
+an annotation; SSA emission consumes the annotation to make a
+precise choice instead of the conservative default.
 
-Each analysis is a walk over the Core term that produces an
-annotation; SSA emission consumes the annotation to make a precise
-choice instead of the conservative default.
-
-| Analysis              | What it proves                                                          | What SSA does with it                                  |
+| Analysis              | What it proves                                                          | SSA emission change                                    |
 | --------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------ |
-| Uniqueness            | This `RcPtr` is never aliased — no store, no escape, no capture        | Skip the counter entirely; treat as a stack value     |
+| Uniqueness            | This value is never aliased — no store, no escape, no capture          | Skip the counter entirely; treat as a stack value     |
 | Borrow inference      | This function arg is only inspected, never stored or returned          | Caller skips the inc before the call                  |
 | Reuse fusion (FBIP)   | This `Match` arm drops a `Cons` box and constructs a same-shape `Cons` | Emit a reuse-alloc instead of free + alloc            |
-| Drop specialization   | This `drop x` is over `x: Result(I64, Str)`                            | Inline the type-directed drop instead of a generic call |
-| Reuse-across-scopes   | This `alloc` follows a drop of a same-sized box in the same scope      | Reuse the freed memory                                |
+| Drop specialization   | This `drop x` is over `x: Result(I64, Str)`                            | Inline the type-directed drop instead of generic call |
+| Loop-invariant cow    | This `BufAppend` runs inside a `Fold` whose target is unique           | Hoist the rc check out of the loop; emit unchecked path inside |
 
-The DAG call graph + lambda-lifted calls + no aggregate identity
-mean every one of these analyses is a finite bottom-up walk per
-function. No fixpoint, no escape-hatch handling.
+**Reuse analysis is pinned as the final Core pass**, after the
+rewrite fixpoint. Rewrites produced before reuse fusion can change
+which alloc/drop pairs exist; running reuse mid-rewrite invalidates
+its own results.
 
-### The variant-vs-annotation line
-
-Some ownership-related semantics earn a Core *variant*. Others stay
-as out-of-band annotations.
+### Variants carry intent; annotations carry analysis output
 
 A variant earns its keep when **lowering needs to distinguish a
-shape**. Two cases qualify today:
+shape**:
 
-- **`BufAppend` / `BufSet`** carry mutation intent at the variant
-  level. The lowering doesn't ask "could this be in-place?" — the
-  variant says "this is an FBIP mutation site." Without the
-  distinct variant, lowering would have to recognize `BufLit`-into-
-  store patterns and reverse-engineer the intent.
-- **`Cata`** carries iteration semantics. Lowering specializes RC
-  handling for the loop (decrement-once-at-loop-exit instead of
-  per-iteration) because it knows the shape is a fold.
+- `BufAppend` / `BufSet` carry mutation intent at the variant
+  level. The lowering doesn't ask "could this be in-place?" —
+  the variant says "this is an FBIP mutation site."
+- `Fold` carries iteration semantics. Lowering specializes RC
+  handling for the loop.
+- `BufLoadUnchecked` carries the bounds-elimination result. The
+  alloc site / load shape is genuinely different.
 
-An out-of-band annotation suffices when the analysis result is just
-"this site is special" — no new lowering shape needed, just a
-modifier on existing lowering. Uniqueness, borrow flags, and reuse
-pairings all fit this — they're side tables produced by Core
-analyses, consumed by the SSA emitter.
+An out-of-band annotation suffices when the analysis result is
+"this site is special" with no new lowering shape needed.
+Uniqueness, borrow flags, loop-invariant-cow markers all fit this.
 
-**A future variant earns its keep** if user-defined inductive reuse
-becomes a thing: a hypothetical `Reuse(scrutinee_box, tag, fields)`
-that says "build this constructor by reusing the dropped scrutinee's
-memory" would be a genuinely different lowering shape than `Con` —
-the alloc instruction is different. The annotation alternative
-(just mark the `Con` with a side-table flag) is possible but
-clunkier; the lowering would have to consult the table per `Con`
-to decide between fresh-alloc and reuse-alloc.
+### Goal 5 honestly
 
-### What Core IR enforces vs preserves
+"C-competitive" depends on uniqueness and reuse analyses landing.
+Concretely:
 
-A common worry: with primitives this simple, can we really enforce
-all the RC invariants — no double-free, no use-after-free, in-place
-when safe?
+- On unique-buffer code, FBIP delivers C-level performance — the
+  cow check is a predictable branch on a cached header word.
+- On shared-buffer code without uniqueness analysis, `xs.append`
+  in a loop is O(n²) (Swift's COW arrays have this exact
+  footgun). The analysis hoists the check out of the loop on the
+  unique-target case; without it, the cliff is real.
+- `BufLoad`'s bounds check has to fire at the Core layer
+  (rewriting to `BufLoadUnchecked` when the index is provably in
+  range) for tight loops to match C. Without it, every load pays
+  the check + the Result-shape projection.
 
-The framing that resolves it: **Core doesn't enforce these
-invariants at the variant level. Core preserves the structure that
-lets downstream analyses prove them.** Enforcement is a property of
-the runtime model + the type system (Perceus precision, total
-purity), not of the Core IR itself.
-
-Compare to records and tuples: Core has no "this record doesn't
-escape" variant; instead, the IR has clean tree structure that an
-escape analysis can walk. Same idea for RC. Clean scopes, clean
-type info, clean constructor/match shapes — these are what
-linearity, borrow, and reuse analyses operate on. The primitives
-don't need a substructural type system; the analyses do the work.
-
-The IR's job is to **not introduce escape hatches** that would
-hide ownership flow from those analyses. The current variant set
-doesn't — every `RcPtr`-producing site is one of the listed
-primitives, every consuming use is visible in the tree, every
-scope is a `Let` or a `Match` arm.
-
-### The path from "conservative RC" to "precise RC"
-
-The progression isn't all-or-nothing. Each piece is an analysis +
-an emission refinement:
-
-1. **Baseline (today's conservative emit).** Every `RcPtr`-typed
-   value gets `rc_inc` on consuming uses, `rc_dec` at scope ends.
-   Buffer primitives use `cow_*`. Correct, but verbose.
-2. **Uniqueness analysis.** Mark bindings that don't escape and
-   aren't aliased. Emission elides their RC traffic. Pure win, no
-   IR changes.
-3. **Borrow inference at call boundaries.** Function args that the
-   callee only inspects don't need a caller-side inc. Annotation
-   on the call site; emission omits the inc.
-4. **Reuse fusion for user inductives.** Recognize `Match(x,
-   Cons(h, t) → ... Con("Cons", ...))` syntactically; emit reuse
-   instead of free + alloc. May warrant a `Reuse` variant.
-5. **Drop specialization.** Type-directed expansion of generic
-   drops. Pure Core rewrite; no new variants.
-
-Each step is independently shippable. None require the IR to
-become more complex than it is — at most, one or two new variants
-when lowering genuinely needs a new shape.
+The Core IR makes these optimizations *expressible*; the work to
+make them *happen* is in the analysis passes that produce the
+annotations.
 
 ## Soundness
 
 The algebraic rewrites that Core enables are sound only because of
-the language guarantees listed at the top:
+the language guarantees:
 
-- **Reorderings** (CSE, code motion, let-floating) are sound because
-  Ori is pure. No expression's evaluation has an effect we'd need
-  to preserve.
-- **Compile-time evaluation** of any closed term is sound because
-  Ori is total. The evaluator terminates by construction.
+- **Reorderings on total subtrees** (CSE, code motion,
+  let-floating) are sound because Ori is pure and the subtree
+  contains no `Crash`. The totality bit makes "is this subtree
+  reorderable" a one-variant-match check.
+- **Compile-time evaluation** of any closed total term is sound
+  because Ori is total within the bit. The evaluator respects a
+  fuel budget.
 - **Eliminations** (dead-let, unreachable arm, case-of-known-
-  constructor) are sound because Ori is total — there's no ⊥ to
-  preserve. A dead `let` doesn't hide a divergence.
-- **Aggregate SROA** is sound because Ori has no aggregate identity.
-  No source program can observe the difference between a record
-  value and the parallel sequence of its fields.
-- **Fold fusion** (banana, deforestation) is sound because Ori's
-  iteration is structural — every loop terminates by descending
-  into smaller subterms of an inductive value. Fusion laws don't
-  need a termination side-condition.
+  constructor) on total values are sound; on crash-tainted values,
+  the rewrite must preserve the crash's position.
+- **Aggregate SROA at Core → SSA** is sound because Ori has no
+  aggregate identity. No source program can observe the difference
+  between an aggregate value and the parallel sequence of its
+  slots.
+- **Fold fusion** (banana, deforestation, hylo) is sound because
+  Ori's iteration is structural and the bound on `Gen` is finite.
+- **Crash barriers** make all of the above precise: a rewrite that
+  preserves the crash set's content and ordering is sound; a
+  rewrite that doesn't isn't.
 
-A rewrite added to Core inherits these properties — every rule
-should preserve them without needing a per-rule soundness argument.
-If a rule needs one, the layer is wrong or the rule is unsound.
+Every Core rewrite either operates within a total subtree (where
+laws are unconditional) or preserves crash position and content
+(where laws are conditional but checkable).
 
-## What we explicitly reject
+## What we deliberately reject
 
-Design choices that look attractive and that we deliberately don't
-make:
-
-- **CCC-style combinators (`id`, `∘`, `fst`, `snd`, …).** Pleasant
-  for fusion but far from source; debugging output becomes
+- **Crashes as first-class values (poison).** Beautiful algebra,
+  dishonest implementation.
+- **CCC-style combinators (`id`, `∘`, `fst`, `snd`, ...).**
+  Pleasant for fusion but far from source; debugging output
   incomprehensible.
 - **ANF as the Core form.** Cleaner for dataflow but buries the
-  algebra under naming. Better to ANF-normalize *before* SSA
-  lowering as a separate pass; keep Core direct-style.
+  algebra under naming. ANF-normalize at Core → SSA if needed.
 - **CPS.** Wrong shape for algebraic rewriting; right shape for
   compilation. Not Core's job.
-- **Sea-of-nodes.** Wrong layer for algebra; V8 is moving away
-  from it anyway.
-- **de Bruijn indices for binders.** Alpha-equivalence becomes
-  free, useful if we ever adopt e-graphs, but less readable and
-  harder to debug. A canonicalize pass can add this if/when needed.
-- **`Record` / `Tuple` as Core variants.** SROA-ed at AST → Core
-  for the reasons above.
-- **Arithmetic / cast / range as Core variants.** Their natural
-  rewrite home is the SSA layer (constant folding), not Core. They
-  flow through as builtin `App` targets.
-- **e-graphs / equality saturation.** Ori's rewrite laws are mostly
-  monotonic (fusion strictly improves cost), so hand-rolled rules
-  applied to fixpoint match what cost-based extraction would find.
-  The infrastructure isn't free, and the value over hand-rolled
-  passes is empirically modest. Reach for e-graphs only if phase-
-  ordering pain shows up in practice.
+- **Sea-of-nodes.** Wrong layer; V8 is moving away from it anyway.
+- **de Bruijn indices.** Alpha-equivalence becomes free but
+  debugging suffers. Canonicalize pass can add this if/when needed.
+- **`Record` / `Tuple` as Core variants.** Records are single-tag
+  `Con`s; tuples are single-tag `Con`s; field projection is a
+  one-arm `Match`. No inert plumbing.
+- **`BinOp` / `Cast` / `Range` as Core variants.** Their natural
+  rewrite home is the SSA layer (constant folding). They flow
+  through as builtin `App` targets.
+- **`Type::Var` in Core.** Structurally impossible to express via
+  `CoreType`'s shape.
+- **Arithmetic / cast / range as Core variants.** Builtin `App`s
+  to bodyless targets the lowering layer dispatches inline.
+- **Slot decomposition at Core.** Values nest; the trio and SROA
+  happen at Core → SSA. The "no boxing by default" guarantee is
+  delivered as a lowering guarantee, not an IR shape.
+- **`Dup` / `Drop` / explicit RC ops.** Pollutes algebraic
+  rewrites for no algebraic benefit. RC operations live at SSA;
+  RC analyses live at Core; the seam is annotations.
+- **`Type` as a value (System F-style).** Mono runs before Core;
+  there are no type abstractions to move around.
+- **e-graphs / equality saturation.** Our rewrite laws are mostly
+  monotonic (fusion strictly improves cost). Hand-rolled rules to
+  fixpoint match what cost-based extraction would find. Adopt
+  e-graphs only if phase-ordering pain shows up in practice.
 - **Effects / I/O at Core.** Ori is pure today. If/when I/O lands,
   an effect annotation on `App` is the likely shape. The pure
   subset stays as-is.
-- **Higher-rank polymorphism past mono.** Would need type
-  abstractions in Core. Mono runs before Core; this is moot.
+- **Higher-rank polymorphism past mono.** Mono runs before Core;
+  moot.
+
+## Future variants (reserved seats)
+
+Two variants are planned but not in the initial set. Each closes a
+hole the current design papers over with a *carried invariant*;
+adding them is additive.
+
+- **Join points.** `LetJoin { label, params, body, cont }` +
+  `Jump { label, args }` — second-class continuations. Maurer,
+  Downen, Ariola, Peyton Jones, *Compiling without Continuations*,
+  PLDI 2017. Make case-of-case fire without code explosion. Match
+  arm `is_return` is the interim; case-of-case in its presence is
+  the current sticky case. Reserved seat in the IR's variant set.
+
+- **Reuse / Reset.** `Reuse { box, tag, fields }` + `Reset { box,
+  tag }` — explicit FBIP reuse for user-defined inductives.
+  Lorenzen & Leijen, *Reference Counting with Frame-Limited
+  Reuse*, ICFP 2022. Adds variants when reuse fusion for user
+  inductives lands. Until then, reuse stays an annotation produced
+  by the final Core pass and consumed by SSA emission.
+
+Both are additive — they don't replace anything, and the existing
+variants continue to work. The IR is designed with these seats
+reserved so the eventual addition is a strict extension.
