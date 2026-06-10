@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/core-ir"]
+
 [package]
 name = "ori"
 version = "0.1.0"

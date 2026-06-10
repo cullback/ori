@@ -1,0 +1,9 @@
+[package]
+name = "core-ir"
+version = "0.1.0"
+edition = "2024"
+description = "Ori Core IR — v1 prototype. See notes/core-ir.md for the spec this implements."
+
+[dependencies]
+
+[dev-dependencies]
