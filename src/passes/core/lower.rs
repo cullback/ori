@@ -2622,8 +2622,8 @@ fn lower_match_arm(
     // For each constructor binder whose source type expands to
     // multiple slots, mint slot syms and register them in
     // `ctx.locals` so `Name(binder)` in the arm body expands to the
-    // per-slot Vars. Wildcards (sym = u32::MAX) skip the lookup.
-    // Single-slot binders keep their AST sym — no minting needed.
+    // per-slot Vars. Wildcards skip the lookup. Single-slot binders
+    // keep their AST sym — no minting needed.
     //
     // The scheme's `field_tys` may be polymorphic (e.g. `Err : b ->
     // Result(a, b)`); we substitute against the scrutinee_ty so the
@@ -2655,19 +2655,24 @@ fn lower_match_arm(
                 if slot_tys.len() <= 1 {
                     continue;
                 }
-                if binder_slots[0].0 == u32::MAX {
+                if binder_slots[0].is_wildcard() {
                     // Wildcard binder over a multi-slot field —
-                    // expand to N wildcard sentinels so the
-                    // pattern's binder count matches the field's
-                    // slot count (to_ssa's binder loader walks them
-                    // in parallel with `slot_tys`).
-                    *binder_slots = vec![SymbolId(u32::MAX); slot_tys.len()];
+                    // expand to N wildcards so the pattern's binder
+                    // count matches the field's slot count (to_ssa's
+                    // binder loader walks them in parallel with
+                    // `slot_tys`).
+                    *binder_slots = vec![super::expr::Binder::Wildcard; slot_tys.len()];
                     continue;
                 }
-                let ast_sym = binder_slots[0];
+                let ast_sym = binder_slots[0]
+                    .as_sym()
+                    .expect("non-wildcard binder must carry a SymbolId");
                 let slot_syms = mint_slot_syms(ctx, ast_sym, slot_tys.len());
                 shadowed.push((ast_sym, ctx.locals.insert(ast_sym, slot_syms.clone())));
-                *binder_slots = slot_syms;
+                *binder_slots = slot_syms
+                    .into_iter()
+                    .map(super::expr::Binder::Sym)
+                    .collect();
             }
         }
     }
@@ -2699,14 +2704,15 @@ fn lower_match_arm(
 }
 
 fn lower_pattern(pat: &AstPattern<'_>) -> Result<Pattern, String> {
+    use super::expr::Binder;
     match pat {
         AstPattern::Constructor { name, fields } => {
-            let mut binders: Vec<Vec<SymbolId>> = Vec::with_capacity(fields.len());
+            let mut binders: Vec<Vec<Binder>> = Vec::with_capacity(fields.len());
             for f in fields {
                 match f {
-                    AstPattern::Binding(sym) => binders.push(vec![*sym]),
+                    AstPattern::Binding(sym) => binders.push(vec![Binder::Sym(*sym)]),
                     AstPattern::Wildcard => {
-                        binders.push(vec![SymbolId(u32::MAX)]);
+                        binders.push(vec![Binder::Wildcard]);
                     }
                     other => {
                         return Err(format!(

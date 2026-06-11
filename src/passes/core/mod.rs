@@ -40,3 +40,4 @@ pub mod lower;
 pub mod pipeline;
 pub mod rules;
 pub mod to_ssa;
+pub mod validate;

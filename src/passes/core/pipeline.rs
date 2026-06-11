@@ -437,6 +437,23 @@ pub fn lower_module(
             .map(|e| super::rules::simplify(e, builtins))
             .collect();
 
+        // Validate the post-rewrite Core. Catches invariant
+        // violations (unbound Vars, residual Type::Var in
+        // expression positions) before they hit to_ssa. Not
+        // load-bearing for correctness when AST→Core is well
+        // formed; load-bearing for catching rewrite bugs early.
+        if std::env::var("ORI_VALIDATE_CORE").is_ok() {
+            for e in &core_body {
+                if let Err(err) = super::validate::validate_function(
+                    &name_str, &params, e,
+                ) {
+                    return Err(format!(
+                        "core::validate ({name_str}): {err:?}",
+                    ));
+                }
+            }
+        }
+
         // Core → SSA via lower_slots so payload Con / multi-result
         // App / multi-slot Match return their full slot list.
         // Concatenating each core_body slot's lowered values gives

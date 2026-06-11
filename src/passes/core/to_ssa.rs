@@ -1026,7 +1026,7 @@ fn lower_match(
         }
         {
         for arm in arms {
-            let binders_opt: Option<&Vec<Vec<SymbolId>>> = match &arm.pattern {
+            let binders_opt: Option<&Vec<Vec<super::expr::Binder>>> = match &arm.pattern {
                 Pattern::Constructor { binders, .. } => Some(binders),
                 Pattern::Wildcard | Pattern::Binding(_) => None,
                 _ => continue,
@@ -1061,20 +1061,19 @@ fn lower_match(
                         })
                         .unwrap_or(binder_slots.len().max(1));
                     if binder_slots.len() == 1 && field_slot_count > 1 {
-                        let sym = binder_slots[0];
                         let end = (slot_idx + field_slot_count).min(scrutinee_slots.len());
                         let vals: Vec<Value> = scrutinee_slots[slot_idx..end].to_vec();
-                        if sym.0 != u32::MAX {
+                        if let Some(sym) = binder_slots[0].as_sym() {
                             bound.push((sym, ctx.locals.insert(sym, vals)));
                         }
                         slot_idx = end;
                     } else {
-                        for &sym in binder_slots {
+                        for binder in binder_slots {
                             if slot_idx >= scrutinee_slots.len() {
                                 break;
                             }
                             let v = scrutinee_slots[slot_idx];
-                            if sym.0 != u32::MAX {
+                            if let Some(sym) = binder.as_sym() {
                                 bound.push((sym, ctx.locals.insert(sym, vec![v])));
                             }
                             slot_idx += 1;
@@ -1170,12 +1169,10 @@ fn lower_match(
                 let mut bound: Vec<(SymbolId, Option<Vec<Value>>)> = Vec::new();
                 let mut idx = 0;
                 for binder_slots in binders {
-                    for &sym in binder_slots {
-                        if sym.0 == u32::MAX {
-                            idx += 1;
-                            continue;
+                    for binder in binder_slots {
+                        if let Some(sym) = binder.as_sym() {
+                            bound.push((sym, ctx.locals.insert(sym, vec![scrutinee_slots[idx]])));
                         }
-                        bound.push((sym, ctx.locals.insert(sym, vec![scrutinee_slots[idx]])));
                         idx += 1;
                     }
                 }
@@ -1371,8 +1368,7 @@ fn lower_match(
                         // heap object referenced at payload_offset
                         // and bind the source name to the full slot
                         // list (multi-slot locals).
-                        let sym = binder_slots[0];
-                        if sym.0 != u32::MAX {
+                        if let Some(sym) = binder_slots[0].as_sym() {
                             let wrapper = ctx.builder.load(payload_param, payload_offset, ScalarType::RcPtr);
                             let slot_vals: Vec<Value> = slot_tys
                                 .iter()
@@ -1393,20 +1389,17 @@ fn lower_match(
                         ));
                     }
                     if binder_slots.len() == 1 {
-                        let sym = binder_slots[0];
-                        if sym.0 == u32::MAX {
-                            continue;
+                        if let Some(sym) = binder_slots[0].as_sym() {
+                            let v = ctx.builder.load(payload_param, payload_offset, slot_tys[0]);
+                            bound.push((sym, ctx.locals.insert(sym, vec![v])));
                         }
-                        let v = ctx.builder.load(payload_param, payload_offset, slot_tys[0]);
-                        bound.push((sym, ctx.locals.insert(sym, vec![v])));
                     } else {
                         let wrapper = ctx.builder.load(payload_param, payload_offset, ScalarType::RcPtr);
-                        for (slot_i, (&sym, &slot_ty)) in binder_slots.iter().zip(&slot_tys).enumerate() {
-                            if sym.0 == u32::MAX {
-                                continue;
+                        for (slot_i, (binder, &slot_ty)) in binder_slots.iter().zip(&slot_tys).enumerate() {
+                            if let Some(sym) = binder.as_sym() {
+                                let v = ctx.builder.load(wrapper, slot_i * 8, slot_ty);
+                                bound.push((sym, ctx.locals.insert(sym, vec![v])));
                             }
-                            let v = ctx.builder.load(wrapper, slot_i * 8, slot_ty);
-                            bound.push((sym, ctx.locals.insert(sym, vec![v])));
                         }
                     }
                 }
@@ -1884,12 +1877,12 @@ fn lower_phase_e_guarded(
             Pattern::Constructor { binders, .. } => {
                 let mut slot_idx = 0;
                 for binder_slots in binders {
-                    for &sym in binder_slots {
+                    for binder in binder_slots {
                         if slot_idx >= scrutinee_slots.len() {
                             break;
                         }
                         let v = scrutinee_slots[slot_idx];
-                        if sym.0 != u32::MAX {
+                        if let Some(sym) = binder.as_sym() {
                             bound.push((sym, ctx.locals.insert(sym, vec![v])));
                         }
                         slot_idx += 1;
@@ -2097,12 +2090,12 @@ fn emit_is_guard(
             // Phase-E: bind every binder directly from scrutinee_vals.
             let mut slot_idx = 0;
             for binder_slots in binders {
-                for &sym in binder_slots {
+                for binder in binder_slots {
                     if slot_idx >= scrutinee_vals.len() {
                         break;
                     }
                     let v = scrutinee_vals[slot_idx];
-                    if sym.0 != u32::MAX {
+                    if let Some(sym) = binder.as_sym() {
                         guard_bindings.push((sym, ctx.locals.insert(sym, vec![v])));
                     }
                     slot_idx += 1;
@@ -2150,8 +2143,7 @@ fn emit_is_guard(
             };
             let offset = i * 8;
             if binder_slots.len() == 1 && slot_tys.len() > 1 {
-                let sym = binder_slots[0];
-                if sym.0 != u32::MAX {
+                if let Some(sym) = binder_slots[0].as_sym() {
                     let wrapper = ctx.builder.load(payload_ptr, offset, ScalarType::RcPtr);
                     let slot_vals: Vec<Value> = slot_tys
                         .iter()
@@ -2163,19 +2155,17 @@ fn emit_is_guard(
                 continue;
             }
             if binder_slots.len() == 1 && slot_tys.len() == 1 {
-                let sym = binder_slots[0];
-                if sym.0 != u32::MAX {
+                if let Some(sym) = binder_slots[0].as_sym() {
                     let v = ctx.builder.load(payload_ptr, offset, slot_tys[0]);
                     guard_bindings.push((sym, ctx.locals.insert(sym, vec![v])));
                 }
             } else if binder_slots.len() == slot_tys.len() {
                 let wrapper = ctx.builder.load(payload_ptr, offset, ScalarType::RcPtr);
-                for (k, (&sym, &t)) in binder_slots.iter().zip(&slot_tys).enumerate() {
-                    if sym.0 == u32::MAX {
-                        continue;
+                for (k, (binder, &t)) in binder_slots.iter().zip(&slot_tys).enumerate() {
+                    if let Some(sym) = binder.as_sym() {
+                        let v = ctx.builder.load(wrapper, k * 8, t);
+                        guard_bindings.push((sym, ctx.locals.insert(sym, vec![v])));
                     }
-                    let v = ctx.builder.load(wrapper, k * 8, t);
-                    guard_bindings.push((sym, ctx.locals.insert(sym, vec![v])));
                 }
             }
         }

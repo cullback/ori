@@ -56,19 +56,46 @@ pub enum Literal {
 pub enum Pattern {
     /// `Cons(x, xs)` — a tag-union constructor with field binders.
     /// Each outer entry corresponds to one source-level binder; the
-    /// inner Vec holds the slot symbols for that binder. Single-slot
-    /// binders (a binder of scalar type, or of an aggregate that
-    /// stays heap-resident) have a 1-element inner vec carrying the
-    /// AST binder sym directly. Multi-slot binders (e.g. binding
-    /// `rest: Lnk` where Lnk decomposes to (tag, payload)) have an
-    /// N-element inner vec of minted slot syms — those are what
-    /// `ctx.locals` maps the source binder to in `Name` expansion.
-    /// A wildcard binder has its `SymbolId` set to `u32::MAX`.
-    Constructor { tag: TagId, binders: Vec<Vec<SymbolId>> },
+    /// inner Vec holds the slot binders for that source binder.
+    /// Single-slot source binders have a 1-element inner vec; multi-
+    /// slot ones (e.g. binding `rest: Lnk` where `Lnk` decomposes to
+    /// `(tag, payload)`) have an N-element inner vec of minted slot
+    /// binders.
+    Constructor { tag: TagId, binders: Vec<Vec<Binder>> },
     /// `_` — match anything, bind nothing.
     Wildcard,
     /// `x` (bare name) — match anything, bind to `x`.
     Binding(SymbolId),
+}
+
+/// One slot of a constructor field's binders.
+///
+/// `Sym(s)` binds the slot value to `s`. `Wildcard` ignores it.
+/// Replaces the previous `SymbolId(u32::MAX)` sentinel convention —
+/// wildcards and real binders are now structurally distinguishable,
+/// catching "compared sentinel against real id" bugs at the type
+/// level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binder {
+    Sym(SymbolId),
+    Wildcard,
+}
+
+impl Binder {
+    /// `true` if this binder ignores its slot value.
+    #[must_use]
+    pub fn is_wildcard(self) -> bool {
+        matches!(self, Self::Wildcard)
+    }
+
+    /// The symbol if this binder binds, else `None`.
+    #[must_use]
+    pub fn as_sym(self) -> Option<SymbolId> {
+        match self {
+            Self::Sym(s) => Some(s),
+            Self::Wildcard => None,
+        }
+    }
 }
 
 /// One arm of a `Match` expression.
