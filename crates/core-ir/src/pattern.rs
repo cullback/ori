@@ -1,39 +1,45 @@
 //! Patterns — three shallow shapes.
 //!
-//! Per the spec, literal patterns (`IntLit`, `StrLit`) are
-//! desugared at AST→Core into `Binding(fresh)` + a synthesized
-//! `Eq(fresh, lit)` guard at the head of the arm. Nested patterns
-//! are flattened upstream by `flatten_patterns`. Three shapes
-//! cover everything Core needs.
+//! Literal patterns are desugared at AST→Core. Nested patterns
+//! are flattened upstream. Three shapes cover everything Core
+//! needs to dispatch.
 
-use crate::sym::{SymbolId, TagId};
+use crate::sym::{LocalId, TagId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
-    /// `Cons(x, xs)` — a tag-union constructor with field binders.
-    ///
-    /// `binders` is `Vec<Vec<SymbolId>>`:
-    /// - Outer Vec: one entry per source-level field.
-    /// - Inner Vec: the slot symbols that field expands to (1 for
-    ///   single-slot scalar fields, N for multi-slot record/tuple/
-    ///   trio fields).
-    ///
-    /// A wildcard binder has its `SymbolId` set to a sentinel value
-    /// (the existing impl uses `SymbolId(u32::MAX)`).
-    ///
-    /// **Open question:** the sentinel-wildcard convention is a
-    /// classic "make-illegal-states-representable" smell — an enum
-    /// `Binder { Sym(SymbolId), Wildcard }` would catch the
-    /// "compared a sentinel value against a real id" bug at the type
-    /// level. Cost: every binder access is `match`.
+    /// `Cons(x, xs)` — a tag-union variant with per-field binders.
+    /// One `Binder` per source-level field; nested fields have
+    /// been flattened upstream.
     Constructor {
         tag: TagId,
-        binders: Vec<Vec<SymbolId>>,
+        binders: Vec<Binder>,
     },
-
-    /// `_` — match anything, bind nothing.
     Wildcard,
+    Binding(LocalId),
+}
 
-    /// `x` (bare name) — match anything, bind to `x`.
-    Binding(SymbolId),
+/// One field's binder in a `Constructor` pattern.
+///
+/// `Binder` is an enum — no `u32::MAX` sentinel for wildcards.
+/// Wildcards and real binders are structurally distinguishable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binder {
+    Sym(LocalId),
+    Wildcard,
+}
+
+impl Binder {
+    #[must_use]
+    pub fn is_wildcard(self) -> bool {
+        matches!(self, Self::Wildcard)
+    }
+
+    #[must_use]
+    pub fn as_sym(self) -> Option<LocalId> {
+        match self {
+            Self::Sym(s) => Some(s),
+            Self::Wildcard => None,
+        }
+    }
 }

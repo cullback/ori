@@ -1,48 +1,39 @@
-//! Identifiers — `SymbolId` for callables/bindings, `TagId` for
-//! constructor tags.
+//! Identifiers — distinct types for distinct concepts.
 //!
-//! Both are deliberately opaque newtypes. The v1 prototype doesn't
-//! reuse the main `ori` crate's `SymbolTable` — keeping these
-//! local makes the IR testable in isolation and forces us to think
-//! about what Core actually needs from an identifier.
+//! The spec calls out that `Var.sym` (a local binding) and
+//! `App.target` (a top-level callable) are semantically different;
+//! splitting them at the type level catches "called a local
+//! variable like a function" at compile time.
 
-/// Stable identifier for a top-level definition or a local binding.
-///
-/// In the full pipeline, this maps 1:1 to the AST's `SymbolId`.
-/// Here it's just an opaque integer; the test harness allocates them.
-///
-/// **Open question:** in the existing implementation, `Var.sym` and
-/// `App.target` are the *same* `SymbolId` type — a top-level function
-/// and a local binding aren't distinguished syntactically. Should we
-/// split them? `Var(LocalId)` vs `App(FuncId)` would catch the
-/// "called a local variable like a function" mistake at the type
-/// level. Cost: every traversal has to handle two kinds.
+/// A local binding: function parameter, `Let` binder, or pattern
+/// binder. The integer is just an allocation tag — we don't reuse
+/// the main `ori` crate's `SymbolTable` here, the test harness
+/// allocates fresh `LocalId`s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SymbolId(pub u32);
+pub struct LocalId(pub u32);
 
-/// Constructor tag — the source name of the variant (`"Cons"`,
-/// `"Ok"`, `"True"`).
-///
-/// Tag unions are structural in Ori — the tag name identifies the
-/// variant within its union. Strings are the natural representation;
-/// could be interned later if profiling shows it matters.
-///
-/// **Open question:** should this be a `SymbolId` too? Constructors
-/// are top-level declarations in the symbol table. Using `String`
-/// here means rewrites that match on `tag == "Cons"` work without a
-/// symbol-table lookup, but the redundancy with the symbol table is
-/// a smell.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TagId(pub String);
+/// A top-level callable: user function, lifted lambda, builtin,
+/// or stdlib. Resolved through a function table at lowering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FnId(pub u32);
 
-impl TagId {
-    #[must_use]
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
+/// A user-declared tag-union constructor (`Cons`, `Nil`, `Ok`,
+/// `Err`, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DeclTagId(pub u32);
 
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+/// A synthesized closure constructor (`__lambda_K`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClosureTagId(pub u32);
+
+/// Tag-union tag. Kinded so closure tags and declared tags can't
+/// be conflated structurally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TagId {
+    Declared(DeclTagId),
+    Closure(ClosureTagId),
 }
+
+/// A user-declared type constructor (`List`, `Result`, `MyUnion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeId(pub u32);
