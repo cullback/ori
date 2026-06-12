@@ -27,4 +27,6 @@ pub use rewrite::{free_vars, simplify, substitute_many, substitute_one};
 pub use sym::{ClosureTagId, DeclTagId, FnId, LocalId, TagId, TypeId};
 pub use totality::{compute_fn_totality, is_total, FnTotality};
 pub use ty::{CoreType, Scalar};
-pub use validate::{validate_call_graph, validate_scope, ValidationError};
+pub use validate::{
+    validate_call_graph, validate_scope, validate_totality, validate_types, ValidationError,
+};
