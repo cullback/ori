@@ -29,3 +29,12 @@ pub enum Scalar {
     F32,
     F64,
 }
+
+/// Every `Scalar` is a valid `CoreType` — the conversion lets us
+/// write `Scalar::I64` (or just `I64` with `use Scalar::*`) wherever
+/// a type is expected.
+impl From<Scalar> for CoreType {
+    fn from(s: Scalar) -> Self {
+        Self::Prim(s)
+    }
+}

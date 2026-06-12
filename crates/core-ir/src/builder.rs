@@ -69,10 +69,10 @@ impl Builder {
 
     /// A fresh local binding with a known type. Use it directly
     /// in `let`, `match`, and argument positions.
-    pub fn local(&mut self, ty: CoreType) -> LocalVar {
+    pub fn local(&mut self, ty: impl Into<CoreType>) -> LocalVar {
         let id = LocalId(self.next_local);
         self.next_local += 1;
-        LocalVar { id, ty }
+        LocalVar { id, ty: ty.into() }
     }
 
     /// A fresh top-level callable identifier.
@@ -100,74 +100,70 @@ impl Builder {
         id
     }
 
-    // ---------------- Type shorthands ----------------
+    // ---------------- Type constructors ----------------
+    //
+    // Primitive types come from `Scalar` directly — write
+    // `Scalar::I64` (or `I64` with `use Scalar::*`) anywhere a
+    // type is expected; conversions via `Into<CoreType>` handle
+    // it. These ADT-shape helpers stay on the builder because
+    // they mint fresh `TypeId`s.
 
-    #[must_use]
-    pub fn i64(&self) -> CoreType { CoreType::Prim(Scalar::I64) }
-    #[must_use]
-    pub fn u8(&self) -> CoreType { CoreType::Prim(Scalar::U8) }
-    #[must_use]
-    pub fn u64(&self) -> CoreType { CoreType::Prim(Scalar::U64) }
-    #[must_use]
-    pub fn bool_ty(&self) -> CoreType { CoreType::Prim(Scalar::Bool) }
-    #[must_use]
-    pub fn f64(&self) -> CoreType { CoreType::Prim(Scalar::F64) }
-
-    /// `List(T)` shorthand. Mints a fresh `TypeId` for the `List`
-    /// head each time — tests that care about head identity
-    /// should mint and reuse one explicitly.
-    pub fn list_of(&mut self, elem: CoreType) -> CoreType {
+    /// `List(T)`. Mints a fresh `TypeId` for the `List` head;
+    /// tests that care about head identity should mint and reuse
+    /// one explicitly.
+    pub fn list_of(&mut self, elem: impl Into<CoreType>) -> CoreType {
         let head = self.type_id();
-        CoreType::Adt(head, vec![elem])
+        CoreType::Adt(head, vec![elem.into()])
     }
 
-    /// `Result(T, E)` shorthand.
-    pub fn result_of(&mut self, ok: CoreType, err: CoreType) -> CoreType {
+    /// `Result(T, E)`.
+    pub fn result_of(
+        &mut self,
+        ok: impl Into<CoreType>,
+        err: impl Into<CoreType>,
+    ) -> CoreType {
         let head = self.type_id();
-        CoreType::Adt(head, vec![ok, err])
+        CoreType::Adt(head, vec![ok.into(), err.into()])
     }
 
-    /// `Maybe(T)` shorthand.
-    pub fn maybe_of(&mut self, t: CoreType) -> CoreType {
+    /// `Maybe(T)`.
+    pub fn maybe_of(&mut self, t: impl Into<CoreType>) -> CoreType {
         let head = self.type_id();
-        CoreType::Adt(head, vec![t])
+        CoreType::Adt(head, vec![t.into()])
     }
 
     /// `Str` (`List(U8)` under the spec).
-    pub fn str_ty(&mut self) -> CoreType {
-        self.list_of(self.u8())
-    }
+    pub fn str_ty(&mut self) -> CoreType { self.list_of(Scalar::U8) }
 
     // ---------------- Literal shortcuts (return Expr) ----------------
 
     /// `42_i64` — emits `Expr::Lit` of `I64` type directly.
     #[must_use]
     pub fn int(&self, n: i64) -> Expr {
-        Expr::Lit { value: Literal::Int(n), ty: self.i64() }
+        Expr::Lit { value: Literal::Int(n), ty: Scalar::I64.into() }
     }
 
     /// `5_u8`.
     #[must_use]
     pub fn byte(&self, n: u8) -> Expr {
-        Expr::Lit { value: Literal::Int(i64::from(n)), ty: self.u8() }
+        Expr::Lit { value: Literal::Int(i64::from(n)), ty: Scalar::U8.into() }
     }
 
     /// `true` / `false` literal.
     #[must_use]
-    pub fn bool_(&self, b: bool) -> Expr {
-        Expr::Lit { value: Literal::Int(i64::from(b)), ty: self.bool_ty() }
+    pub fn bool_(&self, v: bool) -> Expr {
+        Expr::Lit { value: Literal::Int(i64::from(v)), ty: Scalar::Bool.into() }
     }
 
     /// `3.14_f64`.
     #[must_use]
     pub fn float(&self, x: f64) -> Expr {
-        Expr::Lit { value: Literal::Float(x), ty: self.f64() }
+        Expr::Lit { value: Literal::Float(x), ty: Scalar::F64.into() }
     }
 
     /// `crash("msg")` of the given result type.
-    #[must_use]
-    pub fn crash(&self, msg: impl Into<String>, ty: CoreType) -> Expr {
-        Expr::Crash { msg: StrLit::new(msg), ty }
+    pub fn crash(&self, msg: impl Into<String>, ty: impl Into<CoreType>) -> Expr {
+        Expr::Crash { msg: StrLit::new(msg), ty: ty.into() }
     }
 
     // ---------------- Composite constructors ----------------
@@ -178,12 +174,12 @@ impl Builder {
         &self,
         target: FnId,
         args: impl IntoIterator<Item = Expr>,
-        ret_ty: CoreType,
+        ret_ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::App {
             target,
             args: args.into_iter().collect(),
-            ty: ret_ty,
+            ty: ret_ty.into(),
         }
     }
 
@@ -201,7 +197,7 @@ impl Builder {
             binder: x.id,
             value: Box::new(value.into()),
             body: Box::new(body_expr),
-            ty,
+            ty: ty.into(),
         }
     }
 
@@ -210,12 +206,12 @@ impl Builder {
         &self,
         scrutinee: impl Into<Expr>,
         arms: impl IntoIterator<Item = MatchArm>,
-        ty: CoreType,
+        ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::Match {
             scrutinee: Box::new(scrutinee.into()),
             arms: arms.into_iter().collect(),
-            ty,
+            ty: ty.into(),
         }
     }
 
@@ -224,12 +220,12 @@ impl Builder {
         &self,
         tag: TagId,
         args: impl IntoIterator<Item = Expr>,
-        ty: CoreType,
+        ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::Con {
             tag,
             args: args.into_iter().collect(),
-            ty,
+            ty: ty.into(),
         }
     }
 
@@ -242,7 +238,7 @@ impl Builder {
         target: impl Into<Expr>,
         init: impl IntoIterator<Item = Expr>,
         captures: impl IntoIterator<Item = Expr>,
-        ty: CoreType,
+        ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::Fold {
             kind: FoldKind::Total,
@@ -251,7 +247,7 @@ impl Builder {
             init: init.into_iter().collect(),
             captures: captures.into_iter().collect(),
             shape: None,
-            ty,
+            ty: ty.into(),
         }
     }
 
@@ -262,7 +258,7 @@ impl Builder {
         target: impl Into<Expr>,
         init: impl IntoIterator<Item = Expr>,
         captures: impl IntoIterator<Item = Expr>,
-        ty: CoreType,
+        ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::Fold {
             kind: FoldKind::EarlyExit,
@@ -271,7 +267,7 @@ impl Builder {
             init: init.into_iter().collect(),
             captures: captures.into_iter().collect(),
             shape: None,
-            ty,
+            ty: ty.into(),
         }
     }
 
@@ -294,16 +290,16 @@ impl Builder {
         step_fn: FnId,
         init: impl IntoIterator<Item = Expr>,
         captures: impl IntoIterator<Item = Expr>,
-        elem_ty: CoreType,
-        ty: CoreType,
+        elem_ty: impl Into<CoreType>,
+        ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::Gen {
             bound: Box::new(bound.into()),
             step_fn,
             init: init.into_iter().collect(),
             captures: captures.into_iter().collect(),
-            elem_ty,
-            ty,
+            elem_ty: elem_ty.into(),
+            ty: ty.into(),
         }
     }
 
@@ -312,21 +308,21 @@ impl Builder {
     pub fn buf_lit(
         &self,
         elements: impl IntoIterator<Item = Expr>,
-        elem_ty: CoreType,
-        ty: CoreType,
+        elem_ty: impl Into<CoreType>,
+        ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::BufLit {
             elements: elements.into_iter().collect(),
-            elem_ty,
-            ty,
+            elem_ty: elem_ty.into(),
+            ty: ty.into(),
         }
     }
 
-    pub fn buf_load(&self, buf: impl Into<Expr>, idx: impl Into<Expr>, ty: CoreType) -> Expr {
+    pub fn buf_load(&self, buf: impl Into<Expr>, idx: impl Into<Expr>, ty: impl Into<CoreType>) -> Expr {
         Expr::BufLoad {
             buf: Box::new(buf.into()),
             idx: Box::new(idx.into()),
-            ty,
+            ty: ty.into(),
         }
     }
 
@@ -334,20 +330,20 @@ impl Builder {
         &self,
         buf: impl Into<Expr>,
         idx: impl Into<Expr>,
-        ty: CoreType,
+        ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::BufLoadUnchecked {
             buf: Box::new(buf.into()),
             idx: Box::new(idx.into()),
-            ty,
+            ty: ty.into(),
         }
     }
 
-    pub fn buf_append(&self, buf: impl Into<Expr>, val: impl Into<Expr>, ty: CoreType) -> Expr {
+    pub fn buf_append(&self, buf: impl Into<Expr>, val: impl Into<Expr>, ty: impl Into<CoreType>) -> Expr {
         Expr::BufAppend {
             buf: Box::new(buf.into()),
             val: Box::new(val.into()),
-            ty,
+            ty: ty.into(),
         }
     }
 
@@ -356,13 +352,13 @@ impl Builder {
         buf: impl Into<Expr>,
         idx: impl Into<Expr>,
         val: impl Into<Expr>,
-        ty: CoreType,
+        ty: impl Into<CoreType>,
     ) -> Expr {
         Expr::BufSet {
             buf: Box::new(buf.into()),
             idx: Box::new(idx.into()),
             val: Box::new(val.into()),
-            ty,
+            ty: ty.into(),
         }
     }
 
