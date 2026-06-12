@@ -1,20 +1,21 @@
 //! Rewrite layer.
 //!
 //! `simplify(expr, fns)` walks an expression bottom-up, applying
-//! local rewrite rules at each node. The traversal is type-
-//! preserving by construction — every rewrite produces an expression
-//! of the same type as its input.
+//! local rewrite rules at each node. Each rule documents the
+//! soundness condition it depends on.
 //!
 //! Today's rules:
 //!
-//! - **Dead-binding elimination.** `let x = e in body` where `body`
-//!   doesn't reference `x` and `e` is total → `body`. Soundness
-//!   requires `e` to be crash-free; we use the totality calculator
-//!   to check.
-//!
-//! Each rule documents which language guarantee it relies on for
-//! soundness; the spec's *Soundness* section catalogs which subtree
-//! shapes admit which rewrites.
+//! - **Dead-binding elimination.** `let x = e in body` where
+//!   `body` doesn't reference `x` and `e` is total → `body`.
+//! - **Beta reduction** (let-of-literal / let-of-var).
+//!   `let x = lit in body` → `body[x → lit]`. Sound
+//!   unconditionally — literals and vars can't crash and are
+//!   trivially cheap to duplicate.
+//! - **Case-of-known-constructor.** `Match(Con(tag, args), arms)`
+//!   rewrites to the matching arm's body with field binders
+//!   substituted by `args`. The flagship syntactic rewrite the
+//!   `Con` + `Match` variant split exists to enable.
 
 use std::collections::HashSet;
 
@@ -23,8 +24,10 @@ use crate::pattern::Pattern;
 use crate::sym::LocalId;
 use crate::totality::{is_total, FnTotality};
 
-/// Walk an expression bottom-up, simplifying children first and
-/// applying local rules at each node.
+/// Walk an expression bottom-up. After simplifying children, apply
+/// the local rules at the current node. If any rule fires, the
+/// result is re-simplified — rules can compose without the caller
+/// running `simplify` multiple times.
 #[must_use]
 pub fn simplify(expr: Expr, fns: &FnTotality) -> Expr {
     let expr = recurse(expr, fns);
@@ -111,33 +114,221 @@ fn recurse(expr: Expr, fns: &FnTotality) -> Expr {
 
 fn apply_local_rules(expr: Expr, fns: &FnTotality) -> Expr {
     match expr {
-        // **Dead-binding elimination.**
-        //
-        // `let x = e in body` where:
-        // - `body` does not reference `x` (binding is dead), and
-        // - `e` is total (no `Crash`, only calls to total fns),
-        //
-        // rewrites to `body`. Soundness: purity makes the eliminated
-        // evaluation unobservable; totality ensures we don't skip a
-        // crash. In a non-total language this rewrite would need a
-        // crash-freedom side condition; in Ori the totality bit is
-        // the check.
+        // **Beta reduction** (let-of-literal / let-of-var) and
+        // **dead-let elimination**, in that order. Beta is unconditional
+        // for literal/var values; dead-let needs totality.
         Expr::Let { binder, value, body, ty } => {
-            if !free_vars(&body).contains(&binder) && is_total(&value, fns) {
-                *body
-            } else {
-                Expr::Let { binder, value, body, ty }
+            // Beta: if value is a literal or a Var, substitute in body.
+            // Both kinds are cheap to duplicate and trivially total.
+            if matches!(*value, Expr::Lit { .. } | Expr::Var { .. }) {
+                let substituted = substitute_one(*body, binder, &value);
+                return simplify(substituted, fns);
             }
+            // Dead-let: if body doesn't reference binder and value
+            // is total, drop the Let.
+            if !free_vars(&body).contains(&binder) && is_total(&value, fns) {
+                return simplify(*body, fns);
+            }
+            Expr::Let { binder, value, body, ty }
         }
+
+        // **Case-of-known-constructor.** If the scrutinee is a `Con`,
+        // find the matching arm and substitute its binders with the
+        // constructor's args. Sound unconditionally — we're just
+        // evaluating the match at compile time. The `Con` is gone
+        // along with the entire `Match`.
+        Expr::Match { scrutinee, arms, ty } => {
+            if matches!(scrutinee.as_ref(), Expr::Con { .. }) {
+                if let Some(reduced) = case_of_known_con(&scrutinee, &arms) {
+                    return simplify(reduced, fns);
+                }
+                // No matching arm: a non-exhaustive match. Leave it
+                // alone — the runtime will crash, which is what the
+                // user wrote.
+            }
+            Expr::Match { scrutinee, arms, ty }
+        }
+
         other => other,
     }
 }
 
+/// Try case-of-known-constructor. Returns `Some(body_after_subst)`
+/// if a matching arm was found.
+fn case_of_known_con(scrutinee: &Expr, arms: &[MatchArm]) -> Option<Expr> {
+    let Expr::Con { tag: con_tag, args: con_args, .. } = scrutinee else {
+        return None;
+    };
+    for arm in arms {
+        // Guards make match outcome run-time dependent; skip the
+        // rewrite (a smarter version could pattern-match on
+        // syntactically-true guards).
+        if !arm.guards.is_empty() {
+            return None;
+        }
+        match &arm.pattern {
+            Pattern::Wildcard => return Some((*arm.body).clone()),
+            Pattern::Binding(b) => {
+                return Some(substitute_one(
+                    (*arm.body).clone(),
+                    *b,
+                    scrutinee,
+                ));
+            }
+            Pattern::Constructor { tag: arm_tag, binders } => {
+                if con_tag != arm_tag {
+                    continue;
+                }
+                if binders.len() != con_args.len() {
+                    return None;
+                }
+                let sub: Vec<(LocalId, Expr)> = binders
+                    .iter()
+                    .zip(con_args.iter())
+                    .filter_map(|(b, arg)| b.as_sym().map(|s| (s, arg.clone())))
+                    .collect();
+                return Some(substitute_many((*arm.body).clone(), &sub));
+            }
+        }
+    }
+    None
+}
+
+// ---- Substitution ----
+
+/// Substitute `target` → `replacement` in `expr`, respecting lexical
+/// scope. `replacement` is cloned at each use site.
+#[must_use]
+pub fn substitute_one(expr: Expr, target: LocalId, replacement: &Expr) -> Expr {
+    substitute_many(expr, &[(target, replacement.clone())])
+}
+
+/// Apply many substitutions simultaneously. Each `(LocalId, Expr)`
+/// pair: any `Var` referencing the `LocalId` is replaced with the
+/// `Expr` (clone). Scope-aware: shadowing binders mask the outer
+/// substitution within their scope.
+#[must_use]
+pub fn substitute_many(expr: Expr, subs: &[(LocalId, Expr)]) -> Expr {
+    fn find<'a>(subs: &'a [(LocalId, Expr)], sym: LocalId) -> Option<&'a Expr> {
+        subs.iter().find_map(|(s, e)| if *s == sym { Some(e) } else { None })
+    }
+    fn shadowed(subs: &[(LocalId, Expr)], sym: LocalId) -> Vec<(LocalId, Expr)> {
+        subs.iter()
+            .filter(|(s, _)| *s != sym)
+            .cloned()
+            .collect()
+    }
+    fn go(expr: Expr, subs: &[(LocalId, Expr)]) -> Expr {
+        if subs.is_empty() {
+            return expr;
+        }
+        match expr {
+            Expr::Var { sym, ty } => {
+                if let Some(r) = find(subs, sym) {
+                    r.clone()
+                } else {
+                    Expr::Var { sym, ty }
+                }
+            }
+            Expr::Lit { .. } | Expr::Crash { .. } => expr,
+            Expr::App { target, args, ty } => Expr::App {
+                target,
+                args: args.into_iter().map(|a| go(a, subs)).collect(),
+                ty,
+            },
+            Expr::Let { binder, value, body, ty } => {
+                let value = go(*value, subs);
+                let body = if find(subs, binder).is_some() {
+                    let shadowed_subs = shadowed(subs, binder);
+                    go(*body, &shadowed_subs)
+                } else {
+                    go(*body, subs)
+                };
+                Expr::Let { binder, value: Box::new(value), body: Box::new(body), ty }
+            }
+            Expr::Match { scrutinee, arms, ty } => Expr::Match {
+                scrutinee: Box::new(go(*scrutinee, subs)),
+                arms: arms
+                    .into_iter()
+                    .map(|arm| go_arm(arm, subs))
+                    .collect(),
+                ty,
+            },
+            Expr::Con { tag, args, ty } => Expr::Con {
+                tag,
+                args: args.into_iter().map(|a| go(a, subs)).collect(),
+                ty,
+            },
+            Expr::Fold { kind, fold_fn, target, init, captures, shape, ty } => Expr::Fold {
+                kind,
+                fold_fn,
+                target: Box::new(go(*target, subs)),
+                init: init.into_iter().map(|e| go(e, subs)).collect(),
+                captures: captures.into_iter().map(|e| go(e, subs)).collect(),
+                shape,
+                ty,
+            },
+            Expr::Gen { bound, step_fn, init, captures, elem_ty, ty } => Expr::Gen {
+                bound: Box::new(go(*bound, subs)),
+                step_fn,
+                init: init.into_iter().map(|e| go(e, subs)).collect(),
+                captures: captures.into_iter().map(|e| go(e, subs)).collect(),
+                elem_ty,
+                ty,
+            },
+            Expr::BufLit { elements, elem_ty, ty } => Expr::BufLit {
+                elements: elements.into_iter().map(|e| go(e, subs)).collect(),
+                elem_ty,
+                ty,
+            },
+            Expr::BufLoad { buf, idx, ty } => Expr::BufLoad {
+                buf: Box::new(go(*buf, subs)),
+                idx: Box::new(go(*idx, subs)),
+                ty,
+            },
+            Expr::BufLoadUnchecked { buf, idx, ty } => Expr::BufLoadUnchecked {
+                buf: Box::new(go(*buf, subs)),
+                idx: Box::new(go(*idx, subs)),
+                ty,
+            },
+            Expr::BufAppend { buf, val, ty } => Expr::BufAppend {
+                buf: Box::new(go(*buf, subs)),
+                val: Box::new(go(*val, subs)),
+                ty,
+            },
+            Expr::BufSet { buf, idx, val, ty } => Expr::BufSet {
+                buf: Box::new(go(*buf, subs)),
+                idx: Box::new(go(*idx, subs)),
+                val: Box::new(go(*val, subs)),
+                ty,
+            },
+        }
+    }
+
+    fn go_arm(arm: MatchArm, subs: &[(LocalId, Expr)]) -> MatchArm {
+        let pattern_binders = pattern_binders(&arm.pattern);
+        let arm_subs: Vec<(LocalId, Expr)> = if pattern_binders.is_empty() {
+            subs.to_vec()
+        } else {
+            subs.iter()
+                .filter(|(s, _)| !pattern_binders.contains(s))
+                .cloned()
+                .collect()
+        };
+        MatchArm {
+            pattern: arm.pattern,
+            guards: arm.guards.into_iter().map(|g| go(g, &arm_subs)).collect(),
+            body: Box::new(go(*arm.body, &arm_subs)),
+            is_return: arm.is_return,
+        }
+    }
+
+    go(expr, subs)
+}
+
+// ---- Free vars ----
+
 /// Compute the set of `LocalId`s referenced free in `expr`.
-///
-/// "Free" means not bound by an enclosing `Let` or `Pattern` binder
-/// *within* `expr`. Function-table identifiers (`FnId`, `TagId`,
-/// `TypeId`) aren't local bindings; they aren't tracked.
 #[must_use]
 pub fn free_vars(expr: &Expr) -> HashSet<LocalId> {
     let mut out = HashSet::new();
@@ -169,14 +360,13 @@ fn collect_free(expr: &Expr, bound: &mut HashSet<LocalId>, out: &mut HashSet<Loc
         Expr::Match { scrutinee, arms, .. } => {
             collect_free(scrutinee, bound, out);
             for arm in arms {
-                let pattern_binders = pattern_binders(&arm.pattern);
-                let was_new: Vec<bool> =
-                    pattern_binders.iter().map(|s| bound.insert(*s)).collect();
+                let pbs = pattern_binders(&arm.pattern);
+                let was_new: Vec<bool> = pbs.iter().map(|s| bound.insert(*s)).collect();
                 for g in &arm.guards {
                     collect_free(g, bound, out);
                 }
                 collect_free(&arm.body, bound, out);
-                for (sym, new) in pattern_binders.iter().zip(was_new) {
+                for (sym, new) in pbs.iter().zip(was_new) {
                     if new {
                         bound.remove(sym);
                     }

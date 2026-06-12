@@ -50,25 +50,37 @@ fn dead_let_preserved_when_value_crashes() {
 }
 
 #[test]
-fn live_let_preserved() {
+fn beta_of_literal_substitutes_into_body() {
+    // let x = 7 in x → 7 (beta of literal)
     let mut b = Builder::new();
     let x = b.local(I64);
     let prog = b.bind(&x, b.int(7), &x);
     let after = simplify(prog, &FnTotality::new());
-    assert!(matches!(&after, Expr::Let { .. }));
+    assert!(matches!(&after, Expr::Lit { .. }), "beta should propagate, got {after}");
 }
 
 #[test]
-fn nested_dead_let_eliminates() {
-    // let x = 1 in (let y = 2 in x) — y dead, x live → let x = 1 in x
+fn live_let_with_opaque_value_preserved() {
+    // let x = opaque() in x — beta doesn't fire (value is App, not lit/var);
+    // dead-let doesn't fire (x is used). Let stays.
+    let mut b = Builder::new();
+    let opaque = b.func();
+    let x = b.local(I64);
+    let prog = b.bind(&x, b.call(opaque, [], I64), &x);
+    let after = simplify(prog, &FnTotality::new());
+    assert!(matches!(&after, Expr::Let { .. }), "Let preserved: {after}");
+}
+
+#[test]
+fn nested_beta_collapses_chain() {
+    // let x = 1 in (let y = 2 in x) — beta propagates x→1, then y→2,
+    // result is just `1`.
     let mut b = Builder::new();
     let x = b.local(I64);
     let y = b.local(I64);
     let prog = b.bind(&x, b.int(1), b.bind(&y, b.int(2), &x));
     let after = simplify(prog, &FnTotality::new());
-    let Expr::Let { binder, body, .. } = &after else { panic!("expected outer Let") };
-    assert_eq!(*binder, x.id);
-    assert!(matches!(body.as_ref(), Expr::Var { sym, .. } if *sym == x.id));
+    assert!(matches!(&after, Expr::Lit { .. }), "expected fully-collapsed literal");
 }
 
 #[test]

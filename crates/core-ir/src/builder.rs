@@ -375,6 +375,10 @@ impl Builder {
     #[must_use]
     pub const fn pat_wild(&self) -> Pattern { Pattern::Wildcard }
 
+    /// `x` (whole-value binder).
+    #[must_use]
+    pub fn pat_bind(&self, x: &LocalVar) -> Pattern { Pattern::Binding(x.id) }
+
     /// One arm with no guards.
     pub fn arm(&self, pattern: Pattern, body: impl Into<Expr>) -> MatchArm {
         MatchArm {

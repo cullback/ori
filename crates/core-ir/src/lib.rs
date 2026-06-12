@@ -23,7 +23,7 @@ pub use builder::Builder;
 pub use expr::{Expr, FoldKind, FoldShape, MatchArm};
 pub use literal::{Literal, StrLit};
 pub use pattern::{Binder, Pattern};
-pub use rewrite::{free_vars, simplify};
+pub use rewrite::{free_vars, simplify, substitute_many, substitute_one};
 pub use sym::{ClosureTagId, DeclTagId, FnId, LocalId, TagId, TypeId};
 pub use totality::{compute_fn_totality, is_total, FnTotality};
 pub use ty::{CoreType, Scalar};
