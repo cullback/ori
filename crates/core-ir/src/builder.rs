@@ -1,9 +1,9 @@
 //! Builder API for constructing Core programs in tests.
 //!
-//! Analogous to `ssa::Builder` but tree-shaped (Core isn't
-//! imperative). The builder manages identifier minting and
-//! provides ergonomic constructors so test programs don't
-//! drown in struct literals.
+//! The builder tracks types for bindings (`LocalVar`) so that
+//! using a binding doesn't require re-stating its type at each
+//! reference site. Conversions via `Into<Expr>` let local
+//! variables flow into argument positions naturally.
 
 use crate::expr::{Expr, FoldKind, FoldShape, MatchArm};
 use crate::literal::{Literal, StrLit};
@@ -11,11 +11,47 @@ use crate::pattern::{Binder, Pattern};
 use crate::sym::{ClosureTagId, DeclTagId, FnId, LocalId, TagId, TypeId};
 use crate::ty::{CoreType, Scalar};
 
-/// Allocates fresh identifiers and provides ergonomic constructors.
+/// A locally-bound variable with its type attached.
 ///
-/// Identifiers are sequentially allocated u32s; tests can build
-/// many independent programs by using separate `Builder`
-/// instances.
+/// `LocalVar` is the unit of binding in builder code. Use it as
+/// the `binder` in `Let` / pattern positions; pass it (by value
+/// or by reference) wherever an `Expr` is expected.
+#[derive(Debug, Clone)]
+pub struct LocalVar {
+    pub id: LocalId,
+    pub ty: CoreType,
+}
+
+impl LocalVar {
+    /// Build an `Expr::Var` referencing this binding.
+    #[must_use]
+    pub fn expr(&self) -> Expr {
+        Expr::Var { sym: self.id, ty: self.ty.clone() }
+    }
+
+    /// Build a `Pattern::Binding` for use in a `Match` arm.
+    #[must_use]
+    pub fn pat(&self) -> Pattern {
+        Pattern::Binding(self.id)
+    }
+
+    /// Build a `Binder::Sym` for use inside a `Constructor` pattern.
+    #[must_use]
+    pub fn as_binder(&self) -> Binder {
+        Binder::Sym(self.id)
+    }
+}
+
+impl From<LocalVar> for Expr {
+    fn from(v: LocalVar) -> Self { v.expr() }
+}
+
+impl From<&LocalVar> for Expr {
+    fn from(v: &LocalVar) -> Self { v.expr() }
+}
+
+/// Builder for Core IR programs. Allocates fresh identifiers and
+/// provides ergonomic constructors.
 #[derive(Default)]
 pub struct Builder {
     next_local: u32,
@@ -27,43 +63,44 @@ pub struct Builder {
 
 impl Builder {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    pub fn new() -> Self { Self::default() }
 
-    // ---- Fresh identifiers ----
+    // ---------------- Fresh identifiers ----------------
 
-    pub fn fresh_local(&mut self) -> LocalId {
+    /// A fresh local binding with a known type. Use it directly
+    /// in `let`, `match`, and argument positions.
+    pub fn local(&mut self, ty: CoreType) -> LocalVar {
         let id = LocalId(self.next_local);
         self.next_local += 1;
-        id
+        LocalVar { id, ty }
     }
 
-    pub fn fresh_fn(&mut self) -> FnId {
+    /// A fresh top-level callable identifier.
+    pub fn func(&mut self) -> FnId {
         let id = FnId(self.next_fn);
         self.next_fn += 1;
         id
     }
 
-    pub fn fresh_decl_tag(&mut self) -> DeclTagId {
+    pub fn decl_tag(&mut self) -> DeclTagId {
         let id = DeclTagId(self.next_decl_tag);
         self.next_decl_tag += 1;
         id
     }
 
-    pub fn fresh_closure_tag(&mut self) -> ClosureTagId {
+    pub fn closure_tag(&mut self) -> ClosureTagId {
         let id = ClosureTagId(self.next_closure_tag);
         self.next_closure_tag += 1;
         id
     }
 
-    pub fn fresh_type(&mut self) -> TypeId {
+    pub fn type_id(&mut self) -> TypeId {
         let id = TypeId(self.next_type);
         self.next_type += 1;
         id
     }
 
-    // ---- Type shorthands ----
+    // ---------------- Type shorthands ----------------
 
     #[must_use]
     pub fn i64(&self) -> CoreType { CoreType::Prim(Scalar::I64) }
@@ -72,117 +109,174 @@ impl Builder {
     #[must_use]
     pub fn u64(&self) -> CoreType { CoreType::Prim(Scalar::U64) }
     #[must_use]
-    pub fn bool(&self) -> CoreType { CoreType::Prim(Scalar::Bool) }
+    pub fn bool_ty(&self) -> CoreType { CoreType::Prim(Scalar::Bool) }
     #[must_use]
     pub fn f64(&self) -> CoreType { CoreType::Prim(Scalar::F64) }
 
-    #[must_use]
-    pub fn adt(&self, head: TypeId, args: Vec<CoreType>) -> CoreType {
-        CoreType::Adt(head, args)
+    /// `List(T)` shorthand. Mints a fresh `TypeId` for the `List`
+    /// head each time — tests that care about head identity
+    /// should mint and reuse one explicitly.
+    pub fn list_of(&mut self, elem: CoreType) -> CoreType {
+        let head = self.type_id();
+        CoreType::Adt(head, vec![elem])
     }
 
-    // ---- Leaf constructors ----
-
-    #[must_use]
-    pub fn var(&self, sym: LocalId, ty: CoreType) -> Expr {
-        Expr::Var { sym, ty }
+    /// `Result(T, E)` shorthand.
+    pub fn result_of(&mut self, ok: CoreType, err: CoreType) -> CoreType {
+        let head = self.type_id();
+        CoreType::Adt(head, vec![ok, err])
     }
 
+    /// `Maybe(T)` shorthand.
+    pub fn maybe_of(&mut self, t: CoreType) -> CoreType {
+        let head = self.type_id();
+        CoreType::Adt(head, vec![t])
+    }
+
+    /// `Str` (`List(U8)` under the spec).
+    pub fn str_ty(&mut self) -> CoreType {
+        self.list_of(self.u8())
+    }
+
+    // ---------------- Literal shortcuts (return Expr) ----------------
+
+    /// `42_i64` — emits `Expr::Lit` of `I64` type directly.
     #[must_use]
-    pub fn lit_i64(&self, n: i64) -> Expr {
+    pub fn int(&self, n: i64) -> Expr {
         Expr::Lit { value: Literal::Int(n), ty: self.i64() }
     }
 
+    /// `5_u8`.
     #[must_use]
-    pub fn lit_u8(&self, n: u8) -> Expr {
+    pub fn byte(&self, n: u8) -> Expr {
         Expr::Lit { value: Literal::Int(i64::from(n)), ty: self.u8() }
     }
 
+    /// `true` / `false` literal.
     #[must_use]
-    pub fn lit_bool(&self, b: bool) -> Expr {
-        Expr::Lit { value: Literal::Int(i64::from(b)), ty: self.bool() }
+    pub fn bool_(&self, b: bool) -> Expr {
+        Expr::Lit { value: Literal::Int(i64::from(b)), ty: self.bool_ty() }
     }
 
+    /// `3.14_f64`.
     #[must_use]
-    pub fn lit_f64(&self, f: f64) -> Expr {
-        Expr::Lit { value: Literal::Float(f), ty: self.f64() }
+    pub fn float(&self, x: f64) -> Expr {
+        Expr::Lit { value: Literal::Float(x), ty: self.f64() }
     }
 
+    /// `crash("msg")` of the given result type.
     #[must_use]
     pub fn crash(&self, msg: impl Into<String>, ty: CoreType) -> Expr {
         Expr::Crash { msg: StrLit::new(msg), ty }
     }
 
-    // ---- Composite constructors ----
+    // ---------------- Composite constructors ----------------
 
+    /// `f(args...)` returning `ret_ty`.
     #[must_use]
-    pub fn call(&self, target: FnId, args: Vec<Expr>, ret_ty: CoreType) -> Expr {
-        Expr::App { target, args, ty: ret_ty }
+    pub fn call(
+        &self,
+        target: FnId,
+        args: impl IntoIterator<Item = Expr>,
+        ret_ty: CoreType,
+    ) -> Expr {
+        Expr::App {
+            target,
+            args: args.into_iter().collect(),
+            ty: ret_ty,
+        }
     }
 
-    #[must_use]
-    pub fn let_(&self, binder: LocalId, value: Expr, body: Expr) -> Expr {
-        let ty = body.ty().clone();
-        Expr::Let { binder, value: Box::new(value), body: Box::new(body), ty }
+    /// `let x = value in body`. The result type is taken from
+    /// `body`.
+    pub fn bind(
+        &self,
+        x: &LocalVar,
+        value: impl Into<Expr>,
+        body: impl Into<Expr>,
+    ) -> Expr {
+        let body_expr: Expr = body.into();
+        let ty = body_expr.ty().clone();
+        Expr::Let {
+            binder: x.id,
+            value: Box::new(value.into()),
+            body: Box::new(body_expr),
+            ty,
+        }
     }
 
-    #[must_use]
-    pub fn match_(&self, scrutinee: Expr, arms: Vec<MatchArm>, ty: CoreType) -> Expr {
-        Expr::Match { scrutinee: Box::new(scrutinee), arms, ty }
+    /// `match scrutinee of arms...` returning `ty`.
+    pub fn match_(
+        &self,
+        scrutinee: impl Into<Expr>,
+        arms: impl IntoIterator<Item = MatchArm>,
+        ty: CoreType,
+    ) -> Expr {
+        Expr::Match {
+            scrutinee: Box::new(scrutinee.into()),
+            arms: arms.into_iter().collect(),
+            ty,
+        }
     }
 
-    #[must_use]
-    pub fn con(&self, tag: TagId, args: Vec<Expr>, ty: CoreType) -> Expr {
-        Expr::Con { tag, args, ty }
+    /// `Tag(args...)` — tag-union constructor.
+    pub fn con(
+        &self,
+        tag: TagId,
+        args: impl IntoIterator<Item = Expr>,
+        ty: CoreType,
+    ) -> Expr {
+        Expr::Con {
+            tag,
+            args: args.into_iter().collect(),
+            ty,
+        }
     }
 
-    // ---- Fold/Gen ----
+    // ---------------- Fold / Gen ----------------
 
-    /// Total catamorphism. `fold_fn` returns `b` directly.
-    #[must_use]
+    /// Total catamorphism — `fold_fn` returns `b` directly.
     pub fn fold(
         &self,
         fold_fn: FnId,
-        target: Expr,
-        init: Vec<Expr>,
-        captures: Vec<Expr>,
+        target: impl Into<Expr>,
+        init: impl IntoIterator<Item = Expr>,
+        captures: impl IntoIterator<Item = Expr>,
         ty: CoreType,
     ) -> Expr {
         Expr::Fold {
             kind: FoldKind::Total,
             fold_fn,
-            target: Box::new(target),
-            init,
-            captures,
+            target: Box::new(target.into()),
+            init: init.into_iter().collect(),
+            captures: captures.into_iter().collect(),
             shape: None,
             ty,
         }
     }
 
-    /// Early-exit catamorphism (`walk_until` shape). `fold_fn`
-    /// returns `Step(b)`.
-    #[must_use]
+    /// Early-exit catamorphism — `fold_fn` returns `Step(b)`.
     pub fn fold_until(
         &self,
         fold_fn: FnId,
-        target: Expr,
-        init: Vec<Expr>,
-        captures: Vec<Expr>,
+        target: impl Into<Expr>,
+        init: impl IntoIterator<Item = Expr>,
+        captures: impl IntoIterator<Item = Expr>,
         ty: CoreType,
     ) -> Expr {
         Expr::Fold {
             kind: FoldKind::EarlyExit,
             fold_fn,
-            target: Box::new(target),
-            init,
-            captures,
+            target: Box::new(target.into()),
+            init: init.into_iter().collect(),
+            captures: captures.into_iter().collect(),
             shape: None,
             ty,
         }
     }
 
-    /// Attach a verified shape annotation to an existing `Fold`.
-    /// Panics if applied to a non-`Fold`.
+    /// Attach a verified shape to an existing `Fold`. Panics if
+    /// applied to a non-`Fold`.
     #[must_use]
     pub fn with_shape(&self, mut expr: Expr, shape: FoldShape) -> Expr {
         if let Expr::Fold { shape: s, .. } = &mut expr {
@@ -193,91 +287,139 @@ impl Builder {
         expr
     }
 
-    #[must_use]
+    /// Bounded anamorphism.
     pub fn gen_(
         &self,
-        bound: Expr,
+        bound: impl Into<Expr>,
         step_fn: FnId,
-        init: Vec<Expr>,
-        captures: Vec<Expr>,
+        init: impl IntoIterator<Item = Expr>,
+        captures: impl IntoIterator<Item = Expr>,
         elem_ty: CoreType,
         ty: CoreType,
     ) -> Expr {
         Expr::Gen {
-            bound: Box::new(bound),
+            bound: Box::new(bound.into()),
             step_fn,
-            init,
-            captures,
+            init: init.into_iter().collect(),
+            captures: captures.into_iter().collect(),
             elem_ty,
             ty,
         }
     }
 
-    // ---- Buffer primitives ----
+    // ---------------- Buffer primitives ----------------
+
+    pub fn buf_lit(
+        &self,
+        elements: impl IntoIterator<Item = Expr>,
+        elem_ty: CoreType,
+        ty: CoreType,
+    ) -> Expr {
+        Expr::BufLit {
+            elements: elements.into_iter().collect(),
+            elem_ty,
+            ty,
+        }
+    }
+
+    pub fn buf_load(&self, buf: impl Into<Expr>, idx: impl Into<Expr>, ty: CoreType) -> Expr {
+        Expr::BufLoad {
+            buf: Box::new(buf.into()),
+            idx: Box::new(idx.into()),
+            ty,
+        }
+    }
+
+    pub fn buf_load_unchecked(
+        &self,
+        buf: impl Into<Expr>,
+        idx: impl Into<Expr>,
+        ty: CoreType,
+    ) -> Expr {
+        Expr::BufLoadUnchecked {
+            buf: Box::new(buf.into()),
+            idx: Box::new(idx.into()),
+            ty,
+        }
+    }
+
+    pub fn buf_append(&self, buf: impl Into<Expr>, val: impl Into<Expr>, ty: CoreType) -> Expr {
+        Expr::BufAppend {
+            buf: Box::new(buf.into()),
+            val: Box::new(val.into()),
+            ty,
+        }
+    }
+
+    pub fn buf_set(
+        &self,
+        buf: impl Into<Expr>,
+        idx: impl Into<Expr>,
+        val: impl Into<Expr>,
+        ty: CoreType,
+    ) -> Expr {
+        Expr::BufSet {
+            buf: Box::new(buf.into()),
+            idx: Box::new(idx.into()),
+            val: Box::new(val.into()),
+            ty,
+        }
+    }
+
+    // ---------------- Patterns + arms ----------------
 
     #[must_use]
-    pub fn buf_lit(&self, elements: Vec<Expr>, elem_ty: CoreType, ty: CoreType) -> Expr {
-        Expr::BufLit { elements, elem_ty, ty }
+    pub fn pat_con(&self, tag: TagId, binders: impl IntoIterator<Item = Binder>) -> Pattern {
+        Pattern::Constructor {
+            tag,
+            binders: binders.into_iter().collect(),
+        }
     }
 
     #[must_use]
-    pub fn buf_load(&self, buf: Expr, idx: Expr, ty: CoreType) -> Expr {
-        Expr::BufLoad { buf: Box::new(buf), idx: Box::new(idx), ty }
+    pub const fn pat_wild(&self) -> Pattern { Pattern::Wildcard }
+
+    /// One arm with no guards.
+    pub fn arm(&self, pattern: Pattern, body: impl Into<Expr>) -> MatchArm {
+        MatchArm {
+            pattern,
+            guards: vec![],
+            body: Box::new(body.into()),
+            is_return: false,
+        }
     }
 
-    #[must_use]
-    pub fn buf_load_unchecked(&self, buf: Expr, idx: Expr, ty: CoreType) -> Expr {
-        Expr::BufLoadUnchecked { buf: Box::new(buf), idx: Box::new(idx), ty }
-    }
-
-    #[must_use]
-    pub fn buf_append(&self, buf: Expr, val: Expr, ty: CoreType) -> Expr {
-        Expr::BufAppend { buf: Box::new(buf), val: Box::new(val), ty }
-    }
-
-    #[must_use]
-    pub fn buf_set(&self, buf: Expr, idx: Expr, val: Expr, ty: CoreType) -> Expr {
-        Expr::BufSet { buf: Box::new(buf), idx: Box::new(idx), val: Box::new(val), ty }
-    }
-
-    // ---- Patterns + arms ----
-
-    #[must_use]
-    pub fn pat_con(&self, tag: TagId, binders: Vec<Binder>) -> Pattern {
-        Pattern::Constructor { tag, binders }
-    }
-
-    #[must_use]
-    pub fn pat_wild(&self) -> Pattern { Pattern::Wildcard }
-
-    #[must_use]
-    pub fn pat_bind(&self, sym: LocalId) -> Pattern { Pattern::Binding(sym) }
-
-    #[must_use]
-    pub fn arm(&self, pattern: Pattern, body: Expr) -> MatchArm {
-        MatchArm { pattern, guards: vec![], body: Box::new(body), is_return: false }
-    }
-
-    #[must_use]
-    pub fn arm_with_guards(
+    /// Arm with guards.
+    pub fn arm_guarded(
         &self,
         pattern: Pattern,
-        guards: Vec<Expr>,
-        body: Expr,
+        guards: impl IntoIterator<Item = Expr>,
+        body: impl Into<Expr>,
     ) -> MatchArm {
-        MatchArm { pattern, guards, body: Box::new(body), is_return: false }
+        MatchArm {
+            pattern,
+            guards: guards.into_iter().collect(),
+            body: Box::new(body.into()),
+            is_return: false,
+        }
     }
 
-    #[must_use]
-    pub fn arm_return(&self, pattern: Pattern, body: Expr) -> MatchArm {
-        MatchArm { pattern, guards: vec![], body: Box::new(body), is_return: true }
+    /// `: pat return body` arm — short-circuits the enclosing
+    /// function.
+    pub fn arm_return(&self, pattern: Pattern, body: impl Into<Expr>) -> MatchArm {
+        MatchArm {
+            pattern,
+            guards: vec![],
+            body: Box::new(body.into()),
+            is_return: true,
+        }
     }
 
-    // ---- Tag constructors ----
+    // ---------------- Tag constructors ----------------
 
     #[must_use]
-    pub fn declared_tag(&self, tag: DeclTagId) -> TagId { TagId::Declared(tag) }
+    pub fn declared(&self, tag: DeclTagId) -> TagId { TagId::Declared(tag) }
 
     #[must_use]
-    pub fn closure_tag(&self, tag: ClosureTagId) -> TagId { TagId::Closure(tag) }
+    pub fn closure(&self, tag: ClosureTagId) -> TagId { TagId::Closure(tag) }
 }

@@ -10,7 +10,7 @@
 //! ```rust,no_run
 //! # use core_ir::Builder;
 //! let b = Builder::new();
-//! let prog = b.lit_i64(42);
+//! let prog = b.int(42);
 //! println!("{prog}");
 //! ```
 
